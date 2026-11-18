@@ -89,8 +89,23 @@ From lowest to highest precedence:
 4. **Project**: `hamster-ball.toml` in the project root.
 
 `hb` finds the project root by walking up from the current directory to the first `hamster-ball.toml`.
-`hb` refuses to run when the current directory is `$HOME`, `/`, `/Users`, or contains `$HOME`
-(a gap found in review of the old `sb`, which only checked `PWD == $HOME`; `sandbox.py` checks containment).
+The walk uses `symlink_metadata` on each candidate: not found keeps walking; a permission error, or a
+symlink, directory or other non-regular file named `hamster-ball.toml`, is fatal, so a parent project's
+config never applies silently.
+
+- If no `hamster-ball.toml` exists up to `/`, `hb` stops with a `NoProjectConfig` error. It never falls back to
+  the current directory (the old `sb` did, which made that directory writable with no approval).
+- `hb` refuses a current directory or a discovered root that is "too broad": `/`, `$HOME`, an ancestor of `$HOME`,
+  or any path with fewer than two components below `/` (`/Users`, `/private`, `/Volumes`). The same check applies
+  to every `fs.read` and `fs.write` grant in every layer (a `write = ["~"]` would otherwise make your whole home
+  writable). Comparison is by path component, so `/Users/rolfs2` is not confused with `/Users/rolfs`.
+  (The old `sb` only checked `PWD == $HOME`; `sandbox.py` checks containment.)
+- The home directory comes from the passwd database, not `$HOME`, and is compared with a canonicalized `$HOME`.
+  A mismatch is a `HomeMismatch` error, because the floor is built from home and `HOME=/tmp/x hb ...` would
+  otherwise relocate every floor path. An unset `$HOME` is fine. `hb` also refuses to run as root.
+  Verified on this machine: a normal shell, a launchd job, `env -i`, a trailing-slash `HOME` and a poisoned
+  `HOME` all give the expected result. Not tested: `sudo -E` (reasoned: root's passwd home is `/var/root`,
+  hence the root refusal) and nix `--pure` shells.
 
 ### 4.2 Merge rules
 
@@ -143,8 +158,23 @@ bind_loopback = true
 - `~` and relative paths are expanded, then **canonicalized with `realpath`** before use.
   Measured: Seatbelt matches resolved paths. `/tmp` is a symlink to `/private/tmp`, and a rule on
   `/tmp/...` made `uv_cwd` fail with `EPERM`.
-- An allow rule whose path does not exist is skipped with a warning in `hb explain` (the safe direction).
-- A deny rule whose path does not exist is still emitted, using the canonical parent plus the name.
+- `~` and `~/...` only (no `~user`); no `$VARIABLE` expansion. **Relative paths resolve against the project root
+  in every layer**, so `write = ["."]` in a preset or the base means the project.
+- An allow rule whose path does not exist is skipped with a recorded reason (`Missing` or `Dangling`) shown by
+  `hb explain` (the safe direction). A permission error on an allow rule is an error, not a skip.
+- A deny rule whose path does not exist is still emitted: the deepest resolvable ancestor, canonicalized, plus the
+  missing tail. `..` in the missing tail is an error. A dangling symlink or a non-directory ancestor is an error.
+  A deny on an existing symlink emits both the target and the link name.
+- **Case and Unicode spelling of a missing tail is not a hole.** Measured on this APFS volume: Seatbelt `literal`,
+  `subpath` and `regex` rules match case-insensitively and NFC/NFD-insensitively (a deny on a missing `ID_RSA`
+  blocks creating `id_rsa`; verified again on 2026-11-18). Do not emit case-folding regexes. Never use a Rust
+  string comparison on an unresolved tail for a security decision; only compare fully canonical paths.
+- `fs.deny_read` and `fs.deny_write` entries may be globs (`config/*.secrets.yaml`). They are represented as a
+  `PathPattern`: the longest non-glob prefix is resolved with deny semantics, and the tail may use only `*`, `?` and
+  `**` (no `[`, `{`, `..` or absolute segments).
+- Config input is untrusted: each file is read once (symlinks refused except for user-level files, regular file
+  only, no blocking), capped at 256 KiB and 4096 entries per list, validated as UTF-8, and the exact bytes are kept
+  for approval hashing (section 5).
 - Paths reach the profile through Seatbelt `-D` parameters (`(param "R3")`), never by string
   interpolation. This is the approach in `sandbox.py`; it avoids the old `sb`'s profile-injection bug
   (an unquoted heredoc put `$HOME` and `$PROJECT` into the profile text). Found in review, not tested here.
@@ -379,6 +409,13 @@ Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen b
 
 - Handles `CONNECT` (HTTPS) and plain HTTP forwarding. Decisions are by hostname from the request.
 - Allowlist entries: exact host or `*.suffix`. Default is deny. Denials return `403` with a reason and are logged.
+  `*.example.com` matches `a.example.com` and `a.b.example.com` but not `example.com`, and is label-boundary safe.
+  Hosts are strict LDH (a `_` in a label is rejected), punycode only, and the last label must start with a letter
+  (so `2130706433` and `0x7f.1` are rejected). **Wildcards over protected suffixes are rejected at config time**:
+  a wildcard whose suffix is on the public suffix list, or is an ancestor of any entry on it, is an error
+  (`*.github.io`, `*.co.uk`, `*.cloudfront.net`, and also `*.amazonaws.com`, which is not itself listed but
+  covers every `*.s3.amazonaws.com` tenant). List exact hosts instead. The list is vendored (MPL-2.0, unmodified)
+  and compiled into a protected set by `build.rs`; no runtime network is used.
 - The proxy resolves names and refuses to connect to loopback, link-local or private addresses for allowed
   names (prevents DNS rebinding into local services). Default port: 443 only.
 - Auth: the proxy URL carries a random per-session credential
@@ -447,7 +484,7 @@ Pure core, effects at the edges: `config` to `policy` to `seatbelt` has no I/O e
   path canonicalization, host pattern matching, closure hashing, profile golden files.
 - **Property**: merge is monotone (adding a layer never removes a deny); profile never contains an unescaped path.
 - **Integration (macOS, real `sandbox-exec`)**: the spike probe matrix as automated tests, including secrets-guard
-  bypass attempts (13 cases), pin swap attempts (7 cases), symlink-mount attack, direct network and DNS blocked,
+  deny cases (13: 4 direct reads and 9 bypass attempts), pin swap attempts (7 cases), symlink-mount attack, direct network and DNS blocked,
   other-loopback-port blocked, env empty.
 - **Proxy**: allowlist, rebinding refusal, port restrictions, auth token, large streaming bodies.
 - **Agent conformance (opt-in, needs installed agents and logins)**: one non-interactive prompt per preset;
@@ -480,7 +517,7 @@ Proposed milestones, each ending with passing tests:
 7. `hb warm`, MCP server handling.
 8. `hb ctl`, preflight and pinning.
 
-I propose to file a beads epic with one child task per milestone after you approve this design.
+Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 3, 6 and 8 became child epics (`hb-ghd.1`, `.2`, `.3`, `.6`, `.8`) with real child tasks; milestones 4, 5 and 7 are tasks (`hb-ghd.4`, `.5`, `.7`). The planned ninth "open-items closeout" milestone was dissolved: each unverified item (section 15) is a task inside the epic that owns it (pty: `hb-ghd.2.4`; proxy credentials: `hb-ghd.3.2`; `/private/tmp` narrowing and claude updater: `hb-ghd.6.2`; `hb ctl` preflight: `hb-ghd.8.2`).
 
 ## 19. Decision log
 
@@ -507,3 +544,12 @@ I propose to file a beads epic with one child task per milestone after you appro
 | D19 | Project name `hamster-ball`; binary stays `hb`; GitHub `dmrolfs/hamster-ball`, private until the project-specific details are moved out | chosen by owner (name); private is my default |
 | D20 | User config and state live under `~/.config/hamster-ball` and `~/.local/state/hamster-ball` (not `sandbox`, which the old `sb` and Linux setup already use as `~/.sandbox`) | change made while renaming; pending owner review |
 | D21 | Binary is `hb` (not `sb`); the project config file is `hamster-ball.toml` (not `sandbox.toml`); "sandbox" becomes "hamster ball" in this repo's prose. Kept as-is: Apple's `sandbox-exec`, `sandbox.py`, Anthropic's "Sandbox Runtime", the legacy `sb` script, `omp-supervisor`'s own sandbox | owner feedback; file name `hamster-ball.toml` is my choice, pending review |
+| D22 | Relative paths resolve against the project root in every layer | agreed |
+| D23 | `fs.read`/`fs.write` grants (and the project root) that are `/`, `$HOME`, an ancestor of `$HOME`, or shallower than two components are rejected in every layer | agreed |
+| D24 | No `hamster-ball.toml` is a typed `NoProjectConfig` error; no fallback to the cwd | agreed |
+| D25 | Config files read once, capped at 256 KiB and 4096 entries per list; exact bytes kept for hashing | agreed |
+| D26 | Glob deny patterns are a `PathPattern` type (resolved base plus validated glob tail) | agreed |
+| D27 | Wildcard hosts are rejected when the suffix is a public suffix or an ancestor of one; list vendored, set generated by `build.rs` | agreed (stricter than the first proposal, which missed `*.amazonaws.com`) |
+| D28 | Home from the passwd database, `HomeMismatch` on disagreement with `$HOME`; `hb` refuses to run as root | agreed; `sudo -E` and nix `--pure` untested |
+| D29 | Error `Display` never interpolates `{source}`; `main` prints chains with `snafu::Report`. The `{source}` examples in the owner's `rust/GUIDELINES` and the `snafu-strum-refactoring` skill were an error to follow | owner decision |
+| D30 | `hb-ghd.1.1` promoted to an epic with five children (11 days; M1 is now 17 days) | agreed |
