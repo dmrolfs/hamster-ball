@@ -1,0 +1,30 @@
+# ABOUTME: Hand-maintained supplement to the Public Suffix List: tenant-hosting namespaces it does not cover.
+# ABOUTME: One name per line, same grammar as a plain PSL rule name. See data/NOTICE.md.
+#
+# Each entry grants an arbitrary party a hostname under it (a free-tier cloud service, app
+# platform, or similar), so a wildcard allowlist entry over it would match attacker-owned
+# tenants. Verified absent from the live Public Suffix List on 2026-11-18 (fetched separately,
+# checked both as a plain rule and as a wildcard-rule parent).
+#
+# storage.googleapis.com     - Google Cloud Storage bucket virtual-hosted URLs (bucket.storage.googleapis.com)
+# googleusercontent.com      - Google user-content proxy (various Google product subdomains)
+# cloudapp.azure.com         - Azure classic cloud service / VM public hostnames; tracked, acknowledged PSL
+#                              gap: https://github.com/publicsuffix/list/issues/1137 (Microsoft has not
+#                              submitted the required proof-of-control DNS record)
+# azurecontainerapps.io      - Azure Container Apps default hostnames
+# r2.cloudflarestorage.com   - Cloudflare R2 object storage public bucket URLs
+# glitch.me                  - Glitch app hosting (app-name.glitch.me)
+# sharepoint.com             - Microsoft 365 tenant SharePoint sites (tenant.sharepoint.com)
+#
+# github.dev - lower confidence than the others: its primary hosting model (the github.dev web
+# editor) is path-based (github.dev/org/repo), not subdomain-based. Included defensively because
+# GitHub Codespaces port-forwarding previews do use a subdomain model on a related domain; not
+# independently confirmed to apply to github.dev itself. Revisit if this proves unnecessary.
+storage.googleapis.com
+googleusercontent.com
+cloudapp.azure.com
+azurecontainerapps.io
+r2.cloudflarestorage.com
+glitch.me
+sharepoint.com
+github.dev

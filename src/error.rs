@@ -5,7 +5,8 @@
 use snafu::Snafu;
 
 use crate::policy::{
-    ContainerNameError, EnvNameError, EnvValueError, PathError, PortError, RootError,
+    ContainerNameError, EnvNameError, EnvValueError, HostNameError, HostPatternError, PathError,
+    PortError, RootError,
 };
 
 /// Any error produced by this crate.
@@ -55,6 +56,20 @@ pub enum Error {
     ContainerName {
         /// The underlying error.
         source: ContainerNameError,
+    },
+
+    /// A hostname was invalid.
+    #[snafu(transparent)]
+    HostName {
+        /// The underlying error.
+        source: HostNameError,
+    },
+
+    /// A network allowlist pattern was invalid.
+    #[snafu(transparent)]
+    HostPattern {
+        /// The underlying error.
+        source: HostPatternError,
     },
 }
 

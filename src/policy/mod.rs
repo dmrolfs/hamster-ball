@@ -5,11 +5,15 @@
 pub mod ctl;
 pub mod env;
 pub mod home;
+pub mod host;
 pub mod path;
 pub mod port;
 
 pub use ctl::{ContainerName, ContainerNameError};
 pub use env::{EnvName, EnvNameError, EnvValue, EnvValueError};
 pub use home::{BroadRoot, HomeDir, ProjectRoot, RootError, broadness};
+pub use host::{
+    HostName, HostNameError, HostPattern, HostPatternError, protected_suffix_list_version,
+};
 pub use path::{CanonicalPath, PathError};
 pub use port::{Port, PortError};

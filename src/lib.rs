@@ -20,4 +20,8 @@ pub mod origin;
 pub mod policy;
 pub mod text;
 
+#[cfg(test)]
+#[path = "../build/psl_gen.rs"]
+mod psl_gen;
+
 pub use error::Error;
