@@ -103,13 +103,16 @@ impl<'a> PathResolver<'a> {
     /// an I/O error other than "missing" or "dangling".
     pub fn allow(&self, spelling: &str) -> Result<AllowOutcome, PathError> {
         let expanded = self.expand(spelling)?;
+        let is_relative = !spelling.starts_with('/') && !spelling.starts_with('~');
         match resolve(&expanded, Mode::Allow)? {
-            Resolution::LeafSymlink { target, .. } => {
-                Ok(AllowOutcome::Granted(self.grant(target)?))
-            }
-            Resolution::Resolved { ancestor, tail } if tail.is_empty() => {
-                Ok(AllowOutcome::Granted(self.grant(ancestor)?))
-            }
+            Resolution::LeafSymlink { target, .. } => Ok(AllowOutcome::Granted(self.grant(
+                spelling,
+                target,
+                is_relative,
+            )?)),
+            Resolution::Resolved { ancestor, tail } if tail.is_empty() => Ok(
+                AllowOutcome::Granted(self.grant(spelling, ancestor, is_relative)?),
+            ),
             Resolution::Resolved {
                 ancestor: _,
                 tail: _,
@@ -126,9 +129,26 @@ impl<'a> PathResolver<'a> {
         }
     }
 
-    /// Checks the breadth of a granted path and wraps it, failing if it is too broad.
-    fn grant(&self, path: PathBuf) -> Result<CanonicalPath, PathError> {
+    /// Checks the breadth and project-containment of a granted path and wraps it.
+    ///
+    /// A relative spelling means "inside this project" (decision D22), so once the walk
+    /// resolves it -- following any symlink on the way -- the result must still be inside
+    /// the project root. An absolute or `~`-based spelling carries no such restriction: a
+    /// preset legitimately reads something like `~/.cargo/registry`.
+    fn grant(
+        &self,
+        spelling: &str,
+        path: PathBuf,
+        is_relative: bool,
+    ) -> Result<CanonicalPath, PathError> {
         let canonical = CanonicalPath::from_canonical(path)?;
+        if is_relative && !self.project_root.path().is_same_or_ancestor_of(&canonical) {
+            return Err(PathError::RelativeEscapesProject {
+                spelling: spelling.to_owned(),
+                resolved: canonical,
+                project_root: self.project_root.path().clone(),
+            });
+        }
         match broadness(&canonical, self.home) {
             Some(reason) => Err(PathError::TooBroad {
                 path: canonical,
@@ -492,7 +512,7 @@ impl PathPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claims::{assert_err, assert_ok};
+    use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
@@ -727,6 +747,100 @@ mod tests {
             matches!(err, PathError::NotADirectoryAncestor { .. }),
             "{err:?}"
         );
+    }
+
+    // ====================================================================================
+    // allow: a relative grant must stay inside the project (D22's own meaning of "relative")
+    // ====================================================================================
+
+    /// A project nested a few levels under home, the realistic layout: a sibling-of-home
+    /// fixture would let the pre-existing $HOME-ancestor check accidentally catch an escape
+    /// by coincidence, masking whether containment is actually enforced.
+    struct NestedFixture {
+        _dir: TempDir,
+        home: HomeDir,
+        root: ProjectRoot,
+    }
+
+    impl NestedFixture {
+        fn new() -> Self {
+            let dir = assert_ok!(TempDir::new());
+            let home_path = dir.path().join("home");
+            let project_path = home_path.join("work").join("myproject");
+            assert_ok!(fs::create_dir_all(&project_path));
+            let home = HomeDir::new(assert_ok!(CanonicalPath::from_canonical(assert_ok!(
+                fs::canonicalize(&home_path)
+            ))));
+            let root = assert_ok!(ProjectRoot::new(
+                assert_ok!(CanonicalPath::from_canonical(assert_ok!(fs::canonicalize(
+                    &project_path
+                )))),
+                &home,
+            ));
+            Self {
+                _dir: dir,
+                home,
+                root,
+            }
+        }
+
+        fn resolver(&self) -> PathResolver<'_> {
+            PathResolver::new(&self.home, &self.root)
+        }
+
+        fn project_path(&self) -> PathBuf {
+            PathBuf::from(self.root.path().as_str())
+        }
+    }
+
+    #[test]
+    fn allow_rejects_a_relative_grant_that_escapes_the_project_root() {
+        let fx = NestedFixture::new();
+        // "work" is the project's own parent; this is a real directory, not merely a missing
+        // tail, so the escape is not incidentally caught by anything else.
+        let err = assert_err!(fx.resolver().allow(".."));
+        assert!(
+            matches!(err, PathError::RelativeEscapesProject { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn allow_rejects_a_multi_component_relative_escape() {
+        let fx = NestedFixture::new();
+        let project_path = fx.project_path();
+        let parent = assert_some!(project_path.parent());
+        assert_ok!(fs::create_dir_all(parent.join("sibling-project")));
+        let err = assert_err!(fx.resolver().allow("../sibling-project"));
+        assert!(
+            matches!(err, PathError::RelativeEscapesProject { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn allow_accepts_a_relative_grant_that_stays_inside_the_project() {
+        let fx = NestedFixture::new();
+        assert_ok!(fs::create_dir(fx.project_path().join("fixtures")));
+        assert!(matches!(
+            assert_ok!(fx.resolver().allow("fixtures")),
+            AllowOutcome::Granted(_)
+        ));
+        assert!(matches!(
+            assert_ok!(fx.resolver().allow(".")),
+            AllowOutcome::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn allow_does_not_apply_project_containment_to_absolute_or_tilde_paths() {
+        let fx = NestedFixture::new();
+        // An absolute or ~-based grant is explicitly allowed to point outside the project;
+        // only a *relative* spelling carries the "stays inside the project" meaning.
+        assert!(matches!(
+            assert_ok!(fx.resolver().allow("~/work")),
+            AllowOutcome::Granted(_)
+        ));
     }
 
     // ====================================================================================

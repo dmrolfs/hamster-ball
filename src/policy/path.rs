@@ -162,6 +162,21 @@ pub enum PathError {
         /// Why it is too broad.
         reason: BroadRoot,
     },
+
+    /// A relative `fs.read`/`fs.write` grant resolved to somewhere outside the project.
+    #[snafu(display(
+        "{} resolves to {resolved}, outside the project ({project_root}); relative paths must \
+         stay inside the project, so use an absolute path to reach outside it",
+        Escaped(spelling)
+    ))]
+    RelativeEscapesProject {
+        /// The spelling as written.
+        spelling: String,
+        /// Where it actually resolved to.
+        resolved: CanonicalPath,
+        /// The project root it escaped.
+        project_root: CanonicalPath,
+    },
 }
 
 /// An absolute, normalized, UTF-8 path with no control characters.
