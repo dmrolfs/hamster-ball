@@ -19,8 +19,12 @@ name = "hb"
 path = "src/bin/hb.rs"
 
 [dependencies]
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
 snafu = "0.9.2"
 strum = { version = "0.28.0", features = ["derive"] }
+toml = "1.2.1"
 
 [dev-dependencies]
 claims = "0.8.0"
