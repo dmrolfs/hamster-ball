@@ -1,40 +1,59 @@
 // ABOUTME: discover() walks up from the current directory to find hamster-ball.toml, never falling back to the cwd.
-// ABOUTME: Refuses a broad cwd or a broad discovered root, reusing the same predicate as fs.read/fs.write grants.
+// ABOUTME: Refuses a broad cwd or root, and a config or root directory that is not yours or is world-writable.
 //! Finds the project root by walking up from the current directory, refusing to fall back to
-//! the current directory when nothing is found, and refusing a root that is too broad.
+//! the current directory when nothing is found, refusing a root that is too broad, and
+//! refusing a project whose config file or directory another user could have written.
 
-use std::fs;
+use std::fs::{self, Metadata};
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use nix::unistd::getuid;
 use snafu::{ResultExt, Snafu};
+use strum::Display;
 
 use crate::policy::{
     BroadRoot, CanonicalPath, HomeDir, PathError, ProjectRoot, RootError, broadness,
 };
-use crate::text::EscapedBounded;
+use crate::sys::{file_kind, path_preview};
 
 /// The name of a project's config file, looked for in every ancestor of the current directory.
 const CONFIG_FILE_NAME: &str = "hamster-ball.toml";
 
-/// How much of a path is echoed in an error message.
-const ERROR_PREVIEW_CHARS: usize = 200;
-
-fn path_preview(path: &Path) -> EscapedBounded<'_> {
-    EscapedBounded::new(
-        path.to_str().unwrap_or("<non-UTF-8 path>"),
-        ERROR_PREVIEW_CHARS,
-    )
-}
+/// Mode bit for "writable by anyone".
+const WORLD_WRITABLE: u32 = 0o002;
 
 /// The project root [`discover`] found, and the `hamster-ball.toml` inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Discovery {
     /// The project root.
     pub root: ProjectRoot,
-    /// The config file found inside it.
+    /// The config file found inside it, spelled from the canonical root directory.
     pub config: PathBuf,
+}
+
+/// What [`DiscoverError::Untrusted`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum Subject {
+    /// The `hamster-ball.toml` file.
+    #[strum(to_string = "config file")]
+    ConfigFile,
+    /// The directory that contains it.
+    #[strum(to_string = "project directory")]
+    ProjectDirectory,
+}
+
+/// Why a config file or project directory is not trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum Untrusted {
+    /// It belongs to another user.
+    #[strum(to_string = "owned by another user")]
+    NotOwnedByYou,
+    /// Any user can write to it.
+    #[strum(to_string = "writable by every user")]
+    WorldWritable,
 }
 
 /// Why [`discover`] could not find a usable project root.
@@ -102,6 +121,26 @@ pub enum DiscoverError {
         reason: BroadRoot,
     },
 
+    /// The config file or its directory belongs to someone else, or anyone can write it.
+    ///
+    /// A shared directory such as `/tmp` would otherwise let any local user, or a process
+    /// confined in a hamster ball with write access there, plant a config that becomes
+    /// the project root for everything below it.
+    #[snafu(display(
+        "the {subject} {} is {problem}; hb only uses a project that belongs to you and that \
+         other users cannot write. Move the project into a directory you own, or fix it with \
+         `chown` or `chmod o-w`.",
+        path_preview(path)
+    ))]
+    Untrusted {
+        /// The config file or directory.
+        path: PathBuf,
+        /// Which of the two it is.
+        subject: Subject,
+        /// What is wrong with it.
+        problem: Untrusted,
+    },
+
     /// A resolved path was not a usable canonical path.
     #[snafu(transparent)]
     Path {
@@ -117,9 +156,26 @@ pub enum DiscoverError {
 /// running `hb` directly in `$HOME` is refused immediately with an actionable message instead
 /// of walking all the way to `/` first.
 ///
+/// The discovered config file and root directory must belong to the real uid and must not be
+/// writable by every user. Group write is allowed: macOS gives every user the shared `staff`
+/// group and some users keep project trees group-writable on purpose. The approval hash is
+/// the control for what the file says; this check is about who could have put it there.
+///
 /// # Errors
 /// See [`DiscoverError`].
 pub fn discover(cwd: &Path, home: &HomeDir) -> Result<Discovery, DiscoverError> {
+    walk(cwd, home, getuid().as_raw(), None)
+}
+
+/// [`discover`] with the owner to trust and an optional directory at which to stop walking
+/// up, so tests need neither another user nor an environment free of stray config files above
+/// the temp directory.
+fn walk(
+    cwd: &Path,
+    home: &HomeDir,
+    uid: u32,
+    ceiling: Option<&Path>,
+) -> Result<Discovery, DiscoverError> {
     let canonical_cwd = fs::canonicalize(cwd).context(CwdUnreadableSnafu {
         path: cwd.to_path_buf(),
     })?;
@@ -138,21 +194,12 @@ pub fn discover(cwd: &Path, home: &HomeDir) -> Result<Discovery, DiscoverError> 
         let candidate = dir.join(CONFIG_FILE_NAME);
         match fs::symlink_metadata(&candidate) {
             Ok(metadata) if metadata.is_file() => {
-                let root_canonical = CanonicalPath::from_canonical(&dir)?;
-                return match ProjectRoot::new(root_canonical, home) {
-                    Ok(root) => Ok(Discovery {
-                        root,
-                        config: candidate,
-                    }),
-                    Err(RootError::TooBroad { path, reason }) => {
-                        RootTooBroadSnafu { path, reason }.fail()
-                    }
-                };
+                return found(&dir, candidate, &metadata, home, uid);
             }
             Ok(metadata) => {
                 return ConfigNotARegularFileSnafu {
                     path: candidate,
-                    kind: classify(&metadata),
+                    kind: file_kind(&metadata),
                 }
                 .fail();
             }
@@ -164,89 +211,89 @@ pub fn discover(cwd: &Path, home: &HomeDir) -> Result<Discovery, DiscoverError> 
             }
         }
 
+        let at_ceiling = ceiling.is_some_and(|ceiling| ceiling == dir);
         match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => return NoProjectConfigSnafu { from: start }.fail(),
+            Some(parent) if !at_ceiling => dir = parent.to_path_buf(),
+            _ => return NoProjectConfigSnafu { from: start }.fail(),
         }
     }
 }
 
-/// What `symlink_metadata` found, when it was not a regular file.
-fn classify(metadata: &fs::Metadata) -> &'static str {
-    if metadata.is_symlink() {
-        "symlink"
-    } else if metadata.is_dir() {
-        "directory"
-    } else if metadata.file_type().is_fifo() {
-        "fifo"
-    } else if metadata.file_type().is_char_device() || metadata.file_type().is_block_device() {
-        "device"
+/// Accepts `dir` as the project root if it is not too broad and neither it nor its config
+/// file is untrusted.
+fn found(
+    dir: &Path,
+    config: PathBuf,
+    config_metadata: &Metadata,
+    home: &HomeDir,
+    uid: u32,
+) -> Result<Discovery, DiscoverError> {
+    let root = match ProjectRoot::new(CanonicalPath::from_canonical(dir)?, home) {
+        Ok(root) => root,
+        Err(RootError::TooBroad { path, reason }) => {
+            return RootTooBroadSnafu { path, reason }.fail();
+        }
+    };
+    let dir_metadata = fs::metadata(dir).context(ConfigUnreadableSnafu {
+        path: dir.to_path_buf(),
+    })?;
+    ensure_trusted(dir, Subject::ProjectDirectory, &dir_metadata, uid)?;
+    ensure_trusted(&config, Subject::ConfigFile, config_metadata, uid)?;
+    Ok(Discovery { root, config })
+}
+
+fn ensure_trusted(
+    path: &Path,
+    subject: Subject,
+    metadata: &Metadata,
+    uid: u32,
+) -> Result<(), DiscoverError> {
+    match untrusted(metadata.uid(), metadata.mode(), uid) {
+        None => Ok(()),
+        Some(problem) => UntrustedSnafu {
+            path: path.to_path_buf(),
+            subject,
+            problem,
+        }
+        .fail(),
+    }
+}
+
+/// Why a file with this owner and mode is not trusted by the user `uid`, if it is not.
+fn untrusted(owner: u32, mode: u32, uid: u32) -> Option<Untrusted> {
+    if owner != uid {
+        Some(Untrusted::NotOwnedByYou)
+    } else if mode & WORLD_WRITABLE != 0 {
+        Some(Untrusted::WorldWritable)
     } else {
-        "other"
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{ModeGuard, Tree, mkfifo};
     use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
     use std::fs as stdfs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use tempfile::TempDir;
+    use std::os::unix::fs::symlink;
 
-    /// A throwaway `home` and `project` tree, so a test never touches the real filesystem
-    /// outside it. `home` and `project` are siblings by default; call `nest` to make `project`
-    /// a real descendant of `home` instead, for the tests that need that shape.
-    struct Fixture {
-        _dir: TempDir,
-        home: HomeDir,
-        home_path: PathBuf,
+    fn me() -> u32 {
+        getuid().as_raw()
     }
 
-    impl Fixture {
-        fn new() -> Self {
-            let dir = assert_ok!(TempDir::new());
-            let home_path = dir.path().join("home");
-            assert_ok!(stdfs::create_dir_all(&home_path));
-            let home = HomeDir::new(assert_ok!(CanonicalPath::from_canonical(assert_ok!(
-                stdfs::canonicalize(&home_path)
-            ))));
-            Self {
-                _dir: dir,
-                home,
-                home_path,
-            }
-        }
+    /// `walk` as the real user, stopping at the tree's base so a stray config file above the
+    /// OS temp directory cannot change the result.
+    fn discover_in(tree: &Tree, cwd: &Path) -> Result<Discovery, DiscoverError> {
+        walk(cwd, tree.home(), me(), Some(tree.base()))
+    }
 
-        fn home(&self) -> &HomeDir {
-            &self.home
-        }
-
-        fn canonical_home_path(&self) -> PathBuf {
-            assert_ok!(stdfs::canonicalize(&self.home_path))
-        }
-
-        /// A directory outside `home`, at `/tmp/<rand>/outside/<rel>`.
-        fn outside(&self, rel: &str) -> PathBuf {
-            let path = self._dir.path().join("outside").join(rel);
-            assert_ok!(stdfs::create_dir_all(&path));
-            path
-        }
-
-        /// A directory inside `home`, at `<home>/<rel>`.
-        fn inside_home(&self, rel: &str) -> PathBuf {
-            let path = self.home_path.join(rel);
-            assert_ok!(stdfs::create_dir_all(&path));
-            path
-        }
-
-        fn write_config(&self, dir: &Path) {
-            assert_ok!(stdfs::write(
-                dir.join(CONFIG_FILE_NAME),
-                b"fs.write = [\".\"]\n"
-            ));
-        }
+    fn write_config(dir: &Path) {
+        assert_ok!(stdfs::write(
+            dir.join(CONFIG_FILE_NAME),
+            b"fs.write = [\".\"]\n"
+        ));
     }
 
     // ====================================================================================
@@ -255,57 +302,95 @@ mod tests {
 
     #[test]
     fn finds_config_in_cwd() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        fx.write_config(&project);
-        let discovery = assert_ok!(discover(&project, fx.home()));
-        assert_eq!(
-            discovery.root.path().as_path(),
-            assert_ok!(stdfs::canonicalize(&project))
-        );
-        assert_eq!(
-            discovery.config,
-            assert_ok!(stdfs::canonicalize(&project)).join(CONFIG_FILE_NAME)
-        );
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let discovery = assert_ok!(discover_in(&tree, &project));
+        assert_eq!(discovery.root.path().as_path(), project);
+        assert_eq!(discovery.config, project.join(CONFIG_FILE_NAME));
     }
 
     #[test]
     fn finds_config_in_ancestor_nearest_wins() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        fx.write_config(&project);
-        let nested = assert_ok!({
-            let path = project.join("src").join("inner");
-            stdfs::create_dir_all(&path).map(|_| path)
-        });
-        // A second, nearer config must win over the outer one.
-        let inner_config = project.join("src");
-        fx.write_config(&inner_config);
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let nested = project.join("src").join("inner");
+        assert_ok!(stdfs::create_dir_all(&nested));
+        // A nearer config must win over the outer one.
+        write_config(&project.join("src"));
 
-        let discovery = assert_ok!(discover(&nested, fx.home()));
-        assert_eq!(
-            discovery.root.path().as_path(),
-            assert_ok!(stdfs::canonicalize(&inner_config))
-        );
+        let discovery = assert_ok!(discover_in(&tree, &nested));
+        assert_eq!(discovery.root.path().as_path(), project.join("src"));
     }
 
     #[test]
-    fn no_config_returns_no_project_config() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        let err = assert_err!(discover(&project, fx.home()));
+    fn finds_an_ancestor_config_from_a_deep_subdirectory() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let deep = project.join("a/b/c/d");
+        assert_ok!(stdfs::create_dir_all(&deep));
+        let discovery = assert_ok!(discover_in(&tree, &deep));
+        assert_eq!(discovery.root.path().as_path(), project);
+    }
+
+    #[test]
+    fn no_config_returns_no_project_config_naming_where_it_started() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        let err = assert_err!(discover_in(&tree, &project));
         assert!(
-            matches!(err, DiscoverError::NoProjectConfig { .. }),
+            matches!(&err, DiscoverError::NoProjectConfig { from } if from.as_path() == project),
             "{err:?}"
         );
     }
 
     #[test]
     fn no_project_config_error_tells_the_user_what_to_do() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        let shown = assert_err!(discover(&project, fx.home())).to_string();
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        let shown = assert_err!(discover_in(&tree, &project)).to_string();
         assert!(shown.contains("create one"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_walk_checks_the_ceiling_itself_but_never_reads_above_it() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        let ceiling = tree.base().join("outside");
+        // A config above the ceiling must not be found...
+        write_config(tree.base());
+        let err = assert_err!(walk(&project, tree.home(), me(), Some(&ceiling)));
+        assert!(
+            matches!(err, DiscoverError::NoProjectConfig { .. }),
+            "{err:?}"
+        );
+
+        // ...but one in the ceiling directory itself is.
+        write_config(&ceiling);
+        let discovery = assert_ok!(walk(&project, tree.home(), me(), Some(&ceiling)));
+        assert_eq!(discovery.root.path().as_path(), ceiling);
+    }
+
+    #[test]
+    fn the_walk_terminates_at_the_filesystem_root() {
+        // Environmental by nature: it walks the real ancestors of the OS temp directory. It
+        // asserts only that the walk ends with a typed result (found, or no config) and never
+        // loops or panics.
+        let tree = Tree::new();
+        let project = tree.outside("proj/deeply/nested/path");
+        let result = discover(&project, tree.home());
+        assert!(
+            matches!(
+                result,
+                Ok(_)
+                    | Err(DiscoverError::NoProjectConfig { .. }
+                        | DiscoverError::RootTooBroad { .. }
+                        | DiscoverError::Untrusted { .. })
+            ),
+            "{result:?}"
+        );
     }
 
     // ====================================================================================
@@ -314,87 +399,81 @@ mod tests {
 
     #[test]
     fn refuses_cwd_equal_to_home_even_with_a_toml_present() {
-        let fx = Fixture::new();
-        fx.write_config(&fx.canonical_home_path());
-        let err = assert_err!(discover(&fx.home_path, fx.home()));
+        let tree = Tree::new();
+        write_config(tree.home_path());
+        let err = assert_err!(discover_in(&tree, tree.home_path()));
         assert!(matches!(err, DiscoverError::CwdTooBroad { .. }), "{err:?}");
     }
 
     #[test]
     fn cwd_too_broad_error_tells_the_user_what_to_do() {
-        let fx = Fixture::new();
-        let shown = assert_err!(discover(&fx.home_path, fx.home())).to_string();
+        let tree = Tree::new();
+        let shown = assert_err!(discover_in(&tree, tree.home_path())).to_string();
         assert!(shown.contains("cd into your project"), "{shown:?}");
     }
 
     #[test]
-    fn refuses_cwd_that_is_root_users_or_home_ancestor() {
-        let fx = Fixture::new();
-        let ancestor = assert_ok!(
-            fx.home_path
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or("no parent")
-        );
-        let err = assert_err!(discover(&ancestor, fx.home()));
+    fn refuses_cwd_that_is_a_home_ancestor() {
+        let tree = Tree::new();
+        let err = assert_err!(discover_in(&tree, tree.base()));
         assert!(matches!(err, DiscoverError::CwdTooBroad { .. }), "{err:?}");
     }
 
     #[test]
+    fn refuses_the_filesystem_root_and_a_top_level_system_directory_as_cwd() {
+        let tree = Tree::new();
+        for cwd in ["/", "/private", "/Users"] {
+            let err = assert_err!(discover_in(&tree, Path::new(cwd)), "{cwd}");
+            assert!(
+                matches!(err, DiscoverError::CwdTooBroad { .. }),
+                "{cwd}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn allows_cwd_inside_home() {
-        let fx = Fixture::new();
-        let project = fx.inside_home("work/app");
-        fx.write_config(&project);
-        let discovery = assert_ok!(discover(&project, fx.home()));
-        assert_eq!(
-            discovery.root.path().as_path(),
-            assert_ok!(stdfs::canonicalize(&project))
-        );
+        let tree = Tree::new();
+        let project = tree.inside_home("work/app");
+        write_config(&project);
+        let discovery = assert_ok!(discover_in(&tree, &project));
+        assert_eq!(discovery.root.path().as_path(), project);
     }
 
     #[test]
     fn sibling_prefix_of_home_is_allowed() {
-        let fx = Fixture::new();
-        let sibling_name = format!(
-            "{}2",
-            assert_ok!(fx.home_path.file_name().ok_or("no name")).to_string_lossy()
-        );
-        let sibling = assert_ok!(fx.home_path.parent().ok_or("no parent"))
-            .join(sibling_name)
-            .join("proj");
+        let tree = Tree::new();
+        let sibling = tree.base().join("home2").join("proj");
         assert_ok!(stdfs::create_dir_all(&sibling));
-        fx.write_config(&sibling);
-        let discovery = assert_ok!(discover(&sibling, fx.home()));
-        assert_eq!(
-            discovery.root.path().as_path(),
-            assert_ok!(stdfs::canonicalize(&sibling))
-        );
+        write_config(&sibling);
+        let discovery = assert_ok!(discover_in(&tree, &sibling));
+        assert_eq!(discovery.root.path().as_path(), sibling);
     }
 
     #[test]
     fn refuses_root_in_home_when_cwd_is_subdir() {
-        let fx = Fixture::new();
-        fx.write_config(&fx.canonical_home_path());
-        let subdir = fx.inside_home("work/app");
-        let err = assert_err!(discover(&subdir, fx.home()));
+        let tree = Tree::new();
+        write_config(tree.home_path());
+        let subdir = tree.inside_home("work/app");
+        let err = assert_err!(discover_in(&tree, &subdir));
         assert!(matches!(err, DiscoverError::RootTooBroad { .. }), "{err:?}");
     }
 
     #[test]
     fn root_too_broad_error_tells_the_user_what_to_do() {
-        let fx = Fixture::new();
-        fx.write_config(&fx.canonical_home_path());
-        let subdir = fx.inside_home("work/app");
-        let shown = assert_err!(discover(&subdir, fx.home())).to_string();
+        let tree = Tree::new();
+        write_config(tree.home_path());
+        let subdir = tree.inside_home("work/app");
+        let shown = assert_err!(discover_in(&tree, &subdir)).to_string();
         assert!(shown.contains("Move"), "{shown:?}");
     }
 
     #[test]
     fn symlinked_cwd_into_home_is_canonicalized_and_refused() {
-        let fx = Fixture::new();
-        let link = fx._dir.path().join("link-to-home");
-        assert_ok!(symlink(&fx.home_path, &link));
-        let err = assert_err!(discover(&link, fx.home()));
+        let tree = Tree::new();
+        let link = tree.base().join("link-to-home");
+        assert_ok!(symlink(tree.home_path(), &link));
+        let err = assert_err!(discover_in(&tree, &link));
         assert!(matches!(err, DiscoverError::CwdTooBroad { .. }), "{err:?}");
     }
 
@@ -404,10 +483,10 @@ mod tests {
 
     #[test]
     fn config_that_is_a_directory_is_fatal() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
+        let tree = Tree::new();
+        let project = tree.outside("proj");
         assert_ok!(stdfs::create_dir_all(project.join(CONFIG_FILE_NAME)));
-        let err = assert_err!(discover(&project, fx.home()));
+        let err = assert_err!(discover_in(&tree, &project));
         assert!(
             matches!(
                 err,
@@ -421,51 +500,16 @@ mod tests {
     }
 
     #[test]
-    fn config_that_is_a_fifo_is_fatal_and_does_not_block() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        let status = assert_ok!(
-            std::process::Command::new("mkfifo")
-                .arg(project.join(CONFIG_FILE_NAME))
-                .status()
-        );
-        assert!(status.success(), "mkfifo failed: {status:?}");
-        let err = assert_err!(discover(&project, fx.home()));
-        assert!(
-            matches!(
-                err,
-                DiscoverError::ConfigNotARegularFile { kind: "fifo", .. }
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn discover_errors_follow_the_display_convention() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        crate::error::conventions::assert_display_excludes_sources(&assert_err!(discover(
-            &project,
-            fx.home()
-        )));
-        let gone = project.join("gone");
-        crate::error::conventions::assert_display_excludes_sources(&assert_err!(discover(
-            &gone,
-            fx.home()
-        )));
-    }
-
-    #[test]
-    fn config_that_is_a_symlink_is_fatal() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        let real = fx.outside("elsewhere");
+    fn config_that_is_a_symlink_is_fatal_even_when_it_points_at_a_regular_file() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        let real = tree.outside("elsewhere");
         assert_ok!(stdfs::write(real.join("real.toml"), b""));
         assert_ok!(symlink(
             real.join("real.toml"),
             project.join(CONFIG_FILE_NAME)
         ));
-        let err = assert_err!(discover(&project, fx.home()));
+        let err = assert_err!(discover_in(&tree, &project));
         assert!(
             matches!(
                 err,
@@ -479,54 +523,208 @@ mod tests {
     }
 
     #[test]
+    fn config_that_is_a_fifo_is_fatal_and_does_not_block() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        mkfifo(&project.join(CONFIG_FILE_NAME));
+        let err = assert_err!(discover_in(&tree, &project));
+        assert!(
+            matches!(
+                err,
+                DiscoverError::ConfigNotARegularFile { kind: "fifo", .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn unreadable_dir_is_fatal_not_skipped_upward() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
+        let tree = Tree::new();
+        let project = tree.outside("proj");
         let nested = project.join("nested");
         assert_ok!(stdfs::create_dir_all(&nested));
-        // An outer config exists; if the permission error were skipped upward instead of being
-        // fatal, this test would wrongly "succeed" by finding it.
-        fx.write_config(&project);
-        assert_ok!(stdfs::set_permissions(
-            &nested,
-            stdfs::Permissions::from_mode(0o000)
-        ));
-        let result = discover(&nested, fx.home());
-        assert_ok!(stdfs::set_permissions(
-            &nested,
-            stdfs::Permissions::from_mode(0o755)
-        ));
-        let err = assert_err!(result);
+        // An outer config exists; if the permission error were skipped upward instead of
+        // being fatal, the walk would wrongly find it.
+        write_config(&project);
+        let _guard = ModeGuard::set(&nested, 0o000);
+        let err = assert_err!(discover_in(&tree, &nested));
+        // The cwd itself cannot be canonicalized or listed; either way the outer config must
+        // not be applied.
         assert!(
-            matches!(err, DiscoverError::ConfigUnreadable { .. }),
+            matches!(
+                err,
+                DiscoverError::ConfigUnreadable { .. } | DiscoverError::CwdUnreadable { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_ancestor_is_fatal_not_skipped_upward() {
+        let tree = Tree::new();
+        let outer = tree.outside("outer");
+        write_config(&outer);
+        let middle = outer.join("middle");
+        let cwd = middle.join("cwd");
+        assert_ok!(stdfs::create_dir_all(&cwd));
+        // `middle` cannot be searched, so `middle/hamster-ball.toml` cannot be checked.
+        let _guard = ModeGuard::set(&middle, 0o600);
+        let err = assert_err!(discover_in(&tree, &cwd));
+        assert!(
+            matches!(
+                err,
+                DiscoverError::ConfigUnreadable { .. } | DiscoverError::CwdUnreadable { .. }
+            ),
             "{err:?}"
         );
     }
 
     #[test]
     fn deleted_cwd_is_a_typed_error() {
-        let fx = Fixture::new();
-        let project = fx.outside("proj");
-        let gone = project.join("gone");
-        assert_ok!(stdfs::create_dir_all(&gone));
-        assert_ok!(stdfs::remove_dir(&gone));
-        let err = assert_err!(discover(&gone, fx.home()));
+        let tree = Tree::new();
+        let gone = tree.outside("proj").join("gone");
+        let err = assert_err!(discover_in(&tree, &gone));
         assert!(
             matches!(err, DiscoverError::CwdUnreadable { .. }),
             "{err:?}"
         );
     }
 
+    // ====================================================================================
+    // Trust: owner and world-writable
+    // ====================================================================================
+
     #[test]
-    fn walk_stops_at_the_filesystem_root() {
-        // No config anywhere under a throwaway tree; the walk must terminate at "/" with
-        // NoProjectConfig rather than looping or panicking.
-        let fx = Fixture::new();
-        let project = fx.outside("proj/deeply/nested/path");
-        let err = assert_err!(discover(&project, fx.home()));
+    fn untrusted_classifies_owner_before_mode() {
+        assert_eq!(untrusted(501, 0o644, 501), None);
+        assert_eq!(untrusted(501, 0o664, 501), None, "group write is allowed");
+        assert_eq!(untrusted(501, 0o666, 501), Some(Untrusted::WorldWritable));
+        assert_eq!(untrusted(501, 0o1777, 501), Some(Untrusted::WorldWritable));
+        assert_eq!(untrusted(0, 0o755, 501), Some(Untrusted::NotOwnedByYou));
+        // The shape of /private/tmp: root-owned, world-writable and sticky.
+        assert_eq!(untrusted(0, 0o41777, 501), Some(Untrusted::NotOwnedByYou));
+    }
+
+    #[test]
+    fn a_project_owned_by_another_user_is_refused() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let err = assert_err!(walk(&project, tree.home(), me() + 1, Some(tree.base())));
         assert!(
-            matches!(err, DiscoverError::NoProjectConfig { .. }),
+            matches!(
+                err,
+                DiscoverError::Untrusted {
+                    subject: Subject::ProjectDirectory,
+                    problem: Untrusted::NotOwnedByYou,
+                    ..
+                }
+            ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_world_writable_project_directory_is_refused() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let _guard = ModeGuard::set(&project, 0o777);
+        let err = assert_err!(discover_in(&tree, &project));
+        assert!(
+            matches!(
+                err,
+                DiscoverError::Untrusted {
+                    subject: Subject::ProjectDirectory,
+                    problem: Untrusted::WorldWritable,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_world_writable_config_file_is_refused() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let _guard = ModeGuard::set(&project.join(CONFIG_FILE_NAME), 0o666);
+        let err = assert_err!(discover_in(&tree, &project));
+        assert!(
+            matches!(
+                err,
+                DiscoverError::Untrusted {
+                    subject: Subject::ConfigFile,
+                    problem: Untrusted::WorldWritable,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_group_writable_project_is_accepted() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let _dir = ModeGuard::set(&project, 0o775);
+        let _file = ModeGuard::set(&project.join(CONFIG_FILE_NAME), 0o664);
+        assert_ok!(discover_in(&tree, &project));
+    }
+
+    #[test]
+    fn untrusted_error_names_the_subject_the_problem_and_the_fix() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        write_config(&project);
+        let _guard = ModeGuard::set(&project, 0o777);
+        let shown = assert_err!(discover_in(&tree, &project)).to_string();
+        assert!(shown.contains("project directory"), "{shown:?}");
+        assert!(shown.contains("writable by every user"), "{shown:?}");
+        assert!(shown.contains("chmod o-w"), "{shown:?}");
+    }
+
+    #[test]
+    fn breadth_is_checked_before_trust() {
+        // A config in a too-broad directory is reported as too broad even if it is also
+        // foreign-owned, because "move it" is the more useful advice.
+        let tree = Tree::new();
+        write_config(tree.home_path());
+        let subdir = tree.inside_home("work/app");
+        let err = assert_err!(walk(&subdir, tree.home(), me() + 1, Some(tree.base())));
+        assert!(matches!(err, DiscoverError::RootTooBroad { .. }), "{err:?}");
+    }
+
+    // ====================================================================================
+    // Error text
+    // ====================================================================================
+
+    #[test]
+    fn discover_errors_follow_the_display_convention() {
+        let tree = Tree::new();
+        let project = tree.outside("proj");
+        crate::error::conventions::assert_display_excludes_sources(&assert_err!(discover_in(
+            &tree, &project
+        )));
+        let gone = project.join("gone");
+        crate::error::conventions::assert_display_excludes_sources(&assert_err!(discover_in(
+            &tree, &gone
+        )));
+    }
+
+    #[test]
+    fn subject_and_problem_have_phrase_displays() {
+        assert_eq!(Subject::ConfigFile.to_string(), "config file");
+        assert_eq!(Subject::ProjectDirectory.to_string(), "project directory");
+        assert_eq!(
+            Untrusted::NotOwnedByYou.to_string(),
+            "owned by another user"
+        );
+        assert_eq!(
+            Untrusted::WorldWritable.to_string(),
+            "writable by every user"
         );
     }
 }

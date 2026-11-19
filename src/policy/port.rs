@@ -31,6 +31,12 @@ impl Port {
     }
 }
 
+impl From<Port> for u16 {
+    fn from(port: Port) -> Self {
+        port.get()
+    }
+}
+
 impl TryFrom<i64> for Port {
     type Error = PortError;
 
@@ -60,6 +66,11 @@ mod tests {
         assert_eq!(assert_ok!(Port::try_from(1)).get(), 1);
         assert_eq!(assert_ok!(Port::try_from(65535)).get(), 65535);
         assert_eq!(assert_ok!(Port::try_from(8080)).get(), 8080);
+    }
+
+    #[test]
+    fn port_converts_into_u16() {
+        assert_eq!(u16::from(assert_ok!(Port::try_from(443))), 443);
     }
 
     #[test]

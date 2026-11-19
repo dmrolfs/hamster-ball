@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use strum::{Display, IntoStaticStr};
 
-use crate::text::Escaped;
+use crate::text::{Escaped, needs_escaping};
 
 /// The layer a config file belongs to, ordered from lowest to highest precedence.
 ///
@@ -84,7 +84,7 @@ fn write_quoted(f: &mut fmt::Formatter<'_>, key: &str) -> fmt::Result {
         match c {
             '"' => f.write_str("\\\"")?,
             '\\' => f.write_str("\\\\")?,
-            c if c.is_control() => write!(f, "{}", c.escape_default())?,
+            c if needs_escaping(c) => write!(f, "{}", c.escape_default())?,
             c => write!(f, "{c}")?,
         }
     }
@@ -253,6 +253,40 @@ mod tests {
             "{shown:?}"
         );
         assert_eq!(shown, "mcp.\"a\\\"b\\n\\u{1b}[2J\\\\\"");
+    }
+
+    #[test]
+    fn key_path_quotes_a_non_bare_first_segment_without_a_leading_dot() {
+        assert_eq!(KeyPath::root().key("a.b").to_string(), "\"a.b\"");
+    }
+
+    #[test]
+    fn key_path_keeps_ordinary_non_ascii_keys_readable() {
+        assert_eq!(
+            KeyPath::root().field("mcp").key("é.x").to_string(),
+            "mcp.\"é.x\""
+        );
+    }
+
+    #[test]
+    fn key_path_escapes_text_reordering_and_invisible_characters_in_keys() {
+        // Right-to-left override, zero-width space, line separator and BOM are not `Cc`
+        // control characters, but each can disguise a key in terminal output.
+        for hostile in ["\u{202e}", "\u{200b}", "\u{2028}", "\u{feff}", "\u{2066}"] {
+            let shown = KeyPath::root()
+                .field("mcp")
+                .key(format!("a{hostile}b"))
+                .to_string();
+            assert!(
+                !shown.contains(hostile),
+                "{hostile:?} reached the output: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_path_root_equals_default() {
+        assert_eq!(KeyPath::root(), KeyPath::default());
     }
 
     #[test]

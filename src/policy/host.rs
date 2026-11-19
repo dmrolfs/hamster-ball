@@ -32,7 +32,8 @@ pub enum HostNameError {
         len: usize,
     },
 
-    /// The host contains a control or text-reordering character.
+    /// The host contains a control character. (Text-reordering characters are non-ASCII and
+    /// are reported as [`HostNameError::NonAscii`].)
     #[snafu(display(
         "host name contains a control character: {}",
         EscapedBounded::new(host, ERROR_PREVIEW_CHARS)
@@ -189,8 +190,9 @@ pub enum HostNameError {
     Localhost,
 }
 
-/// A validated, normalized hostname: lowercase ASCII, at most 253 labels bytes, no control
-/// characters, no scheme, userinfo, path, port or address literal.
+/// A validated, normalized hostname: lowercase ASCII, at most 253 bytes (plus an optional
+/// trailing dot, which is dropped), no control characters, no scheme, userinfo, path, port or
+/// address literal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostName(String);
 
@@ -785,6 +787,15 @@ mod tests {
     #[test]
     fn an_exact_host_that_is_itself_a_public_suffix_is_still_allowed() {
         assert_ok!(HostPattern::parse("github.io"));
+    }
+
+    #[test]
+    fn the_protected_suffix_list_version_is_the_vendored_lists_own_header() {
+        let version = protected_suffix_list_version();
+        assert!(!version.is_empty());
+        assert!(!version.contains('\n'), "{version:?}");
+        assert!(version.chars().any(|c| c.is_ascii_digit()), "{version:?}");
+        assert_eq!(version, LIST_VERSION);
     }
 
     #[test]

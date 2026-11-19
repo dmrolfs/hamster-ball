@@ -11,7 +11,7 @@ use std::fmt;
 /// and isolates, zero-width characters, the line and paragraph separators, and the BOM. A
 /// hostile host name or path containing `U+202E` (right-to-left override), for example, could
 /// otherwise make an error message display in a misleading order.
-fn needs_escaping(c: char) -> bool {
+pub(crate) fn needs_escaping(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

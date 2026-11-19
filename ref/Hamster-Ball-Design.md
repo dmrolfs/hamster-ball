@@ -100,6 +100,11 @@ config never applies silently.
   to every `fs.read` and `fs.write` grant in every layer (a `write = ["~"]` would otherwise make your whole home
   writable). Comparison is by path component, so `/Users/rolfs2` is not confused with `/Users/rolfs`.
   (The old `sb` only checked `PWD == $HOME`; `sandbox.py` checks containment.)
+- The discovered `hamster-ball.toml` and its directory must belong to the real uid and must not be
+  world-writable, so a file planted in a shared directory such as `/tmp` (`/private/tmp` has only two
+  components and passes the breadth rule) cannot become a project root. Group write is allowed:
+  every macOS user shares the `staff` group and some keep project trees group-writable on purpose.
+  The approval hash (section 5) controls what the file says; this check is about who could have put it there.
 - The home directory comes from the passwd database, not `$HOME`, and is compared with a canonicalized `$HOME`.
   A mismatch is a `HomeMismatch` error, because the floor is built from home and `HOME=/tmp/x hb ...` would
   otherwise relocate every floor path. An unset `$HOME` is fine. `hb` also refuses to run as root.
@@ -452,7 +457,8 @@ values, `ABOUTME` headers, TDD, `claims` and `pretty_assertions` in tests.
 | Module | Responsibility |
 |---|---|
 | `config` | Parse TOML (`serde`), resolve `extends`, merge, produce a `Policy` with provenance |
-| `policy` | Policy intermediate representation; newtypes `CanonicalPath`, `HostPattern`, `Port`, `EnvName` |
+| `policy` | Pure validated value types: `CanonicalPath`, `HostPattern`, `Port`, `EnvName`, `ContainerLabel`, `Argv`, `McpName`, `PathPattern`. No I/O |
+| `system` | The only OS access besides config reading: `PathResolver` (filesystem), `HomeDir::from_environment` (passwd and `$HOME`) |
 | `floor` | Compiled-in rules |
 | `approval` | Closure hash, store, grant summary, prompt |
 | `seatbelt` | Policy to SBPL text plus `-D` parameter list. Pure function, golden-file tested |
@@ -462,7 +468,7 @@ values, `ABOUTME` headers, TDD, `claims` and `pretty_assertions` in tests.
 | `session` | Per-session directory (0700), env construction, hooks, pty, spawn, cleanup |
 | `cli` | `clap` commands |
 
-Pure core, effects at the edges: `config` to `policy` to `seatbelt` has no I/O except reading files and `realpath`.
+Pure core, effects at the edges: `policy` is pure; `system` and the file loading and discovery in `config` hold the I/O (reading files, `realpath`, passwd); `seatbelt` is a pure function of the resolved policy.
 
 ## 15. Open items (decide or verify before or during implementation)
 
@@ -553,3 +559,5 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D28 | Home from the passwd database, `HomeMismatch` on disagreement with `$HOME`; `hb` refuses to run as root | agreed; `sudo -E` and nix `--pure` untested |
 | D29 | Error `Display` never interpolates `{source}`; `main` prints chains with `snafu::Report`. The `{source}` examples in the owner's `rust/GUIDELINES` and the `snafu-strum-refactoring` skill were an error to follow | owner decision |
 | D30 | `hb-ghd.1.1` promoted to an epic with five children (11 days; M1 is now 17 days) | agreed |
+| D31 | `discover` requires the config file and root directory to be owned by the real uid and not world-writable; group write is allowed | review finding H2 (hb-alt); ownership-only rule chosen over also requiring roots under `$HOME`, to keep projects outside home usable; confirmed by owner |
+| D32 | `ctl.label` must be `key=value` with a non-empty value from a restricted alphabet (a bare key or empty selector would widen `hb ctl`'s scope); hooks and MCP commands are validated argument vectors (non-empty program, no NUL, bounded); `extends` and `guard.exceptions` are form-checked text until M1.2 and the guard define their meaning; `mcp.<name>` names match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` | review finding H1 and gap 6 (hb-alt); confirmed by owner |

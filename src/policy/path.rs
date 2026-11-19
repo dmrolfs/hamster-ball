@@ -1,5 +1,5 @@
 // ABOUTME: CanonicalPath: an absolute, normalized, UTF-8 path that is safe to hand to Seatbelt as a parameter.
-// ABOUTME: Pure form check only (no I/O); resolving a spelling against the filesystem lives in a later module.
+// ABOUTME: CanonicalPath (a pure form check, no I/O) and PathError, which also carries PathResolver's resolution errors.
 //! The [`CanonicalPath`] value type.
 
 use std::fmt;
@@ -7,9 +7,28 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use snafu::{OptionExt, Snafu, ensure};
+use strum::Display;
 
-use crate::policy::home::BroadRoot;
 use crate::text::Escaped;
+
+/// Why a path is too broad to be a project root or a read/write grant.
+///
+/// `Display` gives a phrase suitable for an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+pub enum BroadRoot {
+    /// The filesystem root, `/`.
+    #[strum(to_string = "the filesystem root")]
+    Filesystem,
+    /// The user's home directory itself.
+    #[strum(to_string = "your home directory")]
+    Home,
+    /// A directory that contains the user's home directory, such as `/Users`.
+    #[strum(to_string = "a parent of your home directory")]
+    HomeAncestor,
+    /// A top-level system directory with fewer than two components, such as `/private`.
+    #[strum(to_string = "a top-level system directory")]
+    TooShallow,
+}
 
 /// Longest accepted path, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;

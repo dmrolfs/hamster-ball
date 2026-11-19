@@ -7,9 +7,12 @@
 //! [`crate::policy::Port`], say, is `resolve_file`'s job, not `serde`'s, so a bad value produces
 //! a typed resolution error with full context instead of a bare serde message.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::origin::KeyPath;
 
 /// The top-level shape of one config file.
 #[derive(Debug, Deserialize, Default)]
@@ -21,7 +24,7 @@ pub(crate) struct RawConfig {
     pub(crate) env: RawEnv,
     pub(crate) tls: RawTls,
     pub(crate) ctl: RawCtl,
-    pub(crate) mcp: HashMap<String, RawMcpServer>,
+    pub(crate) mcp: BTreeMap<String, RawMcpServer>,
     pub(crate) hooks: Vec<Vec<String>>,
     pub(crate) guard: RawGuard,
 }
@@ -49,7 +52,7 @@ pub(crate) struct RawNet {
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct RawEnv {
     pub(crate) pass: Vec<String>,
-    pub(crate) set: HashMap<String, String>,
+    pub(crate) set: BTreeMap<String, String>,
 }
 
 /// `[tls]`.
@@ -98,35 +101,36 @@ pub(crate) struct RawGuard {
     crate::text::Escaped(message)
 ))]
 pub(crate) struct ParseError {
-    pub(crate) file: std::path::PathBuf,
+    pub(crate) file: PathBuf,
     pub(crate) line: u32,
     pub(crate) column: u32,
     pub(crate) message: String,
-    pub(crate) key: crate::origin::KeyPath,
+    pub(crate) key: KeyPath,
 }
 
 /// Parses `text` into [`RawConfig`], reporting the exact key path on failure.
 pub(crate) fn parse(text: &crate::config::ConfigText) -> Result<RawConfig, ParseError> {
-    let deserializer = match toml::Deserializer::parse(text.as_str()) {
+    parse_str(text.as_str(), text.path())
+}
+
+/// Parses `source`, which was read from `file`, into [`RawConfig`].
+///
+/// The pure core of [`parse`]: `file` is used only to label an error.
+pub(crate) fn parse_str(source: &str, file: &Path) -> Result<RawConfig, ParseError> {
+    let deserializer = match toml::Deserializer::parse(source) {
         Ok(deserializer) => deserializer,
-        Err(error) => {
-            return Err(build_parse_error(
-                text,
-                &error,
-                crate::origin::KeyPath::root(),
-            ));
-        }
+        Err(error) => return Err(build_parse_error(source, file, &error, KeyPath::root())),
     };
     serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let key = convert_path(error.path());
-        build_parse_error(text, error.inner(), key)
+        build_parse_error(source, file, error.inner(), key)
     })
 }
 
-/// Converts a `serde_path_to_error::Path` into this crate's own [`crate::origin::KeyPath`].
-fn convert_path(path: &serde_path_to_error::Path) -> crate::origin::KeyPath {
+/// Converts a `serde_path_to_error::Path` into this crate's own [`KeyPath`].
+fn convert_path(path: &serde_path_to_error::Path) -> KeyPath {
     use serde_path_to_error::Segment;
-    let mut key = crate::origin::KeyPath::root();
+    let mut key = KeyPath::root();
     for segment in path.iter() {
         key = match segment {
             Segment::Seq { index } => key.index(*index),
@@ -139,17 +143,18 @@ fn convert_path(path: &serde_path_to_error::Path) -> crate::origin::KeyPath {
 }
 
 /// Builds a [`ParseError`] from a `toml::de::Error`'s structured accessors, converting its byte
-/// span into a 1-based line and column by counting newlines in the already-resident bytes.
+/// span into a 1-based line and column by counting newlines in the already-resident text.
 fn build_parse_error(
-    text: &crate::config::ConfigText,
+    source: &str,
+    file: &Path,
     error: &toml::de::Error,
-    key: crate::origin::KeyPath,
+    key: KeyPath,
 ) -> ParseError {
     let (line, column) = error
         .span()
-        .map_or((1, 1), |span| line_column_at(text.as_str(), span.start));
+        .map_or((1, 1), |span| line_column_at(source, span.start));
     ParseError {
-        file: text.path().to_path_buf(),
+        file: file.to_path_buf(),
         line,
         column,
         message: error.message().to_owned(),
@@ -157,13 +162,26 @@ fn build_parse_error(
     }
 }
 
-/// 1-based line and column of byte offset `at` in `text`.
+/// 1-based line and column (in characters) of byte offset `at` in `text`.
+///
+/// An offset past the end is clamped, and one inside a multibyte character is moved back to
+/// that character's start, so hostile input can never make this slice mid-character.
 fn line_column_at(text: &str, at: usize) -> (u32, u32) {
-    let before = &text[..at.min(text.len())];
-    let line = u32::try_from(before.matches('\n').count()).unwrap_or(u32::MAX) + 1;
-    let column =
-        u32::try_from(before.rsplit('\n').next().map_or(0, str::len)).unwrap_or(u32::MAX) + 1;
-    (line, column)
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before = &text[..at];
+    let line = before.matches('\n').count();
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.chars().count());
+    (saturating_u32(line) + 1, saturating_u32(column) + 1)
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -171,18 +189,11 @@ mod tests {
     use super::*;
     use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
-    use std::fs;
+
+    const FILE: &str = "/p/hamster-ball.toml";
 
     fn parsed(toml_text: &str) -> Result<RawConfig, ParseError> {
-        let dir = assert_ok!(tempfile::TempDir::new());
-        let path = dir.path().join("hamster-ball.toml");
-        assert_ok!(fs::write(&path, toml_text));
-        let text = assert_ok!(crate::config::ConfigText::read(
-            &path,
-            crate::origin::Layer::Project,
-            false
-        ));
-        parse(&text)
+        parse_str(toml_text, Path::new(FILE))
     }
 
     // ====================================================================================
@@ -236,6 +247,14 @@ mod tests {
         assert!(config.fs.write.is_empty());
     }
 
+    #[test]
+    fn a_leading_byte_order_mark_is_accepted() {
+        // Pinned behavior: the toml crate skips a BOM, so a file saved by an editor that adds
+        // one still parses. The exact bytes (BOM included) are what approval hashes.
+        let config = assert_ok!(parsed("\u{feff}[fs]\nwrite = [\"x\"]\n"));
+        assert_eq!(config.fs.write, vec!["x"]);
+    }
+
     // ====================================================================================
     // Rejected shapes
     // ====================================================================================
@@ -244,6 +263,7 @@ mod tests {
     fn unknown_top_level_key_reports_the_file_and_key() {
         let err = assert_err!(parsed("bogus_field = 1\n"));
         assert_eq!(err.key.to_string(), "bogus_field");
+        assert_eq!(err.file, Path::new(FILE));
         assert!(err.message.contains("unknown field"), "{}", err.message);
     }
 
@@ -271,23 +291,36 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_table_reports_file_and_line() {
-        let err = assert_err!(parsed("[fs]\nwrite = [\".\"]\n[fs]\nwrite = [\"x\"]\n"));
-        assert!(err.line >= 1, "{err:?}");
+    fn wrong_element_type_reports_the_index() {
+        let err = assert_err!(parsed("[fs]\nwrite = [\"a\", 2]\n"));
+        assert_eq!(err.key.to_string(), "fs.write[1]");
     }
 
     #[test]
-    fn syntax_error_carries_the_file() {
-        let dir = assert_ok!(tempfile::TempDir::new());
-        let path = dir.path().join("hamster-ball.toml");
-        assert_ok!(fs::write(&path, "fs = [this is not valid toml\n"));
-        let text = assert_ok!(crate::config::ConfigText::read(
-            &path,
-            crate::origin::Layer::Project,
-            false
-        ));
-        let err = assert_err!(parse(&text));
-        assert_eq!(err.file, path);
+    fn duplicate_table_reports_the_line_of_the_second_table() {
+        let err = assert_err!(parsed("[fs]\nwrite = [\".\"]\n[fs]\nwrite = [\"x\"]\n"));
+        assert_eq!(err.line, 3);
+    }
+
+    #[test]
+    fn syntax_error_carries_the_file_line_and_column() {
+        let err = assert_err!(parsed("a = 1\nfs = [this is not valid toml\n"));
+        assert_eq!(err.file, Path::new(FILE));
+        assert_eq!(err.line, 2);
+        assert!(err.column > 1, "{err:?}");
+    }
+
+    #[test]
+    fn wrong_type_reports_line_and_column_of_the_value() {
+        let err = assert_err!(parsed("[fs]\nwrite = \"not-a-list\"\n"));
+        assert_eq!((err.line, err.column), (2, 9));
+    }
+
+    #[test]
+    fn column_counts_characters_not_bytes() {
+        // Two multibyte strings precede the error, so a byte column would be larger.
+        let err = assert_err!(parsed("[fs]\nwrite = [\"héllo\", \"日本語\" \"x\"]\n"));
+        assert_eq!((err.line, err.column), (2, 25));
     }
 
     #[test]
@@ -297,29 +330,98 @@ mod tests {
     }
 
     #[test]
+    fn hostile_nesting_is_a_clean_error_not_a_stack_overflow() {
+        // Runs on a test thread, whose stack is smaller than the main thread's.
+        let arrays = format!("a = {}{}\n", "[".repeat(100_000), "]".repeat(100_000));
+        let err = assert_err!(parsed(&arrays));
+        assert!(err.message.contains("recurse"), "{}", err.message);
+
+        let tables = format!("a = {}1{}\n", "{b=".repeat(30_000), "}".repeat(30_000));
+        assert_err!(parsed(&tables));
+    }
+
+    // ====================================================================================
+    // Error text
+    // ====================================================================================
+
+    #[test]
     fn display_never_contains_the_source_excerpt_box() {
-        let dir = assert_ok!(tempfile::TempDir::new());
-        let path = dir.path().join("hamster-ball.toml");
-        assert_ok!(fs::write(&path, "[fs]\nwrite = \"not-a-list\"\n"));
-        let text = assert_ok!(crate::config::ConfigText::read(
-            &path,
-            crate::origin::Layer::Project,
-            false
-        ));
-        let err = assert_err!(parse(&text));
+        let err = assert_err!(parsed("[fs]\nwrite = \"not-a-list\"\n"));
         let shown = err.to_string();
-        // The message legitimately names the bad value (ordinary, useful error reporting);
-        // what must never appear is the multi-line "2 | write = ..." excerpt box with its
-        // `^^^` marker that `toml::de::Error`'s own `Display` embeds.
+        // The message legitimately names the bad value; what must never appear is the
+        // multi-line "2 | write = ..." excerpt box with its `^^^` marker that
+        // `toml::de::Error`'s own `Display` embeds.
         assert!(!shown.contains('\n'), "{shown:?}");
+        assert!(!shown.contains('^'), "{shown:?}");
         assert!(!shown.contains("write ="), "{shown:?}");
     }
 
     #[test]
-    fn error_never_echoes_the_source_excerpt() {
-        // Regression for the Display-leak finding: toml::de::Error's own Display embeds the
-        // raw file line with a ^^^ marker; this crate's ParseError must never call it.
-        let err = assert_err!(parsed("[fs]\nwrite = \"not-a-list\"\n"));
-        assert!(!err.to_string().contains('^'), "{}", err);
+    fn display_is_file_line_column_message() {
+        let err = assert_err!(parsed("[fs]\nwrite = \"x\"\n"));
+        assert!(
+            err.to_string().starts_with("/p/hamster-ball.toml:2:9: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn display_escapes_a_hostile_file_name() {
+        let err = assert_err!(parse_str("a = [", Path::new("/p/\u{1b}[2J.toml")));
+        assert!(!err.to_string().contains('\u{1b}'), "{err}");
+    }
+
+    // ====================================================================================
+    // line_column_at
+    // ====================================================================================
+
+    #[test]
+    fn line_column_at_is_one_based_and_counts_newlines() {
+        assert_eq!(line_column_at("abc", 0), (1, 1));
+        assert_eq!(line_column_at("abc", 2), (1, 3));
+        assert_eq!(line_column_at("a\nbc", 2), (2, 1));
+        assert_eq!(line_column_at("a\nbc", 3), (2, 2));
+        assert_eq!(line_column_at("a\nb\nc", 4), (3, 1));
+    }
+
+    #[test]
+    fn line_column_at_treats_crlf_as_one_line_break() {
+        assert_eq!(line_column_at("a\r\nb", 3), (2, 1));
+    }
+
+    #[test]
+    fn line_column_at_clamps_an_offset_past_the_end() {
+        assert_eq!(line_column_at("ab", 99), (1, 3));
+        assert_eq!(line_column_at("", 5), (1, 1));
+    }
+
+    #[test]
+    fn line_column_at_never_slices_inside_a_multibyte_character() {
+        let text = "é\nñx";
+        // Byte 1 is the middle of `é`; every offset must be safe.
+        for at in 0..=text.len() + 2 {
+            let _ = line_column_at(text, at);
+        }
+        assert_eq!(line_column_at(text, 1), (1, 1));
+    }
+
+    #[test]
+    fn line_column_at_counts_characters_in_the_current_line() {
+        assert_eq!(line_column_at("é\nñx", "é\nñ".len()), (2, 2));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn line_column_at_never_panics_and_stays_in_range(text in "\\PC{0,40}", at in 0usize..200) {
+            let (line, column) = line_column_at(&text, at);
+            proptest::prop_assert!(line >= 1);
+            proptest::prop_assert!(column >= 1);
+            proptest::prop_assert!(line as usize <= text.matches('\n').count() + 1);
+        }
+
+        #[test]
+        fn parse_str_never_panics_on_arbitrary_text(text in "\\PC{0,200}") {
+            let _ = parse_str(&text, Path::new(FILE));
+        }
     }
 }

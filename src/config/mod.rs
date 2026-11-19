@@ -7,8 +7,10 @@ mod raw;
 mod resolve;
 mod text;
 
-pub use discover::{DiscoverError, Discovery, discover};
+pub use discover::{DiscoverError, Discovery, Subject, Untrusted, discover};
 pub use resolve::{
-    Diagnostics, EntryError, ResolveContext, ResolveErrors, Resolved, ResolvedConfig, resolve_file,
+    Diagnostics, EntryError, ResolveContext, ResolveErrors, Resolved, ResolvedConfig, ResolvedCtl,
+    ResolvedEnv, ResolvedFs, ResolvedGuard, ResolvedMcpServer, ResolvedNet, ResolvedTls,
+    resolve_file,
 };
-pub use text::{ConfigText, ConfigTextError, MAX_CONFIG_BYTES};
+pub use text::{ConfigText, ConfigTextError, MAX_CONFIG_BYTES, SymlinkPolicy};

@@ -1,22 +1,26 @@
-// ABOUTME: PathResolver turns a config spelling into filesystem-checked CanonicalPath values; the crate's only I/O.
-// ABOUTME: Also PathPattern/GlobTail for fs.deny_read/fs.deny_write globs, whose base is resolved the same way.
+// ABOUTME: PathResolver turns a config spelling into filesystem-checked CanonicalPath values.
+// ABOUTME: Also builds a PathPattern from a deny-rule spelling by resolving its literal base.
 //! Resolves config path spellings against the real filesystem.
 //!
-//! Every other type in [`super`] is a pure form check with no I/O. This module is the
-//! exception: it is where `~` and relative spellings are expanded, and where the result is
-//! checked against what actually exists, because Seatbelt will later compare against the
-//! filesystem's own resolved form, not the text a user wrote (a rule on `/tmp/...` silently
-//! does nothing on macOS, because `/tmp` is a symlink to `/private/tmp`).
+//! The value types in [`crate::policy`] are pure form checks. This module is where `~` and
+//! relative spellings are expanded, and where the result is checked against what actually
+//! exists, because Seatbelt will later compare against the filesystem's own resolved form, not
+//! the text a user wrote (a rule on `/tmp/...` silently does nothing on macOS, because `/tmp`
+//! is a symlink to `/private/tmp`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-use snafu::{Snafu, ensure};
+use snafu::ensure;
 use strum::{Display, IntoStaticStr};
 
-use super::home::{HomeDir, ProjectRoot, broadness};
-use super::path::{CanonicalPath, DotDotInTailSnafu, PathError};
+use crate::policy::path::DotDotInTailSnafu;
+use crate::policy::{
+    CanonicalPath, GlobTail, HomeDir, PathError, PathPattern, PathPatternError, ProjectRoot,
+    broadness,
+};
+use crate::sys::is_symlink_loop;
 
 /// Why an allow rule's path was skipped instead of granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
@@ -224,16 +228,19 @@ impl<'a> PathResolver<'a> {
     /// This is the only place `~` is substituted; nothing downstream re-detects or re-expands
     /// it, so there is no risk of expanding twice.
     fn expand(&self, spelling: &str) -> Result<PathBuf, PathError> {
-        ensure!(!spelling.is_empty(), super::path::EmptySpellingSnafu);
         ensure!(
-            spelling.len() <= super::path::MAX_PATH_BYTES,
-            super::path::SpellingTooLongSnafu {
+            !spelling.is_empty(),
+            crate::policy::path::EmptySpellingSnafu
+        );
+        ensure!(
+            spelling.len() <= crate::policy::path::MAX_PATH_BYTES,
+            crate::policy::path::SpellingTooLongSnafu {
                 len: spelling.len()
             }
         );
         ensure!(
             !spelling.chars().any(char::is_control),
-            super::path::SpellingControlCharacterSnafu { spelling }
+            crate::policy::path::SpellingControlCharacterSnafu { spelling }
         );
 
         let full = if spelling == "~" {
@@ -241,7 +248,7 @@ impl<'a> PathResolver<'a> {
         } else if let Some(rest) = spelling.strip_prefix("~/") {
             format!("{}/{rest}", self.home.path().as_str())
         } else if spelling.starts_with('~') {
-            return super::path::TildeUserSnafu { spelling }.fail();
+            return crate::policy::path::TildeUserSnafu { spelling }.fail();
         } else if spelling.starts_with('/') {
             spelling.to_owned()
         } else {
@@ -270,86 +277,101 @@ enum Mode {
 /// of those as `NotFound` from `canonicalize`.
 fn resolve(full: &Path, mode: Mode) -> Result<Resolution, PathError> {
     let spelling = full.to_string_lossy().into_owned();
-
-    match fs::symlink_metadata(full) {
-        Ok(meta) if meta.is_symlink() => {
-            return match fs::canonicalize(full) {
-                Ok(target) => {
-                    let name = full.file_name().unwrap_or_default();
-                    let parent = fs::canonicalize(full.parent().unwrap_or(Path::new("/")))
-                        .map_err(|error| classify_other(error, &spelling))?;
-                    Ok(Resolution::LeafSymlink {
-                        target,
-                        alias: parent.join(name),
-                    })
-                }
-                Err(error) if is_symlink_loop(&error) => Err(PathError::SymlinkLoop { spelling }),
-                Err(_) => Ok(Resolution::Dangling),
-            };
-        }
-        Ok(_) => {} // exists, not a symlink: the walk below resolves it in one step.
-        Err(error) if error.kind() == ErrorKind::NotFound => {} // fall through to the walk.
-        Err(error) if error.kind() == ErrorKind::PermissionDenied && mode == Mode::Allow => {
-            return Err(PathError::PathUnreadable {
-                spelling,
-                source: error,
-            });
-        }
-        Err(error) if error.kind() == ErrorKind::PermissionDenied => {} // deny: fall through, fail closed.
-        Err(error) => return Err(classify_other(error, &spelling)),
+    if is_symlink(full) {
+        return leaf_symlink(full, &spelling);
     }
+    walk_up(full, mode, &spelling)
+}
 
+fn is_symlink(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Ok(meta) if meta.is_symlink())
+}
+
+/// Resolves a spelling whose final component is itself a symlink.
+///
+/// The target and the symlink's own (parent-resolved) location are both reported, so a deny
+/// rule can cover the link as well as what it points to.
+fn leaf_symlink(full: &Path, spelling: &str) -> Result<Resolution, PathError> {
+    match fs::canonicalize(full) {
+        Ok(target) => {
+            let name = full.file_name().unwrap_or_default();
+            let parent = fs::canonicalize(full.parent().unwrap_or(Path::new("/")))
+                .map_err(|error| classify_other(error, spelling))?;
+            Ok(Resolution::LeafSymlink {
+                target,
+                alias: parent.join(name),
+            })
+        }
+        Err(error) if is_symlink_loop(&error) => Err(PathError::SymlinkLoop {
+            spelling: spelling.to_owned(),
+        }),
+        Err(_) => Ok(Resolution::Dangling),
+    }
+}
+
+/// Canonicalizes `full`, or its deepest existing ancestor, collecting the missing components.
+///
+/// `NotFound` always continues upward. `PermissionDenied` continues only for a deny rule
+/// ("fail closed": the rule must keep applying to what it cannot see) and is an error for an
+/// allow rule. Any other error stops the walk.
+fn walk_up(full: &Path, mode: Mode, spelling: &str) -> Result<Resolution, PathError> {
     let mut current = full.to_path_buf();
     let mut tail: Vec<String> = Vec::new();
     loop {
-        match fs::canonicalize(&current) {
+        let error = match fs::canonicalize(&current) {
             Ok(ancestor) => {
                 tail.reverse();
                 return Ok(Resolution::Resolved { ancestor, tail });
             }
-            Err(error) => {
-                let ambiguous_with_dangling = match error.kind() {
-                    ErrorKind::NotFound => true,
-                    ErrorKind::PermissionDenied if mode == Mode::Deny => true,
-                    ErrorKind::PermissionDenied => {
-                        return Err(PathError::PathUnreadable {
-                            spelling,
-                            source: error,
-                        });
-                    }
-                    _ => false,
-                };
-                if !ambiguous_with_dangling {
-                    return Err(classify_other(error, &spelling));
-                }
-                // `canonicalize` reports both "missing" and "a dangling symlink here" as
-                // `NotFound` (and, for deny, `PermissionDenied` is treated the same way); only
-                // `symlink_metadata` on this exact candidate can tell them apart.
-                if matches!(fs::symlink_metadata(&current), Ok(meta) if meta.is_symlink()) {
-                    return Ok(Resolution::Dangling);
-                }
-                // `Path::file_name()` returns `None` for a path ending in `..`, so a trailing
-                // `..` must be detected through `Component`, not `file_name`, or it would be
-                // silently popped as an empty name instead of rejected.
-                match current.components().next_back() {
-                    Some(std::path::Component::ParentDir) => {
-                        return DotDotInTailSnafu {
-                            spelling: spelling.clone(),
-                        }
-                        .fail();
-                    }
-                    Some(std::path::Component::Normal(name)) => {
-                        tail.push(name.to_str().unwrap_or_default().to_owned());
-                    }
-                    _ => return Err(classify_other(error, &spelling)),
-                }
-                current = match current.parent() {
-                    Some(parent) => parent.to_path_buf(),
-                    None => return Err(classify_other(error, &spelling)),
-                };
+            Err(error) => error,
+        };
+        match error.kind() {
+            ErrorKind::NotFound => {}
+            ErrorKind::PermissionDenied if mode == Mode::Deny => {}
+            ErrorKind::PermissionDenied => {
+                return Err(PathError::PathUnreadable {
+                    spelling: spelling.to_owned(),
+                    source: error,
+                });
             }
+            _ => return Err(classify_other(error, spelling)),
         }
+        // `canonicalize` reports both "missing" and "a dangling symlink here" as `NotFound`
+        // (and, for deny, `PermissionDenied` is treated the same way); only `symlink_metadata`
+        // on this exact candidate can tell them apart.
+        if is_symlink(&current) {
+            return Ok(Resolution::Dangling);
+        }
+        pop_component(&mut current, &mut tail, spelling, error)?;
     }
+}
+
+/// Moves `current`'s last component into `tail` and `current` up one level.
+///
+/// `Path::file_name()` returns `None` for a path ending in `..`, so a trailing `..` must be
+/// detected through `Component`, not `file_name`, or it would be silently popped as an empty
+/// name instead of rejected.
+fn pop_component(
+    current: &mut PathBuf,
+    tail: &mut Vec<String>,
+    spelling: &str,
+    error: io::Error,
+) -> Result<(), PathError> {
+    match current.components().next_back() {
+        Some(std::path::Component::ParentDir) => {
+            return DotDotInTailSnafu { spelling }.fail();
+        }
+        Some(std::path::Component::Normal(name)) => {
+            // The spelling is `&str`, so every component is valid UTF-8.
+            tail.push(name.to_string_lossy().into_owned());
+        }
+        _ => return Err(classify_other(error, spelling)),
+    }
+    match current.parent() {
+        Some(parent) => *current = parent.to_path_buf(),
+        None => return Err(classify_other(error, spelling)),
+    }
+    Ok(())
 }
 
 /// Maps an I/O error that isn't "missing" or "permission denied" to a typed [`PathError`].
@@ -368,111 +390,6 @@ fn classify_other(error: io::Error, spelling: &str) -> PathError {
             source: error,
         },
     }
-}
-
-/// `ELOOP`'s errno value. `std::io::ErrorKind::FilesystemLoop` is still unstable (library
-/// feature `io_error_more`), so this crate detects a symlink loop by raw errno instead. This
-/// crate targets macOS only (62); the Linux value (40) is kept only so the crate still builds
-/// elsewhere for linting, not because this error path is expected to run there.
-#[cfg(target_os = "macos")]
-const ELOOP: i32 = 62;
-#[cfg(not(target_os = "macos"))]
-const ELOOP: i32 = 40;
-
-fn is_symlink_loop(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(ELOOP)
-}
-
-/// Why a glob tail component is not acceptable.
-#[derive(Debug, Snafu)]
-#[non_exhaustive]
-pub enum GlobTailError {
-    /// A component is `..`.
-    #[snafu(display("glob pattern must not contain `..`"))]
-    DotDot,
-    /// A component is empty (consecutive or leading/trailing slash in the tail).
-    #[snafu(display("glob pattern has an empty segment"))]
-    EmptySegment,
-    /// A component contains `[` or `{`, which this grammar does not support.
-    #[snafu(display("glob pattern may only use `*`, `?` and `**`, not `[` or `{{`"))]
-    UnsupportedMetacharacter,
-    /// `**` is combined with other characters in the same segment.
-    #[snafu(display("`**` must be its own path segment, not combined with other text"))]
-    DoubleStarMixedWithText,
-}
-
-/// One segment of a glob tail: `**` (any number of path segments), or a segment that may mix
-/// literal characters with `*` and `?` (an ordinary shell-style glob within one segment).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GlobSegment {
-    /// Matches any number of path segments, including zero.
-    AnyDepth,
-    /// A pattern to match within exactly one path segment.
-    Segment(String),
-}
-
-/// The non-literal tail of an `fs.deny_read`/`fs.deny_write` glob pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GlobTail(Vec<GlobSegment>);
-
-impl GlobTail {
-    /// Parses the glob segments after a `PathPattern`'s literal base.
-    ///
-    /// # Errors
-    /// See [`GlobTailError`].
-    pub fn parse(segments: &[&str]) -> Result<Self, GlobTailError> {
-        let mut parsed = Vec::with_capacity(segments.len());
-        for segment in segments {
-            ensure!(!segment.is_empty(), EmptySegmentSnafu);
-            if *segment == "**" {
-                parsed.push(GlobSegment::AnyDepth);
-                continue;
-            }
-            ensure!(*segment != "..", DotDotSnafu);
-            ensure!(!segment.contains(['[', '{']), UnsupportedMetacharacterSnafu);
-            ensure!(!segment.contains("**"), DoubleStarMixedWithTextSnafu);
-            parsed.push(GlobSegment::Segment((*segment).to_owned()));
-        }
-        Ok(Self(parsed))
-    }
-
-    /// The parsed segments, in order.
-    #[must_use]
-    pub fn segments(&self) -> &[GlobSegment] {
-        &self.0
-    }
-}
-
-/// An `fs.deny_read`/`fs.deny_write` entry: a resolved literal base, and an optional glob tail.
-///
-/// `config/*.secrets.yaml` has base `config` and a tail of one segment, `*.secrets.yaml`. A
-/// plain literal entry such as `~/.ssh` has no glob metacharacter anywhere, so `tail` is
-/// `None` and `base` is the whole thing. The base is resolved with deny semantics (a glob
-/// target does not exist yet as a literal path, so a missing base is not an error).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathPattern {
-    /// The longest glob-free prefix, resolved as a deny rule.
-    pub base: CanonicalPath,
-    /// The glob segments after the base, or `None` for a plain literal entry.
-    pub tail: Option<GlobTail>,
-}
-
-/// Why a glob pattern spelling could not be parsed.
-#[derive(Debug, Snafu)]
-#[non_exhaustive]
-pub enum PathPatternError {
-    /// The base, or the whole spelling for a literal entry, could not be resolved.
-    #[snafu(transparent)]
-    Base {
-        /// The underlying error.
-        source: PathError,
-    },
-    /// The glob tail was malformed.
-    #[snafu(transparent)]
-    Tail {
-        /// The underlying error.
-        source: GlobTailError,
-    },
 }
 
 impl PathPattern {
@@ -498,7 +415,12 @@ impl PathPattern {
                 })
             }
             Some(index) => {
-                let base_spelling = components[..index].join("/");
+                let mut base_spelling = components[..index].join("/");
+                if base_spelling.is_empty() && spelling.starts_with('/') {
+                    // `/*`: the glob is directly under the filesystem root, whose own spelling
+                    // is `/`, not the empty string `join` produces for a single empty component.
+                    base_spelling.push('/');
+                }
                 let tail = GlobTail::parse(&components[index..])?;
                 Ok(Self {
                     base: resolver.deny(&base_spelling)?.target,
@@ -512,48 +434,31 @@ impl PathPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{ModeGuard, Tree, canonical};
     use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use tempfile::TempDir;
+    use std::os::unix::fs::symlink;
 
+    /// A throwaway tree whose project root is a sibling of the home directory (outside it).
     struct Fixture {
-        _dir: TempDir,
-        home: HomeDir,
+        tree: Tree,
         root: ProjectRoot,
     }
 
     impl Fixture {
-        /// A fresh temp directory with `home` and `project` subdirectories, so tests never
-        /// touch the real filesystem outside a throwaway tree.
         fn new() -> Self {
-            let dir = assert_ok!(TempDir::new());
-            let home_path = dir.path().join("home");
-            let project_path = dir.path().join("project");
-            assert_ok!(fs::create_dir_all(&home_path));
-            assert_ok!(fs::create_dir_all(&project_path));
-            let home = HomeDir::new(assert_ok!(CanonicalPath::from_canonical(assert_ok!(
-                fs::canonicalize(&home_path)
-            ))));
-            let root = assert_ok!(ProjectRoot::new(
-                assert_ok!(CanonicalPath::from_canonical(assert_ok!(fs::canonicalize(
-                    &project_path
-                )))),
-                &home,
-            ));
-            Self {
-                _dir: dir,
-                home,
-                root,
-            }
+            let tree = Tree::new();
+            let project = tree.outside("project");
+            let root = assert_ok!(ProjectRoot::new(canonical(&project), tree.home()));
+            Self { tree, root }
         }
 
         fn resolver(&self) -> PathResolver<'_> {
-            PathResolver::new(&self.home, &self.root)
+            PathResolver::new(self.tree.home(), &self.root)
         }
 
         fn home_path(&self) -> PathBuf {
-            PathBuf::from(self.home.path().as_str())
+            self.tree.home_path().to_path_buf()
         }
 
         fn project_path(&self) -> PathBuf {
@@ -704,15 +609,9 @@ mod tests {
         let blocked = fx.project_path().join("blocked");
         assert_ok!(fs::create_dir(&blocked));
         assert_ok!(fs::write(blocked.join("inner.txt"), b"x"));
-        assert_ok!(fs::set_permissions(
-            &blocked,
-            fs::Permissions::from_mode(0o000)
-        ));
+        let guard = ModeGuard::set(&blocked, 0o000);
         let result = fx.resolver().allow("blocked/inner.txt");
-        assert_ok!(fs::set_permissions(
-            &blocked,
-            fs::Permissions::from_mode(0o755)
-        ));
+        drop(guard);
         assert!(matches!(
             assert_err!(result),
             PathError::PathUnreadable { .. }
@@ -756,36 +655,22 @@ mod tests {
     /// A project nested a few levels under home, the realistic layout: a sibling-of-home
     /// fixture would let the pre-existing $HOME-ancestor check accidentally catch an escape
     /// by coincidence, masking whether containment is actually enforced.
+    /// A throwaway tree whose project root is nested under the home directory, the shape a real
+    /// project has.
     struct NestedFixture {
-        _dir: TempDir,
-        home: HomeDir,
+        tree: Tree,
         root: ProjectRoot,
     }
 
     impl NestedFixture {
         fn new() -> Self {
-            let dir = assert_ok!(TempDir::new());
-            let home_path = dir.path().join("home");
-            let project_path = home_path.join("work").join("myproject");
-            assert_ok!(fs::create_dir_all(&project_path));
-            let home = HomeDir::new(assert_ok!(CanonicalPath::from_canonical(assert_ok!(
-                fs::canonicalize(&home_path)
-            ))));
-            let root = assert_ok!(ProjectRoot::new(
-                assert_ok!(CanonicalPath::from_canonical(assert_ok!(fs::canonicalize(
-                    &project_path
-                )))),
-                &home,
-            ));
-            Self {
-                _dir: dir,
-                home,
-                root,
-            }
+            let tree = Tree::new();
+            let root = tree.project_root("work/myproject");
+            Self { tree, root }
         }
 
         fn resolver(&self) -> PathResolver<'_> {
-            PathResolver::new(&self.home, &self.root)
+            PathResolver::new(self.tree.home(), &self.root)
         }
 
         fn project_path(&self) -> PathBuf {
@@ -912,15 +797,9 @@ mod tests {
         let blocked = fx.project_path().join("blocked");
         assert_ok!(fs::create_dir(&blocked));
         assert_ok!(fs::write(blocked.join("inner.txt"), b"x"));
-        assert_ok!(fs::set_permissions(
-            &blocked,
-            fs::Permissions::from_mode(0o000)
-        ));
+        let guard = ModeGuard::set(&blocked, 0o000);
         let result = fx.resolver().deny("blocked/inner.txt");
-        assert_ok!(fs::set_permissions(
-            &blocked,
-            fs::Permissions::from_mode(0o755)
-        ));
+        drop(guard);
         let resolution = assert_ok!(result);
         assert_eq!(
             resolution.target,
@@ -933,15 +812,9 @@ mod tests {
         let fx = Fixture::new();
         let restricted = fx.project_path().join("restricted_itself");
         assert_ok!(fs::create_dir(&restricted));
-        assert_ok!(fs::set_permissions(
-            &restricted,
-            fs::Permissions::from_mode(0o000)
-        ));
+        let guard = ModeGuard::set(&restricted, 0o000);
         let result = fx.resolver().deny("restricted_itself");
-        assert_ok!(fs::set_permissions(
-            &restricted,
-            fs::Permissions::from_mode(0o755)
-        ));
+        drop(guard);
         let resolution = assert_ok!(result);
         assert_eq!(
             resolution.target,
@@ -1025,7 +898,7 @@ mod tests {
         assert!(matches!(
             assert_err!(
                 fx.resolver()
-                    .deny(&"a".repeat(super::super::path::MAX_PATH_BYTES + 1))
+                    .deny(&"a".repeat(crate::policy::path::MAX_PATH_BYTES + 1))
             ),
             PathError::SpellingTooLong { .. }
         ));
@@ -1070,6 +943,33 @@ mod tests {
                 fx.project_path().join("f.txt")
             ))
         );
+    }
+
+    #[test]
+    fn existing_distinguishes_a_file_ancestor_a_symlink_loop_and_a_permission_error_from_missing() {
+        let fx = Fixture::new();
+        let project = fx.project_path();
+
+        assert_ok!(fs::write(project.join("afile"), b"x"));
+        assert!(matches!(
+            assert_err!(fx.resolver().existing("afile/inner")),
+            PathError::NotADirectoryAncestor { .. }
+        ));
+
+        assert_ok!(symlink(project.join("loop-b"), project.join("loop-a")));
+        assert_ok!(symlink(project.join("loop-a"), project.join("loop-b")));
+        assert!(matches!(
+            assert_err!(fx.resolver().existing("loop-a/inner")),
+            PathError::SymlinkLoop { .. }
+        ));
+
+        let blocked = project.join("blocked");
+        assert_ok!(fs::create_dir(&blocked));
+        assert_ok!(fs::write(blocked.join("inner.txt"), b"x"));
+        let guard = ModeGuard::set(&blocked, 0o000);
+        let result = fx.resolver().existing("blocked/inner.txt");
+        drop(guard);
+        assert!(matches!(assert_err!(result), PathError::Io { .. }));
     }
 
     #[test]
@@ -1145,60 +1045,29 @@ mod tests {
     }
 
     #[test]
-    fn pattern_rejects_dotdot_absolute_brackets_and_braces_in_the_tail() {
-        assert!(matches!(
-            assert_err!(GlobTail::parse(&[".."])),
-            GlobTailError::DotDot
-        ));
-        assert!(matches!(
-            assert_err!(GlobTail::parse(&["[abc]"])),
-            GlobTailError::UnsupportedMetacharacter
-        ));
-        assert!(matches!(
-            assert_err!(GlobTail::parse(&["{a,b}"])),
-            GlobTailError::UnsupportedMetacharacter
-        ));
-    }
+    fn pattern_with_a_glob_directly_under_the_filesystem_root_has_slash_as_base() {
+        let fx = Fixture::new();
+        let pattern = assert_ok!(PathPattern::parse(&fx.resolver(), "/*"));
+        assert_eq!(pattern.base.as_str(), "/");
+        assert_eq!(pattern.tail, Some(assert_ok!(GlobTail::parse(&["*"]))));
 
-    #[test]
-    fn pattern_rejects_double_star_mixed_with_other_text() {
-        assert!(matches!(
-            assert_err!(GlobTail::parse(&["**x"])),
-            GlobTailError::DoubleStarMixedWithText
-        ));
-    }
-
-    #[test]
-    fn pattern_rejects_an_empty_segment() {
-        assert!(matches!(
-            assert_err!(GlobTail::parse(&[""])),
-            GlobTailError::EmptySegment
-        ));
-    }
-
-    #[test]
-    fn pattern_double_star_is_its_own_segment() {
-        let tail = assert_ok!(GlobTail::parse(&["logs", "**", "*.log"]));
+        let nested = assert_ok!(PathPattern::parse(&fx.resolver(), "/**/id_rsa"));
+        assert_eq!(nested.base.as_str(), "/");
         assert_eq!(
-            tail.segments(),
-            &[
-                GlobSegment::Segment("logs".to_owned()),
-                GlobSegment::AnyDepth,
-                GlobSegment::Segment("*.log".to_owned())
-            ]
+            nested.tail,
+            Some(assert_ok!(GlobTail::parse(&["**", "id_rsa"])))
         );
     }
 
     #[test]
-    fn pattern_allows_star_and_question_mark_mixed_with_literal_text_in_one_segment() {
-        let tail = assert_ok!(GlobTail::parse(&["*.secrets.yaml", "a?b.env"]));
-        assert_eq!(
-            tail.segments(),
-            &[
-                GlobSegment::Segment("*.secrets.yaml".to_owned()),
-                GlobSegment::Segment("a?b.env".to_owned())
-            ]
-        );
+    fn pattern_with_an_empty_spelling_is_still_an_error() {
+        let fx = Fixture::new();
+        assert!(matches!(
+            assert_err!(PathPattern::parse(&fx.resolver(), "")),
+            PathPatternError::Base {
+                source: PathError::EmptySpelling
+            }
+        ));
     }
 
     // ====================================================================================

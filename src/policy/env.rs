@@ -117,6 +117,10 @@ impl fmt::Display for EnvName {
 
 /// An environment variable value: any text without NUL.
 ///
+/// There is no per-value length limit here; a value is bounded only by the config file's size
+/// cap. The session builder must check the total size of the child environment against the
+/// OS argument limit (`ARG_MAX`, 1 MiB on macOS) before `exec`.
+///
 /// TOML's `\u0000` escape parses to a real NUL, so this check must happen explicitly.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct EnvValue(String);
@@ -150,6 +154,20 @@ mod tests {
     use super::*;
     use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn env_name_displays_as_its_text() {
+        let name = assert_ok!(EnvName::parse("RUST_LOG"));
+        assert_eq!(name.to_string(), "RUST_LOG");
+        assert_eq!(name.as_str(), "RUST_LOG");
+    }
+
+    #[test]
+    fn env_value_debug_reports_only_the_length_and_as_str_returns_the_text() {
+        let value = assert_ok!(EnvValue::parse("s3cr3t-token"));
+        assert_eq!(format!("{value:?}"), "EnvValue(<12 bytes>)");
+        assert_eq!(value.as_str(), "s3cr3t-token");
+    }
 
     #[test]
     fn env_name_accepts_posix_names() {

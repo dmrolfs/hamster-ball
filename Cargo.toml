@@ -19,7 +19,6 @@ name = "hb"
 path = "src/bin/hb.rs"
 
 [dependencies]
-libc = "0.2.191"
 nix = { version = "0.32", default-features = false, features = ["user"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"

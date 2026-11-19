@@ -4,10 +4,13 @@
 
 use snafu::Snafu;
 
+use crate::config::{ConfigTextError, DiscoverError, EntryError, ResolveErrors};
 use crate::policy::{
-    ContainerNameError, EnvNameError, EnvValueError, HostNameError, HostPatternError, PathError,
-    PortError, RootError,
+    ArgWordError, ArgvError, ContainerLabelError, ContainerNameError, EnvNameError, EnvValueError,
+    GlobTailError, HostNameError, HostPatternError, McpNameError, PathError, PathPatternError,
+    PortError, RefTextError, RootError,
 };
+use crate::system::HomeError;
 
 /// Any error produced by this crate.
 ///
@@ -71,6 +74,90 @@ pub enum Error {
         /// The underlying error.
         source: HostPatternError,
     },
+
+    /// A deny glob pattern was invalid.
+    #[snafu(transparent)]
+    PathPattern {
+        /// The underlying error.
+        source: PathPatternError,
+    },
+
+    /// A glob tail was invalid.
+    #[snafu(transparent)]
+    GlobTail {
+        /// The underlying error.
+        source: GlobTailError,
+    },
+
+    /// A container label selector was invalid.
+    #[snafu(transparent)]
+    ContainerLabel {
+        /// The underlying error.
+        source: ContainerLabelError,
+    },
+
+    /// A command-line word was invalid.
+    #[snafu(transparent)]
+    ArgWord {
+        /// The underlying error.
+        source: ArgWordError,
+    },
+
+    /// An argument vector was invalid.
+    #[snafu(transparent)]
+    Argv {
+        /// The underlying error.
+        source: ArgvError,
+    },
+
+    /// An MCP server name was invalid.
+    #[snafu(transparent)]
+    McpName {
+        /// The underlying error.
+        source: McpNameError,
+    },
+
+    /// An `extends` or `guard.exceptions` value was invalid.
+    #[snafu(transparent)]
+    RefText {
+        /// The underlying error.
+        source: RefTextError,
+    },
+
+    /// The home directory could not be established.
+    #[snafu(transparent)]
+    Home {
+        /// The underlying error.
+        source: HomeError,
+    },
+
+    /// A config file could not be read.
+    #[snafu(transparent)]
+    ConfigText {
+        /// The underlying error.
+        source: ConfigTextError,
+    },
+
+    /// No usable project root was found.
+    #[snafu(transparent)]
+    Discover {
+        /// The underlying error.
+        source: DiscoverError,
+    },
+
+    /// One config entry was invalid.
+    #[snafu(transparent)]
+    Entry {
+        /// The underlying error.
+        source: EntryError,
+    },
+
+    /// A config file had invalid entries.
+    #[snafu(transparent)]
+    Resolve {
+        /// The underlying error.
+        source: ResolveErrors,
+    },
 }
 
 /// Test helpers that enforce the crate's error conventions.
@@ -105,7 +192,7 @@ mod tests {
     use snafu::{Report, ResultExt};
     use std::error::Error as StdError;
 
-    use crate::policy::{CanonicalPath, EnvName, Port};
+    use crate::policy::{Argv, CanonicalPath, EnvName, Port};
 
     /// A local error that follows the convention: context only, no `{source}`.
     #[derive(Debug, Snafu)]
@@ -177,6 +264,47 @@ mod tests {
         let env: Error = assert_err!(EnvName::parse("1x")).into();
         assert!(matches!(path, Error::Path { .. }));
         assert!(matches!(env, Error::EnvName { .. }));
+    }
+
+    #[test]
+    fn every_public_error_type_converts_into_the_crate_error_and_keeps_its_text() {
+        use crate::policy::{ArgWord, ContainerLabel, ExtendRef, GlobTail, HomeDir, McpName};
+
+        let errors: Vec<Error> = vec![
+            assert_err!(ContainerLabel::parse("")).into(),
+            assert_err!(ArgWord::parse("a\0b")).into(),
+            assert_err!(Argv::parse(&[])).into(),
+            assert_err!(ExtendRef::parse("")).into(),
+            assert_err!(McpName::parse("")).into(),
+            assert_err!(GlobTail::parse(&[".."])).into(),
+            HomeError::RunningAsRoot.into(),
+            assert_err!(crate::config::ConfigText::read(
+                "/nonexistent/hb.toml",
+                crate::origin::Layer::Project,
+                crate::config::SymlinkPolicy::Refuse
+            ))
+            .into(),
+            assert_err!(crate::config::discover(
+                std::path::Path::new("/nonexistent/dir"),
+                &HomeDir::new(assert_ok!(CanonicalPath::from_canonical("/Users/x")))
+            ))
+            .into(),
+            EntryError::TooManyEntries { count: 5, max: 4 }.into(),
+            ResolveErrors {
+                errors: Vec::new(),
+                truncated: false,
+            }
+            .into(),
+        ];
+        assert_eq!(errors.len(), 11);
+        for error in &errors {
+            assert!(!error.to_string().is_empty(), "{error:?}");
+        }
+        assert!(matches!(errors[0], Error::ContainerLabel { .. }));
+        assert!(matches!(errors[4], Error::McpName { .. }));
+        assert!(matches!(errors[6], Error::Home { .. }));
+        assert!(matches!(errors[9], Error::Entry { .. }));
+        assert!(matches!(errors[10], Error::Resolve { .. }));
     }
 
     #[test]
