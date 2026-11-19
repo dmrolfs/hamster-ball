@@ -34,7 +34,10 @@ use super::text::{ConfigText, ConfigTextError, FileRole};
 use crate::origin::{FileId, KeyPath, Layer, Origin, Source};
 use crate::policy::{CanonicalPath, HomeDir, PresetName};
 use crate::sys::path_preview;
-use crate::system::{UserConfigDir, UserConfigError};
+use crate::system::{
+    FloorDiagnostic, FloorEnvironment, FloorError, FloorInputs, UserConfigDir, UserConfigError,
+    build_floor,
+};
 use crate::text::Escaped;
 
 /// Most files a closure may hold, base and project included.
@@ -52,19 +55,28 @@ pub struct LoadRequest<'a> {
     home: &'a HomeDir,
     project: &'a Discovery,
     user_config: &'a UserConfigDir,
+    floor_env: &'a FloorEnvironment,
     builtins: &'a dyn BuiltinPresets,
     pub(crate) uid: u32,
 }
 
 impl<'a> LoadRequest<'a> {
     /// A request for `project`, with the presets compiled into this build of `hb`.
+    ///
+    /// `floor_env` is required, so a caller cannot forget to say what `PATH` and `hb` are.
     #[must_use]
-    pub fn new(home: &'a HomeDir, project: &'a Discovery, user_config: &'a UserConfigDir) -> Self {
+    pub fn new(
+        home: &'a HomeDir,
+        project: &'a Discovery,
+        user_config: &'a UserConfigDir,
+        floor_env: &'a FloorEnvironment,
+    ) -> Self {
         static EMBEDDED: EmbeddedPresets = EmbeddedPresets;
         Self {
             home,
             project,
             user_config,
+            floor_env,
             builtins: &EMBEDDED,
             uid: getuid().as_raw(),
         }
@@ -203,6 +215,14 @@ pub enum LoadError {
         max: usize,
     },
 
+    /// The floor could not be built for this project.
+    #[snafu(display("the floor could not be built"))]
+    Floor {
+        /// The underlying error.
+        #[snafu(source(from(FloorError, Box::new)))]
+        source: Box<FloorError>,
+    },
+
     /// The files load but do not merge: a keyed value or scalar conflicts, or a user-only
     /// section is in the wrong file.
     #[snafu(display("the config files do not merge"))]
@@ -243,6 +263,8 @@ pub enum FileSource {
         path: PathBuf,
         /// Where it really is.
         canonical: CanonicalPath,
+        /// The preset name it was reached by, for a user preset named in `extends`.
+        preset: Option<PresetName>,
     },
 }
 
@@ -319,20 +341,54 @@ impl ClosureFile {
 pub struct Loaded {
     /// Every config file that applies, with its exact bytes.
     pub closure: Closure,
-    /// The merged policy.
+    /// The merged policy, including the floor.
     pub policy: Policy,
+    /// Things the floor builder noticed that are not errors.
+    pub floor_diagnostics: Vec<FloorDiagnostic>,
 }
 
-/// Loads the config closure for `request` and merges it into one policy.
+/// Loads the config closure for `request`, builds the floor, and merges them into one policy.
 ///
 /// # Errors
 /// See [`LoadError`].
 pub fn load(request: &LoadRequest<'_>) -> Result<Loaded, LoadError> {
     let closure = load_closure(request)?;
-    let policy = merge(closure.files()).map_err(|source| LoadError::Merge {
+    let approval_files: Vec<CanonicalPath> = closure
+        .approval_files()
+        .filter_map(|file| match &file.source {
+            FileSource::Disk { canonical, .. } => Some(canonical.clone()),
+            FileSource::Builtin { .. } => None,
+        })
+        .collect();
+    let write_grants: Vec<CanonicalPath> = closure
+        .files()
+        .iter()
+        .flat_map(|file| {
+            file.resolved
+                .fs
+                .write
+                .iter()
+                .map(|grant| grant.value.clone())
+        })
+        .collect();
+    let built = build_floor(&FloorInputs::new(
+        request.home,
+        &request.project.root,
+        request.floor_env,
+        &approval_files,
+        &write_grants,
+    ))
+    .map_err(|source| LoadError::Floor {
         source: Box::new(source),
     })?;
-    Ok(Loaded { closure, policy })
+    let policy = merge(closure.files(), built.floor).map_err(|source| LoadError::Merge {
+        source: Box::new(source),
+    })?;
+    Ok(Loaded {
+        closure,
+        policy,
+        floor_diagnostics: built.diagnostics,
+    })
 }
 
 /// Loads the config closure for `request`, without merging it.
@@ -467,9 +523,13 @@ impl<'a> Loader<'a> {
             self.user_canonical.as_ref(),
         );
         self.check_user_only(&text, canonical.as_path(), location, &label)?;
+        let preset = (role == FileRole::UserPresetByName)
+            .then(|| self.request.user_config.preset_name_of(&path))
+            .flatten();
         let source = FileSource::Disk {
             path: path.clone(),
             canonical: canonical.clone(),
+            preset,
         };
         let dir = canonical.as_path().parent().map(Path::to_path_buf);
         let containing = dir.as_deref().map_or(Containing::Builtin, Containing::Disk);
@@ -673,6 +733,7 @@ mod tests {
         tree: Tree,
         user: UserConfigDir,
         discovery: Discovery,
+        floor_env: FloorEnvironment,
     }
 
     const BUILTINS: StaticPresets<'static> = StaticPresets(&[
@@ -692,6 +753,7 @@ mod tests {
                 tree,
                 user,
                 discovery: Discovery { root, config },
+                floor_env: FloorEnvironment::new(),
             }
         }
 
@@ -722,7 +784,13 @@ mod tests {
 
         fn request(&self) -> LoadRequest<'_> {
             // Re-locate so a base file created after `World::new` is picked up.
-            LoadRequest::new(self.tree.home(), &self.discovery, &self.user).with_builtins(&BUILTINS)
+            LoadRequest::new(
+                self.tree.home(),
+                &self.discovery,
+                &self.user,
+                &self.floor_env,
+            )
+            .with_builtins(&BUILTINS)
         }
 
         fn load(&self) -> Result<Closure, LoadError> {
@@ -1542,7 +1610,9 @@ mod tests {
         assert_ok!(fs::write(&config, "hooks = [[\"x\"]]\n"));
         assert_ok!(fs::write(user.base_file(), ""));
         let discovery = Discovery { root, config };
-        let request = LoadRequest::new(tree.home(), &discovery, &user).with_builtins(&BUILTINS);
+        let floor_env = FloorEnvironment::new();
+        let request =
+            LoadRequest::new(tree.home(), &discovery, &user, &floor_env).with_builtins(&BUILTINS);
         assert!(matches!(
             assert_err!(load_closure(&request)),
             LoadError::UserOnlySection { .. }

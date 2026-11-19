@@ -8,10 +8,17 @@
 //! in [`crate::policy`]. Config-file reading ([`crate::config::ConfigText`]) and project
 //! discovery ([`crate::config::discover`]) are the other I/O, and live with the config model.
 
+pub mod environment;
+pub mod floor;
 pub mod home;
 pub mod resolver;
 pub mod userdir;
 
+pub use environment::{Environment, EnvironmentError};
+pub use floor::{
+    BuiltFloor, FloorDiagnostic, FloorEnvironment, FloorError, FloorInputs, MAX_PATH_TARGETS,
+    build_floor,
+};
 pub use home::HomeError;
 pub use resolver::{AllowOutcome, DenyResolution, PathResolver, SkipReason, SkippedPath};
-pub use userdir::{BASE_TEMPLATE, UserConfigDir, UserConfigError};
+pub use userdir::{BASE_TEMPLATE, StateDir, UserConfigDir, UserConfigError};

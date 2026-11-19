@@ -1,0 +1,154 @@
+hb explain
+project  ~/work/proj
+config   ~/work/proj/hamster-ball.toml
+
+files (a later file takes precedence)
+  [0] user_base ~/.config/hamster-ball/base.toml  [in ~/.config/hamster-ball]
+  [1] preset    rust (built into hb)  [built into hb]
+  [2] project   ~/work/proj/hamster-ball.toml  [inside the project]
+
+fs.read
+  ~/ref  <- [0] fs.read[0]; [2] fs.read[0]
+
+fs.write
+  ~/work/proj  <- [2] fs.write[0]
+
+deny (102 from the floor, which no config can change; 2 from config)
+  floor  ssh                       deny_read_write  ~/.ssh  (credentials)
+  floor  aws                       deny_read_write  ~/.aws  (credentials)
+  floor  gnupg                     deny_read_write  ~/.gnupg  (credentials)
+  floor  netrc                     deny_read_write  ~/.netrc  (credentials)
+  floor  gh                        deny_read_write  ~/.config/gh  (credentials)
+  floor  docker-config             deny_read_write  ~/.docker  (credentials)
+  floor  kube                      deny_read_write  ~/.kube  (credentials)
+  floor  keychains                 deny_read_write  ~/Library/Keychains  (credentials)
+  floor  git-credentials           deny_read_write  ~/.git-credentials  (credentials)
+  floor  cargo-credentials         deny_read_write  ~/.cargo/credentials*  (credentials)
+  floor  op                        deny_read_write  ~/.config/op  (credentials)
+  floor  rclone                    deny_read_write  ~/.config/rclone  (credentials)
+  floor  gcloud                    deny_read_write  ~/.config/gcloud  (credentials)
+  floor  azure                     deny_read_write  ~/.azure  (credentials)
+  floor  oci                       deny_read_write  ~/.oci  (credentials)
+  floor  doctl                     deny_read_write  ~/.config/doctl  (credentials)
+  floor  hub                       deny_read_write  ~/.config/hub  (credentials)
+  floor  glab                      deny_read_write  ~/.config/glab-cli  (credentials)
+  floor  vault-token               deny_read_write  ~/.vault-token  (credentials)
+  floor  pgpass                    deny_read_write  ~/.pgpass  (credentials)
+  floor  gem-credentials           deny_read_write  ~/.gem/credentials  (credentials)
+  floor  terraform-credentials     deny_read_write  ~/.terraform.d/credentials.tfrc.json  (credentials)
+  floor  pypirc                    deny_read_write  ~/.pypirc  (credentials)
+  floor  npmrc                     deny_read_write  ~/.npmrc  (credentials)
+  floor  1password-data            deny_read_write  ~/Library/Application Support/1Password  (credentials)
+  floor  1password-group           deny_read_write  ~/Library/Group Containers/2BUA8C4S2C.com.1password  (credentials)
+  floor  history                   deny_read_write  ~/.*_history  (shell and tool history can contain secrets)
+  floor  zsh-sessions              deny_read_write  ~/.zsh_sessions  (shell and tool history can contain secrets)
+  floor  atuin-data                deny_read_write  ~/.local/share/atuin  (shell and tool history can contain secrets)
+  floor  atuin-config              deny_read_write  ~/.config/atuin  (shell and tool history can contain secrets)
+  floor  browser-chrome            deny_read_write  ~/Library/Application Support/Google  (browser profile, cookies and sessions)
+  floor  browser-chromium          deny_read_write  ~/Library/Application Support/Chromium  (browser profile, cookies and sessions)
+  floor  browser-edge              deny_read_write  ~/Library/Application Support/Microsoft Edge  (browser profile, cookies and sessions)
+  floor  browser-edge-beta         deny_read_write  ~/Library/Application Support/Microsoft Edge Beta  (browser profile, cookies and sessions)
+  floor  browser-edge-dev          deny_read_write  ~/Library/Application Support/Microsoft Edge Dev  (browser profile, cookies and sessions)
+  floor  browser-edge-canary       deny_read_write  ~/Library/Application Support/Microsoft Edge Canary  (browser profile, cookies and sessions)
+  floor  browser-vivaldi           deny_read_write  ~/Library/Application Support/Vivaldi  (browser profile, cookies and sessions)
+  floor  browser-vivaldi-snapshot  deny_read_write  ~/Library/Application Support/Vivaldi Snapshot  (browser profile, cookies and sessions)
+  floor  browser-opera             deny_read_write  ~/Library/Application Support/com.operasoftware.Opera  (browser profile, cookies and sessions)
+  floor  browser-brave             deny_read_write  ~/Library/Application Support/BraveSoftware  (browser profile, cookies and sessions)
+  floor  browser-arc               deny_read_write  ~/Library/Application Support/Arc  (browser profile, cookies and sessions)
+  floor  browser-comet             deny_read_write  ~/Library/Application Support/Comet  (browser profile, cookies and sessions)
+  floor  browser-firefox           deny_read_write  ~/Library/Application Support/Firefox  (browser profile, cookies and sessions)
+  floor  browser-mozilla           deny_read_write  ~/Library/Application Support/Mozilla  (browser profile, cookies and sessions)
+  floor  browser-zen               deny_read_write  ~/Library/Application Support/zen  (browser profile, cookies and sessions)
+  floor  browser-tor               deny_read_write  ~/Library/Application Support/TorBrowser-Data  (browser profile, cookies and sessions)
+  floor  browser-safari            deny_read_write  ~/Library/Safari  (browser profile, cookies and sessions)
+  floor  browser-cookies           deny_read_write  ~/Library/Cookies  (browser profile, cookies and sessions)
+  floor  browser-webkit            deny_read_write  ~/Library/WebKit  (browser profile, cookies and sessions)
+  floor  browser-http-storages     deny_read_write  ~/Library/HTTPStorages  (browser profile, cookies and sessions)
+  floor  browser-safari-container  deny_read_write  ~/Library/Containers/com.apple.Safari  (browser profile, cookies and sessions)
+  floor  browser-safari-broker     deny_read_write  ~/Library/Group Containers/group.com.apple.Safari.SandboxBroker  (browser profile, cookies and sessions)
+  floor  browser-cache-google      deny_read_write  ~/Library/Caches/Google  (browser profile, cookies and sessions)
+  floor  browser-cache-firefox     deny_read_write  ~/Library/Caches/Firefox  (browser profile, cookies and sessions)
+  floor  browser-cache-mozilla     deny_read_write  ~/Library/Caches/Mozilla  (browser profile, cookies and sessions)
+  floor  browser-cache-safari      deny_read_write  ~/Library/Caches/com.apple.Safari  (browser profile, cookies and sessions)
+  floor  browser-cache-arc         deny_read_write  ~/Library/Caches/Arc  (browser profile, cookies and sessions)
+  floor  browser-cache-arc-bundle  deny_read_write  ~/Library/Caches/company.thebrowser.Browser  (browser profile, cookies and sessions)
+  floor  containers-data           deny_read_write  ~/.local/share/containers  (container runtime access is host access)
+  floor  containers-config         deny_read_write  ~/.config/containers  (container runtime access is host access)
+  floor  connect-docker-run        deny_connect     ~/.docker/run  (container runtime access is host access)
+  floor  connect-colima            deny_connect     ~/.colima  (container runtime access is host access)
+  floor  connect-lima              deny_connect     ~/.lima  (container runtime access is host access)
+  floor  connect-rancher           deny_connect     ~/.rd  (container runtime access is host access)
+  floor  connect-orbstack          deny_connect     ~/.orbstack  (container runtime access is host access)
+  floor  connect-docker-desktop    deny_connect     ~/Library/Containers/com.docker.docker  (container runtime access is host access)
+  floor  connect-podman-data       deny_connect     ~/.local/share/containers  (container runtime access is host access)
+  floor  hb-config                 deny_read_write  ~/.config/hamster-ball  (hamster-ball's own configuration and approvals)
+  floor  hb-state                  deny_read_write  ~/.local/state/hamster-ball  (hamster-ball's own configuration and approvals)
+  floor  zshrc                     deny_write       ~/.zshrc  (runs outside the sandbox at the next shell start)
+  floor  zshenv                    deny_write       ~/.zshenv  (runs outside the sandbox at the next shell start)
+  floor  zprofile                  deny_write       ~/.zprofile  (runs outside the sandbox at the next shell start)
+  floor  zlogin                    deny_write       ~/.zlogin  (runs outside the sandbox at the next shell start)
+  floor  zlogout                   deny_write       ~/.zlogout  (runs outside the sandbox at the next shell start)
+  floor  bashrc                    deny_write       ~/.bashrc  (runs outside the sandbox at the next shell start)
+  floor  bash-profile              deny_write       ~/.bash_profile  (runs outside the sandbox at the next shell start)
+  floor  bash-login                deny_write       ~/.bash_login  (runs outside the sandbox at the next shell start)
+  floor  bash-logout               deny_write       ~/.bash_logout  (runs outside the sandbox at the next shell start)
+  floor  profile                   deny_write       ~/.profile  (runs outside the sandbox at the next shell start)
+  floor  fish                      deny_write       ~/.config/fish  (runs outside the sandbox at the next shell start)
+  floor  cargo-env                 deny_write       ~/.cargo/env  (runs outside the sandbox at the next shell start)
+  floor  launch-agents             deny_write       ~/Library/LaunchAgents  (runs outside the sandbox at the next shell start)
+  floor  gitconfig                 deny_write       ~/.gitconfig  (tool configuration that runs code or redirects package sources)
+  floor  git-config-dir            deny_write       ~/.config/git  (tool configuration that runs code or redirects package sources)
+  floor  cargo-config-toml         deny_write       ~/.cargo/config.toml  (tool configuration that runs code or redirects package sources)
+  floor  cargo-config              deny_write       ~/.cargo/config  (tool configuration that runs code or redirects package sources)
+  floor  terraformrc               deny_write       ~/.terraformrc  (tool configuration that runs code or redirects package sources)
+  floor  yarnrc                    deny_write       ~/.yarnrc  (tool configuration that runs code or redirects package sources)
+  floor  yarnrc-yml                deny_write       ~/.yarnrc.yml  (tool configuration that runs code or redirects package sources)
+  floor  maven-settings            deny_write       ~/.m2/settings.xml  (tool configuration that runs code or redirects package sources)
+  floor  pip-config                deny_write       ~/.config/pip  (tool configuration that runs code or redirects package sources)
+  floor  uv-config                 deny_write       ~/.config/uv  (tool configuration that runs code or redirects package sources)
+  floor  bin-local                 deny_write       ~/.local/bin  (a directory of programs you run outside the sandbox)
+  floor  bin-cargo                 deny_write       ~/.cargo/bin  (a directory of programs you run outside the sandbox)
+  floor  bin-go                    deny_write       ~/go/bin  (a directory of programs you run outside the sandbox)
+  floor  bin-bun                   deny_write       ~/.bun/bin  (a directory of programs you run outside the sandbox)
+  floor  connect-podman-temp       deny_connect     <FIX>/tmp/podman  (container runtime access is host access)
+  floor  project-config            deny_write       ~/work/proj/hamster-ball.toml  (the project's config, which the agent must not change to widen itself)
+  floor  git-missing               deny_write       ~/work/proj/.git [node only]  (git runs hooks and config outside the sandbox)
+  floor  path                      deny_write       <FIX>/bin  (a directory of programs you run outside the sandbox)
+  floor  hb-exe                    deny_write       <FIX>/install/hb  (hb itself)
+  floor  pin                       pin_unlink       ~/work/proj [node only]  (keeps a protected path from being moved aside by renaming an ancestor)
+  config                           deny_read_write  ~/ref/private  <- [2] fs.deny_read[0]
+  config                           deny_write       ~/work/proj/secrets/*.yaml  <- [2] fs.deny_write[0]
+
+net.allow
+  api.example.com  <- [0] net.allow[0]
+  crates.io  <- [1] net.allow[0]; [2] net.allow[1]
+  github.com  <- [2] net.allow[0]
+
+net.loopback_ports
+  5432  <- [2] net.loopback_ports[0]
+
+env.pass
+  LANG  <- [0] env.pass[1]
+  TERM  <- [0] env.pass[0]
+
+env.set (values are never shown)
+  API_TOKEN  (value hidden)  <- [2] env.set.API_TOKEN
+
+tls
+  system_trust = true  <- [0] tls.system_trust
+
+ctl
+  label = com.docker.compose.project=demo  <- [2] ctl.label
+
+mcp
+  serena: uvx 3 args hidden  binds loopback  <- [2] mcp.serena
+
+hooks (run on the host, in order)
+  notify 2 args hidden  <- [0] hooks[0]
+
+guard.exceptions
+  (none)
+
+warnings
+  skipped_allow: `~/.cargo/registry` was not granted: missing  <- [1] fs.read[0]
+  skipped_allow: `~/missing` was not granted: missing  <- [2] fs.read[1]

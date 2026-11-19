@@ -15,8 +15,10 @@
 //! never interpolates its `source`; callers print the chain with [`snafu::Report`]. Any
 //! user-controlled text in a message is escaped (see [`text::Escaped`]).
 
+pub mod cli;
 pub mod config;
 pub mod error;
+pub mod explain;
 pub mod origin;
 pub mod policy;
 pub(crate) mod sys;

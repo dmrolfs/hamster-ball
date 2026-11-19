@@ -30,12 +30,13 @@ mod raw;
 mod resolve;
 mod text;
 
+pub use crate::policy::FsAccess;
 pub use builtin::{BuiltinPresets, EmbeddedPresets, StaticPresets};
 pub use closure::{
     Closure, ClosureFile, FileSource, LoadError, LoadRequest, Loaded, MAX_CLOSURE_FILES,
     MAX_EXTENDS_DEPTH, MAX_EXTENDS_PER_FILE, load, load_closure,
 };
-pub use decision::{FsAccess, FsDecision};
+pub use decision::FsDecision;
 pub use discover::{DiscoverError, Discovery, Subject, Untrusted, discover};
 pub use extends::ExtendsError;
 pub use location::{FileLocation, classify};

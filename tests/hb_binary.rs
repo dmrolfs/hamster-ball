@@ -21,8 +21,36 @@ fn an_unknown_command_prints_usage_and_exits_2() {
     let output = assert_ok!(Command::new(env!("CARGO_BIN_EXE_hb")).arg("bogus").output());
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("usage: hb"), "{stderr}");
-    assert!(stderr.contains("init"), "{stderr}");
+    assert!(stderr.contains("Usage: hb"), "{stderr}");
+    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+}
+
+#[test]
+fn help_lists_the_commands_on_stdout() {
+    let output = assert_ok!(
+        Command::new(env!("CARGO_BIN_EXE_hb"))
+            .arg("--help")
+            .output()
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("init"), "{stdout}");
+    assert!(stdout.contains("explain"), "{stdout}");
+}
+
+#[test]
+fn explain_outside_any_project_exits_1_with_a_message_and_prints_nothing_to_stdout() {
+    let dir = assert_ok!(tempfile::TempDir::new());
+    let output = assert_ok!(
+        Command::new(env!("CARGO_BIN_EXE_hb"))
+            .arg("explain")
+            .current_dir(dir.path())
+            .output()
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.to_lowercase().contains("project"), "{stderr}");
 }
 
 #[test]

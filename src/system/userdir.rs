@@ -39,6 +39,37 @@ system_trust = true
 pass = [\"TERM\", \"LANG\", \"COLORTERM\"]
 ";
 
+/// Where `hb` keeps approvals: `<home>/.local/state/hamster-ball`.
+///
+/// `XDG_STATE_HOME` is deliberately not consulted. A project's `.envrc` (after `direnv allow`)
+/// can set it, which would move the approval store into a directory the agent can write. This is
+/// the same relocation hazard as `$HOME` (decision D28) and `XDG_CONFIG_HOME` (D39).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDir {
+    dir: PathBuf,
+}
+
+impl StateDir {
+    /// Locates `<home>/.local/state/hamster-ball`. Performs no I/O; the directory need not exist.
+    #[must_use]
+    pub fn locate(home: &HomeDir) -> Self {
+        Self {
+            dir: home
+                .path()
+                .as_path()
+                .join(".local")
+                .join("state")
+                .join("hamster-ball"),
+        }
+    }
+
+    /// The directory, spelled from the home directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
 /// Why the user's config directory could not be located or initialized.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -139,6 +170,18 @@ impl UserConfigDir {
         self.dir.join(PRESETS_DIR_NAME).join(format!("{name}.toml"))
     }
 
+    /// The preset name a file under `presets/` answers to: its path below that directory, without `.toml`.
+    ///
+    /// `None` if `path` is not under the presets directory or the name is not a valid preset name.
+    #[must_use]
+    pub fn preset_name_of(&self, path: &Path) -> Option<PresetName> {
+        let relative = path
+            .strip_prefix(self.dir.join(PRESETS_DIR_NAME))
+            .ok()?
+            .with_extension("");
+        PresetName::parse(relative.to_str()?).ok()
+    }
+
     /// Writes [`BASE_TEMPLATE`] as the base config, creating the directory (mode 0700) and the
     /// file (mode 0600), and returns the file's path.
     ///
@@ -190,6 +233,32 @@ mod tests {
         assert_eq!(
             dir.base_file(),
             tree.home_path().join(".config/hamster-ball/base.toml")
+        );
+    }
+
+    #[test]
+    fn a_preset_file_maps_back_to_its_name() {
+        let tree = Tree::new();
+        let dir = UserConfigDir::locate(tree.home());
+        let name = assert_ok!(PresetName::parse("team/rust"));
+        assert_eq!(dir.preset_name_of(&dir.preset_file(&name)), Some(name));
+        assert_none!(dir.preset_name_of(&dir.dir().join("base.toml")));
+        assert_none!(dir.preset_name_of(Path::new("/elsewhere/presets/x.toml")));
+    }
+
+    #[test]
+    fn the_state_dir_is_under_the_passwd_home_and_ignores_xdg_state_home() {
+        let tree = Tree::new();
+        let dir = StateDir::locate(tree.home());
+        assert_eq!(
+            dir.dir(),
+            tree.home_path().join(".local/state/hamster-ball")
+        );
+        // `locate` takes no environment, so a variable cannot move it. The floor protects it.
+        assert!(
+            crate::policy::floor::TABLE
+                .iter()
+                .any(|rule| rule.base == "~/.local/state/hamster-ball")
         );
     }
 

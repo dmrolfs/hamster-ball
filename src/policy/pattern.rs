@@ -191,6 +191,28 @@ fn components(path: &CanonicalPath) -> Vec<&str> {
     text.split('/').filter(|part| !part.is_empty()).collect()
 }
 
+/// How much of the tree below a pattern's base a rule covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Extent {
+    /// The base and everything beneath it.
+    Subtree,
+    /// Only the base itself.
+    Node,
+    /// Only the base's direct children, not the base.
+    Children,
+}
+
+impl Extent {
+    /// Whether a path `candidate` components long sits at this extent below a `base` of `base` components.
+    fn admits(self, base: usize, candidate: usize) -> bool {
+        match self {
+            Self::Subtree => candidate >= base,
+            Self::Node => candidate == base,
+            Self::Children => candidate == base + 1,
+        }
+    }
+}
+
 impl PathPattern {
     /// Reports whether this deny rule covers `path`, erring toward "covers".
     ///
@@ -199,20 +221,31 @@ impl PathPattern {
     /// everything beneath either; with a glob tail, everything beneath a match.
     #[must_use]
     pub fn covers(&self, path: &CanonicalPath) -> Coverage {
+        self.covers_within(path, Extent::Subtree)
+    }
+
+    /// Like [`covers`](Self::covers), limited to `extent` below the base (and the alias).
+    ///
+    /// A glob tail only makes sense for [`Extent::Subtree`]; for the others the tail is ignored
+    /// and the extent is measured from the base.
+    #[must_use]
+    pub fn covers_within(&self, path: &CanonicalPath, extent: Extent) -> Coverage {
         let candidate = components(path);
         let bases = std::iter::once(&self.base).chain(self.alias.as_ref());
         let covers_with = |compare: Compare| {
             bases.clone().any(|base| {
                 let base = components(base);
-                base.len() <= candidate.len()
+                extent.admits(base.len(), candidate.len())
                     && base
                         .iter()
                         .zip(&candidate)
                         .all(|(b, c)| names_may_match(b, c, compare))
-                    && self
-                        .tail
-                        .as_ref()
-                        .is_none_or(|tail| tail_matches(tail, &candidate[base.len()..], compare))
+                    && match (&self.tail, extent) {
+                        (Some(tail), Extent::Subtree) => {
+                            tail_matches(tail, &candidate[base.len()..], compare)
+                        }
+                        _ => true,
+                    }
             })
         };
         if !covers_with(Compare::Lenient) {
@@ -606,5 +639,95 @@ mod tests {
             let candidate = format!("{}{}", base.to_ascii_uppercase(), below);
             proptest::prop_assert_ne!(deny.covers(&path(&candidate)), Coverage::No);
         }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Extent-limited coverage, used by floor rules that protect one node or its children
+    // ------------------------------------------------------------------------------------
+
+    fn ext_cp(p: &str) -> CanonicalPath {
+        assert_ok!(CanonicalPath::from_canonical(p))
+    }
+
+    fn ext_literal(base: &str) -> PathPattern {
+        PathPattern {
+            base: ext_cp(base),
+            alias: None,
+            tail: None,
+        }
+    }
+
+    #[test]
+    fn covers_within_node_matches_only_the_node_itself() {
+        let rule = ext_literal("/Users/me/p/.git");
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/p/.git"), Extent::Node),
+            Coverage::Yes
+        );
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/p/.git/hooks"), Extent::Node),
+            Coverage::No
+        );
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/p"), Extent::Node),
+            Coverage::No
+        );
+    }
+
+    #[test]
+    fn covers_within_children_matches_direct_children_only() {
+        let rule = ext_literal("/Users/me/bin");
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/bin"), Extent::Children),
+            Coverage::No
+        );
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/bin/tool"), Extent::Children),
+            Coverage::Yes
+        );
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/bin/sub/tool"), Extent::Children),
+            Coverage::No
+        );
+    }
+
+    #[test]
+    fn covers_within_node_follows_the_alias_and_folds_case() {
+        let rule = PathPattern {
+            base: ext_cp("/Users/me/dotfiles/zshrc"),
+            alias: Some(ext_cp("/Users/me/.zshrc")),
+            tail: None,
+        };
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/.zshrc"), Extent::Node),
+            Coverage::Yes
+        );
+        assert_eq!(
+            rule.covers_within(&ext_cp("/Users/me/.ZSHRC"), Extent::Node),
+            Coverage::YesFolded
+        );
+    }
+
+    #[test]
+    fn covers_within_subtree_is_covers() {
+        let rule = ext_literal("/Users/me/.ssh");
+        for p in ["/Users/me/.ssh", "/Users/me/.ssh/id", "/Users/me/other"] {
+            assert_eq!(
+                rule.covers_within(&ext_cp(p), Extent::Subtree),
+                rule.covers(&ext_cp(p))
+            );
+        }
+    }
+
+    #[test]
+    fn extent_ignores_the_data_volume_firmlink_prefix() {
+        let rule = ext_literal("/Users/me/p/.git");
+        assert_eq!(
+            rule.covers_within(
+                &ext_cp("/System/Volumes/Data/Users/me/p/.git"),
+                Extent::Node
+            ),
+            Coverage::Yes
+        );
     }
 }

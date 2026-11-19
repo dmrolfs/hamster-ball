@@ -7,12 +7,13 @@ use snafu::Snafu;
 use crate::config::{
     ConfigTextError, DiscoverError, EntryError, ExtendsError, LoadError, MergeErrors, ResolveErrors,
 };
+use crate::explain::ExplainError;
 use crate::policy::{
     ArgWordError, ArgvError, ContainerLabelError, ContainerNameError, EnvNameError, EnvValueError,
     ExtendTargetError, GlobTailError, HostNameError, HostPatternError, McpNameError, PathError,
     PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
-use crate::system::{HomeError, UserConfigError};
+use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 
 /// Any error produced by this crate.
 ///
@@ -196,6 +197,27 @@ pub enum Error {
         source: LoadError,
     },
 
+    /// `hb explain` failed.
+    #[snafu(transparent)]
+    Explain {
+        /// The underlying error.
+        source: ExplainError,
+    },
+
+    /// The process environment could not be read.
+    #[snafu(transparent)]
+    Environment {
+        /// The underlying error.
+        source: EnvironmentError,
+    },
+
+    /// The floor could not be built.
+    #[snafu(transparent)]
+    Floor {
+        /// The underlying error.
+        source: FloorError,
+    },
+
     /// The user's config directory could not be located or initialized.
     #[snafu(transparent)]
     UserConfig {
@@ -351,12 +373,16 @@ mod tests {
             }
             .into(),
             LoadError::TooManyFiles.into(),
+            FloorError::GitUnsupported {
+                path: "/x/.git".to_owned(),
+            }
+            .into(),
             UserConfigError::BaseExists {
                 path: std::path::PathBuf::from("/x"),
             }
             .into(),
         ];
-        assert_eq!(errors.len(), 17);
+        assert_eq!(errors.len(), 18);
         for error in &errors {
             assert!(!error.to_string().is_empty(), "{error:?}");
         }
@@ -370,7 +396,8 @@ mod tests {
         assert!(matches!(errors[13], Error::Extends { .. }));
         assert!(matches!(errors[14], Error::Merge { .. }));
         assert!(matches!(errors[15], Error::Load { .. }));
-        assert!(matches!(errors[16], Error::UserConfig { .. }));
+        assert!(matches!(errors[16], Error::Floor { .. }));
+        assert!(matches!(errors[17], Error::UserConfig { .. }));
     }
 
     #[test]

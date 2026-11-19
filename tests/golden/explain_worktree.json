@@ -1,0 +1,2692 @@
+{
+  "schema_version": 1,
+  "project": {
+    "root": "<FIX>/home/work/proj",
+    "config": "<FIX>/home/work/proj/hamster-ball.toml",
+    "home": "<FIX>/home"
+  },
+  "files": [
+    {
+      "index": 0,
+      "layer": "user_base",
+      "source": "file",
+      "name": null,
+      "file": "<FIX>/home/.config/hamster-ball/base.toml",
+      "location": "in ~/.config/hamster-ball"
+    },
+    {
+      "index": 1,
+      "layer": "project",
+      "source": "file",
+      "name": null,
+      "file": "<FIX>/home/work/proj/hamster-ball.toml",
+      "location": "inside the project"
+    }
+  ],
+  "fs": {
+    "read": [
+      {
+        "value": "<FIX>/home/ref",
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "fs.read[0]",
+            "floor_rule": null
+          },
+          {
+            "layer": "project",
+            "file_index": 1,
+            "name": null,
+            "file": "<FIX>/home/work/proj/hamster-ball.toml",
+            "key": "fs.read[0]",
+            "floor_rule": null
+          }
+        ]
+      }
+    ],
+    "write": [
+      {
+        "value": "<FIX>/home/work/proj",
+        "origins": [
+          {
+            "layer": "project",
+            "file_index": 1,
+            "name": null,
+            "file": "<FIX>/home/work/proj/hamster-ball.toml",
+            "key": "fs.write[0]",
+            "floor_rule": null
+          }
+        ]
+      }
+    ]
+  },
+  "deny": [
+    {
+      "source": "floor",
+      "rule": "ssh",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.ssh",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "ssh"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "aws",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.aws",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "aws"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "gnupg",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.gnupg",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "gnupg"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "netrc",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.netrc",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "netrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "gh",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/gh",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "gh"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "docker-config",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.docker",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "docker-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "kube",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.kube",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "kube"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "keychains",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Keychains",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "keychains"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-credentials",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.git-credentials",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-credentials"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "cargo-credentials",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cargo",
+      "alias": null,
+      "tail": "credentials*",
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "cargo-credentials"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "op",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/op",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "op"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "rclone",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/rclone",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "rclone"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "gcloud",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/gcloud",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "gcloud"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "azure",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.azure",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "azure"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "oci",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.oci",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "oci"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "doctl",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/doctl",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "doctl"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "hub",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/hub",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "hub"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "glab",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/glab-cli",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "glab"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "vault-token",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.vault-token",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "vault-token"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "pgpass",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.pgpass",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "pgpass"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "gem-credentials",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.gem/credentials",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "gem-credentials"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "terraform-credentials",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.terraform.d/credentials.tfrc.json",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "terraform-credentials"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "pypirc",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.pypirc",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "pypirc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "npmrc",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.npmrc",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "npmrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "1password-data",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/1Password",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "1password-data"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "1password-group",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Group Containers/2BUA8C4S2C.com.1password",
+      "alias": null,
+      "tail": null,
+      "reason": "credentials",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "1password-group"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "history",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home",
+      "alias": null,
+      "tail": ".*_history",
+      "reason": "shell and tool history can contain secrets",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "history"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zsh-sessions",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zsh_sessions",
+      "alias": null,
+      "tail": null,
+      "reason": "shell and tool history can contain secrets",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zsh-sessions"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "atuin-data",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.local/share/atuin",
+      "alias": null,
+      "tail": null,
+      "reason": "shell and tool history can contain secrets",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "atuin-data"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "atuin-config",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/atuin",
+      "alias": null,
+      "tail": null,
+      "reason": "shell and tool history can contain secrets",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "atuin-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-chrome",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Google",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-chrome"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-chromium",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Chromium",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-chromium"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-edge",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Microsoft Edge",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-edge"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-edge-beta",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Microsoft Edge Beta",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-edge-beta"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-edge-dev",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Microsoft Edge Dev",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-edge-dev"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-edge-canary",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Microsoft Edge Canary",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-edge-canary"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-vivaldi",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Vivaldi",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-vivaldi"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-vivaldi-snapshot",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Vivaldi Snapshot",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-vivaldi-snapshot"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-opera",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/com.operasoftware.Opera",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-opera"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-brave",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/BraveSoftware",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-brave"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-arc",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Arc",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-arc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-comet",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Comet",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-comet"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-firefox",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Firefox",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-firefox"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-mozilla",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/Mozilla",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-mozilla"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-zen",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/zen",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-zen"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-tor",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Application Support/TorBrowser-Data",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-tor"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-safari",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Safari",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-safari"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cookies",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Cookies",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cookies"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-webkit",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/WebKit",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-webkit"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-http-storages",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/HTTPStorages",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-http-storages"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-safari-container",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Containers/com.apple.Safari",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-safari-container"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-safari-broker",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Group Containers/group.com.apple.Safari.SandboxBroker",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-safari-broker"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-google",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/Google",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-google"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-firefox",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/Firefox",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-firefox"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-mozilla",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/Mozilla",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-mozilla"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-safari",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/com.apple.Safari",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-safari"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-arc",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/Arc",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-arc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "browser-cache-arc-bundle",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Caches/company.thebrowser.Browser",
+      "alias": null,
+      "tail": null,
+      "reason": "browser profile, cookies and sessions",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "browser-cache-arc-bundle"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "containers-data",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.local/share/containers",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "containers-data"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "containers-config",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/containers",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "containers-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-docker-run",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.docker/run",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-docker-run"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-colima",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.colima",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-colima"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-lima",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.lima",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-lima"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-rancher",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.rd",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-rancher"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-orbstack",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.orbstack",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-orbstack"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-docker-desktop",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/Containers/com.docker.docker",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-docker-desktop"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-podman-data",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/home/.local/share/containers",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-podman-data"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "hb-config",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/hamster-ball",
+      "alias": null,
+      "tail": null,
+      "reason": "hamster-ball's own configuration and approvals",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "hb-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "hb-state",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.local/state/hamster-ball",
+      "alias": null,
+      "tail": null,
+      "reason": "hamster-ball's own configuration and approvals",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "hb-state"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zshrc",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zshrc",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zshrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zshenv",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zshenv",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zshenv"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zprofile",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zprofile",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zprofile"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zlogin",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zlogin",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zlogin"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "zlogout",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.zlogout",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "zlogout"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bashrc",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.bashrc",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bashrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bash-profile",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.bash_profile",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bash-profile"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bash-login",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.bash_login",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bash-login"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bash-logout",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.bash_logout",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bash-logout"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "profile",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.profile",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "profile"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "fish",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/fish",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "fish"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "cargo-env",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cargo/env",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "cargo-env"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "launch-agents",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/Library/LaunchAgents",
+      "alias": null,
+      "tail": null,
+      "reason": "runs outside the sandbox at the next shell start",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "launch-agents"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "gitconfig",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.gitconfig",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "gitconfig"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-config-dir",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/git",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-config-dir"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "cargo-config-toml",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cargo/config.toml",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "cargo-config-toml"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "cargo-config",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cargo/config",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "cargo-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "terraformrc",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.terraformrc",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "terraformrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "yarnrc",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.yarnrc",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "yarnrc"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "yarnrc-yml",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.yarnrc.yml",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "yarnrc-yml"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "maven-settings",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.m2/settings.xml",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "maven-settings"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "pip-config",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/pip",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "pip-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "uv-config",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.config/uv",
+      "alias": null,
+      "tail": null,
+      "reason": "tool configuration that runs code or redirects package sources",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "uv-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bin-local",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.local/bin",
+      "alias": null,
+      "tail": null,
+      "reason": "a directory of programs you run outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bin-local"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bin-cargo",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cargo/bin",
+      "alias": null,
+      "tail": null,
+      "reason": "a directory of programs you run outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bin-cargo"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bin-go",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/go/bin",
+      "alias": null,
+      "tail": null,
+      "reason": "a directory of programs you run outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bin-go"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "bin-bun",
+      "group": "table",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.bun/bin",
+      "alias": null,
+      "tail": null,
+      "reason": "a directory of programs you run outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "bin-bun"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "connect-podman-temp",
+      "group": "table",
+      "effect": "deny_connect",
+      "extent": "subtree",
+      "path": "<FIX>/tmp/podman",
+      "alias": null,
+      "tail": null,
+      "reason": "container runtime access is host access",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "connect-podman-temp"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "project-config",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/work/proj/hamster-ball.toml",
+      "alias": null,
+      "tail": null,
+      "reason": "the project's config, which the agent must not change to widen itself",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "project-config"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-file",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "node",
+      "path": "<FIX>/home/work/proj/.git",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-file"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-hooks:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/hooks",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-hooks:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-config:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/config",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-config:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-config-worktree:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/config.worktree",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-config-worktree:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-commondir:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/commondir",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-commondir:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-hooks:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/modules",
+      "alias": null,
+      "tail": "**/hooks",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-hooks:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-config:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/modules",
+      "alias": null,
+      "tail": "**/config",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-config:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-config-worktree:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/modules",
+      "alias": null,
+      "tail": "**/config.worktree",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-config-worktree:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-commondir:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/modules",
+      "alias": null,
+      "tail": "**/commondir",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-commondir:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-worktrees-config:<FIX>/main/.git/worktrees/wt",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees/wt/worktrees",
+      "alias": null,
+      "tail": "*/config.worktree",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-worktrees-config:<FIX>/main/.git/worktrees/wt"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-hooks:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/hooks",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-hooks:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-config:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/config",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-config:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-config-worktree:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/config.worktree",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-config-worktree:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-commondir:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/commondir",
+      "alias": null,
+      "tail": null,
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-commondir:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-hooks:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/modules",
+      "alias": null,
+      "tail": "**/hooks",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-hooks:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-config:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/modules",
+      "alias": null,
+      "tail": "**/config",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-config:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-config-worktree:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/modules",
+      "alias": null,
+      "tail": "**/config.worktree",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-config-worktree:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-modules-commondir:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/modules",
+      "alias": null,
+      "tail": "**/commondir",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-modules-commondir:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "git-worktrees-config:<FIX>/main/.git",
+      "group": "project",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/main/.git/worktrees",
+      "alias": null,
+      "tail": "*/config.worktree",
+      "reason": "git runs hooks and config outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "git-worktrees-config:<FIX>/main/.git"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "path:<FIX>/store/bin",
+      "group": "path",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/store/bin",
+      "alias": "<FIX>/link-bin",
+      "tail": null,
+      "reason": "a directory of programs you run outside the sandbox",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "path:<FIX>/store/bin"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "hb-exe",
+      "group": "path",
+      "effect": "deny_write",
+      "extent": "subtree",
+      "path": "<FIX>/install/hb",
+      "alias": null,
+      "tail": null,
+      "reason": "hb itself",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "hb-exe"
+        }
+      ]
+    },
+    {
+      "source": "floor",
+      "rule": "pin:<FIX>/home/work/proj",
+      "group": "pin",
+      "effect": "pin_unlink",
+      "extent": "node",
+      "path": "<FIX>/home/work/proj",
+      "alias": null,
+      "tail": null,
+      "reason": "keeps a protected path from being moved aside by renaming an ancestor",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "pin:<FIX>/home/work/proj"
+        }
+      ]
+    }
+  ],
+  "net": {
+    "hosts": [
+      {
+        "value": "api.example.com",
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "net.allow[0]",
+            "floor_rule": null
+          }
+        ]
+      }
+    ],
+    "loopback_ports": []
+  },
+  "env": {
+    "pass": [
+      {
+        "value": "LANG",
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "env.pass[1]",
+            "floor_rule": null
+          }
+        ]
+      },
+      {
+        "value": "TERM",
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "env.pass[0]",
+            "floor_rule": null
+          }
+        ]
+      }
+    ],
+    "set": []
+  },
+  "tls": {
+    "system_trust": {
+      "value": true,
+      "origins": [
+        {
+          "layer": "user_base",
+          "file_index": 0,
+          "name": null,
+          "file": "<FIX>/home/.config/hamster-ball/base.toml",
+          "key": "tls.system_trust",
+          "floor_rule": null
+        }
+      ]
+    },
+    "extra_ca_files": []
+  },
+  "ctl": {
+    "label": null,
+    "containers": []
+  },
+  "mcp": [],
+  "hooks": [
+    {
+      "program": "notify",
+      "arg_count": 2,
+      "args": null,
+      "origins": [
+        {
+          "layer": "user_base",
+          "file_index": 0,
+          "name": null,
+          "file": "<FIX>/home/.config/hamster-ball/base.toml",
+          "key": "hooks[0]",
+          "floor_rule": null
+        }
+      ]
+    }
+  ],
+  "guard_exceptions": [],
+  "warnings": [
+    {
+      "kind": "skipped_allow",
+      "message": "`~/gone\u202e` was not granted: missing",
+      "origins": [
+        {
+          "layer": "project",
+          "file_index": 1,
+          "name": null,
+          "file": "<FIX>/home/work/proj/hamster-ball.toml",
+          "key": "fs.read[1]",
+          "floor_rule": null
+        }
+      ]
+    }
+  ]
+}

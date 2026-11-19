@@ -10,21 +10,22 @@
 
 use super::merge::Policy;
 use crate::origin::Sourced;
-use crate::policy::{CanonicalPath, Coverage, PathPattern};
-
-/// What the caller wants to do with a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsAccess {
-    /// Read the path.
-    Read,
-    /// Write, create, delete or rename the path.
-    Write,
-}
+use crate::policy::{CanonicalPath, Coverage, FloorRule, FloorRuleId, FsAccess, PathPattern};
 
 /// The advisory answer for one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FsDecision<'a> {
+    /// A floor rule forbids this access; no config can change that.
+    DeniedByFloor {
+        /// The rule's position in the policy's floor.
+        id: FloorRuleId,
+        /// The rule.
+        rule: &'a FloorRule,
+        /// Whether the rule matched only under case-insensitive or Unicode-conservative
+        /// comparison.
+        folded: bool,
+    },
     /// A deny rule covers the path; no allow can change that.
     Denied {
         /// The rule, with every place it was declared.
@@ -45,15 +46,26 @@ pub enum FsDecision<'a> {
 impl Policy {
     /// Decides whether `access` to `path` is denied, allowed or not granted.
     ///
-    /// A read-deny also denies writing (decision D5); a write-deny denies only writing. A
-    /// write grant also allows reading; a read grant does not allow writing. When several
-    /// rules deny, one that matches exactly is reported in preference to one that matches only
-    /// after folding, and otherwise the first in sorted order.
+    /// The floor is consulted first and cannot be outvoted. A read-deny also denies writing
+    /// (decision D5); a write-deny denies only writing. A write grant also allows reading; a
+    /// read grant does not allow writing. `tls.extra_ca_files` are read grants (design 4.5).
+    /// Connecting to a socket is never granted by a file rule, so it is either denied by the
+    /// floor or not granted. When several rules deny, one that matches exactly is reported in
+    /// preference to one that matches only after folding, and otherwise the first in sorted
+    /// order.
     #[must_use]
     pub fn decide(&self, path: &CanonicalPath, access: FsAccess) -> FsDecision<'_> {
+        if let Some(hit) = self.floor().denying(path, access) {
+            return FsDecision::DeniedByFloor {
+                id: hit.id,
+                rule: hit.rule,
+                folded: hit.folded,
+            };
+        }
         let denies: &[&[Sourced<PathPattern>]] = match access {
             FsAccess::Read => &[&self.fs.deny_read],
             FsAccess::Write => &[&self.fs.deny_read, &self.fs.deny_write],
+            FsAccess::Connect => &[],
         };
         let mut folded_match = None;
         for rule in denies.iter().flat_map(|rules| rules.iter()) {
@@ -75,8 +87,9 @@ impl Policy {
         }
 
         let grants: &[&[Sourced<CanonicalPath>]] = match access {
-            FsAccess::Read => &[&self.fs.read, &self.fs.write],
+            FsAccess::Read => &[&self.fs.read, &self.fs.write, &self.tls.extra_ca_files],
             FsAccess::Write => &[&self.fs.write],
+            FsAccess::Connect => &[],
         };
         grants
             .iter()
@@ -95,6 +108,7 @@ mod tests {
     };
     use crate::origin::{FileId, Layer, Source};
     use crate::policy::{CanonicalPath, GlobTail, PathPattern, PresetName};
+    use crate::policy::{Extent, Floor, FloorEffect, FloorRule};
     use claims::{assert_ok, assert_some};
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
@@ -158,7 +172,7 @@ mod tests {
             file("base", Layer::UserBase, FileLocation::UserConfig, base),
             file("project", Layer::Project, FileLocation::InProject, project),
         ]);
-        assert_ok!(merge(&files))
+        assert_ok!(merge(&files, Floor::empty()))
     }
 
     fn config(
@@ -349,8 +363,227 @@ mod tests {
     #[test]
     fn an_empty_policy_grants_nothing() {
         assert!(matches!(
-            Policy::default().decide(&cpath("/anything"), FsAccess::Read),
+            assert_ok!(merge(&[], Floor::empty())).decide(&cpath("/anything"), FsAccess::Read),
             FsDecision::NotGranted
+        ));
+    }
+
+    // ====================================================================================
+    // The floor: no layer can override it
+    // ====================================================================================
+
+    fn floor_rule(
+        name: &'static str,
+        effect: FloorEffect,
+        extent: Extent,
+        base: &str,
+    ) -> FloorRule {
+        FloorRule::new(
+            name,
+            effect,
+            extent,
+            PathPattern {
+                base: cpath(base),
+                alias: None,
+                tail: None,
+            },
+            "test",
+        )
+    }
+
+    fn sample_floor() -> Floor {
+        assert_ok!(Floor::new(vec![
+            floor_rule(
+                "ssh",
+                FloorEffect::DenyReadWrite,
+                Extent::Subtree,
+                "/Users/me/.ssh"
+            ),
+            floor_rule(
+                "gh",
+                FloorEffect::DenyReadWrite,
+                Extent::Subtree,
+                "/Users/me/.config/gh"
+            ),
+            floor_rule(
+                "zshrc",
+                FloorEffect::DenyWrite,
+                Extent::Subtree,
+                "/Users/me/.zshrc"
+            ),
+            floor_rule(
+                "sock",
+                FloorEffect::DenyConnect,
+                Extent::Subtree,
+                "/var/run/docker.sock"
+            ),
+            floor_rule(
+                "pin",
+                FloorEffect::PinUnlink,
+                Extent::Node,
+                "/Users/me/p/.git"
+            ),
+        ]))
+    }
+
+    fn policy_on(floor: Floor, base: ResolvedConfig, project: ResolvedConfig) -> Policy {
+        let files = numbered(vec![
+            file("base", Layer::UserBase, FileLocation::UserConfig, base),
+            file("project", Layer::Project, FileLocation::InProject, project),
+        ]);
+        assert_ok!(merge(&files, floor))
+    }
+
+    fn floor_name<'a>(decision: &FsDecision<'a>) -> Option<&'a str> {
+        match decision {
+            FsDecision::DeniedByFloor { rule, .. } => Some(&rule.name),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_project_allow_of_a_floor_path_is_denied_by_the_floor_and_attributed_to_it() {
+        let project = config(&["/Users/me/.ssh"], &["/Users/me/.ssh"], vec![], vec![]);
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        for access in [FsAccess::Read, FsAccess::Write] {
+            let decision = policy.decide(&cpath("/Users/me/.ssh/id_ed25519"), access);
+            assert_eq!(floor_name(&decision), Some("ssh"), "{access:?}");
+        }
+    }
+
+    #[test]
+    fn a_grant_of_an_ancestor_loses_to_floor_entries_beneath_it_only() {
+        let project = config(&[], &["/Users/me/.config"], vec![], vec![]);
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/.config/gh/hosts.yml"), FsAccess::Write)),
+            Some("gh")
+        );
+        assert!(matches!(
+            policy.decide(&cpath("/Users/me/.config/other"), FsAccess::Write),
+            FsDecision::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_grant_of_a_descendant_of_a_floor_path_is_still_denied() {
+        let project = config(&["/Users/me/.ssh/sub"], &[], vec![], vec![]);
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/.ssh/sub/key"), FsAccess::Read)),
+            Some("ssh")
+        );
+    }
+
+    #[test]
+    fn a_write_deny_floor_rule_still_lets_the_path_be_read_when_granted() {
+        let project = config(&["/Users/me"], &[], vec![], vec![]);
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert!(matches!(
+            policy.decide(&cpath("/Users/me/.zshrc"), FsAccess::Read),
+            FsDecision::Allowed { .. }
+        ));
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/.zshrc"), FsAccess::Write)),
+            Some("zshrc")
+        );
+    }
+
+    #[test]
+    fn a_tls_extra_ca_file_is_a_read_grant_and_cannot_reach_the_floor() {
+        let mut project = ResolvedConfig::default();
+        project.tls.extra_ca_files = vec![cpath("/Users/me/.ssh/id_rsa")];
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/.ssh/id_rsa"), FsAccess::Read)),
+            Some("ssh")
+        );
+    }
+
+    #[test]
+    fn a_tls_extra_ca_file_outside_the_floor_is_reported_as_a_read_grant() {
+        let mut project = ResolvedConfig::default();
+        project.tls.extra_ca_files = vec![cpath("/Users/me/ca/corp.pem")];
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert!(matches!(
+            policy.decide(&cpath("/Users/me/ca/corp.pem"), FsAccess::Read),
+            FsDecision::Allowed { .. }
+        ));
+        // A CA file is read-only.
+        assert!(matches!(
+            policy.decide(&cpath("/Users/me/ca/corp.pem"), FsAccess::Write),
+            FsDecision::NotGranted
+        ));
+    }
+
+    #[test]
+    fn connecting_is_denied_by_the_floor_and_otherwise_never_granted_by_a_file_rule() {
+        let project = config(&["/var/run"], &["/var/run"], vec![], vec![]);
+        let policy = policy_on(sample_floor(), ResolvedConfig::default(), project);
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/var/run/docker.sock"), FsAccess::Connect)),
+            Some("sock")
+        );
+        assert!(matches!(
+            policy.decide(&cpath("/var/run/other.sock"), FsAccess::Connect),
+            FsDecision::NotGranted
+        ));
+    }
+
+    #[test]
+    fn case_unicode_and_firmlink_spellings_of_a_floor_path_are_denied() {
+        let policy = policy_on(
+            sample_floor(),
+            ResolvedConfig::default(),
+            config(&["/Users/me/.config"], &[], vec![], vec![]),
+        );
+        for spelling in [
+            "/Users/me/.SSH/id",
+            "/System/Volumes/Data/Users/me/.ssh/id",
+            "/Users/me/.ssh\u{301}/id",
+        ] {
+            assert!(
+                floor_name(&policy.decide(&cpath(spelling), FsAccess::Read)).is_some(),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_denial_wins_over_a_file_deny_that_also_matches() {
+        let base = config(&[], &[], vec![deny("/Users/me/.ssh")], vec![]);
+        let policy = policy_on(sample_floor(), base, ResolvedConfig::default());
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/.ssh/x"), FsAccess::Read)),
+            Some("ssh")
+        );
+    }
+
+    #[test]
+    fn the_policy_keeps_exactly_the_floor_it_was_given() {
+        let floor = sample_floor();
+        let policy = policy_on(
+            floor.clone(),
+            ResolvedConfig::default(),
+            ResolvedConfig::default(),
+        );
+        assert_eq!(policy.floor(), &floor);
+    }
+
+    #[test]
+    fn a_pin_denies_writing_its_node_and_is_reported_by_the_floor() {
+        let policy = policy_on(
+            sample_floor(),
+            ResolvedConfig::default(),
+            config(&["/Users/me/p"], &["/Users/me/p"], vec![], vec![]),
+        );
+        assert_eq!(
+            floor_name(&policy.decide(&cpath("/Users/me/p/.git"), FsAccess::Write)),
+            Some("pin")
+        );
+        assert!(matches!(
+            policy.decide(&cpath("/Users/me/p/.git/objects/ab"), FsAccess::Write),
+            FsDecision::Allowed { .. }
         ));
     }
 
@@ -525,6 +758,21 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
         #[test]
+        fn no_configs_can_change_the_floor_or_make_a_floor_path_reachable(
+            configs in proptest::collection::vec(arb_config(), 1..5),
+        ) {
+            let files = as_files(&configs, &NAMES[..configs.len()]);
+            let floor = sample_floor();
+            let policy = assert_ok!(merge(&files, floor.clone()));
+            prop_assert_eq!(policy.floor(), &floor);
+            for access in [FsAccess::Read, FsAccess::Write] {
+                prop_assert!(
+                    floor_name(&policy.decide(&cpath("/Users/me/.ssh/id"), access)).is_some()
+                );
+            }
+        }
+
+        #[test]
         fn merging_in_any_order_gives_the_same_policy(
             configs in proptest::collection::vec(arb_config(), 1..5),
             seed in any::<u64>(),
@@ -541,8 +789,8 @@ mod tests {
             let shuffled_configs: Vec<ResolvedConfig> = order.iter().map(|&i| configs[i].clone()).collect();
             let shuffled_names: Vec<&str> = order.iter().map(|&i| names[i]).collect();
             let shuffled = as_files(&shuffled_configs, &shuffled_names);
-            let a = assert_ok!(merge(&forward));
-            let b = assert_ok!(merge(&shuffled));
+            let a = assert_ok!(merge(&forward, Floor::empty()));
+            let b = assert_ok!(merge(&shuffled, Floor::empty()));
             prop_assert_eq!(normal_form(&a, &forward), normal_form(&b, &shuffled));
         }
 
@@ -552,10 +800,10 @@ mod tests {
             extra in arb_config(),
         ) {
             let names = &NAMES[..configs.len()];
-            let before = assert_ok!(merge(&as_files(&configs, names)));
+            let before = assert_ok!(merge(&as_files(&configs, names), Floor::empty()));
             let mut more = configs.clone();
             more.push(extra);
-            let after = assert_ok!(merge(&as_files(&more, &NAMES[..more.len()])));
+            let after = assert_ok!(merge(&as_files(&more, &NAMES[..more.len()]), Floor::empty()));
             for deny in &before.fs.deny_read {
                 prop_assert!(after.fs.deny_read.iter().any(|d| d.value == deny.value));
             }
@@ -572,10 +820,10 @@ mod tests {
             write in any::<bool>(),
         ) {
             let access = if write { FsAccess::Write } else { FsAccess::Read };
-            let before = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()])));
+            let before = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()]), Floor::empty()));
             let mut more = configs.clone();
             more.push(extra);
-            let after = assert_ok!(merge(&as_files(&more, &NAMES[..more.len()])));
+            let after = assert_ok!(merge(&as_files(&more, &NAMES[..more.len()]), Floor::empty()));
             let target = cpath(PATHS[probe]);
             if is_denied(&before.decide(&target, access)) {
                 prop_assert!(is_denied(&after.decide(&target, access)));
@@ -604,8 +852,8 @@ mod tests {
 
         #[test]
         fn merging_the_same_file_twice_changes_no_value(config in arb_config()) {
-            let once = assert_ok!(merge(&as_files(std::slice::from_ref(&config), &["f0"])));
-            let twice = assert_ok!(merge(&as_files(&[config.clone(), config], &["f0", "f1"])));
+            let once = assert_ok!(merge(&as_files(std::slice::from_ref(&config), &["f0"]), Floor::empty()));
+            let twice = assert_ok!(merge(&as_files(&[config.clone(), config], &["f0", "f1"]), Floor::empty()));
             prop_assert_eq!(
                 once.fs.deny_read.iter().map(|d| d.value.clone()).collect::<Vec<_>>(),
                 twice.fs.deny_read.iter().map(|d| d.value.clone()).collect::<Vec<_>>()
@@ -619,7 +867,7 @@ mod tests {
 
         #[test]
         fn every_input_list_value_appears_in_the_output(configs in proptest::collection::vec(arb_config(), 1..4)) {
-            let policy = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()])));
+            let policy = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()]), Floor::empty()));
             for config in &configs {
                 for host in &config.net.allow {
                     prop_assert!(policy.net.allow.iter().any(|h| &h.value == host));
@@ -632,7 +880,7 @@ mod tests {
 
         #[test]
         fn the_merged_system_trust_is_never_looser_than_any_input(configs in proptest::collection::vec(arb_config(), 1..5)) {
-            let policy = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()])));
+            let policy = assert_ok!(merge(&as_files(&configs, &NAMES[..configs.len()]), Floor::empty()));
             let any_false = configs.iter().any(|c| c.tls.system_trust == Some(false));
             let any_true = configs.iter().any(|c| c.tls.system_trust == Some(true));
             let result = policy.tls.system_trust.map(|t| t.value);
@@ -657,7 +905,7 @@ mod tests {
             let layer = if hooked_in_project { Layer::Project } else { Layer::Preset };
             let files = numbered(vec![file("evil", layer, location, c)]);
             // Either the merge refuses, or the hook is absent; it is never merged in.
-            match merge(&files) {
+            match merge(&files, Floor::empty()) {
                 Err(_) => {}
                 Ok(policy) => prop_assert!(policy.hooks.is_empty()),
             }

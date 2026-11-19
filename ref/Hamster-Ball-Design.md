@@ -248,39 +248,114 @@ changed by the agent, or by a `git pull` of someone else's change.
   User-level files are outside the hamster ball's reach and need no approval.
 - On first run, or when any hash changes, `hb` prints what the project **adds beyond the base**
   (the grant summary) and asks for confirmation. The result is stored in
-  `$XDG_STATE_HOME/hamster-ball/approvals/` (default `~/.local/state/hamster-ball/approvals/`), which the floor denies
-  to the hamster ball for read and write.
+  `~/.local/state/hamster-ball/approvals/`, which the floor denies to the hamster ball for read and write.
+  `XDG_STATE_HOME` is **ignored** (D47): a project `.envrc` (after `direnv allow`) could otherwise move the store into
+  a directory the agent can write. `hb explain` says when the variable is set and ignored.
 - Without a terminal, an unapproved config is a hard error (exit code 78). It is never auto-approved.
 - This is an approval store like `direnv allow`. It is not an access log.
 
 ## 6. The floor
 
-Compiled into `hb`. Cannot be overridden by the user base, presets or projects.
+Compiled into `hb` (`policy::floor`), resolved against the real filesystem when a project is loaded
+(`system::floor`). It cannot be overridden by the user base, presets or projects: a `Policy` holds the floor it
+was built on, has no `Default`, and config files never see it. Every rule has an **effect** and an **extent**:
 
-Read and write denied:
+| Effect | Forbids | Seatbelt form (hb-ghd.2.1) |
+|---|---|---|
+| `deny_read_write` | read, write, create, delete, rename | `(deny file-read* file-write* ...)` (`file-read*`, not `file-read-data`: `stat` would leak existence and size) |
+| `deny_write` | write, create, delete, rename | `(deny file-write* ...)` |
+| `deny_connect` | `connect()` to a unix socket | `(deny network-outbound (remote unix-socket (subpath ...)))` |
+| `pin_unlink` | unlink or rename of the node itself | `(deny file-write-unlink (literal ...))` |
 
-- `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/gh`, `~/.docker`, `~/.kube`
-- `~/Library/Keychains` and browser profile directories (Chromium, Chrome, Firefox, Safari)
-- Container runtimes: `~/.local/share/containers`, `~/.config/containers`, the podman socket
-  directory, `/var/run/docker.sock` (section 9)
+| Extent | Covers |
+|---|---|
+| subtree | the path and everything under it (`subpath`); a symlink's own name is added as `literal` |
+| node | the path only |
+| children | the path's direct children, not the path |
+
+Rules are emitted after every allow (7.1 step 8), so a floor rule wins. Every rule names a canonical path (a test
+asserts none starts with `/System/Volumes/Data`). A path that does not exist yet is still covered.
+
+**Read and write denied** (credentials, history, browsers, containers, `hb` itself):
+
+- `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/gh`, `~/.docker`, `~/.kube`, `~/Library/Keychains`
+- More credential stores: `~/.git-credentials`, `~/.cargo/credentials*`, `~/.npmrc`, `~/.pypirc`, `~/.pgpass`,
+  `~/.vault-token`, `~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.config/{op,rclone,gcloud,doctl,hub,glab-cli}`,
+  `~/.azure`, `~/.oci`, and the 1Password data and group-container directories
+- History: `~/.*_history`, `~/.zsh_sessions`, atuin's data and config
+- Browsers, whole vendor directories under `~/Library` (Application Support: Google, Chromium, Microsoft Edge (+ Beta, Dev,
+  Canary), Vivaldi (+ Snapshot), Opera, BraveSoftware, Arc, Comet, Firefox, Mozilla, zen, TorBrowser-Data; plus Safari,
+  Cookies, WebKit, HTTPStorages, the Safari container and sandbox broker; caches for Google, Firefox, Mozilla, Safari, Arc)
+- Containers: `~/.local/share/containers`, `~/.config/containers`, `/var/run/docker.sock`, `/var/run/podman`
 - `~/.config/hamster-ball` and `~/.local/state/hamster-ball` (base config and approvals)
 
-Write denied (reads may be allowed elsewhere):
+**Connect denied** (D42; a file deny does not stop `connect()`): `/var/run/docker.sock`, `/var/run/podman`, `~/.docker/run`,
+`~/.colima`, `~/.lima`, `~/.rd`, `~/.orbstack`, `~/Library/Containers/com.docker.docker`, `~/.local/share/containers`, and
+`<per-user temp dir>/podman`, where a podman machine started from a nix shell or launcher puts its API socket. The temp
+directory comes from `getconf DARWIN_USER_TEMP_DIR`, not `$TMPDIR`. A socket at an unknowable path is covered only by
+the deny-default network (7.1 step 5): no `network-outbound` rule may allow a unix socket except the `hb ctl` socket.
 
-- Shell startup files: `~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.bashrc`, `~/.profile`
-- Every directory on your `PATH`, plus `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `~/.bun/bin`
-- `~/Library/LaunchAgents`
-- In the project: `hamster-ball.toml`, `.git/hooks`, `.git/config`
+**Write denied** (reads stay up to the grants):
+
+- Shell startup: `~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`,
+  `~/.bash_logout`, `~/.profile`, `~/.config/fish`, `~/.cargo/env`, `~/Library/LaunchAgents`
+- Tool configuration that runs code or redirects package sources (D43): `~/.gitconfig`, `~/.config/git`, `~/.cargo/config.toml`,
+  `~/.cargo/config`, `~/.terraformrc`, `~/.yarnrc`, `~/.yarnrc.yml`, `~/.m2/settings.xml`, `~/.config/pip`, `~/.config/uv`
+- Programs: `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `~/.bun/bin`, `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`,
+  every absolute directory on your `PATH`, and `hb` itself (D45)
+- In the project: `hamster-ball.toml`, every approval file (the closure files the ball could write), and git's hooks and
+  config (D41)
+
+**Git** (D41). `.git` is classified by what is there, because an agent that can rename `.git` can plant a `gitdir:` pointer
+and have git run its hooks outside the sandbox (measured: real `git commit` ran the planted hook):
+
+| `.git` is | Rules |
+|---|---|
+| a directory | `hooks`, `config`, `config.worktree`, `commondir`, `modules/**/{hooks,config,config.worktree,commondir}` and `worktrees/*/config.worktree` below it. `commondir` is on the list because git takes hooks and config from the directory that file names (verified: a planted `commondir` made git 2.50 run a hook from an agent-controlled directory). `worktrees/*/commondir` is not, so `git worktree add` keeps working |
+| a file (`gitdir:` pointer: worktree, submodule) | the file itself, and the same rules under the git directory it names and under that directory's `commondir` |
+| a symlink | the link's own name, and the same rules under what it points to |
+| missing | the `.git` name itself, so a pointer cannot be created |
+
+The pointer is untrusted text (the agent can write it): at most 1 KiB, one line, no control characters, only the line ending
+removed (git keeps trailing spaces, so a directory named `x ` is not `x`), joined to the directory holding `.git` and resolved
+as a literal path (never as `~` or a glob). Only regular files are read, so a FIFO or symlink named `commondir` is an error. A malformed pointer in the project is an
+error; the same walk applies to every enclosing repository above the project root, where a problem is a warning. Not
+protected: standalone repositories nested below the root (protecting them would break `git init` and `git clone` in
+subdirectories; D46), and hard links that existed before the ball started (reported when a protected file has `nlink > 1`).
+
+**Pins** (D41). Denying a path does not stop renaming one of its ancestors. For every protected path, each ancestor that a
+write grant (or the project root) reaches gets a `pin_unlink`, so `mv .git .git-old` and `mv presets presets-old` fail while
+ordinary writes beside them work. A glob rule's base is pinned too, since the base itself is not denied.
+
+**`PATH`** (D44, D45). Read from the process once. Only absolute entries are used; empty, `.`, relative and unexpanded `~`
+entries are reported and skipped. Entries are resolved (a symlinked entry covers both names), de-duplicated and sorted by
+path. A missing directory is kept. An entry that equals or contains the project, your home or a write grant is covered for
+its direct children only, so the project stays writable. An entry inside the project (`.venv/bin`, `node_modules/.bin`)
+is not write-denied, because that would stop `uv sync` and `npm install`; it is reported. A symlink in a program directory
+that points into a write grant has its target write-denied (up to 256 targets), and so does every link on the way
+(`~/.tool/current -> versions/1.2`), including when the end of the chain does not exist yet, because the agent could otherwise replace
+a program you later run outside the sandbox (`~/.local/bin/pi` into `~/.pi/agent`; a preset can say
+`deny_write = ["~/.pi/agent/bin"]` to make that intent explicit).
+
+**Failure behavior** (D48). A table or project rule whose path cannot be resolved (a dangling or looping symlink, a file where a
+directory should be) is an error naming the rule; there is no lexical fallback, because an unresolvable path is where something
+could be planted. Only `PATH` entries and enclosing repositories degrade to warnings.
 
 Notes:
 
 - `~/.kube` is denied because it can hold credentials for real clusters. A project that needs
   `kubectl` to a local cluster should point `KUBECONFIG` at a project-scoped file.
   llm_gateway needs this; the exact mechanism is an open item (section 15).
+- `~/.npmrc` is denied for read as well as write (D43). A private registry needs its auth in a project `.npmrc` that
+  reads `${NPM_TOKEN}`, passed with `env.pass`.
 - Denying `.git/config` blocks `git push -u` and `git remote add` inside the hamster ball. This is the
-  default; revisit after use (section 15).
+  default; revisit after use (section 15). `config.lock` can still be created, so git fails with "could not write config file".
 - Git network operations work over HTTPS through the proxy only, with no credentials
   (keychain and credential helpers are not reachable). Pushing is done by you, outside the hamster ball.
+- Out of scope, because they are project files you run and the agent legitimately edits: `Makefile`, `justfile`, `.husky/`,
+  `.envrc`, `.vscode/tasks.json`, `.pre-commit-config.yaml`, `package.json` scripts, `conftest.py`.
+- A floor rule can make a grant useless. `hb explain` reports a grant that the floor overrides in whole or in part
+  (`grant_shadowed_by_floor`), so a mistaken grant does not lose silently.
 
 ## 7. Enforcement
 
@@ -301,7 +376,7 @@ placed after a deny reopened the file; placed before, it did not). Generated ord
    `network-bind` and inbound on loopback only for MCP servers that opt in
 6. Secrets guard denies (section 8)
 7. Template re-allow (`*.example`, `*.sample`, `*.template`)
-8. Floor, pins and `deny_*` rules last, so nothing re-allows them
+8. Floor (all four effects, 6), pins and `deny_*` rules last, so nothing re-allows them. Read denies use `file-read*`
 
 ### 7.2 Environment
 
@@ -357,7 +432,8 @@ Measured:
 - Podman follows symlinks the agent plants in the project. Swapping a bind-mount source for a
   symlink, then running `podman restart`, exposed a canary file outside the project.
 
-The floor denies the podman machine key, socket directory and config paths (section 6).
+The floor denies the podman machine key and config paths for read and write, and denies `connect()` to the known socket
+locations (section 6). A file deny alone does not stop a unix-socket `connect()` (measured).
 
 ### 9.2 Tier 1: connect-only
 
@@ -514,6 +590,10 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 8. **llm_gateway ledger port**: `justfile` and the running container use 15433; two `psql` probes in
    `just/analytics.just` use 15432. Report to that project; not a change for this repo.
 9. Presets for codex and omp once installed.
+10. **Unverified under the final profile** (hb-ghd.2.1 probes): reaching user keychain items through `securityd` (the Mach
+    lookups in 4.5 stay allowed while the keychain files are denied), AppleEvents (`osascript` driving Terminal) and
+    `launchctl submit`.
+11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
 
 ## 16. Test plan
 
@@ -600,3 +680,13 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D38 | A preset name that is both built-in and a user file is an error naming both | owner, hb-ghd.1.2 |
 | D39 | A missing base is an error; `hb init` creates one (0600, never overwrites); `XDG_CONFIG_HOME` is ignored | owner, hb-ghd.1.2 |
 | D40 | A user preset symlinked outside the config directory is classified by where it really is: it loses hook rights and is approved and hashed like any other writable file | owner, hb-ghd.1.2 |
+| D41 | The floor protects `.git` by classification (directory, `gitdir:` file, symlink, missing), parses the untrusted pointer safely, and adds unlink pins on every ancestor of a protected path that a write grant reaches; enclosing repositories get the same treatment | owner, hb-ghd.1.3; both bypasses measured (rename of `.git`, rename of a closure file's directory) |
+| D42 | A `deny_connect` effect covers container sockets; section 6's "podman socket directory" becomes the named paths plus `<per-user temp dir>/podman` | owner, hb-ghd.1.3; measured: a file deny does not stop `connect()` |
+| D43 | Floor additions: persistence and code-running tool config (write-deny), credential stores, history and browser vendor directories (read+write deny), `~/.npmrc` read+write deny | owner, hb-ghd.1.3 |
+| D44 | `PATH` is read once; only absolute entries count; entries inside the project are not write-denied; entries containing the project, home or a write grant are covered for direct children only | owner, hb-ghd.1.3 |
+| D45 | Program directories also include `/opt/homebrew/{bin,sbin}` and `/usr/local/bin`; `hb` itself is write-denied; symlink targets of program-directory entries under a write grant are write-denied (cap 256) | owner, hb-ghd.1.3 |
+| D46 | Standalone repositories nested below the project root stay unprotected | owner, hb-ghd.1.3 |
+| D47 | `XDG_STATE_HOME` is ignored; approvals live in `~/.local/state/hamster-ball` (amends section 5 and hb-ghd.4) | owner, hb-ghd.1.3 |
+| D48 | Floor path-resolution errors fail closed with a `FloorError` naming the rule; only `PATH` entries and enclosing repositories degrade to warnings. A `Policy` has no `Default` and `Floor` has no public constructor | owner (recommendation), hb-ghd.1.3 |
+| D49 | `hb explain` ships `--format json` (`schema_version: 1`, typed structs, bidi-escaping formatter), `--show-args`, `--path` and a `grant_shadowed_by_floor` warning; `env.set` values are never shown; `clap` and `serde_json` are dependencies | owner, hb-ghd.1.3 |
+| D50 | The in-project closure files' read-only rule belongs to the floor (hb-ghd.1.3), not to the approval task; `FloorRule` provenance is the `FsDecision::DeniedByFloor` variant, not a `Source::Floor` | owner, hb-ghd.1.3 |

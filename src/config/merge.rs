@@ -22,7 +22,7 @@ use super::location::FileLocation;
 use super::resolve::ResolvedMcpServer;
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
-    Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, GuardException,
+    Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor, GuardException,
     HostPattern, McpName, PathPattern, Port,
 };
 use crate::sys::path_preview;
@@ -95,8 +95,10 @@ pub struct MergedCtl {
     pub containers: Vec<Sourced<ContainerName>>,
 }
 
-/// The merged policy of a whole closure.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The merged policy of a whole closure, and the floor it can never loosen.
+///
+/// There is no `Default`: a policy without a [`Floor`] is not representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Policy {
     /// `[fs]`.
@@ -115,6 +117,16 @@ pub struct Policy {
     pub hooks: Vec<Sourced<Argv>>,
     /// Secrets-guard exceptions.
     pub guard_exceptions: Vec<Sourced<GuardException>>,
+    /// The floor: no layer can narrow it, and it is the same one `merge` was given.
+    floor: Floor,
+}
+
+impl Policy {
+    /// The floor this policy was built on.
+    #[must_use]
+    pub fn floor(&self) -> &Floor {
+        &self.floor
+    }
 }
 
 /// Why a closure could not be merged.
@@ -191,11 +203,13 @@ impl Collected {
     }
 }
 
-/// Merges `files`, which must be in closure order, into one policy.
+/// Merges `files`, which must be in closure order, into one policy on top of `floor`.
+///
+/// The floor is stored as given. No file can add to, remove from or narrow it.
 ///
 /// # Errors
 /// [`MergeErrors`] if a keyed value conflicts or a file defines a user-only section it may not.
-pub fn merge(files: &[ClosureFile]) -> Result<Policy, MergeErrors> {
+pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors> {
     let mut collected = Collected::default();
     reassert_user_only(files, &mut collected);
 
@@ -241,6 +255,7 @@ pub fn merge(files: &[ClosureFile]) -> Result<Policy, MergeErrors> {
         ),
         hooks: ordered_union(files, |c| positions(&c.hooks)),
         guard_exceptions: union(files, |c| positions(&c.guard.exceptions)),
+        floor,
     };
     if collected.errors.is_empty() {
         Ok(policy)
@@ -496,7 +511,7 @@ mod tests {
     }
 
     fn merged(files: Vec<ClosureFile>) -> Policy {
-        assert_ok!(merge(&closure(files)))
+        assert_ok!(merge(&closure(files), Floor::empty()))
     }
 
     fn values<T: Clone>(items: &[Sourced<T>]) -> Vec<T> {
@@ -617,7 +632,7 @@ mod tests {
 
     #[test]
     fn merging_nothing_gives_an_empty_policy() {
-        assert_eq!(merged(Vec::new()), Policy::default());
+        assert_eq!(merged(Vec::new()), assert_ok!(merge(&[], Floor::empty())));
     }
 
     // ====================================================================================
@@ -697,7 +712,7 @@ mod tests {
             user("base", with_env("TOKEN", "secret-one")),
             project(with_env("TOKEN", "secret-two")),
         ]);
-        let errors = assert_err!(merge(&files));
+        let errors = assert_err!(merge(&files, Floor::empty()));
         assert_eq!(errors.errors.len(), 1);
         let shown = errors.errors[0].to_string();
         assert!(shown.contains("env.set.TOKEN"), "{shown}");
@@ -753,7 +768,7 @@ mod tests {
                 user("base", with_mcp("serena", server("uvx", &["a"]))),
                 project(with_mcp("serena", other)),
             ]);
-            let errors = assert_err!(merge(&files));
+            let errors = assert_err!(merge(&files, Floor::empty()));
             assert!(
                 errors.errors[0].to_string().contains("mcp.serena"),
                 "{}",
@@ -855,7 +870,7 @@ mod tests {
             user("base", with_label(Some("app=icehouse"))),
             project(with_label(Some("app=other"))),
         ]);
-        let errors = assert_err!(merge(&files));
+        let errors = assert_err!(merge(&files, Floor::empty()));
         assert!(
             errors.errors[0].to_string().contains("ctl.label"),
             "{}",
@@ -902,7 +917,7 @@ mod tests {
     fn hooks_from_an_ineligible_file_are_refused_even_if_the_loader_was_bypassed() {
         for location in [FileLocation::InProject, FileLocation::Other] {
             let files = closure(vec![file("evil", Layer::Preset, location, with_hooks())]);
-            let errors = assert_err!(merge(&files));
+            let errors = assert_err!(merge(&files, Floor::empty()));
             assert!(
                 matches!(errors.errors[0], MergeError::UserOnlySection { .. }),
                 "{location:?}"
@@ -919,7 +934,7 @@ mod tests {
             with_hooks(),
         )]);
         assert!(matches!(
-            assert_err!(merge(&files)).errors[0],
+            assert_err!(merge(&files, Floor::empty())).errors[0],
             MergeError::UserOnlySection { .. }
         ));
     }
@@ -929,7 +944,7 @@ mod tests {
         let mut config = ResolvedConfig::default();
         config.guard.exceptions = vec![assert_ok!(GuardException::parse(".env"))];
         let files = closure(vec![project(config)]);
-        let errors = assert_err!(merge(&files));
+        let errors = assert_err!(merge(&files, Floor::empty()));
         assert!(
             errors.errors[0].to_string().contains("guard.exceptions"),
             "{}",
@@ -960,7 +975,10 @@ mod tests {
                 .insert(name.clone(), assert_ok!(EnvValue::parse("1")));
             b.env.set.insert(name, assert_ok!(EnvValue::parse("2")));
         }
-        let errors = assert_err!(merge(&closure(vec![user("a", a), project(b)])));
+        let errors = assert_err!(merge(
+            &closure(vec![user("a", a), project(b)]),
+            Floor::empty()
+        ));
         assert_eq!(errors.errors.len(), MAX_MERGE_ERRORS);
         assert!(errors.truncated);
         assert!(
@@ -981,7 +999,7 @@ mod tests {
             user("base", with_label(Some("app=a"))),
             project(with_label(Some("app=b"))),
         ]);
-        let errors = assert_err!(merge(&files));
+        let errors = assert_err!(merge(&files, Floor::empty()));
         crate::error::conventions::assert_display_excludes_sources(&errors.errors[0]);
         assert_eq!(errors.to_string(), "1 merge error(s)");
     }

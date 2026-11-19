@@ -20,6 +20,15 @@ pub(crate) fn needs_escaping(c: char) -> bool {
             | '\u{202a}'..='\u{202e}' // bidi embedding/override
             | '\u{2066}'..='\u{2069}' // bidi isolates
             | '\u{feff}' // BOM / zero-width no-break space
+            // The rest of Unicode category Cf: invisible, or able to reorder or hide text.
+            | '\u{ad}' // soft hyphen
+            | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{890}'..='\u{891}' | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{2060}'..='\u{2064}' | '\u{206a}'..='\u{206f}' // word joiner, invisible operators
+            | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+            | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}' // musical formatting
+            | '\u{e0001}' | '\u{e0020}'..='\u{e007f}' // tag characters
         )
 }
 
@@ -125,6 +134,48 @@ mod tests {
         ] {
             let shown = Escaped(&bad.to_string()).to_string();
             assert!(!shown.contains(bad), "{bad:04x?} was not escaped");
+        }
+    }
+
+    #[test]
+    fn escaped_replaces_every_invisible_format_character_not_just_the_common_ones() {
+        // Unicode category Cf, Zl and Zp samples from each block that has them.
+        for bad in [
+            '\u{ad}',
+            '\u{600}',
+            '\u{605}',
+            '\u{61c}',
+            '\u{6dd}',
+            '\u{70f}',
+            '\u{180e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{1d173}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ] {
+            let shown = Escaped(&bad.to_string()).to_string();
+            assert!(!shown.contains(bad), "{:04x} was not escaped", bad as u32);
+        }
+    }
+
+    #[test]
+    fn escaped_keeps_ordinary_non_ascii_text() {
+        for text in [
+            "caf\u{e9}",
+            "\u{4e2d}\u{6587}",
+            "\u{1f600}",
+            "\u{3b1}\u{3b2}",
+            "a\u{a0}b",
+        ] {
+            assert_eq!(Escaped(text).to_string(), text);
         }
     }
 
