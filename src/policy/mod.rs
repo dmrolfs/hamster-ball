@@ -12,7 +12,7 @@ pub mod resolve;
 
 pub use ctl::{ContainerName, ContainerNameError};
 pub use env::{EnvName, EnvNameError, EnvValue, EnvValueError};
-pub use home::{BroadRoot, HomeDir, ProjectRoot, RootError, broadness};
+pub use home::{BroadRoot, HomeDir, HomeError, ProjectRoot, RootError, broadness};
 pub use host::{
     HostName, HostNameError, HostPattern, HostPatternError, protected_suffix_list_version,
 };

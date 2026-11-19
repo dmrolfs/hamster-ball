@@ -1,11 +1,29 @@
 // ABOUTME: HomeDir, ProjectRoot and the single "too broad" predicate that guards roots and read/write grants.
-// ABOUTME: Pure: the passwd lookup that produces a HomeDir from the environment lives in a later task (hb-ghd.1.1.5).
+// ABOUTME: Mostly pure; HomeDir::from_environment is the one constructor that reads the passwd database and $HOME.
 //! Home directory, project root, and the rule for what is too broad to grant.
+//!
+//! # Verified and unverified setups for [`HomeDir::from_environment`]
+//!
+//! Checked on a developer macOS machine: a normal shell, a launchd job, `env -i`, a
+//! trailing-slash `HOME`, and a poisoned `HOME` all give the expected result (the passwd
+//! entry is unaffected by `HOME`).
+//!
+//! **Not tested:** `sudo -E` (needs a password; reasoned instead: root's passwd home is
+//! `/var/root` while `HOME` stays the invoking user's, which is why `hb` refuses uid 0 before
+//! any comparison) and nix `--pure` shells (could not be built offline).
 
-use snafu::Snafu;
+use std::env;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+use nix::errno::Errno;
+use nix::unistd::{Uid, User, getuid};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use strum::Display;
 
-use super::path::CanonicalPath;
+use super::path::{CanonicalPath, PathError};
 
 /// Why a path is too broad to be a project root or a read/write grant.
 ///
@@ -43,7 +61,7 @@ pub enum RootError {
 /// The user's home directory.
 ///
 /// Constructed from an already-validated path. Reading it from the passwd database, and
-/// refusing a mismatch with `$HOME`, is the job of the discovery task.
+/// refusing a mismatch with `$HOME`, is [`HomeDir::from_environment`]'s job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomeDir(CanonicalPath);
 
@@ -58,6 +76,138 @@ impl HomeDir {
     #[must_use]
     pub fn path(&self) -> &CanonicalPath {
         &self.0
+    }
+
+    /// Establishes the home directory from the OS's own passwd entry for the real uid,
+    /// cross-checked against `$HOME`.
+    ///
+    /// The floor (section 6 of the design doc) is built from this value, not from `$HOME`
+    /// directly: `$HOME` is just an environment variable any launcher can set, and trusting it
+    /// would let `HOME=/tmp/x hb …` silently relocate every floor rule. `$HOME` being unset is
+    /// fine; the passwd entry wins. `$HOME` disagreeing with the passwd entry is a hard error,
+    /// not a choice of one over the other, because there is no safe way to guess which one the
+    /// user meant. `hb` also refuses to run as uid 0 before any of this, because under
+    /// `sudo -E` the passwd entry (`/var/root`) and `$HOME` (the invoking user's) would
+    /// otherwise disagree for a reason that has nothing to do with a real misconfiguration.
+    ///
+    /// The only production constructor that reads the environment; tests inject a `HomeDir`
+    /// via [`HomeDir::new`] instead.
+    ///
+    /// # Errors
+    /// See [`HomeError`].
+    pub fn from_environment() -> Result<Self, HomeError> {
+        let uid = getuid();
+        refuse_if_root(uid)?;
+
+        let user = User::from_uid(uid)
+            .context(PasswdLookupFailedSnafu { uid: uid.as_raw() })?
+            .context(NoPasswdEntrySnafu { uid: uid.as_raw() })?;
+
+        let canonical_dir = fs::canonicalize(&user.dir).context(PasswdHomeUnresolvableSnafu {
+            path: user.dir.clone(),
+        })?;
+        let passwd_home = CanonicalPath::from_canonical(canonical_dir)?;
+
+        home_matches_env(&passwd_home, env::var_os("HOME").as_deref())?;
+        Ok(Self(passwd_home))
+    }
+}
+
+/// Why `hb` refuses to continue, or why [`HomeDir::from_environment`] could not establish a
+/// trustworthy home directory.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum HomeError {
+    /// `hb` was started as uid 0.
+    #[snafu(display(
+        "hb refuses to run as root: the floor denies root's own sensitive paths the same way \
+         it denies any other user's, and `sudo -E` leaves $HOME set to your normal account \
+         while root's own passwd entry says /var/root, which would otherwise look like a \
+         confusing mismatch rather than what it is. Run hb as your normal user instead."
+    ))]
+    RunningAsRoot,
+
+    /// The passwd database has no entry for the running user.
+    #[snafu(display("no passwd entry exists for uid {uid}"))]
+    NoPasswdEntry {
+        /// The uid that was looked up.
+        uid: u32,
+    },
+
+    /// The passwd lookup itself failed.
+    #[snafu(display("could not read the passwd database for uid {uid}"))]
+    PasswdLookupFailed {
+        /// The uid that was looked up.
+        uid: u32,
+        /// The underlying error.
+        source: Errno,
+    },
+
+    /// The passwd entry's home directory could not be resolved on disk.
+    #[snafu(display(
+        "the passwd entry's home directory, {}, could not be resolved",
+        crate::text::EscapedBounded::new(&path.to_string_lossy(), 200)
+    ))]
+    PasswdHomeUnresolvable {
+        /// The passwd entry's home directory, as reported by the passwd database.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// `$HOME` disagrees with the passwd database's home directory.
+    #[snafu(display(
+        "$HOME ({}) disagrees with the passwd database's home directory ({passwd}); hb refuses \
+         to guess which one is right",
+        crate::text::EscapedBounded::new(&env.to_string_lossy(), 200)
+    ))]
+    Mismatch {
+        /// The home directory from the passwd database.
+        passwd: CanonicalPath,
+        /// The value `$HOME` was set to, verbatim, even if it could not itself be resolved.
+        env: PathBuf,
+    },
+
+    /// The passwd entry's home directory, once resolved, was not a usable canonical path.
+    #[snafu(transparent)]
+    Path {
+        /// The underlying error.
+        source: PathError,
+    },
+}
+
+/// Refuses to continue if `uid` is root.
+///
+/// Pulled out of [`HomeDir::from_environment`] so a test can exercise this check without
+/// actually running the test process as root.
+fn refuse_if_root(uid: Uid) -> Result<(), HomeError> {
+    ensure!(!uid.is_root(), RunningAsRootSnafu);
+    Ok(())
+}
+
+/// Checks `home_env` (the raw `$HOME` value, if set) against `passwd_home`.
+///
+/// Pulled out of [`HomeDir::from_environment`] so a test can exercise the comparison --
+/// including trailing-slash and symlink normalization -- against an injected, throwaway
+/// `passwd_home` instead of the real passwd database and the real `$HOME`.
+fn home_matches_env(
+    passwd_home: &CanonicalPath,
+    home_env: Option<&OsStr>,
+) -> Result<(), HomeError> {
+    let Some(home_env) = home_env else {
+        return Ok(());
+    };
+    let home_env_path = PathBuf::from(home_env);
+    let matches = fs::canonicalize(&home_env_path)
+        .is_ok_and(|canonical| canonical.as_path() == passwd_home.as_path());
+    if matches {
+        Ok(())
+    } else {
+        MismatchSnafu {
+            passwd: passwd_home.clone(),
+            env: home_env_path,
+        }
+        .fail()
     }
 }
 
@@ -239,5 +389,127 @@ mod tests {
     #[test]
     fn home_dir_exposes_its_path() {
         assert_eq!(home().path().as_str(), "/Users/rolfs");
+    }
+
+    // ====================================================================================
+    // refuse_if_root
+    //
+    // A unit test of the check, not a real root run: `refuse_if_root` takes a `Uid` instead of
+    // calling `getuid()` itself, exactly so this does not need to run as root to exercise.
+    // ====================================================================================
+
+    #[test]
+    fn refuses_to_run_as_root() {
+        let err = assert_err!(refuse_if_root(Uid::from_raw(0)));
+        assert!(matches!(err, HomeError::RunningAsRoot));
+    }
+
+    #[test]
+    fn allows_a_non_root_uid() {
+        assert_ok!(refuse_if_root(Uid::from_raw(502)));
+    }
+
+    #[test]
+    fn running_as_root_error_explains_why() {
+        let shown = assert_err!(refuse_if_root(Uid::from_raw(0))).to_string();
+        assert!(shown.contains("root"), "{shown:?}");
+    }
+
+    // ====================================================================================
+    // home_matches_env
+    //
+    // Exercises the exact comparison `HomeDir::from_environment` uses, against an injected,
+    // throwaway `passwd_home` and a crafted `$HOME` value -- never the real passwd database or
+    // the real `$HOME`, so these tests are hermetic and can run in parallel with everything else.
+    // ====================================================================================
+
+    struct EnvFixture {
+        _dir: tempfile::TempDir,
+        passwd_home: CanonicalPath,
+    }
+
+    impl EnvFixture {
+        fn new() -> Self {
+            let dir = assert_ok!(tempfile::TempDir::new());
+            let passwd_home = assert_ok!(CanonicalPath::from_canonical(assert_ok!(
+                fs::canonicalize(dir.path())
+            )));
+            Self {
+                _dir: dir,
+                passwd_home,
+            }
+        }
+    }
+
+    #[test]
+    fn home_from_passwd_ignores_unset_home() {
+        let fx = EnvFixture::new();
+        assert_ok!(home_matches_env(&fx.passwd_home, None));
+    }
+
+    #[test]
+    fn home_from_passwd_rejects_mismatching_home_env() {
+        let fx = EnvFixture::new();
+        let other = assert_ok!(tempfile::TempDir::new());
+        let err = assert_err!(home_matches_env(
+            &fx.passwd_home,
+            Some(other.path().as_os_str())
+        ));
+        assert!(matches!(err, HomeError::Mismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn home_from_passwd_rejects_a_poisoned_home_env_rather_than_treating_it_as_unset() {
+        let fx = EnvFixture::new();
+        let poisoned = std::ffi::OsStr::new("/this-path-does-not-exist-hb-test-xyz");
+        let err = assert_err!(home_matches_env(&fx.passwd_home, Some(poisoned)));
+        assert!(matches!(err, HomeError::Mismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn home_trailing_slash_and_symlink_forms_compare_equal() {
+        let fx = EnvFixture::new();
+
+        let trailing_slash = format!("{}/", fx.passwd_home.as_str());
+        assert_ok!(home_matches_env(
+            &fx.passwd_home,
+            Some(std::ffi::OsStr::new(&trailing_slash))
+        ));
+
+        let symlink_dir = assert_ok!(tempfile::TempDir::new());
+        let link = symlink_dir.path().join("home-link");
+        assert_ok!(std::os::unix::fs::symlink(fx.passwd_home.as_path(), &link));
+        assert_ok!(home_matches_env(&fx.passwd_home, Some(link.as_os_str())));
+    }
+
+    #[test]
+    fn home_errors_follow_the_display_convention() {
+        let fx = EnvFixture::new();
+        let other = assert_ok!(tempfile::TempDir::new());
+        crate::error::conventions::assert_display_excludes_sources(&assert_err!(home_matches_env(
+            &fx.passwd_home,
+            Some(other.path().as_os_str())
+        )));
+        crate::error::conventions::assert_display_excludes_sources(&assert_err!(refuse_if_root(
+            Uid::from_raw(0)
+        )));
+        let unresolvable = HomeError::PasswdHomeUnresolvable {
+            path: PathBuf::from("/nope"),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        crate::error::conventions::assert_display_excludes_sources(&unresolvable);
+    }
+
+    #[test]
+    fn mismatch_error_names_both_paths_and_explains_the_refusal() {
+        let fx = EnvFixture::new();
+        let other = assert_ok!(tempfile::TempDir::new());
+        let shown = assert_err!(home_matches_env(
+            &fx.passwd_home,
+            Some(other.path().as_os_str())
+        ))
+        .to_string();
+        assert!(shown.contains("$HOME"), "{shown:?}");
+        assert!(shown.contains(fx.passwd_home.as_str()), "{shown:?}");
     }
 }
