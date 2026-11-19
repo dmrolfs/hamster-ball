@@ -6,7 +6,7 @@
 //! The value types in [`policy`] are pure: constructing one never performs I/O. The code that
 //! does touch the system is small and named: [`system::PathResolver`],
 //! [`policy::HomeDir::from_environment`] (in [`system`]), and in [`config`] the loader
-//! ([`config::ConfigText::read`]) and [`config::discover`].
+//! ([`config::load`]) and [`config::discover`].
 //!
 //! # Error conventions
 //!

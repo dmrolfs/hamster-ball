@@ -178,9 +178,109 @@ impl<T> Located<T> {
     }
 }
 
+/// Which file of a loaded closure a value came from: an index into the closure's file list.
+///
+/// A `u16` because a closure is capped at a few dozen files; it keeps provenance records small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileId(u16);
+
+impl FileId {
+    /// Wraps an index into the closure's file list.
+    #[must_use]
+    pub fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    /// The index into the closure's file list.
+    #[must_use]
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+/// Where one merged value came from, compactly.
+///
+/// A full [`Origin`] costs about 300 bytes (path and key path); this is a few bytes. The
+/// closure turns a `Source` back into an `Origin` on demand, for errors and `hb explain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Source {
+    /// A value declared in a loaded file.
+    File {
+        /// The file.
+        file: FileId,
+        /// The entry's index in its list in that file, when it came from a list.
+        index: Option<u32>,
+    },
+}
+
+impl Source {
+    /// A source for a list entry at `index` in `file`.
+    #[must_use]
+    pub fn entry(file: FileId, index: u32) -> Self {
+        Self::File {
+            file,
+            index: Some(index),
+        }
+    }
+
+    /// A source for a value with no list position (a map entry or a scalar) in `file`.
+    #[must_use]
+    pub fn value(file: FileId) -> Self {
+        Self::File { file, index: None }
+    }
+
+    /// The file this value came from.
+    #[must_use]
+    pub fn file(self) -> FileId {
+        match self {
+            Self::File { file, .. } => file,
+        }
+    }
+}
+
+/// A merged value and every place it was declared.
+///
+/// Equal values from several files collapse into one `Sourced` that keeps all their sources,
+/// so `hb explain` can say "base and project both grant this" and the approval summary can tell
+/// a genuine addition from a restatement of something the base already gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sourced<T> {
+    /// The value.
+    pub value: T,
+    /// Every declaration of this value, sorted, never empty.
+    pub sources: Vec<Source>,
+}
+
+impl<T> Sourced<T> {
+    /// A value declared once.
+    #[must_use]
+    pub fn new(value: T, source: Source) -> Self {
+        Self {
+            value,
+            sources: vec![source],
+        }
+    }
+
+    /// A value declared in several places; `sources` is sorted and deduplicated.
+    ///
+    /// Returns `None` if `sources` is empty, since a value with no declaration cannot exist.
+    #[must_use]
+    pub fn from_sources(value: T, mut sources: Vec<Source>) -> Option<Self> {
+        sources.sort_unstable();
+        sources.dedup();
+        if sources.is_empty() {
+            None
+        } else {
+            Some(Self { value, sources })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claims::{assert_none, assert_some};
     use pretty_assertions::assert_eq;
 
     // ====================================================================================
@@ -351,5 +451,71 @@ mod tests {
         let located = Located::new(443_u16, origin.clone());
         assert_eq!(located.value, 443);
         assert_eq!(located.origin, origin);
+    }
+
+    // ====================================================================================
+    // FileId, Source, Sourced
+    // ====================================================================================
+
+    #[test]
+    fn file_id_round_trips_its_index_and_orders_by_it() {
+        assert_eq!(FileId::new(7).index(), 7);
+        assert!(FileId::new(1) < FileId::new(2));
+    }
+
+    #[test]
+    fn source_constructors_set_the_index_only_for_list_entries() {
+        let file = FileId::new(3);
+        assert_eq!(
+            Source::entry(file, 5),
+            Source::File {
+                file,
+                index: Some(5)
+            }
+        );
+        assert_eq!(Source::value(file), Source::File { file, index: None });
+        assert_eq!(Source::entry(file, 5).file(), file);
+    }
+
+    #[test]
+    fn sources_sort_by_file_then_index() {
+        let (a, b) = (FileId::new(1), FileId::new(2));
+        let mut sources = vec![
+            Source::entry(b, 0),
+            Source::entry(a, 9),
+            Source::entry(a, 1),
+        ];
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![
+                Source::entry(a, 1),
+                Source::entry(a, 9),
+                Source::entry(b, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn sourced_from_sources_sorts_dedups_and_refuses_an_empty_list() {
+        let (a, b) = (FileId::new(1), FileId::new(2));
+        let sourced = assert_some!(Sourced::from_sources(
+            "v",
+            vec![Source::value(b), Source::value(a), Source::value(b)]
+        ));
+        assert_eq!(sourced.sources, vec![Source::value(a), Source::value(b)]);
+        assert_none!(Sourced::from_sources("v", Vec::new()));
+    }
+
+    #[test]
+    fn sourced_new_has_exactly_one_source() {
+        let sourced = Sourced::new(1_u8, Source::value(FileId::new(0)));
+        assert_eq!(sourced.sources.len(), 1);
+    }
+
+    #[test]
+    fn a_source_is_a_few_bytes_where_an_origin_is_hundreds() {
+        // An Origin owns a PathBuf and a key path on the heap; a Source is plain data.
+        assert!(std::mem::size_of::<Source>() <= 16);
     }
 }

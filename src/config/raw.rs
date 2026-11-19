@@ -127,6 +127,50 @@ pub(crate) fn parse_str(source: &str, file: &Path) -> Result<RawConfig, ParseErr
     })
 }
 
+/// Which user-only sections a file mentions, whatever their value.
+///
+/// `hooks` run unsandboxed on the host and `guard.exceptions` switch secret protection off, so
+/// only files the user controls may carry them (see `closure`). This probe answers "does the
+/// key appear" without depending on the sections' shape, so it keeps working when the hooks
+/// schema changes, and it sees `hooks = []` that the typed schema cannot tell from absence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UserOnlySections {
+    /// `hooks` appears in any TOML spelling.
+    pub(crate) hooks: bool,
+    /// `guard.exceptions` appears in any TOML spelling.
+    pub(crate) guard_exceptions: bool,
+}
+
+impl UserOnlySections {
+    /// Whether any user-only section is present.
+    pub(crate) fn any(self) -> bool {
+        self.hooks || self.guard_exceptions
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct UserOnlyProbe {
+    hooks: Option<serde::de::IgnoredAny>,
+    guard: Option<GuardProbe>,
+}
+
+#[derive(Deserialize, Default)]
+struct GuardProbe {
+    exceptions: Option<serde::de::IgnoredAny>,
+}
+
+/// Probes `source` for user-only sections.
+///
+/// A document that does not parse reports none: it will fail the real parse next, so nothing
+/// in it can take effect.
+pub(crate) fn user_only_sections(source: &str) -> UserOnlySections {
+    let probe: UserOnlyProbe = toml::from_str(source).unwrap_or_default();
+    UserOnlySections {
+        hooks: probe.hooks.is_some(),
+        guard_exceptions: probe.guard.is_some_and(|guard| guard.exceptions.is_some()),
+    }
+}
+
 /// Converts a `serde_path_to_error::Path` into this crate's own [`KeyPath`].
 fn convert_path(path: &serde_path_to_error::Path) -> KeyPath {
     use serde_path_to_error::Segment;
@@ -338,6 +382,83 @@ mod tests {
 
         let tables = format!("a = {}1{}\n", "{b=".repeat(30_000), "}".repeat(30_000));
         assert_err!(parsed(&tables));
+    }
+
+    // ====================================================================================
+    // User-only section probe
+    // ====================================================================================
+
+    fn probe(toml_text: &str) -> UserOnlySections {
+        user_only_sections(toml_text)
+    }
+
+    #[test]
+    fn the_probe_flags_every_spelling_of_a_hooks_key() {
+        for spelling in [
+            "[hooks]\n",
+            "[hooks.a.b]\nx = 1\n",
+            "[[hooks]]\n",
+            "hooks = []\n",
+            "hooks.x = 1\n",
+            "hooks = {}\n",
+            "\"hooks\" = []\n",
+            "'hooks' = []\n",
+            "\"h\\u006foks\" = []\n",
+            "  hooks   =   []\n",
+            "hooks = [[\"echo\"]]\n",
+            "a = 1\n[hooks.pre_run.x]\ncommand = [\"echo\"]\n",
+        ] {
+            assert!(probe(spelling).hooks, "{spelling:?} was not flagged");
+        }
+    }
+
+    #[test]
+    fn the_probe_does_not_flag_look_alikes() {
+        for innocent in [
+            "# hooks = []\n",
+            "x = \"hooks\"\n",
+            "[fs]\nwrite = [\"hooks\"]\n",
+            "extends = [\"hooks\"]\n",
+            "",
+        ] {
+            assert!(!probe(innocent).hooks, "{innocent:?} was flagged");
+        }
+    }
+
+    #[test]
+    fn the_probe_flags_guard_exceptions_but_not_an_empty_guard_table() {
+        for spelling in [
+            "[guard]\nexceptions = []\n",
+            "guard.exceptions = [\".env\"]\n",
+            "guard = { exceptions = [] }\n",
+            "[guard]\n\"exceptions\" = [\"x\"]\n",
+        ] {
+            assert!(
+                probe(spelling).guard_exceptions,
+                "{spelling:?} was not flagged"
+            );
+        }
+        assert!(!probe("[guard]\n").guard_exceptions);
+        assert!(!probe("guard = {}\n").guard_exceptions);
+    }
+
+    #[test]
+    fn the_probe_reports_each_section_independently() {
+        let both = probe("hooks = []\n[guard]\nexceptions = []\n");
+        assert!(both.hooks && both.guard_exceptions);
+        assert!(!probe("hooks = []\n").guard_exceptions);
+        assert!(!probe("[guard]\nexceptions = []\n").hooks);
+    }
+
+    #[test]
+    fn the_probe_gives_no_false_alarm_on_a_syntax_error_because_resolve_reports_it() {
+        assert_eq!(probe("hooks = [\n"), UserOnlySections::default());
+    }
+
+    #[test]
+    fn the_probe_is_independent_of_the_hooks_value_shape() {
+        // hb-ghd.6.1 will change the hooks schema; the rule must not depend on it.
+        assert!(probe("[hooks.pre_run.cred]\ncommand = [\"x\"]\ntimeout = 5\n").hooks);
     }
 
     // ====================================================================================

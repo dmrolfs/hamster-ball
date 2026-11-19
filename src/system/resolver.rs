@@ -395,6 +395,9 @@ fn classify_other(error: io::Error, spelling: &str) -> PathError {
 impl PathPattern {
     /// Parses an `fs.deny_read`/`fs.deny_write` entry, which may contain `*`, `?` or `**`.
     ///
+    /// The longest glob-free prefix is resolved as a deny rule, so a missing base is kept and a
+    /// base that is itself a symlink reports both its target and its own name (`alias`).
+    ///
     /// # Errors
     /// See [`PathPatternError`].
     pub fn parse(resolver: &PathResolver<'_>, spelling: &str) -> Result<Self, PathPatternError> {
@@ -402,18 +405,9 @@ impl PathPattern {
         let glob_at = components
             .iter()
             .position(|segment| segment.contains('*') || segment.contains('?'));
-        match glob_at {
-            None => Ok(Self {
-                base: resolver.deny(spelling)?.target,
-                tail: None,
-            }),
-            Some(0) => {
-                let tail = GlobTail::parse(&components)?;
-                Ok(Self {
-                    base: resolver.deny(".")?.target,
-                    tail: Some(tail),
-                })
-            }
+        let (base_spelling, tail) = match glob_at {
+            None => (spelling.to_owned(), None),
+            Some(0) => (".".to_owned(), Some(GlobTail::parse(&components)?)),
             Some(index) => {
                 let mut base_spelling = components[..index].join("/");
                 if base_spelling.is_empty() && spelling.starts_with('/') {
@@ -421,13 +415,15 @@ impl PathPattern {
                     // is `/`, not the empty string `join` produces for a single empty component.
                     base_spelling.push('/');
                 }
-                let tail = GlobTail::parse(&components[index..])?;
-                Ok(Self {
-                    base: resolver.deny(&base_spelling)?.target,
-                    tail: Some(tail),
-                })
+                (base_spelling, Some(GlobTail::parse(&components[index..])?))
             }
-        }
+        };
+        let DenyResolution { target, alias } = resolver.deny(&base_spelling)?;
+        Ok(Self {
+            base: target,
+            alias,
+            tail,
+        })
     }
 }
 
@@ -435,7 +431,7 @@ impl PathPattern {
 mod tests {
     use super::*;
     use crate::testutil::{ModeGuard, Tree, canonical};
-    use claims::{assert_err, assert_ok, assert_some};
+    use claims::{assert_err, assert_none, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
     use std::os::unix::fs::symlink;
 
@@ -1057,6 +1053,52 @@ mod tests {
             nested.tail,
             Some(assert_ok!(GlobTail::parse(&["**", "id_rsa"])))
         );
+    }
+
+    #[test]
+    fn pattern_on_a_symlink_keeps_the_link_name_as_an_alias() {
+        let fx = Fixture::new();
+        let real = fx.project_path().join("real-secret");
+        assert_ok!(fs::write(&real, b"x"));
+        let link = fx.project_path().join("link-secret");
+        assert_ok!(symlink(&real, &link));
+
+        let pattern = assert_ok!(PathPattern::parse(&fx.resolver(), "link-secret"));
+        assert_eq!(
+            pattern.base,
+            assert_ok!(CanonicalPath::from_canonical(&real))
+        );
+        assert_eq!(
+            pattern.alias,
+            Some(assert_ok!(CanonicalPath::from_canonical(&link))),
+            "denying the link must also deny the link's own name"
+        );
+    }
+
+    #[test]
+    fn pattern_on_a_symlinked_glob_base_keeps_the_alias_too() {
+        let fx = Fixture::new();
+        let real_dir = fx.project_path().join("real-dir");
+        assert_ok!(fs::create_dir(&real_dir));
+        let link_dir = fx.project_path().join("link-dir");
+        assert_ok!(symlink(&real_dir, &link_dir));
+
+        let pattern = assert_ok!(PathPattern::parse(&fx.resolver(), "link-dir/*.pem"));
+        assert_eq!(
+            pattern.base,
+            assert_ok!(CanonicalPath::from_canonical(&real_dir))
+        );
+        assert_eq!(
+            pattern.alias,
+            Some(assert_ok!(CanonicalPath::from_canonical(&link_dir)))
+        );
+    }
+
+    #[test]
+    fn pattern_on_an_ordinary_path_has_no_alias() {
+        let fx = Fixture::new();
+        let pattern = assert_ok!(PathPattern::parse(&fx.resolver(), "plain/*.env"));
+        assert_none!(pattern.alias);
     }
 
     #[test]

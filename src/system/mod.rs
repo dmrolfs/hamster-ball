@@ -10,6 +10,8 @@
 
 pub mod home;
 pub mod resolver;
+pub mod userdir;
 
 pub use home::HomeError;
 pub use resolver::{AllowOutcome, DenyResolution, PathResolver, SkipReason, SkippedPath};
+pub use userdir::{BASE_TEMPLATE, UserConfigDir, UserConfigError};

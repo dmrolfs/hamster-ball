@@ -114,15 +114,45 @@ config never applies silently.
 
 ### 4.2 Merge rules
 
-- Lists (allow, deny, hosts, ports, env names) are **unioned**.
-- Maps merge by key; a duplicate key from a higher layer is an error unless the values are equal.
-- `deny` rules from every layer apply, and **deny wins** over any allow.
+- Lists (allow, deny, hosts, ports, env names) are **unioned**; equal values collapse into one entry that keeps
+  every place it was declared. The result does not depend on the order files are merged in.
+- Maps (`env.set`, `mcp`) merge by key; a duplicate key is an error unless the values are equal. The error names
+  both files and never prints the values (an environment value can be a secret).
+- `deny` rules from every layer apply, and **deny wins** over any allow. A read-deny (`fs.deny_read`) also denies
+  write, delete and rename; a write-deny denies only those (D34).
 - There is no syntax to remove or narrow an entry that a lower layer added. A project can only add.
-- Scalars (few exist) take the stricter value when they are ordered, otherwise the highest layer.
-- Sections that run code on the host (`[hooks]`) are **accepted only** from the user base,
-  built-in presets and user presets. A project file or any file inside the project that defines
-  `[hooks]` is an error.
+- Scalars (few exist) never loosen: `tls.system_trust` takes `false` if any file says `false` (D35), and
+  `ctl.label` must be the same in every file that sets it, because a project label would otherwise replace the base's
+  scope (D33). The earlier "otherwise the highest layer" fallback is removed.
+- Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`) are accepted **only**
+  from files that physically are the user's own: the base, files under `~/.config/hamster-ball` (with no other hard
+  link), and built-in presets (D36). The rule is by where the file really is (its canonical path), not by how it was
+  reached, so a path alias of a user preset behaves exactly like the name, and a symlinked or hard-linked user file
+  loses the right. A project file, any file inside the project, and any other file (including one the project
+  names by absolute path) that defines them is an error naming that file. The error never prints the hook.
+- Even a trusted file's hooks are chosen by the project when it extends that preset. The approval summary (M4) must
+  list every hook that will run, labelled project-selected.
 - `hb explain` prints each effective rule with its origin file, so every grant can be audited.
+
+### 4.2a Extends and the closure
+
+- An `extends` entry is a **path** if it starts with `/`, `~/`, `./` or `../`; otherwise it is a preset **name**
+  (`[a-z0-9][a-z0-9_-]*` segments joined by `/`, at most 64 bytes, no `.`, so `foo.toml` is an error that suggests
+  `./foo.toml`). `~` alone and `~user/...` are errors.
+- A relative path resolves against the directory of the file that contains the `extends` (D37). Decision D22 is
+  about filesystem grants only.
+- A name is looked up among the built-in presets and `~/.config/hamster-ball/presets/<name>.toml`. A name in both is
+  an error naming both (D38). A built-in may extend only other built-ins. A missing preset is always an error,
+  never a skip, because a skipped preset could silently drop its denies.
+- The closure is loaded depth first, dependencies before the files that extend them, the base chain before the
+  project chain, so the project is last. Files are identified by device and inode, so a hard link, a symlinked
+  directory or a case variant is the same file, and a cycle through an alias is still a cycle. Limits: 16 files,
+  nesting depth 8, 32 `extends` entries per file.
+- Each file is read once. The same bytes are parsed and returned to M4 for hashing; M4 hashes the files whose
+  location is inside the project or elsewhere (anything the ball could write), in closure order.
+- Every closure file must belong to you and not be world-writable (D31), starting with the base.
+- A missing `~/.config/hamster-ball/base.toml` is an error that says to run `hb init`, which writes a commented
+  template with mode 0600 and never overwrites (D39). `XDG_CONFIG_HOME` is ignored (D39).
 
 ### 4.3 Schema (draft)
 
@@ -163,8 +193,9 @@ bind_loopback = true
 - `~` and relative paths are expanded, then **canonicalized with `realpath`** before use.
   Measured: Seatbelt matches resolved paths. `/tmp` is a symlink to `/private/tmp`, and a rule on
   `/tmp/...` made `uv_cwd` fail with `EPERM`.
-- `~` and `~/...` only (no `~user`); no `$VARIABLE` expansion. **Relative paths resolve against the project root
-  in every layer**, so `write = ["."]` in a preset or the base means the project.
+- `~` and `~/...` only (no `~user`); no `$VARIABLE` expansion. **Relative filesystem paths resolve against the
+  project root in every layer**, so `write = ["."]` in a preset or the base means the project. (`extends` paths are
+  different: see 4.2a.)
 - An allow rule whose path does not exist is skipped with a recorded reason (`Missing` or `Dangling`) shown by
   `hb explain` (the safe direction). A permission error on an allow rule is an error, not a skip.
 - A deny rule whose path does not exist is still emitted: the deepest resolvable ancestor, canonicalized, plus the
@@ -550,7 +581,7 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D19 | Project name `hamster-ball`; binary stays `hb`; GitHub `dmrolfs/hamster-ball`, private until the project-specific details are moved out | chosen by owner (name); private is my default |
 | D20 | User config and state live under `~/.config/hamster-ball` and `~/.local/state/hamster-ball` (not `sandbox`, which the old `sb` and Linux setup already use as `~/.sandbox`) | change made while renaming; pending owner review |
 | D21 | Binary is `hb` (not `sb`); the project config file is `hamster-ball.toml` (not `sandbox.toml`); "sandbox" becomes "hamster ball" in this repo's prose. Kept as-is: Apple's `sandbox-exec`, `sandbox.py`, Anthropic's "Sandbox Runtime", the legacy `sb` script, `omp-supervisor`'s own sandbox | owner feedback; file name `hamster-ball.toml` is my choice, pending review |
-| D22 | Relative paths resolve against the project root in every layer | agreed |
+| D22 | Relative filesystem grant paths resolve against the project root in every layer (scoped to grants by D37; `extends` paths resolve against the containing file) | agreed |
 | D23 | `fs.read`/`fs.write` grants (and the project root) that are `/`, `$HOME`, an ancestor of `$HOME`, or shallower than two components are rejected in every layer | agreed |
 | D24 | No `hamster-ball.toml` is a typed `NoProjectConfig` error; no fallback to the cwd | agreed |
 | D25 | Config files read once, capped at 256 KiB and 4096 entries per list; exact bytes kept for hashing | agreed |
@@ -561,3 +592,11 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D30 | `hb-ghd.1.1` promoted to an epic with five children (11 days; M1 is now 17 days) | agreed |
 | D31 | `discover` requires the config file and root directory to be owned by the real uid and not world-writable; group write is allowed | review finding H2 (hb-alt); ownership-only rule chosen over also requiring roots under `$HOME`, to keep projects outside home usable; confirmed by owner |
 | D32 | `ctl.label` must be `key=value` with a non-empty value from a restricted alphabet (a bare key or empty selector would widen `hb ctl`'s scope); hooks and MCP commands are validated argument vectors (non-empty program, no NUL, bounded); `extends` and `guard.exceptions` are form-checked text until M1.2 and the guard define their meaning; `mcp.<name>` names match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` | review finding H1 and gap 6 (hb-alt); confirmed by owner |
+| D33 | A differing `ctl.label` across files is an error (amends 4.2's "highest layer" scalar fallback) | owner, hb-ghd.1.2 |
+| D34 | `fs.deny_read` also denies write-class access | owner, hb-ghd.1.2 |
+| D35 | `tls.system_trust`: any `false` wins; unset in every file is unset (the compiled default is `false`; the base template sets `true`) | owner, hb-ghd.1.2 |
+| D36 | Hooks and `guard.exceptions` are accepted only from files that physically are the user's own or built-in (amends the AC5 wording, which named only the project) | owner, hb-ghd.1.2 |
+| D37 | Relative `extends` paths resolve against the containing file's directory; D22 is scoped to filesystem grants | owner, hb-ghd.1.2 |
+| D38 | A preset name that is both built-in and a user file is an error naming both | owner, hb-ghd.1.2 |
+| D39 | A missing base is an error; `hb init` creates one (0600, never overwrites); `XDG_CONFIG_HOME` is ignored | owner, hb-ghd.1.2 |
+| D40 | A user preset symlinked outside the config directory is classified by where it really is: it loses hook rights and is approved and hashed like any other writable file | owner, hb-ghd.1.2 |

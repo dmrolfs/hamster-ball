@@ -215,7 +215,7 @@ fn escaped_parse_message(message: &str) -> EscapedBounded<'_> {
 /// and diagnostic types above. Every `raw` type stays `pub(crate)`.
 ///
 /// `#[non_exhaustive]`: later milestones add fields. Only this crate builds one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedConfig {
     /// The presets and base files this file extends, in the order written.
@@ -239,14 +239,28 @@ pub struct ResolvedConfig {
     pub guard: ResolvedGuard,
 }
 
-/// `[fs]`: granted read/write paths, and deny patterns that apply regardless of any grant.
+/// A value together with its position in its list in the file.
+///
+/// Only `fs.read` and `fs.write` need this: they are the only lists where an entry can be
+/// dropped without failing the file (a missing path is skipped), so a kept entry's position in
+/// the `Vec` no longer says where it was written. Every other list fails the whole file on a
+/// bad entry, so there position equals index.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Indexed<T> {
+    /// The value.
+    pub value: T,
+    /// Its zero-based index in its list in the file.
+    pub index: u32,
+}
+
+/// `[fs]`: granted read/write paths, and deny patterns that apply regardless of any grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedFs {
     /// Extra read-only paths, each one granted or skipped (see [`Diagnostics::skipped`]).
-    pub read: Vec<CanonicalPath>,
+    pub read: Vec<Indexed<CanonicalPath>>,
     /// Writable paths, each one granted or skipped (see [`Diagnostics::skipped`]).
-    pub write: Vec<CanonicalPath>,
+    pub write: Vec<Indexed<CanonicalPath>>,
     /// Read-deny patterns; deny always wins over an allow.
     pub deny_read: Vec<PathPattern>,
     /// Write-deny patterns; deny always wins over an allow.
@@ -254,7 +268,7 @@ pub struct ResolvedFs {
 }
 
 /// `[net]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedNet {
     /// Allowed outbound hosts.
@@ -264,7 +278,7 @@ pub struct ResolvedNet {
 }
 
 /// `[env]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedEnv {
     /// Variable names copied from the invoking shell.
@@ -274,7 +288,7 @@ pub struct ResolvedEnv {
 }
 
 /// `[tls]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedTls {
     /// Whether the system trust store is reachable; `None` means this file did not say,
@@ -287,7 +301,7 @@ pub struct ResolvedTls {
 }
 
 /// `[ctl]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedCtl {
     /// The container label selector that scopes `hb ctl`.
@@ -297,7 +311,7 @@ pub struct ResolvedCtl {
 }
 
 /// One `[mcp.<name>]` entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedMcpServer {
     /// The program to run.
@@ -311,7 +325,7 @@ pub struct ResolvedMcpServer {
 }
 
 /// `[guard]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedGuard {
     /// Secrets-guard patterns to re-allow; only their form is checked here, what they match is
@@ -505,7 +519,7 @@ impl<'a> Resolution<'a> {
 
     /// Resolves `fs.read`/`fs.write` allow rules: granted paths are returned, skipped ones go
     /// to the diagnostics, and only a genuine error (not "missing" or "dangling") is an error.
-    fn allow_list(&mut self, key: KeyPath, items: &[String]) -> Vec<CanonicalPath> {
+    fn allow_list(&mut self, key: KeyPath, items: &[String]) -> Vec<Indexed<CanonicalPath>> {
         if self.over_cap(&key, items.len()) {
             return Vec::new();
         }
@@ -513,7 +527,10 @@ impl<'a> Resolution<'a> {
         for (index, item) in items.iter().enumerate() {
             let entry_key = key.clone().index(index);
             match self.resolver.allow(item) {
-                Ok(AllowOutcome::Granted(path)) => granted.push(path),
+                Ok(AllowOutcome::Granted(path)) => granted.push(Indexed {
+                    value: path,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                }),
                 Ok(AllowOutcome::Skipped(skipped)) => {
                     let origin = self.origin(entry_key);
                     self.skipped.push(Located::new(skipped, origin));
@@ -689,7 +706,7 @@ mod tests {
         fn write_config(&self, toml_text: &str) -> ConfigText {
             let path = self.project_path().join("hamster-ball.toml");
             assert_ok!(fs::write(&path, toml_text));
-            assert_ok!(ConfigText::read(
+            assert_ok!(ConfigText::read_with(
                 &path,
                 Layer::Project,
                 SymlinkPolicy::Refuse
@@ -1095,6 +1112,51 @@ mod tests {
             resolved.diagnostics.skipped[1].origin.key.to_string(),
             "fs.write[2]"
         );
+    }
+
+    #[test]
+    fn a_kept_allow_entry_remembers_its_index_in_the_file_after_skips() {
+        let fx = Fixture::new();
+        assert_ok!(fs::create_dir_all(fx.project_path().join("src")));
+        assert_ok!(fs::create_dir_all(fx.project_path().join("docs")));
+        let resolved = fx.resolved(
+            "[fs]\nread = [\"gone-a\", \"src\", \"gone-b\", \"docs\"]\nwrite = [\"gone\", \"src\"]\n",
+        );
+        let read: Vec<u32> = resolved.config.fs.read.iter().map(|e| e.index).collect();
+        assert_eq!(read, vec![1, 3]);
+        let write: Vec<u32> = resolved.config.fs.write.iter().map(|e| e.index).collect();
+        assert_eq!(write, vec![1]);
+        // And the skipped entries report the indexes that are missing from the kept ones.
+        let skipped: Vec<String> = resolved
+            .diagnostics
+            .skipped
+            .iter()
+            .map(|s| s.origin.key.to_string())
+            .collect();
+        assert_eq!(skipped, vec!["fs.read[0]", "fs.read[2]", "fs.write[0]"]);
+    }
+
+    #[test]
+    fn every_other_list_fails_the_whole_file_on_a_bad_entry_so_position_equals_index() {
+        // Only fs.read and fs.write can drop an entry without an error. For every other list
+        // a Vec position IS the file index, which is why only those two carry an `Indexed`.
+        let fx = Fixture::new();
+        let cases = [
+            "extends = [\"ok\", \"\"]\n",
+            "[net]\nallow = [\"ok.example.com\", \"bad host\"]\n",
+            "[net]\nloopback_ports = [80, 0]\n",
+            "[env]\npass = [\"OK\", \"1bad\"]\n",
+            "[ctl]\ncontainers = [\"ok\", \"-bad\"]\n",
+            "[guard]\nexceptions = [\"ok\", \"\"]\n",
+            "hooks = [[\"ok\"], []]\n",
+            "[fs]\ndeny_read = [\"ok\", \"a\\u0000b\"]\n",
+            "[fs]\ndeny_write = [\"ok\", \"a\\u0000b\"]\n",
+            "[tls]\nextra_ca_files = [\"missing.pem\"]\n",
+        ];
+        for toml_text in cases {
+            let errors = fx.errors(toml_text);
+            assert!(!errors.errors.is_empty(), "{toml_text}");
+        }
     }
 
     #[test]

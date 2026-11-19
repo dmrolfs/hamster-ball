@@ -1,0 +1,1001 @@
+// ABOUTME: Merges the closure's files into one Policy: add-only unions, keyed equal-or-error, scalar lattice.
+// ABOUTME: Pure and order-insensitive for values; every deny from every file is kept; every value keeps all its sources.
+//! Merging the closure into one policy.
+//!
+//! The merge is a join: lists union, keyed maps must agree, and the few scalars combine toward
+//! the stricter value. There is no syntax to remove or narrow anything a lower layer added, so
+//! precedence only affects the order sources are listed in, never what is allowed. Every deny
+//! from every file is kept; an allow never cancels one. Each merged value keeps every place it
+//! was declared (a [`Sourced`]), so `hb explain` can show them and the approval summary can
+//! tell a genuine addition from a restatement of the base.
+//!
+//! Whether a path is finally denied is decided by Seatbelt rule order (M2.1); the advisory
+//! query for tests and `explain` is [`Policy::decide`].
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+
+use snafu::Snafu;
+
+use super::closure::ClosureFile;
+use super::location::FileLocation;
+use super::resolve::ResolvedMcpServer;
+use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
+use crate::policy::{
+    Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, GuardException,
+    HostPattern, McpName, PathPattern, Port,
+};
+use crate::sys::path_preview;
+
+/// Most merge errors collected before the rest are summarized as truncated.
+pub const MAX_MERGE_ERRORS: usize = 64;
+
+/// The merged `[fs]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedFs {
+    /// Read-only grants.
+    pub read: Vec<Sourced<CanonicalPath>>,
+    /// Write grants.
+    pub write: Vec<Sourced<CanonicalPath>>,
+    /// Read-deny patterns. A read-deny also denies writes.
+    pub deny_read: Vec<Sourced<PathPattern>>,
+    /// Write-deny patterns.
+    pub deny_write: Vec<Sourced<PathPattern>>,
+}
+
+/// The merged `[net]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedNet {
+    /// Allowed hosts.
+    pub allow: Vec<Sourced<HostPattern>>,
+    /// Reachable loopback ports.
+    pub loopback_ports: Vec<Sourced<Port>>,
+}
+
+/// The merged `[env]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedEnv {
+    /// Variables copied from the invoking shell.
+    pub pass: Vec<Sourced<EnvName>>,
+    /// Variables set to a fixed value, in sorted name order.
+    pub set: BTreeMap<EnvName, Sourced<EnvValue>>,
+}
+
+/// The merged `[tls]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedTls {
+    /// `Some(false)` if any file says `false` (the stricter value), else `Some(true)` if any
+    /// says `true`, else `None`. The sources are the files that gave the winning value.
+    pub system_trust: Option<Sourced<bool>>,
+    /// Extra CA bundle files.
+    pub extra_ca_files: Vec<Sourced<CanonicalPath>>,
+}
+
+impl MergedTls {
+    /// Whether the system trust store is reachable: the merged value, or `false` if no file
+    /// set it. The stricter default is deliberate (decision D35); the base template written by
+    /// `hb init` sets `true`.
+    #[must_use]
+    pub fn effective_system_trust(&self) -> bool {
+        self.system_trust.as_ref().is_some_and(|trust| trust.value)
+    }
+}
+
+/// The merged `[ctl]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedCtl {
+    /// The container label selector; every file that sets one must agree.
+    pub label: Option<Sourced<ContainerLabel>>,
+    /// Container names `hb ctl` may operate on.
+    pub containers: Vec<Sourced<ContainerName>>,
+}
+
+/// The merged policy of a whole closure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Policy {
+    /// `[fs]`.
+    pub fs: MergedFs,
+    /// `[net]`.
+    pub net: MergedNet,
+    /// `[env]`.
+    pub env: MergedEnv,
+    /// `[tls]`.
+    pub tls: MergedTls,
+    /// `[ctl]`.
+    pub ctl: MergedCtl,
+    /// `[mcp.<name>]`, in sorted name order; every file naming a server must agree on it.
+    pub mcp: BTreeMap<McpName, Sourced<ResolvedMcpServer>>,
+    /// Host-side commands, in closure order, equal commands collapsed.
+    pub hooks: Vec<Sourced<Argv>>,
+    /// Secrets-guard exceptions.
+    pub guard_exceptions: Vec<Sourced<GuardException>>,
+}
+
+/// Why a closure could not be merged.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum MergeError {
+    /// Two files define the same keyed value differently.
+    ///
+    /// The values are not echoed: an environment value can be a secret.
+    #[snafu(display(
+        "`{key}` is defined differently in {} and {}; a project can add, but cannot change what a lower layer set",
+        path_preview(&first.file),
+        path_preview(&second.file)
+    ))]
+    Conflict {
+        /// The key.
+        key: KeyPath,
+        /// The first definition, in closure order.
+        first: Origin,
+        /// The conflicting definition.
+        second: Origin,
+    },
+
+    /// A file that may not define a user-only section does.
+    #[snafu(display(
+        "`{section}` is only allowed in your own files and built-in presets, but {} ({location}) defines it",
+        path_preview(&origin.file)
+    ))]
+    UserOnlySection {
+        /// The file.
+        origin: Origin,
+        /// The section: `hooks` or `guard.exceptions`.
+        section: &'static str,
+        /// Where the file is.
+        location: FileLocation,
+    },
+}
+
+/// The merge errors found, in closure order, capped at [`MAX_MERGE_ERRORS`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct MergeErrors {
+    /// The errors.
+    pub errors: Vec<MergeError>,
+    /// Whether more existed beyond the cap.
+    pub truncated: bool,
+}
+
+impl fmt::Display for MergeErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} merge error(s)", self.errors.len())?;
+        if self.truncated {
+            write!(f, " (more exist past the first {MAX_MERGE_ERRORS})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MergeErrors {}
+
+#[derive(Default)]
+struct Collected {
+    errors: Vec<MergeError>,
+    truncated: bool,
+}
+
+impl Collected {
+    fn push(&mut self, error: MergeError) {
+        if self.errors.len() >= MAX_MERGE_ERRORS {
+            self.truncated = true;
+        } else {
+            self.errors.push(error);
+        }
+    }
+}
+
+/// Merges `files`, which must be in closure order, into one policy.
+///
+/// # Errors
+/// [`MergeErrors`] if a keyed value conflicts or a file defines a user-only section it may not.
+pub fn merge(files: &[ClosureFile]) -> Result<Policy, MergeErrors> {
+    let mut collected = Collected::default();
+    reassert_user_only(files, &mut collected);
+
+    let policy = Policy {
+        fs: MergedFs {
+            read: union(files, |c| indexed(&c.fs.read)),
+            write: union(files, |c| indexed(&c.fs.write)),
+            deny_read: union(files, |c| positions(&c.fs.deny_read)),
+            deny_write: union(files, |c| positions(&c.fs.deny_write)),
+        },
+        net: MergedNet {
+            allow: union(files, |c| positions(&c.net.allow)),
+            loopback_ports: union(files, |c| positions(&c.net.loopback_ports)),
+        },
+        env: MergedEnv {
+            pass: union(files, |c| positions(&c.env.pass)),
+            set: keyed(
+                files,
+                &mut collected,
+                |c| {
+                    c.env
+                        .set
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                },
+                |name| KeyPath::root().field("env").field("set").key(name.as_str()),
+            ),
+        },
+        tls: MergedTls {
+            system_trust: system_trust(files),
+            extra_ca_files: union(files, |c| positions(&c.tls.extra_ca_files)),
+        },
+        ctl: MergedCtl {
+            label: label(files, &mut collected),
+            containers: union(files, |c| positions(&c.ctl.containers)),
+        },
+        mcp: keyed(
+            files,
+            &mut collected,
+            |c| c.mcp.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            |name| KeyPath::root().field("mcp").key(name.as_str()),
+        ),
+        hooks: ordered_union(files, |c| positions(&c.hooks)),
+        guard_exceptions: union(files, |c| positions(&c.guard.exceptions)),
+    };
+    if collected.errors.is_empty() {
+        Ok(policy)
+    } else {
+        Err(MergeErrors {
+            errors: collected.errors,
+            truncated: collected.truncated,
+        })
+    }
+}
+
+fn index_of(position: usize) -> u32 {
+    u32::try_from(position).unwrap_or(u32::MAX)
+}
+
+/// Entries of a plain list, each at its position.
+fn positions<T: Clone>(items: &[T]) -> Vec<(T, u32)> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (item.clone(), index_of(position)))
+        .collect()
+}
+
+/// Entries that remember their own file index.
+fn indexed(items: &[super::resolve::Indexed<CanonicalPath>]) -> Vec<(CanonicalPath, u32)> {
+    items
+        .iter()
+        .map(|entry| (entry.value.clone(), entry.index))
+        .collect()
+}
+
+/// Unions a list field over all files: equal values collapse and keep every source; the
+/// result is sorted by value, which also makes it independent of file order.
+fn union<T: Ord>(
+    files: &[ClosureFile],
+    pick: impl Fn(&super::resolve::ResolvedConfig) -> Vec<(T, u32)>,
+) -> Vec<Sourced<T>> {
+    let mut grouped: BTreeMap<T, Vec<Source>> = BTreeMap::new();
+    for file in files {
+        for (value, index) in pick(&file.resolved) {
+            grouped
+                .entry(value)
+                .or_default()
+                .push(Source::entry(file.id, index));
+        }
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(value, sources)| Sourced::from_sources(value, sources))
+        .collect()
+}
+
+/// Like [`union`], but keeps first-seen order, for fields where order is meaningful.
+fn ordered_union<T: std::hash::Hash + Eq + Clone>(
+    files: &[ClosureFile],
+    pick: impl Fn(&super::resolve::ResolvedConfig) -> Vec<(T, u32)>,
+) -> Vec<Sourced<T>> {
+    let mut positions: HashMap<T, usize> = HashMap::new();
+    let mut out: Vec<Sourced<T>> = Vec::new();
+    for file in files {
+        for (value, index) in pick(&file.resolved) {
+            let source = Source::entry(file.id, index);
+            match positions.get(&value) {
+                Some(&at) => {
+                    out[at].sources.push(source);
+                }
+                None => {
+                    positions.insert(value.clone(), out.len());
+                    out.push(Sourced::new(value, source));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Merges a keyed map: equal values from several files combine; a different value for a key
+/// that is already set is a conflict naming both files.
+fn keyed<K: Ord + Clone, V: PartialEq + Clone>(
+    files: &[ClosureFile],
+    collected: &mut Collected,
+    pick: impl Fn(&super::resolve::ResolvedConfig) -> Vec<(K, V)>,
+    key_path: impl Fn(&K) -> KeyPath,
+) -> BTreeMap<K, Sourced<V>> {
+    let mut merged: BTreeMap<K, (Sourced<V>, usize)> = BTreeMap::new();
+    for (position, file) in files.iter().enumerate() {
+        for (key, value) in pick(&file.resolved) {
+            match merged.get_mut(&key) {
+                None => {
+                    merged.insert(key, (Sourced::new(value, Source::value(file.id)), position));
+                }
+                Some((existing, _)) if existing.value == value => {
+                    existing.sources.push(Source::value(file.id));
+                }
+                Some((_, first_position)) => {
+                    let path = key_path(&key);
+                    collected.push(MergeError::Conflict {
+                        key: path.clone(),
+                        first: files[*first_position].origin(path.clone()),
+                        second: file.origin(path),
+                    });
+                }
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(key, (sourced, _))| (key, sourced))
+        .collect()
+}
+
+/// `false` beats `true`: any file that distrusts the system store wins.
+fn system_trust(files: &[ClosureFile]) -> Option<Sourced<bool>> {
+    let sources_saying = |wanted: bool| -> Vec<Source> {
+        files
+            .iter()
+            .filter(|file| file.resolved.tls.system_trust == Some(wanted))
+            .map(|file| Source::value(file.id))
+            .collect()
+    };
+    Sourced::from_sources(false, sources_saying(false))
+        .or_else(|| Sourced::from_sources(true, sources_saying(true)))
+}
+
+/// Every file that sets a label must set the same one.
+fn label(files: &[ClosureFile], collected: &mut Collected) -> Option<Sourced<ContainerLabel>> {
+    let mut found: Option<(Sourced<ContainerLabel>, usize)> = None;
+    for (position, file) in files.iter().enumerate() {
+        let Some(value) = &file.resolved.ctl.label else {
+            continue;
+        };
+        match &mut found {
+            None => {
+                found = Some((
+                    Sourced::new(value.clone(), Source::value(file.id)),
+                    position,
+                ))
+            }
+            Some((existing, _)) if &existing.value == value => {
+                existing.sources.push(Source::value(file.id));
+            }
+            Some((_, first_position)) => {
+                let key = KeyPath::root().field("ctl").field("label");
+                collected.push(MergeError::Conflict {
+                    key: key.clone(),
+                    first: files[*first_position].origin(key.clone()),
+                    second: file.origin(key),
+                });
+            }
+        }
+    }
+    found.map(|(sourced, _)| sourced)
+}
+
+/// Defence in depth: the loader refuses these before resolving, but merge must hold the
+/// invariant on its own, so a caller that builds a closure by hand cannot smuggle hooks in.
+fn reassert_user_only(files: &[ClosureFile], collected: &mut Collected) {
+    for file in files {
+        let eligible =
+            file.location.may_define_user_only_sections() && file.layer != Layer::Project;
+        if eligible {
+            continue;
+        }
+        for (section, present) in [
+            ("hooks", !file.resolved.hooks.is_empty()),
+            (
+                "guard.exceptions",
+                !file.resolved.guard.exceptions.is_empty(),
+            ),
+        ] {
+            if present {
+                collected.push(MergeError::UserOnlySection {
+                    origin: file.origin(KeyPath::root().field(section)),
+                    section,
+                    location: file.location,
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClosureFile, FileLocation, FileSource};
+    use crate::config::{ConfigText, Diagnostics};
+    use crate::config::{Indexed, ResolvedConfig, ResolvedMcpServer};
+    use crate::origin::{FileId, Layer, Source};
+    use crate::policy::{
+        ArgWord, Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, GlobTail,
+        GuardException, HostPattern, McpName, PathPattern, Port, PresetName,
+    };
+    use claims::{assert_err, assert_ok, assert_some};
+    use pretty_assertions::assert_eq;
+
+    fn cpath(p: &str) -> CanonicalPath {
+        assert_ok!(CanonicalPath::from_canonical(p))
+    }
+
+    fn host(h: &str) -> HostPattern {
+        assert_ok!(HostPattern::parse(h))
+    }
+
+    fn argv(words: &[&str]) -> Argv {
+        let owned: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        assert_ok!(Argv::parse(&owned))
+    }
+
+    fn deny(base: &str) -> PathPattern {
+        PathPattern {
+            base: cpath(base),
+            alias: None,
+            tail: None,
+        }
+    }
+
+    /// A closure file named `name` (its origin path is `builtin:<name>`).
+    fn file(
+        name: &str,
+        layer: Layer,
+        location: FileLocation,
+        config: ResolvedConfig,
+    ) -> ClosureFile {
+        ClosureFile {
+            id: FileId::new(0),
+            source: FileSource::Builtin {
+                name: assert_ok!(PresetName::parse(name)),
+            },
+            layer,
+            location,
+            from_base: false,
+            text: ConfigText::builtin(name, ""),
+            resolved: config,
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    /// Numbers the files by position, as the loader does.
+    fn closure(mut files: Vec<ClosureFile>) -> Vec<ClosureFile> {
+        for (index, f) in files.iter_mut().enumerate() {
+            f.id = FileId::new(u16::try_from(index).unwrap_or(0));
+        }
+        files
+    }
+
+    fn user(name: &str, config: ResolvedConfig) -> ClosureFile {
+        file(name, Layer::Preset, FileLocation::UserConfig, config)
+    }
+
+    fn project(config: ResolvedConfig) -> ClosureFile {
+        file("project", Layer::Project, FileLocation::InProject, config)
+    }
+
+    fn merged(files: Vec<ClosureFile>) -> Policy {
+        assert_ok!(merge(&closure(files)))
+    }
+
+    fn values<T: Clone>(items: &[Sourced<T>]) -> Vec<T> {
+        items.iter().map(|s| s.value.clone()).collect()
+    }
+
+    fn with_net(hosts: &[&str]) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.net.allow = hosts.iter().map(|h| host(h)).collect();
+        config
+    }
+
+    // ====================================================================================
+    // Lists union, keep every source, and are value-sorted
+    // ====================================================================================
+
+    #[test]
+    fn lists_from_every_file_are_unioned_and_sorted_by_value() {
+        let policy = merged(vec![
+            user("base", with_net(&["zeta.example.com", "alpha.example.com"])),
+            project(with_net(&["mid.example.com"])),
+        ]);
+        assert_eq!(
+            values(&policy.net.allow),
+            vec![
+                host("alpha.example.com"),
+                host("mid.example.com"),
+                host("zeta.example.com")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_equal_value_in_two_files_is_one_entry_that_keeps_both_sources() {
+        let policy = merged(vec![
+            user("base", with_net(&["crates.io"])),
+            project(with_net(&["crates.io", "extra.example.com"])),
+        ]);
+        let crates = assert_some!(
+            policy
+                .net
+                .allow
+                .iter()
+                .find(|s| s.value == host("crates.io"))
+        );
+        assert_eq!(
+            crates.sources,
+            vec![
+                Source::entry(FileId::new(0), 0),
+                Source::entry(FileId::new(1), 0)
+            ]
+        );
+        let extra = assert_some!(
+            policy
+                .net
+                .allow
+                .iter()
+                .find(|s| s.value == host("extra.example.com"))
+        );
+        assert_eq!(extra.sources, vec![Source::entry(FileId::new(1), 1)]);
+    }
+
+    #[test]
+    fn a_value_listed_twice_in_one_file_keeps_both_indexes() {
+        let policy = merged(vec![project(with_net(&["a.example.com", "a.example.com"]))]);
+        assert_eq!(policy.net.allow.len(), 1);
+        assert_eq!(policy.net.allow[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn fs_grants_keep_their_original_file_index_after_skips() {
+        let mut config = ResolvedConfig::default();
+        config.fs.read = vec![
+            Indexed {
+                value: cpath("/p/a"),
+                index: 1,
+            },
+            Indexed {
+                value: cpath("/p/b"),
+                index: 3,
+            },
+        ];
+        let policy = merged(vec![project(config)]);
+        assert_eq!(
+            policy.fs.read[0].sources,
+            vec![Source::entry(FileId::new(0), 1)]
+        );
+        assert_eq!(
+            policy.fs.read[1].sources,
+            vec![Source::entry(FileId::new(0), 3)]
+        );
+    }
+
+    #[test]
+    fn every_list_section_is_merged() {
+        let mut a = ResolvedConfig::default();
+        a.fs.write = vec![Indexed {
+            value: cpath("/p/w"),
+            index: 0,
+        }];
+        a.fs.deny_read = vec![deny("/p/r")];
+        a.fs.deny_write = vec![deny("/p/w2")];
+        a.net.loopback_ports = vec![assert_ok!(Port::try_from(3030))];
+        a.env.pass = vec![assert_ok!(EnvName::parse("TERM"))];
+        a.tls.extra_ca_files = vec![cpath("/p/ca.pem")];
+        a.ctl.containers = vec![assert_ok!(ContainerName::parse("pg"))];
+        a.guard.exceptions = vec![assert_ok!(GuardException::parse(".env.example"))];
+        let policy = merged(vec![user("base", a)]);
+        assert_eq!(policy.fs.write.len(), 1);
+        assert_eq!(policy.fs.deny_read.len(), 1);
+        assert_eq!(policy.fs.deny_write.len(), 1);
+        assert_eq!(policy.net.loopback_ports.len(), 1);
+        assert_eq!(policy.env.pass.len(), 1);
+        assert_eq!(policy.tls.extra_ca_files.len(), 1);
+        assert_eq!(policy.ctl.containers.len(), 1);
+        assert_eq!(policy.guard_exceptions.len(), 1);
+    }
+
+    #[test]
+    fn merging_nothing_gives_an_empty_policy() {
+        assert_eq!(merged(Vec::new()), Policy::default());
+    }
+
+    // ====================================================================================
+    // Denies are never lost
+    // ====================================================================================
+
+    #[test]
+    fn every_deny_from_every_file_is_kept() {
+        let mut base = ResolvedConfig::default();
+        base.fs.deny_read = vec![deny("/Users/me/.ssh")];
+        let mut preset = ResolvedConfig::default();
+        preset.fs.deny_read = vec![deny("/Users/me/.aws")];
+        preset.fs.deny_write = vec![deny("/p/.git/hooks")];
+        let mut proj = ResolvedConfig::default();
+        proj.fs.deny_read = vec![deny("/p/secrets")];
+        let policy = merged(vec![
+            user("base", base),
+            user("preset", preset),
+            project(proj),
+        ]);
+        assert_eq!(policy.fs.deny_read.len(), 3);
+        assert_eq!(policy.fs.deny_write.len(), 1);
+    }
+
+    #[test]
+    fn a_project_allow_never_removes_a_base_deny_from_the_policy() {
+        let mut base = ResolvedConfig::default();
+        base.fs.deny_read = vec![deny("/Users/me/.ssh")];
+        let mut proj = ResolvedConfig::default();
+        proj.fs.read = vec![Indexed {
+            value: cpath("/Users/me/.ssh"),
+            index: 0,
+        }];
+        proj.fs.write = vec![Indexed {
+            value: cpath("/Users/me/.ssh"),
+            index: 0,
+        }];
+        let policy = merged(vec![user("base", base), project(proj)]);
+        assert_eq!(values(&policy.fs.deny_read), vec![deny("/Users/me/.ssh")]);
+        assert_eq!(
+            policy.fs.read.len(),
+            1,
+            "the allow is retained too; the deny wins at decision time"
+        );
+    }
+
+    // ====================================================================================
+    // Keyed maps: equal values merge, different values are an error naming both files
+    // ====================================================================================
+
+    fn with_env(name: &str, value: &str) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.env.set.insert(
+            assert_ok!(EnvName::parse(name)),
+            assert_ok!(EnvValue::parse(value)),
+        );
+        config
+    }
+
+    #[test]
+    fn an_env_key_with_equal_values_in_two_files_merges_and_keeps_both_sources() {
+        let policy = merged(vec![
+            user("base", with_env("RUST_LOG", "info")),
+            project(with_env("RUST_LOG", "info")),
+        ]);
+        let entry = assert_some!(policy.env.set.get(&assert_ok!(EnvName::parse("RUST_LOG"))));
+        assert_eq!(entry.value.as_str(), "info");
+        assert_eq!(
+            entry.sources,
+            vec![Source::value(FileId::new(0)), Source::value(FileId::new(1))]
+        );
+    }
+
+    #[test]
+    fn an_env_key_with_different_values_is_an_error_naming_both_files_and_not_the_values() {
+        let files = closure(vec![
+            user("base", with_env("TOKEN", "secret-one")),
+            project(with_env("TOKEN", "secret-two")),
+        ]);
+        let errors = assert_err!(merge(&files));
+        assert_eq!(errors.errors.len(), 1);
+        let shown = errors.errors[0].to_string();
+        assert!(shown.contains("env.set.TOKEN"), "{shown}");
+        assert!(
+            shown.contains("builtin:base") && shown.contains("builtin:project"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("secret-one") && !shown.contains("secret-two"),
+            "values must not be echoed: {shown}"
+        );
+    }
+
+    fn with_mcp(name: &str, server: ResolvedMcpServer) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.mcp.insert(assert_ok!(McpName::parse(name)), server);
+        config
+    }
+
+    fn server(command: &str, args: &[&str]) -> ResolvedMcpServer {
+        ResolvedMcpServer {
+            command: Some(assert_ok!(ArgWord::parse_program(command))),
+            args: args.iter().map(|a| assert_ok!(ArgWord::parse(a))).collect(),
+            ..ResolvedMcpServer::default()
+        }
+    }
+
+    #[test]
+    fn an_identical_mcp_server_in_two_files_merges() {
+        let policy = merged(vec![
+            user("base", with_mcp("serena", server("uvx", &["a"]))),
+            project(with_mcp("serena", server("uvx", &["a"]))),
+        ]);
+        let name = assert_ok!(McpName::parse("serena"));
+        assert_eq!(assert_some!(policy.mcp.get(&name)).sources.len(), 2);
+    }
+
+    #[test]
+    fn an_mcp_server_that_differs_in_any_field_is_a_conflict() {
+        for other in [
+            server("npx", &["a"]),
+            server("uvx", &["b"]),
+            ResolvedMcpServer {
+                bind_loopback: Some(false),
+                ..server("uvx", &["a"])
+            },
+            ResolvedMcpServer {
+                net: vec![host("x.example.com")],
+                ..server("uvx", &["a"])
+            },
+        ] {
+            let files = closure(vec![
+                user("base", with_mcp("serena", server("uvx", &["a"]))),
+                project(with_mcp("serena", other)),
+            ]);
+            let errors = assert_err!(merge(&files));
+            assert!(
+                errors.errors[0].to_string().contains("mcp.serena"),
+                "{}",
+                errors.errors[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_mcp_server_name_from_the_project_is_an_addition_not_a_conflict() {
+        let policy = merged(vec![
+            user("base", with_mcp("serena", server("uvx", &[]))),
+            project(with_mcp("other", server("npx", &[]))),
+        ]);
+        assert_eq!(policy.mcp.len(), 2);
+    }
+
+    // ====================================================================================
+    // Scalars
+    // ====================================================================================
+
+    fn with_trust(value: Option<bool>) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.tls.system_trust = value;
+        config
+    }
+
+    #[test]
+    fn system_trust_false_beats_true_from_any_file_and_names_the_files_that_said_false() {
+        let policy = merged(vec![
+            user("base", with_trust(Some(true))),
+            user("preset", with_trust(Some(false))),
+            project(with_trust(Some(true))),
+        ]);
+        let trust = assert_some!(policy.tls.system_trust);
+        assert!(!trust.value);
+        assert_eq!(trust.sources, vec![Source::value(FileId::new(1))]);
+    }
+
+    #[test]
+    fn a_project_setting_system_trust_false_only_tightens() {
+        let policy = merged(vec![
+            user("base", with_trust(Some(true))),
+            project(with_trust(Some(false))),
+        ]);
+        assert!(!assert_some!(policy.tls.system_trust).value);
+    }
+
+    #[test]
+    fn unset_system_trust_is_effectively_false_the_stricter_default() {
+        let unset = merged(vec![user("base", with_trust(None))]);
+        assert!(!unset.tls.effective_system_trust());
+        let on = merged(vec![user("base", with_trust(Some(true)))]);
+        assert!(on.tls.effective_system_trust());
+        let off = merged(vec![
+            user("base", with_trust(Some(true))),
+            project(with_trust(Some(false))),
+        ]);
+        assert!(!off.tls.effective_system_trust());
+    }
+
+    #[test]
+    fn system_trust_true_alone_stays_true_and_unset_everywhere_stays_unset() {
+        let policy = merged(vec![
+            user("base", with_trust(Some(true))),
+            project(with_trust(None)),
+        ]);
+        assert!(assert_some!(policy.tls.system_trust).value);
+        let policy = merged(vec![
+            user("base", with_trust(None)),
+            project(with_trust(None)),
+        ]);
+        assert_eq!(policy.tls.system_trust, None);
+    }
+
+    fn with_label(label: Option<&str>) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.ctl.label = label.map(|l| assert_ok!(ContainerLabel::parse(l)));
+        config
+    }
+
+    #[test]
+    fn an_equal_ctl_label_in_two_files_merges_and_one_label_alone_is_kept() {
+        let policy = merged(vec![
+            user("base", with_label(Some("app=icehouse"))),
+            project(with_label(Some("app=icehouse"))),
+        ]);
+        assert_eq!(assert_some!(policy.ctl.label).sources.len(), 2);
+        let policy = merged(vec![
+            user("base", with_label(None)),
+            project(with_label(Some("app=x"))),
+        ]);
+        assert_eq!(assert_some!(policy.ctl.label).value.to_string(), "app=x");
+    }
+
+    #[test]
+    fn a_differing_ctl_label_is_a_conflict_so_a_project_cannot_override_the_base_scope() {
+        let files = closure(vec![
+            user("base", with_label(Some("app=icehouse"))),
+            project(with_label(Some("app=other"))),
+        ]);
+        let errors = assert_err!(merge(&files));
+        assert!(
+            errors.errors[0].to_string().contains("ctl.label"),
+            "{}",
+            errors.errors[0]
+        );
+    }
+
+    // ====================================================================================
+    // Hooks keep order
+    // ====================================================================================
+
+    #[test]
+    fn hooks_keep_closure_order_and_collapse_equal_commands_keeping_both_sources() {
+        let a = ResolvedConfig {
+            hooks: vec![argv(&["zeta"]), argv(&["alpha"])],
+            ..ResolvedConfig::default()
+        };
+        let b = ResolvedConfig {
+            hooks: vec![argv(&["alpha"]), argv(&["mid"])],
+            ..ResolvedConfig::default()
+        };
+        let policy = merged(vec![user("base", a), user("preset", b)]);
+        let order: Vec<Vec<&str>> = policy
+            .hooks
+            .iter()
+            .map(|h| h.value.words().iter().map(ArgWord::as_str).collect())
+            .collect();
+        assert_eq!(order, vec![vec!["zeta"], vec!["alpha"], vec!["mid"]]);
+        assert_eq!(policy.hooks[1].sources.len(), 2);
+    }
+
+    // ====================================================================================
+    // User-only sections, re-asserted
+    // ====================================================================================
+
+    fn with_hooks() -> ResolvedConfig {
+        ResolvedConfig {
+            hooks: vec![argv(&["echo"])],
+            ..ResolvedConfig::default()
+        }
+    }
+
+    #[test]
+    fn hooks_from_an_ineligible_file_are_refused_even_if_the_loader_was_bypassed() {
+        for location in [FileLocation::InProject, FileLocation::Other] {
+            let files = closure(vec![file("evil", Layer::Preset, location, with_hooks())]);
+            let errors = assert_err!(merge(&files));
+            assert!(
+                matches!(errors.errors[0], MergeError::UserOnlySection { .. }),
+                "{location:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_layer_file_may_not_define_hooks_whatever_its_location() {
+        let files = closure(vec![file(
+            "p",
+            Layer::Project,
+            FileLocation::UserConfig,
+            with_hooks(),
+        )]);
+        assert!(matches!(
+            assert_err!(merge(&files)).errors[0],
+            MergeError::UserOnlySection { .. }
+        ));
+    }
+
+    #[test]
+    fn guard_exceptions_from_an_ineligible_file_are_refused() {
+        let mut config = ResolvedConfig::default();
+        config.guard.exceptions = vec![assert_ok!(GuardException::parse(".env"))];
+        let files = closure(vec![project(config)]);
+        let errors = assert_err!(merge(&files));
+        assert!(
+            errors.errors[0].to_string().contains("guard.exceptions"),
+            "{}",
+            errors.errors[0]
+        );
+    }
+
+    #[test]
+    fn hooks_from_user_files_and_builtins_are_accepted() {
+        for location in [FileLocation::UserConfig, FileLocation::Builtin] {
+            let policy = merged(vec![file("ok", Layer::Preset, location, with_hooks())]);
+            assert_eq!(policy.hooks.len(), 1);
+        }
+    }
+
+    // ====================================================================================
+    // Error collection
+    // ====================================================================================
+
+    #[test]
+    fn conflicts_are_reported_in_a_stable_order_and_capped() {
+        let mut a = ResolvedConfig::default();
+        let mut b = ResolvedConfig::default();
+        for i in 0..100 {
+            let name = assert_ok!(EnvName::parse(&format!("VAR{i:03}")));
+            a.env
+                .set
+                .insert(name.clone(), assert_ok!(EnvValue::parse("1")));
+            b.env.set.insert(name, assert_ok!(EnvValue::parse("2")));
+        }
+        let errors = assert_err!(merge(&closure(vec![user("a", a), project(b)])));
+        assert_eq!(errors.errors.len(), MAX_MERGE_ERRORS);
+        assert!(errors.truncated);
+        assert!(
+            errors.errors[0].to_string().contains("env.set.VAR000"),
+            "{}",
+            errors.errors[0]
+        );
+        assert!(
+            errors.errors[MAX_MERGE_ERRORS - 1]
+                .to_string()
+                .contains("VAR063")
+        );
+    }
+
+    #[test]
+    fn merge_errors_follow_the_display_convention() {
+        let files = closure(vec![
+            user("base", with_label(Some("app=a"))),
+            project(with_label(Some("app=b"))),
+        ]);
+        let errors = assert_err!(merge(&files));
+        crate::error::conventions::assert_display_excludes_sources(&errors.errors[0]);
+        assert_eq!(errors.to_string(), "1 merge error(s)");
+    }
+
+    #[test]
+    fn a_glob_tail_deny_survives_the_merge_unchanged() {
+        let pattern = PathPattern {
+            base: cpath("/p/config"),
+            alias: None,
+            tail: Some(assert_ok!(GlobTail::parse(&["*.secrets.yaml"]))),
+        };
+        let mut config = ResolvedConfig::default();
+        config.fs.deny_read = vec![pattern.clone()];
+        let policy = merged(vec![project(config)]);
+        assert_eq!(values(&policy.fs.deny_read), vec![pattern]);
+    }
+}

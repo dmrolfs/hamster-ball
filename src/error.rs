@@ -4,13 +4,15 @@
 
 use snafu::Snafu;
 
-use crate::config::{ConfigTextError, DiscoverError, EntryError, ResolveErrors};
+use crate::config::{
+    ConfigTextError, DiscoverError, EntryError, ExtendsError, LoadError, MergeErrors, ResolveErrors,
+};
 use crate::policy::{
     ArgWordError, ArgvError, ContainerLabelError, ContainerNameError, EnvNameError, EnvValueError,
-    GlobTailError, HostNameError, HostPatternError, McpNameError, PathError, PathPatternError,
-    PortError, RefTextError, RootError,
+    ExtendTargetError, GlobTailError, HostNameError, HostPatternError, McpNameError, PathError,
+    PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
-use crate::system::HomeError;
+use crate::system::{HomeError, UserConfigError};
 
 /// Any error produced by this crate.
 ///
@@ -158,6 +160,48 @@ pub enum Error {
         /// The underlying error.
         source: ResolveErrors,
     },
+
+    /// A preset name was invalid.
+    #[snafu(transparent)]
+    PresetName {
+        /// The underlying error.
+        source: PresetNameError,
+    },
+
+    /// An `extends` entry could not be classified.
+    #[snafu(transparent)]
+    ExtendTarget {
+        /// The underlying error.
+        source: ExtendTargetError,
+    },
+
+    /// An `extends` entry could not be resolved to something to load.
+    #[snafu(transparent)]
+    Extends {
+        /// The underlying error.
+        source: ExtendsError,
+    },
+
+    /// The config files could not be merged.
+    #[snafu(transparent)]
+    Merge {
+        /// The underlying error.
+        source: MergeErrors,
+    },
+
+    /// The config closure could not be loaded.
+    #[snafu(transparent)]
+    Load {
+        /// The underlying error.
+        source: LoadError,
+    },
+
+    /// The user's config directory could not be located or initialized.
+    #[snafu(transparent)]
+    UserConfig {
+        /// The underlying error.
+        source: UserConfigError,
+    },
 }
 
 /// Test helpers that enforce the crate's error conventions.
@@ -278,7 +322,7 @@ mod tests {
             assert_err!(McpName::parse("")).into(),
             assert_err!(GlobTail::parse(&[".."])).into(),
             HomeError::RunningAsRoot.into(),
-            assert_err!(crate::config::ConfigText::read(
+            assert_err!(crate::config::ConfigText::read_with(
                 "/nonexistent/hb.toml",
                 crate::origin::Layer::Project,
                 crate::config::SymlinkPolicy::Refuse
@@ -295,8 +339,24 @@ mod tests {
                 truncated: false,
             }
             .into(),
+            assert_err!(crate::policy::PresetName::parse("")).into(),
+            assert_err!(assert_ok!(crate::policy::ExtendRef::parse("~x")).target()).into(),
+            ExtendsError::BuiltinExtendsFile {
+                entry: assert_ok!(crate::policy::ExtendRef::parse("./x.toml")),
+            }
+            .into(),
+            MergeErrors {
+                errors: Vec::new(),
+                truncated: false,
+            }
+            .into(),
+            LoadError::TooManyFiles.into(),
+            UserConfigError::BaseExists {
+                path: std::path::PathBuf::from("/x"),
+            }
+            .into(),
         ];
-        assert_eq!(errors.len(), 11);
+        assert_eq!(errors.len(), 17);
         for error in &errors {
             assert!(!error.to_string().is_empty(), "{error:?}");
         }
@@ -305,6 +365,12 @@ mod tests {
         assert!(matches!(errors[6], Error::Home { .. }));
         assert!(matches!(errors[9], Error::Entry { .. }));
         assert!(matches!(errors[10], Error::Resolve { .. }));
+        assert!(matches!(errors[11], Error::PresetName { .. }));
+        assert!(matches!(errors[12], Error::ExtendTarget { .. }));
+        assert!(matches!(errors[13], Error::Extends { .. }));
+        assert!(matches!(errors[14], Error::Merge { .. }));
+        assert!(matches!(errors[15], Error::Load { .. }));
+        assert!(matches!(errors[16], Error::UserConfig { .. }));
     }
 
     #[test]

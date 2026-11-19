@@ -9,6 +9,7 @@
 pub mod argv;
 pub mod ctl;
 pub mod env;
+pub mod extends;
 pub mod home;
 pub mod host;
 pub mod names;
@@ -19,11 +20,14 @@ pub mod port;
 pub use argv::{ArgWord, ArgWordError, Argv, ArgvError};
 pub use ctl::{ContainerLabel, ContainerLabelError, ContainerName, ContainerNameError};
 pub use env::{EnvName, EnvNameError, EnvValue, EnvValueError};
+pub use extends::{
+    ExtendTarget, ExtendTargetError, MAX_PRESET_NAME_BYTES, PresetName, PresetNameError,
+};
 pub use home::{HomeDir, ProjectRoot, RootError, broadness};
 pub use host::{
     HostName, HostNameError, HostPattern, HostPatternError, protected_suffix_list_version,
 };
 pub use names::{ExtendRef, GuardException, McpName, McpNameError, RefTextError};
 pub use path::{BroadRoot, CanonicalPath, PathError};
-pub use pattern::{GlobSegment, GlobTail, GlobTailError, PathPattern, PathPatternError};
+pub use pattern::{Coverage, GlobSegment, GlobTail, GlobTailError, PathPattern, PathPatternError};
 pub use port::{Port, PortError};

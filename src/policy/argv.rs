@@ -96,7 +96,7 @@ impl ArgWord {
 }
 
 /// A non-empty argument vector whose first word is a non-empty program name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Argv(Vec<ArgWord>);
 
 impl Argv {

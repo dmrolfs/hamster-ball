@@ -260,7 +260,7 @@ fn ensure_trusted(
 }
 
 /// Why a file with this owner and mode is not trusted by the user `uid`, if it is not.
-fn untrusted(owner: u32, mode: u32, uid: u32) -> Option<Untrusted> {
+pub(crate) fn untrusted(owner: u32, mode: u32, uid: u32) -> Option<Untrusted> {
     if owner != uid {
         Some(Untrusted::NotOwnedByYou)
     } else if mode & WORLD_WRITABLE != 0 {
