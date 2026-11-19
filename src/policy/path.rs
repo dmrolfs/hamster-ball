@@ -3,10 +3,12 @@
 //! The [`CanonicalPath`] value type.
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use snafu::{OptionExt, Snafu, ensure};
 
+use crate::policy::home::BroadRoot;
 use crate::text::Escaped;
 
 /// Longest accepted path, in bytes.
@@ -14,6 +16,7 @@ pub const MAX_PATH_BYTES: usize = 1024;
 
 /// Why a string is not an acceptable canonical path.
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum PathError {
     /// The path does not start with `/`.
@@ -54,6 +57,110 @@ pub enum PathError {
     NotNormalized {
         /// The offending path as written.
         path: String,
+    },
+
+    // ------------------------------------------------------------------------------------
+    // Resolution errors: produced only by `PathResolver` (policy::resolve), which is the
+    // crate's one module that touches the filesystem. Everything above this point is a pure
+    // form check with no I/O.
+    // ------------------------------------------------------------------------------------
+    /// The spelling is empty.
+    #[snafu(display("path spelling is empty"))]
+    EmptySpelling,
+
+    /// The spelling is longer than [`MAX_PATH_BYTES`].
+    #[snafu(display("path spelling is {len} bytes long; the limit is {MAX_PATH_BYTES}"))]
+    SpellingTooLong {
+        /// Length in bytes.
+        len: usize,
+    },
+
+    /// The spelling contains NUL or another control character.
+    #[snafu(display("path spelling contains a control character: {}", Escaped(spelling)))]
+    SpellingControlCharacter {
+        /// The offending spelling as written.
+        spelling: String,
+    },
+
+    /// The spelling uses the `~user` form, which is not supported (only `~` and `~/...`).
+    #[snafu(display(
+        "`~user` is not supported; use `~/...` for your own home directory: {}",
+        Escaped(spelling)
+    ))]
+    TildeUser {
+        /// The offending spelling as written.
+        spelling: String,
+    },
+
+    /// A path popped into an unresolved tail was `..`, which is rejected rather than collapsed.
+    #[snafu(display(
+        "{} has `..` in a part that does not exist yet, which is rejected rather than guessed at",
+        Escaped(spelling)
+    ))]
+    DotDotInTail {
+        /// The spelling that produced this tail.
+        spelling: String,
+    },
+
+    /// The path does not exist (used by `existing`, which never tolerates a missing path).
+    #[snafu(display("{} does not exist", Escaped(spelling)))]
+    Missing {
+        /// The spelling that was resolved.
+        spelling: String,
+    },
+
+    /// The path, or an ancestor of it, is an existing symlink whose target does not exist.
+    /// A deny rule treats this as an error rather than a skip, because a deny rule that
+    /// silently covers nothing is a fail-open bug, not a fail-closed one.
+    #[snafu(display(
+        "{} is a symlink with no target (or has one in its path)",
+        Escaped(spelling)
+    ))]
+    Dangling {
+        /// The spelling that was resolved.
+        spelling: String,
+    },
+
+    /// An allow rule could not be resolved because a directory in its path denies access.
+    /// A deny rule never produces this: it falls through and keeps the rule in force instead.
+    #[snafu(display("{} is not readable", Escaped(spelling)))]
+    PathUnreadable {
+        /// The spelling that was resolved.
+        spelling: String,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+
+    /// A non-final component of the path is a regular file, not a directory.
+    #[snafu(display("{} has a file where a directory was expected", Escaped(spelling)))]
+    NotADirectoryAncestor {
+        /// The spelling that was resolved.
+        spelling: String,
+    },
+
+    /// Resolving the path required following more symlinks than the OS allows.
+    #[snafu(display("{} has a symlink loop", Escaped(spelling)))]
+    SymlinkLoop {
+        /// The spelling that was resolved.
+        spelling: String,
+    },
+
+    /// An I/O error occurred that does not fit a more specific variant above.
+    #[snafu(display("{} could not be resolved", Escaped(spelling)))]
+    Io {
+        /// The spelling that was resolved.
+        spelling: String,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+
+    /// An `fs.read` or `fs.write` allow rule is too broad to grant.
+    #[snafu(display("{path} is too broad to grant as a read/write rule: it is {reason}"))]
+    TooBroad {
+        /// The rejected path.
+        path: CanonicalPath,
+        /// Why it is too broad.
+        reason: BroadRoot,
     },
 }
 
