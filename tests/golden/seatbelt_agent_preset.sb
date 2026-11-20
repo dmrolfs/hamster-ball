@@ -1,0 +1,252 @@
+(version 1)
+(deny default (with message "hb-0123abcd"))
+(import "system.sb")
+; process
+(allow process-exec)
+(allow process-fork)
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow signal (target same-sandbox))
+; metadata
+(allow file-read-metadata)
+(allow file-read-data (path-ancestors (param "A0")) (path-ancestors (param "A1")) (path-ancestors (param "A2")) (path-ancestors (param "A3")) (path-ancestors (param "A4")) (path-ancestors (param "A5")))
+; system_read
+(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/private/etc") (subpath "/private/var/select") (subpath "/Library/Developer/CommandLineTools"))
+(allow file-read* file-write* (regex #"^/dev/fd/[0-9]+$") (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr"))
+; grants
+(allow file-read* (subpath (param "R0")) (subpath (param "R1")))
+(allow file-read* file-write* (subpath (param "W0")) (subpath (param "W1")))
+(allow file-read* file-write* (subpath (param "S0")))
+(allow file-ioctl (literal (param "T0")))
+; tls
+(allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.SystemConfiguration.configd"))
+(allow file-read* (literal "/Library/Keychains/System.keychain") (literal "/Library/Keychains/System.keychain-db"))
+(allow file-read* (literal (param "R2")))
+; network
+(allow network-outbound (remote ip (param "PROXY")))
+(allow network-bind (local ip (param "B0")) (local ip (param "B1")))
+(allow network-inbound (local ip (param "B0")) (local ip (param "B1")))
+; floor
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F0")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F1")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F2")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F3")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F4")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F5")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F6")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F7")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F8")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F9")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F10")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F11")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F12")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F13")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F14")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F15")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F16")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F17")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F18")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F19")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F20")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F21")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F22")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F23")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F24")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F25")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F26")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F27")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F28")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F29")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F30")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F31")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F32")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F33")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F34")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F35")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F36")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F37")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F38")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F39")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F40")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F41")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F42")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F43")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F44")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F45")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F46")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F47")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F48")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F49")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F50")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F51")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F52")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F53")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F54")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F55")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F56")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F57")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F58")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F59")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G0")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G1")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F60")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F61")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F62")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F63")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F64")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F65")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F66")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F67")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F68")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F69")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F70")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F71")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F72")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F73")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F74")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F75")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F76")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F77")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F78")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F79")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F80")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F81")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F82")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F83")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F84")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F85")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F86")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F87")))
+(deny file-write* (with message "hb-0123abcd floor") (literal (param "F88")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F89")))
+(deny file-write* (with message "hb-0123abcd floor") (subpath (param "F90")))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K0"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K1"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K2"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K3"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K4"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K5"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K6"))))
+(deny network-outbound (with message "hb-0123abcd floor") (remote unix-socket (subpath (param "K7"))))
+; pins
+(deny file-write-unlink (with message "hb-0123abcd pin") (literal (param "F91")))
+
+;; parameters
+;; A0=<FIX>/ca/corp.pem
+;; A1=<FIX>/home/.nvm/versions/node
+;; A2=<FIX>/home/.nvm/versions/node/v24/bin
+;; A3=<FIX>/home/.pi/agent
+;; A4=<FIX>/home/work/proj
+;; A5=<FIX>/tmp/hb-1-2-3
+;; R0=<FIX>/home/.nvm/versions/node
+;; R1=<FIX>/home/.nvm/versions/node/v24/bin
+;; W0=<FIX>/home/.pi/agent
+;; W1=<FIX>/home/work/proj
+;; S0=<FIX>/tmp/hb-1-2-3
+;; T0=/dev/ttys004
+;; R2=<FIX>/ca/corp.pem
+;; PROXY=localhost:41234
+;; B0=localhost:24282
+;; B1=localhost:24283
+;; F0=<FIX>/home/.aws
+;; F1=<FIX>/home/.azure
+;; F2=<FIX>/home/.config/atuin
+;; F3=<FIX>/home/.config/containers
+;; F4=<FIX>/home/.config/doctl
+;; F5=<FIX>/home/.config/gcloud
+;; F6=<FIX>/home/.config/gh
+;; F7=<FIX>/home/.config/glab-cli
+;; F8=<FIX>/home/.config/hamster-ball
+;; F9=<FIX>/home/.config/hub
+;; F10=<FIX>/home/.config/op
+;; F11=<FIX>/home/.config/rclone
+;; F12=<FIX>/home/.docker
+;; F13=<FIX>/home/.gem/credentials
+;; F14=<FIX>/home/.git-credentials
+;; F15=<FIX>/home/.gnupg
+;; F16=<FIX>/home/.kube
+;; F17=<FIX>/home/.local/share/atuin
+;; F18=<FIX>/home/.local/share/containers
+;; F19=<FIX>/home/.local/state/hamster-ball
+;; F20=<FIX>/home/.netrc
+;; F21=<FIX>/home/.npmrc
+;; F22=<FIX>/home/.oci
+;; F23=<FIX>/home/.pgpass
+;; F24=<FIX>/home/.pypirc
+;; F25=<FIX>/home/.ssh
+;; F26=<FIX>/home/.terraform.d/credentials.tfrc.json
+;; F27=<FIX>/home/.vault-token
+;; F28=<FIX>/home/.zsh_sessions
+;; F29=<FIX>/home/Library/Application Support/1Password
+;; F30=<FIX>/home/Library/Application Support/Arc
+;; F31=<FIX>/home/Library/Application Support/BraveSoftware
+;; F32=<FIX>/home/Library/Application Support/Chromium
+;; F33=<FIX>/home/Library/Application Support/Comet
+;; F34=<FIX>/home/Library/Application Support/Firefox
+;; F35=<FIX>/home/Library/Application Support/Google
+;; F36=<FIX>/home/Library/Application Support/Microsoft Edge
+;; F37=<FIX>/home/Library/Application Support/Microsoft Edge Beta
+;; F38=<FIX>/home/Library/Application Support/Microsoft Edge Canary
+;; F39=<FIX>/home/Library/Application Support/Microsoft Edge Dev
+;; F40=<FIX>/home/Library/Application Support/Mozilla
+;; F41=<FIX>/home/Library/Application Support/TorBrowser-Data
+;; F42=<FIX>/home/Library/Application Support/Vivaldi
+;; F43=<FIX>/home/Library/Application Support/Vivaldi Snapshot
+;; F44=<FIX>/home/Library/Application Support/com.operasoftware.Opera
+;; F45=<FIX>/home/Library/Application Support/zen
+;; F46=<FIX>/home/Library/Caches/Arc
+;; F47=<FIX>/home/Library/Caches/Firefox
+;; F48=<FIX>/home/Library/Caches/Google
+;; F49=<FIX>/home/Library/Caches/Mozilla
+;; F50=<FIX>/home/Library/Caches/com.apple.Safari
+;; F51=<FIX>/home/Library/Caches/company.thebrowser.Browser
+;; F52=<FIX>/home/Library/Containers/com.apple.Safari
+;; F53=<FIX>/home/Library/Cookies
+;; F54=<FIX>/home/Library/Group Containers/2BUA8C4S2C.com.1password
+;; F55=<FIX>/home/Library/Group Containers/group.com.apple.Safari.SandboxBroker
+;; F56=<FIX>/home/Library/HTTPStorages
+;; F57=<FIX>/home/Library/Keychains
+;; F58=<FIX>/home/Library/Safari
+;; F59=<FIX>/home/Library/WebKit
+;; G0=^<FIX>/home/\.[^/]*_history(/.*)?$
+;; G1=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
+;; F60=<FIX>/bin
+;; F61=<FIX>/home/.bash_login
+;; F62=<FIX>/home/.bash_logout
+;; F63=<FIX>/home/.bash_profile
+;; F64=<FIX>/home/.bashrc
+;; F65=<FIX>/home/.bun/bin
+;; F66=<FIX>/home/.cargo/bin
+;; F67=<FIX>/home/.cargo/config
+;; F68=<FIX>/home/.cargo/config.toml
+;; F69=<FIX>/home/.cargo/env
+;; F70=<FIX>/home/.config/fish
+;; F71=<FIX>/home/.config/git
+;; F72=<FIX>/home/.config/pip
+;; F73=<FIX>/home/.config/uv
+;; F74=<FIX>/home/.gitconfig
+;; F75=<FIX>/home/.local/bin
+;; F76=<FIX>/home/.m2/settings.xml
+;; F77=<FIX>/home/.profile
+;; F78=<FIX>/home/.terraformrc
+;; F79=<FIX>/home/.yarnrc
+;; F80=<FIX>/home/.yarnrc.yml
+;; F81=<FIX>/home/.zlogin
+;; F82=<FIX>/home/.zlogout
+;; F83=<FIX>/home/.zprofile
+;; F84=<FIX>/home/.zshenv
+;; F85=<FIX>/home/.zshrc
+;; F86=<FIX>/home/Library/LaunchAgents
+;; F87=<FIX>/home/go/bin
+;; F88=<FIX>/home/work/proj/.git
+;; F89=<FIX>/home/work/proj/hamster-ball.toml
+;; F90=<FIX>/install/hb
+;; K0=<FIX>/home/.colima
+;; K1=<FIX>/home/.docker/run
+;; K2=<FIX>/home/.lima
+;; K3=<FIX>/home/.local/share/containers
+;; K4=<FIX>/home/.orbstack
+;; K5=<FIX>/home/.rd
+;; K6=<FIX>/home/Library/Containers/com.docker.docker
+;; K7=<FIX>/tmp/podman
+;; F91=<FIX>/home/work/proj

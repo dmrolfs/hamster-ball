@@ -19,8 +19,11 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use snafu::Report;
 
+use crate::config::load_project;
 use crate::explain::{ExplainRequest, Format, explain};
+use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::system::{Environment, UserConfigDir};
+use crate::text::Escaped;
 
 /// Run AI coding agents inside a hamster ball.
 #[derive(Debug, Parser)]
@@ -36,6 +39,10 @@ enum Command {
     Init,
     /// Show every effective rule for this project and where it came from.
     Explain(ExplainArgs),
+    /// Print the Seatbelt profile and parameters this project would run under.
+    ///
+    /// The proxy parameter is a placeholder until the proxy exists.
+    Profile,
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +134,13 @@ where
             }
             Err(error) => fail(err, crate::Error::from(error)),
         },
+        Command::Profile => match profile(env) {
+            Ok(text) => {
+                let _ = write!(out, "{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(err, error),
+        },
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())
@@ -145,6 +159,43 @@ where
     }
 }
 
+/// The profile for the current project, with its `-D` parameters as leading comments.
+fn profile(env: &Environment) -> Result<String, crate::Error> {
+    let (_, loaded) = load_project(env)?;
+    let inputs = RenderInputs::new().with_proxy(ProxyEndpoint::Placeholder);
+    let profile = render(&loaded.policy, &inputs)?;
+    let mut text = String::from(
+        "; hb profile. Run with: sandbox-exec -p <profile> <-D name=value>... -- <command>\n",
+    );
+    for (name, value) in &profile.params {
+        text.push_str(&param_line(name, value));
+    }
+    for diagnostic in &loaded.floor_diagnostics {
+        text.push_str(&format!("; warning: {diagnostic}\n"));
+    }
+    for warning in &profile.warnings {
+        text.push_str(&format!("; warning: {warning}\n"));
+    }
+    text.push_str(&profile.text);
+    Ok(text)
+}
+
+/// One `-D` comment line of `hb profile`.
+///
+/// The value is escaped so a terminal cannot be steered by it. If escaping changed it, the line
+/// says so, because it is then not the exact text to pass to `sandbox-exec`.
+fn param_line(name: &str, value: &str) -> String {
+    let shown = Escaped(value).to_string();
+    let note = if name == "PROXY" {
+        "  (placeholder until the proxy exists)"
+    } else if shown != value {
+        "  (escaped for display; not copy-exact)"
+    } else {
+        ""
+    };
+    format!("; -D {name}={shown}{note}\n")
+}
+
 /// Prints `error` with its cause chain, and returns exit code 1.
 fn fail(err: &mut dyn Write, error: crate::Error) -> ExitCode {
     let _ = writeln!(err, "{}", Report::from_error(error));
@@ -159,6 +210,38 @@ mod tests {
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
     use std::fs;
+
+    #[test]
+    fn a_plain_parameter_line_is_copy_exact_with_no_note() {
+        assert_eq!(
+            param_line("R0", "/Users/me/p"),
+            "; -D R0=/Users/me/p\n".to_owned()
+        );
+    }
+
+    #[test]
+    fn a_parameter_line_that_had_to_be_escaped_says_it_is_not_copy_exact() {
+        for value in ["/a\u{202e}b", "/a\u{1b}[31mb", "/a\nb"] {
+            let line = param_line("R0", value);
+            assert!(
+                line.ends_with("(escaped for display; not copy-exact)\n"),
+                "{line}"
+            );
+            assert!(
+                !line.contains('\u{202e}') && !line.contains('\u{1b}'),
+                "{line:?}"
+            );
+            assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_proxy_parameter_is_always_marked_a_placeholder() {
+        assert_eq!(
+            param_line("PROXY", "localhost:1"),
+            "; -D PROXY=localhost:1  (placeholder until the proxy exists)\n"
+        );
+    }
 
     /// The exit code as a number; `ExitCode` has no accessor.
     fn code(code: ExitCode) -> u8 {
@@ -296,6 +379,70 @@ mod tests {
         let ran = run_with(&["explain"], Some(&env));
         assert_eq!(ran.code, 1);
         assert!(ran.err.to_lowercase().contains("project"), "{}", ran.err);
+    }
+
+    #[test]
+    fn profile_prints_a_valid_profile_with_its_parameters_as_comments_and_a_proxy_placeholder() {
+        let (_tree, env) = world();
+        let ran = run_with(&["profile"], Some(&env));
+        assert_eq!(ran.code, 0, "{}", ran.err);
+        assert_eq!(ran.err, "");
+        assert!(ran.out.starts_with("; hb profile"), "{}", ran.out);
+        assert!(
+            ran.out
+                .contains("(version 1)\n(deny default)\n(import \"system.sb\")"),
+            "{}",
+            ran.out
+        );
+        assert!(
+            ran.out
+                .contains("; -D PROXY=localhost:1  (placeholder until the proxy exists)"),
+            "{}",
+            ran.out
+        );
+        assert!(
+            ran.out
+                .contains("(allow network-outbound (remote ip (param \"PROXY\")))")
+        );
+        // The project path is a parameter, never profile text.
+        let (code, params): (Vec<&str>, Vec<&str>) =
+            ran.out.lines().partition(|l| !l.starts_with("; -D "));
+        assert!(
+            params.iter().any(|l| l.contains("/work/proj")),
+            "{params:?}"
+        );
+        assert!(!code.iter().any(|l| l.contains("/work/proj")), "{code:?}");
+    }
+
+    #[test]
+    fn profile_reports_what_the_floor_builder_noticed_so_the_profile_does_not_look_complete() {
+        let (_tree, mut env) = world();
+        env.floor.path_var = Some(std::ffi::OsString::from("relative/bin:/usr/bin"));
+        let ran = run_with(&["profile"], Some(&env));
+        assert_eq!(ran.code, 0, "{}", ran.err);
+        assert!(
+            ran.out
+                .lines()
+                .any(|l| l.starts_with("; warning: PATH entry") && l.contains("relative/bin")),
+            "{}",
+            ran.out.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn profile_outside_a_project_is_code_1_and_prints_nothing_to_stdout() {
+        let (tree, mut env) = world();
+        env.cwd = tree.outside("nowhere");
+        let ran = run_with(&["profile"], Some(&env));
+        assert_eq!(ran.code, 1);
+        assert_eq!(ran.out, "");
+        assert!(ran.err.to_lowercase().contains("project"), "{}", ran.err);
+    }
+
+    #[test]
+    fn profile_help_is_listed() {
+        let ran = run_with(&["--help"], None);
+        assert!(ran.out.contains("profile"), "{}", ran.out);
     }
 
     #[test]

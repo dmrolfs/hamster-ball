@@ -170,8 +170,9 @@ allow          = ["crates.io", "static.crates.io", "index.crates.io"]   # exact 
 loopback_ports = [3030, 3031, 3032, 5432, 9001, 9002]                   # services you started yourself
 
 [env]
-pass = ["TERM", "LANG", "COLORTERM"]            # variable names copied from your shell
-set  = { RUST_BACKTRACE = "1" }
+pass  = ["TERM", "LANG", "COLORTERM"]           # variable names copied from your shell
+set   = { RUST_BACKTRACE = "1" }
+tools = ["node", "git"]                         # programs found on your PATH when hb starts; see 7.2
 
 [tls]
 system_trust = true                             # base default; see 4.5
@@ -185,7 +186,7 @@ containers = []
 command = "uvx"
 args    = ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server"]
 net     = []                                    # hosts needed at run time (none: cache is warm)
-bind_loopback = true
+bind_ports = []                                 # ports it may listen on, 1024-65535, at most 16 (profile-wide, at most 64 distinct in all; see 7.1 step 5)
 ```
 
 ### 4.4 Path handling
@@ -217,9 +218,10 @@ bind_loopback = true
 
 ### 4.5 TLS
 
-- `tls.system_trust` (base default `true`): allows the Mach lookups `com.apple.trustd`,
-  `trustd.agent`, `SecurityServer`, `securityd`, `securityd.xpc`, `SystemConfiguration.configd`,
-  read access to `/Library/Keychains` and `/private/var/db/mds`, and sets `NODE_USE_SYSTEM_CA=1`.
+- `tls.system_trust` (base default `true`): allows the Mach lookups `com.apple.SecurityServer` and
+  `com.apple.SystemConfiguration.configd`, read access to the files `/Library/Keychains/System.keychain` and
+  `System.keychain-db` (never the directory), and sets `NODE_USE_SYSTEM_CA=1` (D62). `trustd` and `trustd.agent` come
+  from `system.sb`.
 - `tls.extra_ca_files`: read access to each file and `NODE_EXTRA_CA_CERTS` set to it
   (several files are concatenated into a per-session bundle).
 - The proxy never decrypts traffic. It tunnels bytes.
@@ -232,6 +234,29 @@ Measured (Node 24 inside the hamster ball, through the proxy):
 | `NODE_USE_SYSTEM_CA=1` | OK | OK | fail |
 | `NODE_EXTRA_CA_CERTS` only | fail | OK | OK |
 | both | OK | OK | OK |
+
+The measured minimum (D62; `history/hb-ghd.2.1_oracle-tls-ports-keychain.md`, then re-checked by hand for Node 24 and `uv`), macOS 15.7.7 only:
+
+| Element | Needed by | Without it |
+|---|---|---|
+| `com.apple.SecurityServer` | Node with `NODE_USE_SYSTEM_CA=1` | Node 24 fails every handshake (`SecItemCopyMatching failed -50`) |
+| read of `System.keychain` | the same | Node 24 fails (`-25300`) |
+| `com.apple.SystemConfiguration.configd` | `uv` and `uvx` (Rust `system-configuration`) | `uv` panics, even with an explicit proxy env |
+| `com.apple.trustd`, `trustd.agent` | curl, git, Node, Go, Rust | in `system.sb` already |
+
+Dropped, because no tested client regressed without them: `securityd`, `securityd.xpc` (also the route to the data-protection
+keychain), the `/private/var/db/mds` read, the whole `/Library/Keychains` directory (it held `apsd.keychain`, 0644, which no client opens)
+and `user-preference-read` for `kCFPreferencesAnyApplication`. Tested clients: curl, git, Node 24/26, Bun, Go, Rust (rustls),
+Python, `uv`, claude, pi and opencode (the last three against a local TLS server only; kiro-cli ignores the CA env vars).
+Not tested: native-tls, Deno, Electron CLIs, a real TLS-inspecting proxy, a system proxy or PAC (`configd` may matter there) and
+macOS versions other than 15.7. A client that needs a dropped item shows up as a denial under `--log-denials` (hb-ghd.2.3b); the fix
+is one more entry in `TLS_SERVICES`. `configd` is kept although it exposes the network configuration store (interface names, SSID text,
+DNS addresses, console user): `uv` needs it.
+
+`NODE_USE_SYSTEM_CA=1` together with `NODE_EXTRA_CA_CERTS` failed to verify a local-CA server in the first M2 analysis. It could not
+be reproduced: both settings worked on Node 24.11, 26.0 and 26.3 under the minimum, in a clean environment. The earlier run most likely did not load
+the extra bundle (an unreadable path prints `Ignoring extra certs` and looks like "system only"). The four-combination handshake test
+(hb-ghd.2.2) still decides. The user keychain domain is not visible inside the ball (the floor denies `~/Library/Keychains`), so a corporate root installed only there is missing. The floor, not `securityd`, is what keeps the user keychain out: see section 6 and `tests/seatbelt_tls.rs`.
 
 These settings add trusted roots only. They work with Zscaler off, because hosts then present
 public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
@@ -262,7 +287,7 @@ was built on, has no `Default`, and config files never see it. Every rule has an
 
 | Effect | Forbids | Seatbelt form (hb-ghd.2.1) |
 |---|---|---|
-| `deny_read_write` | read, write, create, delete, rename | `(deny file-read* file-write* ...)` (`file-read*`, not `file-read-data`: `stat` would leak existence and size) |
+| `deny_read_write` | read, write, create, delete, rename | `(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-write* ...)`. The shorter `file-read*` form leaves `stat` working under the global metadata allow (7.1) |
 | `deny_write` | write, create, delete, rename | `(deny file-write* ...)` |
 | `deny_connect` | `connect()` to a unix socket | `(deny network-outbound (remote unix-socket (subpath ...)))` |
 | `pin_unlink` | unlink or rename of the node itself | `(deny file-write-unlink (literal ...))` |
@@ -279,6 +304,11 @@ asserts none starts with `/System/Volumes/Data`). A path that does not exist yet
 **Read and write denied** (credentials, history, browsers, containers, `hb` itself):
 
 - `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/gh`, `~/.docker`, `~/.kube`, `~/Library/Keychains`
+  (measured with a throwaway keychain, D62: every client fails to read a secret while the floor is on, because the Security framework opens
+  the file itself; `securityd` does **not** check the client's sandbox. A process that already held an open, unlocked keychain handle
+  before the sandbox was applied keeps reading through it, and a descriptor inherited from before the sandbox is readable. `hb` spawns the agent inside
+  the sandbox with no such handle, so neither case arises; any path that gives the agent an unsandboxed reader of the file would defeat the floor. The
+  data-protection keychain was not exercised.)
 - More credential stores: `~/.git-credentials`, `~/.cargo/credentials*`, `~/.npmrc`, `~/.pypirc`, `~/.pgpass`,
   `~/.vault-token`, `~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.config/{op,rclone,gcloud,doctl,hub,glab-cli}`,
   `~/.azure`, `~/.oci`, and the 1Password data and group-container directories
@@ -361,40 +391,102 @@ Notes:
 
 ### 7.1 Seatbelt profile
 
-`hb` generates a profile and runs `sandbox-exec -p <profile> -D name=value ... -- <command>`.
+`hb` generates a profile and runs `sandbox-exec -p <profile> -D name=value ... -- <command>`. All config-derived
+text (paths, regexes, ports) reaches the profile only as `(param "...")` values; the profile text itself contains no
+config-derived string (D52). The generator is a pure function of `(Policy, RenderInputs)` that builds a typed rule list,
+checks it (`check.rs`), then emits text (`emit.rs`).
 
-Rule order matters and is verified: **later rules override earlier ones** (a template re-allow
-placed after a deny reopened the file; placed before, it did not). Generated order:
+**Rule precedence** (measured, D51). Seatbelt resolves the most specific *operation* first; rule order only decides
+between rules at the same operation level. A later `(deny file-read* X)` does **not** override an earlier
+`(allow file-read-metadata)`: `stat`, `ls -ld`, `test -e` and `readlink` still work on X. Floor and guard denies
+therefore name the operations explicitly. Order still matters inside one level (a template re-allow placed after a deny
+reopened the file; placed before, it did not). Generated order:
 
-1. `(deny default)`, `(import "system.hb")`, process exec and fork, `sysctl-read`, `ipc-posix-shm`
-2. Metadata read for all paths (names only, never contents), plus literal directory reads of
-   `/`, `/private`, `/Users`, `$HOME`, `~/.cache`, `~/.config` and the per-user temp directory's parent
-   (Bun and Node list ancestors while resolving modules; measured)
-3. Allow reads and writes from the merged config, system directories read-only
-4. TLS Mach services and keychain reads (section 4.5)
-5. Network: outbound only to `localhost:<proxy-port>`, plus each `loopback_ports` entry;
-   `network-bind` and inbound on loopback only for MCP servers that opt in
-6. Secrets guard denies (section 8)
-7. Template re-allow (`*.example`, `*.sample`, `*.template`)
-8. Floor (all four effects, 6), pins and `deny_*` rules last, so nothing re-allows them. Read denies use `file-read*`
+1. `(version 1)` (version 3 breaks exec), `(deny default (with message "hb-<token>"))`, `(import "system.sb")` (`system.hb`
+   does not exist; the file is `system.sb`), `process-exec`, `process-fork`, `(allow signal (target same-sandbox))`,
+   `ipc-posix-shm`, `ipc-posix-sem`. `sysctl-read` is already in `system.sb`. No `hid-control`, ever: it is the
+   operation that gates `TIOCSTI` keystroke injection (D54).
+2. Metadata for all paths: `(allow file-read-metadata)`. This is more than names: existence, size, mode, owner, times and a
+   symlink's target text are visible for every path, including floor paths. Contents, directory listings and xattr
+   values are not. Plus `(allow file-read-data (path-ancestors ...))` for each grant (Bun and Node list ancestors while
+   resolving modules; a floor-denied ancestor is not listed).
+3. Allow reads and writes from the merged config, with wildcard operations only. System read-only directories: `/usr`,
+   `/bin`, `/sbin`, `/private/etc`, `/private/var/select` (`/bin/sh` is a select symlink), `/Library/Developer/CommandLineTools`
+   (git, clang). Not `/Library` whole: it contains `/Library/Keychains`, which section 4.5 gates. Device nodes: `/dev/fd/N`,
+   `/dev/stdin`, `/dev/stdout`, `/dev/stderr`.
+4. TLS Mach services and keychain reads (section 4.5), as typed rules in the first renderer cut.
+5. Network: outbound only to `(remote ip (param "PROXY"))`, plus each `loopback_ports` entry. Never `localhost:*`
+   (a wildcard allowed other loopback ports). The port is a parameter, so the text does not depend on it.
+   `network-bind` and `network-inbound` are allowed only for the ports a config lists in `mcp.<name>.bind_ports`, one
+   `localhost:<port>` rule each (D58). A bind port must be 1024-65535 (macOS lets any user bind a port below 1024 on the wildcard
+   address, measured; `localhost:80` matches that bind), at most 16 per server and 64 distinct in all (D62). The cap is exposure,
+   not cost: each parameterised port adds compile time (about 0.1 s at 64 ports, 0.3 s at 256), Seatbelt refuses a profile somewhere
+   above 3000, and no real server asked for more than two. Measured: both are needed (bind alone fails), a wrong port is denied, there is no
+   range syntax, and port 0 needs the wildcard `localhost:*`, which is never emitted. Two limits to state plainly: the rule
+   is profile-wide, because the agent spawns its MCP servers and every process shares one profile; and it does **not**
+   confine the listener to loopback: a server that bound `0.0.0.0` on an allowed port was reachable from the machine's LAN
+   address. `hb explain` and the approval summary list every bind port with that caveat.
+6. Secrets guard denies (section 8): `file-read-data file-read-xattr` plus the write class, so file names stay visible.
+7. Template re-allow (`*.example`, `*.sample`, `*.template`), naming the same operations the guard deny names (a wildcard `file-read*` allow cannot reopen a specific-operation deny; measured).
+8. Floor (all four effects, 6), pins and `deny_*` rules last, so nothing re-allows them. Read-class denies list the full
+   read set: `file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable`, plus `file-write*`
+   (`file-map-executable` is a child of `file-read-data`; naming it closes mapping a denied file as code through a descriptor
+   opened before the sandbox, D62).
+
+Invariants checked on the typed rule list before any text is written (`check.rs`): sections are non-decreasing; each section
+allows or denies, not both (the guard, policy-deny, floor and pin sections only deny); no allow of `file-write-unlink` or any
+specific write operation (it would override a `file-write*` deny regardless of order); a deny never uses `file-read*`, and a
+floor or policy deny that names reads names all five and `file-write*` (the guard may name a subset so file names stay visible,
+but must name the write class); a specific read allow appears only in the metadata section and the template re-allow;
+every `network-outbound` allow is a `remote ip (param)` or a unix-socket path-literal; `mach-lookup`, `file-ioctl` and the
+network operations are never allowed unfiltered or with another operation's filter; each filter carries the parameter kind that
+belongs to it; every param is non-empty and absolute (endpoints are `localhost:<port>`, port 1-65535; a bind port 1024-65535); static text contains no
+quote, backslash or control character. `hid-control` and `appleevent-send` are not representable at all. Whether "no specific
+operation allow can match a floor path" holds is a consequence of these, since every deny names its operations explicitly and
+comes after every allow. A render budget warns at 600 filters and errors at about 1500 (compile time follows the filter count and
+is roughly quadratic: 0.06 s at 131, 1.5 s at 600, 36 s at 4096).
 
 ### 7.2 Environment
 
-The child starts with an empty environment (`env -i` semantics). `hb` sets `HOME` (real), `PATH`
-(system directories plus the agent's own directory), `TERM`, proxy variables, TLS variables, and
-the names in `[env] pass` / values in `[env] set`. Measured gap in the old `sb`: it inherited
-every token in the parent shell. Static AWS keys are never passed (section 11).
+The child starts with an empty environment (`env -i` semantics). `hb` sets `HOME` (real), `TMPDIR` (the session directory),
+`PATH`, `TERM`, proxy variables, TLS variables, and the names in `[env] pass` / values in `[env] set`. Measured gap in the
+old `sb`: it inherited every token in the parent shell. Static AWS keys are never passed (section 11).
+
+**`PATH`** (D59) is the fixed system directories `/usr/bin:/bin:/usr/sbin:/sbin`, then the directory of each program named in
+`[env] tools`. `hb` resolves each name against the invoking shell's `PATH` when it starts, canonicalizes the directory, adds it
+to the child's `PATH` and grants it read (a script on `PATH` needs the read; a binary does not). A name that is not found is a
+warning, like a skipped allow. This is how `pi` and `npx` (`#!/usr/bin/env node`) find node under nvm, whose directory changes
+with the version; an agent binary launched by absolute path needs nothing. A project that steers your `PATH` only changes which
+program runs inside the sandbox. `hb explain` shows each resolved directory.
+
+**Reserved names** (D59): `[env] pass` and `[env] set` cannot name `HOME`, `PATH`, `TMPDIR`, `TERM`, the proxy and TLS variables,
+`HB_*`, `DYLD_*` or `LD_*`. The error names the file. `set` wins over `pass`. `TERM` is the parent's when stdin is a tty, else
+`dumb`.
+
+**Exit status** (D60). `hb run` returns the child's exit code. If the child died of a signal, `hb` cleans up (session directory,
+terminal) and then re-raises that signal on itself for INT, TERM, HUP and KILL, so a calling shell sees a signalled child and a
+script aborts on Ctrl-C (measured: with `exit 130` a bash loop kept going; with a re-raise it stopped). Other signals (SEGV, ABRT)
+return `128+n`, so `hb` does not leave core files.
 
 ### 7.3 Terminal
 
-Interactive agents need a terminal. Giving the child your real tty allows keystroke injection
-into your shell after exit. `hb` should allocate a fresh pty for the child and relay I/O.
-**Unverified**; must be tested before release (section 15).
+Measured during the M2 analysis, and to be re-run as the regression probe of hb-ghd.2.4 (D54): `TIOCSTI` injects keystrokes into a controlling tty when run unsandboxed. Under any deny-default profile it
+fails with EPERM, even with `file-ioctl` granted on the real tty. The gate is the `hid-control` operation, which
+`system.sb` does not grant. So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
+whenever stdin is a tty, so `/dev/tty` and re-opens name the child's own slave, `^C` and job control work, and a child that
+changes terminal modes cannot leave your shell raw. The profile grants `file-ioctl` on that one slave only, and must never
+gain `hid-control` (an invariant, checked on the rendered text; the real `TIOCSTI` regression probe is hb-ghd.2.4). The terminal is restored on exit, panic, SIGINT, SIGTERM and SIGHUP. Restoring after a
+SIGKILL of `hb` is impossible by construction; raw mode is therefore entered as late as possible and `reset` is the cure.
+Escape sequences in the child's output still reach your terminal through the relay (UNVERIFIED).
 
 ### 7.4 Nesting
 
-`sandbox-exec` fails when run inside another macOS sandbox (also documented in `omp-supervisor`).
-`hb` detects this and exits with a clear message.
+`sandbox-exec` fails when run inside another macOS sandbox (also documented in `omp-supervisor`): `sandbox-exec: sandbox_apply:
+Operation not permitted`, exit 71, whether the outer profile is deny-default or `(allow default)`. `hb` always runs the
+preflight `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` (about 60 ms) before anything else; exit 71 with that text
+means nested, and `hb` stops with a clear message. An environment marker is used only to say "inside hb" in that message,
+because other sandboxes (Claude Code's, Codex's) leave none. Integration tests skip, not fail, when the preflight reports
+nesting, since agents run `cargo test` inside `hb`.
 
 ## 8. Secrets guard
 
@@ -485,7 +577,7 @@ Measured: each of your MCP servers started inside the hamster ball and answered 
 | Server | Hosts needed on first start | Offline from warm cache |
 |---|---|---|
 | time, fetch (uvx) | `pypi.org`, `files.pythonhosted.org` | yes, `uvx --offline` |
-| serena (uvx from git) | `api.github.com`, `raw.githubusercontent.com`, `oraios-software.de`, `pypi.org` | needs loopback bind (dashboard) |
+| serena (uvx from git) | `api.github.com`, `raw.githubusercontent.com`, `oraios-software.de`, `pypi.org` | its web dashboard binds a loopback port (24282, then upward until one is free; a denied bind makes it scan every port): run it with `--enable-web-dashboard false`, or list `bind_ports` |
 | reddit, ripgrep, browsermap, sequential-thinking (npx) | `registry.npmjs.org` | yes, `npx --offline` |
 | obscura, lean-ctx | none | n/a |
 
@@ -549,7 +641,7 @@ All measured under the deny-default profile with proxy-only network. Home-relati
 | kiro-cli 3.3.0 | `~/.local/bin/kiro-cli` | `~/.kiro`, `~/Library/Application Support/kiro-cli` | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com`, `desktop-release.q.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (Zscaler re-signs `kiro.dev`). |
 | pi 1.5.2 | `~/.pi/agent/bin`, `~/.pi/agent/install`, `~/.nvm/versions/node` | `~/.pi/agent` (whole directory; it creates lock files) | provider gateway (user-specific) | Needs `NODE_EXTRA_CA_CERTS` for the private gateway CA. Default provider is `localhost:18089`. |
 | claude 2.1.296 | `~/.local/share/claude`, `~/.local/bin/claude`, `/private/tmp` | `~/.claude`, `~/.claude.json`, `~/.cache/claude`, `~/.local/state/claude` | Bedrock: `bedrock-runtime`, `bedrock`, `sts` in `us-east-1` | Credentials via host hook (section 11). Uses fixed `/tmp/claude-<uid>`; narrowing `/private/tmp` is open (section 15). Optional hosts seen: `api.anthropic.com`, `downloads.claude.ai` (updater); denied by default. |
-| opencode 1.2.0 | `~/.config/opencode`, `~/.bun/install`, `/opt/homebrew` | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode` | `models.dev`, `opencode.ai` (Zscaler-signed) | Needs `com.apple.securityd.xpc` Mach lookup, `user-preference-read` for `kCFPreferencesAnyApplication`, loopback bind for its in-process server. Not run end to end: no provider is configured on this machine. |
+| opencode 1.2.0 | `~/.config/opencode`, `~/.bun/install`, `/opt/homebrew` | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode` | `models.dev`, `opencode.ai` (Zscaler-signed) | Earlier notes said it needs `com.apple.securityd.xpc` and the `kCFPreferencesAnyApplication` read. The D62 run showed a TLS fetch to a local server works without both (a denial is logged, the call succeeds); an end-to-end run is still missing (no provider is configured on this machine). Loopback bind for its in-process server needs `bind_ports`. |
 | codex, omp | | | | **Not installed here; no preset until tested.** |
 
 Presets are hand-written. Measured: Seatbelt denial logs are incomplete (40 of 40 reported for `sh` and
@@ -590,9 +682,9 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 8. **llm_gateway ledger port**: `justfile` and the running container use 15433; two `psql` probes in
    `just/analytics.just` use 15432. Report to that project; not a change for this repo.
 9. Presets for codex and omp once installed.
-10. **Unverified under the final profile** (hb-ghd.2.1 probes): reaching user keychain items through `securityd` (the Mach
-    lookups in 4.5 stay allowed while the keychain files are denied), AppleEvents (`osascript` driving Terminal) and
-    `launchctl submit`.
+10. **Unverified under the final profile**: AppleEvents (`osascript` driving Terminal) and `launchctl submit` (hb-ghd.2.5).
+    Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
+    open: the data-protection keychain, a real corporate TLS-inspecting proxy, and a system proxy or PAC that might need `configd`.
 11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
 
 ## 16. Test plan
@@ -690,3 +782,15 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D48 | Floor path-resolution errors fail closed with a `FloorError` naming the rule; only `PATH` entries and enclosing repositories degrade to warnings. A `Policy` has no `Default` and `Floor` has no public constructor | owner (recommendation), hb-ghd.1.3 |
 | D49 | `hb explain` ships `--format json` (`schema_version: 1`, typed structs, bidi-escaping formatter), `--show-args`, `--path` and a `grant_shadowed_by_floor` warning; `env.set` values are never shown; `clap` and `serde_json` are dependencies | owner, hb-ghd.1.3 |
 | D50 | The in-project closure files' read-only rule belongs to the floor (hb-ghd.1.3), not to the approval task; `FloorRule` provenance is the `FsDecision::DeniedByFloor` variant, not a `Source::Floor` | owner, hb-ghd.1.3 |
+| D51 | Seatbelt resolves the most specific operation first, so floor and guard denies name their operations explicitly; section 7.1 baseline is `(version 1)` + `system.sb` (not `system.hb`) with the measured additions (`signal same-sandbox`, `ipc-posix-sem`, `/dev/fd` and std nodes, `/private/var/select`, CLT read) and no explicit `sysctl-read`; global `file-read-metadata` is kept and its real leak documented | owner, hb-ghd.2; measured |
+| D52 | The profile text contains no config-derived string; the render is a pure function of `(Policy, RenderInputs)`; `Loaded` is built after the last interactive step instead of "re-resolving at the last moment"; `hb profile` prints a placeholder `PROXY` param (`localhost:1`; this macOS rejects port 0); a render budget replaces the 4096-rule cap | owner, hb-ghd.2 |
+| D53 | Signals, pty and cleanup stay under `unsafe_code = forbid`: nix (`signal`, `term`, `process`, `event`) plus rustix, a hidden `hb __child` re-exec helper that clears the signal mask, kqueue `EVFILT_SIGNAL`, and `FD_CLOEXEC` on the pty master | owner, hb-ghd.2 |
+| D54 | The pty is hygiene and job control; `TIOCSTI` is already blocked by the absence of `hid-control`, which the profile must never gain | owner, hb-ghd.2 |
+| D55 | TLS rules are part of the first renderer cut; 2.2 covers env vars, the CA bundle and a four-combination handshake test | owner, hb-ghd.2 |
+| D56 | Nesting is detected by an always-on preflight probe (exit 71 plus `sandbox_apply: Operation not permitted`) | owner, hb-ghd.2 |
+| D57 | hb-ghd.2.3 is split: 2.3a (environment, session directory, nesting preflight, spawn, `session::run`) and 2.3b (signals, `hb __child` helper, `--log-denials`); epic estimate 16-18 days | owner, hb-ghd.2 |
+| D58 | `mcp.<name>.bind_loopback` (boolean) is replaced by `bind_ports = [..]`: per-port `network-bind` + `network-inbound`, profile-wide, never a wildcard; Seatbelt cannot confine the listener to loopback (measured), so the ports are shown in `explain` and the approval summary; the serena preset disables its dashboard instead | owner, hb-ghd.2 |
+| D59 | `[env] tools = [names]` resolved against the invoking `PATH` adds each directory to the child's `PATH` with a read grant; reserved variable names are rejected at load | owner, hb-ghd.2 |
+| D60 | A signal-killed child makes `hb` clean up and re-raise INT, TERM, HUP or KILL on itself; other signals exit `128+n` | owner, hb-ghd.2; measured with a real Ctrl-C in a pty |
+| D61 | The config's own `deny_read`/`deny_write` entries get unlink pins by the same computation as the floor (`pin_ancestors`); the template re-allow names the guard deny's operations; `render_filtered` exists only under `cfg(test)` or the `test-support` feature, so a release build cannot render a floor-less profile; the `hb ctl` socket allow is a `path-literal` | review of hb-ghd.2.1 |
+| D62 | `system_trust` grants exactly the measured minimum: `SecurityServer` and `configd` lookups, and reads of the `System.keychain` and `System.keychain-db` files (no `trustd`, `securityd`, `securityd.xpc`, `mds`, preference domain or keychain directory); a `BindPort` is 1024-65535, at most 16 per server and 64 distinct in all (`MergeError::TooManyBindPorts`); `file-map-executable` joins the floor's read set; the floor stays the keychain control and `securityd` is documented as not a gate; `hb profile` marks a `-D` value it had to escape as not copy-exact | owner (high-confidence items), oracle `hb-ghd.2.1_oracle-tls-ports-keychain.md` |

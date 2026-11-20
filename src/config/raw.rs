@@ -78,7 +78,7 @@ pub(crate) struct RawMcpServer {
     pub(crate) command: Option<String>,
     pub(crate) args: Vec<String>,
     pub(crate) net: Vec<String>,
-    pub(crate) bind_loopback: Option<bool>,
+    pub(crate) bind_ports: Vec<i64>,
 }
 
 /// `[guard]`.
@@ -265,7 +265,7 @@ mod tests {
              [mcp.serena]\n\
              command = \"uvx\"\n\
              args = [\"start-mcp-server\"]\n\
-             bind_loopback = true\n"
+             bind_ports = [24282]\n"
         ));
         assert_eq!(config.extends, vec!["rust", "git"]);
         assert_eq!(config.fs.write, vec!["."]);

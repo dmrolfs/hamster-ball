@@ -5,7 +5,8 @@
 use snafu::Snafu;
 
 use crate::config::{
-    ConfigTextError, DiscoverError, EntryError, ExtendsError, LoadError, MergeErrors, ResolveErrors,
+    ConfigTextError, DiscoverError, EntryError, ExtendsError, LoadError, MergeErrors, ProjectError,
+    ResolveErrors,
 };
 use crate::explain::ExplainError;
 use crate::policy::{
@@ -13,6 +14,7 @@ use crate::policy::{
     ExtendTargetError, GlobTailError, HostNameError, HostPatternError, McpNameError, PathError,
     PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
+use crate::seatbelt::RenderError;
 use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 
 /// Any error produced by this crate.
@@ -190,11 +192,25 @@ pub enum Error {
         source: MergeErrors,
     },
 
+    /// The project could not be found or loaded.
+    #[snafu(transparent)]
+    Project {
+        /// The underlying error.
+        source: ProjectError,
+    },
+
     /// The config closure could not be loaded.
     #[snafu(transparent)]
     Load {
         /// The underlying error.
         source: LoadError,
+    },
+
+    /// A profile could not be rendered.
+    #[snafu(transparent)]
+    Render {
+        /// The underlying error.
+        source: RenderError,
     },
 
     /// `hb explain` failed.

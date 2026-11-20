@@ -39,4 +39,4 @@ pub use path::{BroadRoot, CanonicalPath, PathError};
 pub use pattern::{
     Coverage, Extent, GlobSegment, GlobTail, GlobTailError, PathPattern, PathPatternError,
 };
-pub use port::{Port, PortError};
+pub use port::{BindPort, Port, PortError};

@@ -1,0 +1,291 @@
+(version 1)
+(deny default)
+(import "system.sb")
+; process
+(allow process-exec)
+(allow process-fork)
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow signal (target same-sandbox))
+; metadata
+(allow file-read-metadata)
+(allow file-read-data (path-ancestors (param "A0")) (path-ancestors (param "A1")))
+; system_read
+(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/private/etc") (subpath "/private/var/select") (subpath "/Library/Developer/CommandLineTools"))
+(allow file-read* file-write* (regex #"^/dev/fd/[0-9]+$") (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr"))
+; grants
+(allow file-read* file-write* (subpath (param "W0")) (subpath (param "W1")))
+; template_allow
+(allow file-read-data file-read-xattr file-write* (literal (param "W2")))
+; policy_deny
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F1")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G0")))
+(deny file-write* (subpath (param "F2")))
+(deny file-write* (regex (param "G1")))
+; floor
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F3")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F4")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F5")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F6")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F7")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F8")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F9")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F10")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F11")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F12")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F13")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F14")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F15")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F16")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F17")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F18")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F19")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F20")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F21")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F22")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F23")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F24")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F25")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F26")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F27")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F28")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F29")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F30")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F31")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F32")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F33")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F34")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F35")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F36")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F37")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F38")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F39")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F40")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F41")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F42")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F43")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F44")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F45")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F46")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F47")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F48")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F49")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F50")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F51")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F52")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F53")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F54")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F55")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F56")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F57")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F58")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F59")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F60")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F61")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G2")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G3")))
+(deny file-write* (subpath (param "F62")))
+(deny file-write* (subpath (param "F63")))
+(deny file-write* (subpath (param "F64")))
+(deny file-write* (subpath (param "F65")))
+(deny file-write* (subpath (param "F66")))
+(deny file-write* (subpath (param "F67")))
+(deny file-write* (subpath (param "F68")))
+(deny file-write* (subpath (param "F69")))
+(deny file-write* (subpath (param "F70")))
+(deny file-write* (subpath (param "F71")))
+(deny file-write* (subpath (param "F72")))
+(deny file-write* (subpath (param "F73")))
+(deny file-write* (subpath (param "F74")))
+(deny file-write* (subpath (param "F75")))
+(deny file-write* (subpath (param "F76")))
+(deny file-write* (subpath (param "F77")))
+(deny file-write* (subpath (param "F78")))
+(deny file-write* (subpath (param "F79")))
+(deny file-write* (subpath (param "F80")))
+(deny file-write* (subpath (param "F81")))
+(deny file-write* (subpath (param "F82")))
+(deny file-write* (subpath (param "F83")))
+(deny file-write* (subpath (param "F84")))
+(deny file-write* (subpath (param "F85")))
+(deny file-write* (subpath (param "F86")))
+(deny file-write* (subpath (param "F87")))
+(deny file-write* (subpath (param "F88")) (literal (param "F89")))
+(deny file-write* (subpath (param "F90")))
+(deny file-write* (literal (param "F91")))
+(deny file-write* (subpath (param "F92")))
+(deny file-write* (subpath (param "F93")))
+(deny file-write* (subpath (param "F94")))
+(deny file-write* (subpath (param "F95")))
+(deny file-write* (subpath (param "F96")))
+(deny file-write* (subpath (param "F97")))
+(deny file-write* (subpath (param "F98")))
+(deny file-write* (subpath (param "F99")))
+(deny file-write* (subpath (param "F100")))
+(deny file-write* (subpath (param "F101")))
+(deny file-write* (regex (param "G4")))
+(deny file-write* (regex (param "G5")))
+(deny file-write* (regex (param "G6")))
+(deny file-write* (regex (param "G7")))
+(deny file-write* (regex (param "G8")))
+(deny file-write* (regex (param "G9")))
+(deny file-write* (regex (param "G10")))
+(deny file-write* (regex (param "G11")))
+(deny file-write* (regex (param "G12")))
+(deny file-write* (regex (param "G13")))
+(deny network-outbound (remote unix-socket (subpath (param "K0"))))
+(deny network-outbound (remote unix-socket (subpath (param "K1"))))
+(deny network-outbound (remote unix-socket (subpath (param "K2"))))
+(deny network-outbound (remote unix-socket (subpath (param "K3"))))
+(deny network-outbound (remote unix-socket (subpath (param "K4"))))
+(deny network-outbound (remote unix-socket (subpath (param "K5"))))
+(deny network-outbound (remote unix-socket (subpath (param "K6"))))
+(deny network-outbound (remote unix-socket (subpath (param "K7"))))
+; pins
+(deny file-write-unlink (literal (param "F102")))
+(deny file-write-unlink (literal (param "F103")))
+(deny file-write-unlink (literal (param "F104")))
+(deny file-write-unlink (literal (param "F105")))
+(deny file-write-unlink (literal (param "F106")))
+(deny file-write-unlink (literal (param "F107")))
+(deny file-write-unlink (literal (param "F108")))
+
+;; parameters
+;; A0=<FIX>/home/Library
+;; A1=<FIX>/home/work/proj
+;; W0=<FIX>/home/Library
+;; W1=<FIX>/home/work/proj
+;; W2=<FIX>/home/work/proj/.env.example
+;; F0=<FIX>/home/.config/gh
+;; F1=<FIX>/home/work/proj/.env
+;; G0=^<FIX>/home/work/proj/secrets/[^/]*\.yaml(/.*)?$
+;; F2=<FIX>/home/work/proj/vendor
+;; G1=^<FIX>/home/work/proj(/[^/]+)*/[^/]*\.lock(/.*)?$
+;; F3=<FIX>/home/.aws
+;; F4=<FIX>/home/.azure
+;; F5=<FIX>/home/.config/atuin
+;; F6=<FIX>/home/.config/containers
+;; F7=<FIX>/home/.config/doctl
+;; F8=<FIX>/home/.config/gcloud
+;; F9=<FIX>/home/.config/glab-cli
+;; F10=<FIX>/home/.config/hamster-ball
+;; F11=<FIX>/home/.config/hub
+;; F12=<FIX>/home/.config/op
+;; F13=<FIX>/home/.config/rclone
+;; F14=<FIX>/home/.docker
+;; F15=<FIX>/home/.gem/credentials
+;; F16=<FIX>/home/.git-credentials
+;; F17=<FIX>/home/.gnupg
+;; F18=<FIX>/home/.kube
+;; F19=<FIX>/home/.local/share/atuin
+;; F20=<FIX>/home/.local/share/containers
+;; F21=<FIX>/home/.local/state/hamster-ball
+;; F22=<FIX>/home/.netrc
+;; F23=<FIX>/home/.npmrc
+;; F24=<FIX>/home/.oci
+;; F25=<FIX>/home/.pgpass
+;; F26=<FIX>/home/.pypirc
+;; F27=<FIX>/home/.ssh
+;; F28=<FIX>/home/.terraform.d/credentials.tfrc.json
+;; F29=<FIX>/home/.vault-token
+;; F30=<FIX>/home/.zsh_sessions
+;; F31=<FIX>/home/Library/Application Support/1Password
+;; F32=<FIX>/home/Library/Application Support/Arc
+;; F33=<FIX>/home/Library/Application Support/BraveSoftware
+;; F34=<FIX>/home/Library/Application Support/Chromium
+;; F35=<FIX>/home/Library/Application Support/Comet
+;; F36=<FIX>/home/Library/Application Support/Firefox
+;; F37=<FIX>/home/Library/Application Support/Google
+;; F38=<FIX>/home/Library/Application Support/Microsoft Edge
+;; F39=<FIX>/home/Library/Application Support/Microsoft Edge Beta
+;; F40=<FIX>/home/Library/Application Support/Microsoft Edge Canary
+;; F41=<FIX>/home/Library/Application Support/Microsoft Edge Dev
+;; F42=<FIX>/home/Library/Application Support/Mozilla
+;; F43=<FIX>/home/Library/Application Support/TorBrowser-Data
+;; F44=<FIX>/home/Library/Application Support/Vivaldi
+;; F45=<FIX>/home/Library/Application Support/Vivaldi Snapshot
+;; F46=<FIX>/home/Library/Application Support/com.operasoftware.Opera
+;; F47=<FIX>/home/Library/Application Support/zen
+;; F48=<FIX>/home/Library/Caches/Arc
+;; F49=<FIX>/home/Library/Caches/Firefox
+;; F50=<FIX>/home/Library/Caches/Google
+;; F51=<FIX>/home/Library/Caches/Mozilla
+;; F52=<FIX>/home/Library/Caches/com.apple.Safari
+;; F53=<FIX>/home/Library/Caches/company.thebrowser.Browser
+;; F54=<FIX>/home/Library/Containers/com.apple.Safari
+;; F55=<FIX>/home/Library/Cookies
+;; F56=<FIX>/home/Library/Group Containers/2BUA8C4S2C.com.1password
+;; F57=<FIX>/home/Library/Group Containers/group.com.apple.Safari.SandboxBroker
+;; F58=<FIX>/home/Library/HTTPStorages
+;; F59=<FIX>/home/Library/Keychains
+;; F60=<FIX>/home/Library/Safari
+;; F61=<FIX>/home/Library/WebKit
+;; G2=^<FIX>/home/\.[^/]*_history(/.*)?$
+;; G3=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
+;; F62=<FIX>/bin
+;; F63=<FIX>/home/.bash_login
+;; F64=<FIX>/home/.bash_logout
+;; F65=<FIX>/home/.bash_profile
+;; F66=<FIX>/home/.bashrc
+;; F67=<FIX>/home/.bun/bin
+;; F68=<FIX>/home/.cargo/bin
+;; F69=<FIX>/home/.cargo/config
+;; F70=<FIX>/home/.cargo/config.toml
+;; F71=<FIX>/home/.cargo/env
+;; F72=<FIX>/home/.config/fish
+;; F73=<FIX>/home/.config/git
+;; F74=<FIX>/home/.config/pip
+;; F75=<FIX>/home/.config/uv
+;; F76=<FIX>/home/.gitconfig
+;; F77=<FIX>/home/.local/bin
+;; F78=<FIX>/home/.m2/settings.xml
+;; F79=<FIX>/home/.profile
+;; F80=<FIX>/home/.terraformrc
+;; F81=<FIX>/home/.yarnrc
+;; F82=<FIX>/home/.yarnrc.yml
+;; F83=<FIX>/home/.zlogin
+;; F84=<FIX>/home/.zlogout
+;; F85=<FIX>/home/.zprofile
+;; F86=<FIX>/home/.zshenv
+;; F87=<FIX>/home/.zshrc
+;; F88=<FIX>/home/dotfiles/LaunchAgents
+;; F89=<FIX>/home/Library/LaunchAgents
+;; F90=<FIX>/home/go/bin
+;; F91=<FIX>/home/work/proj/.git
+;; F92=<FIX>/home/work/proj/hamster-ball.toml
+;; F93=<FIX>/install/hb
+;; F94=<FIX>/main/.git/commondir
+;; F95=<FIX>/main/.git/config
+;; F96=<FIX>/main/.git/config.worktree
+;; F97=<FIX>/main/.git/hooks
+;; F98=<FIX>/main/.git/worktrees/wt/commondir
+;; F99=<FIX>/main/.git/worktrees/wt/config
+;; F100=<FIX>/main/.git/worktrees/wt/config.worktree
+;; F101=<FIX>/main/.git/worktrees/wt/hooks
+;; G4=^<FIX>/main/\.git/modules(/[^/]+)*/commondir(/.*)?$
+;; G5=^<FIX>/main/\.git/modules(/[^/]+)*/config(/.*)?$
+;; G6=^<FIX>/main/\.git/modules(/[^/]+)*/config\.worktree(/.*)?$
+;; G7=^<FIX>/main/\.git/modules(/[^/]+)*/hooks(/.*)?$
+;; G8=^<FIX>/main/\.git/worktrees/[^/]*/config\.worktree(/.*)?$
+;; G9=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/commondir(/.*)?$
+;; G10=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config(/.*)?$
+;; G11=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config\.worktree(/.*)?$
+;; G12=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/hooks(/.*)?$
+;; G13=^<FIX>/main/\.git/worktrees/wt/worktrees/[^/]*/config\.worktree(/.*)?$
+;; K0=<FIX>/home/.colima
+;; K1=<FIX>/home/.docker/run
+;; K2=<FIX>/home/.lima
+;; K3=<FIX>/home/.local/share/containers
+;; K4=<FIX>/home/.orbstack
+;; K5=<FIX>/home/.rd
+;; K6=<FIX>/home/Library/Containers/com.docker.docker
+;; K7=<FIX>/tmp/podman
+;; F102=<FIX>/home/Library
+;; F103=<FIX>/home/Library/Application Support
+;; F104=<FIX>/home/Library/Caches
+;; F105=<FIX>/home/Library/Containers
+;; F106=<FIX>/home/Library/Group Containers
+;; F107=<FIX>/home/work/proj
+;; F108=<FIX>/home/work/proj/secrets

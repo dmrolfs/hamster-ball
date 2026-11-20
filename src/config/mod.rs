@@ -26,6 +26,7 @@ mod discover;
 mod extends;
 mod location;
 mod merge;
+mod project;
 mod raw;
 mod resolve;
 mod text;
@@ -44,6 +45,7 @@ pub use merge::{
     MAX_MERGE_ERRORS, MergeError, MergeErrors, MergedCtl, MergedEnv, MergedFs, MergedNet,
     MergedTls, Policy, merge,
 };
+pub use project::{ProjectError, load_project};
 pub use resolve::{
     Diagnostics, EntryError, Indexed, ResolveContext, ResolveErrors, Resolved, ResolvedConfig,
     ResolvedCtl, ResolvedEnv, ResolvedFs, ResolvedGuard, ResolvedMcpServer, ResolvedNet,

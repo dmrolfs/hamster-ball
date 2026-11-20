@@ -62,7 +62,7 @@ label = "com.docker.compose.project=demo"
 [mcp.serena]
 command = "uvx"
 args = ["--from", "git+https://example.invalid/serena", "start"]
-bind_loopback = true
+bind_ports = [24282]
 "#;
 
 const BUILTINS: StaticPresets<'static> = StaticPresets(&[("rust", RUST)]);

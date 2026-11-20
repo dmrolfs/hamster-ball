@@ -2408,7 +2408,9 @@
       "arg_count": 3,
       "args": null,
       "net": [],
-      "bind_loopback": true,
+      "bind_ports": [
+        24282
+      ],
       "origins": [
         {
           "layer": "project",

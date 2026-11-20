@@ -18,6 +18,11 @@ path = "src/lib.rs"
 name = "hb"
 path = "src/bin/hb.rs"
 
+[features]
+# Test-only entry points (a control profile without part of the floor). Enabled for this
+# package's own tests through the self dev-dependency below; never part of a release build.
+test-support = []
+
 [dependencies]
 clap = { version = "4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 nix = { version = "0.32", default-features = false, features = ["user"] }
@@ -29,6 +34,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 toml = "1.2.1"
 
 [dev-dependencies]
+hamster-ball = { path = ".", features = ["test-support"] }
 claims = "0.8.0"
 idna = "1.1.0"
 pretty_assertions = "1.4.1"

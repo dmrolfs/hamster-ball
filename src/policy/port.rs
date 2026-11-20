@@ -5,7 +5,7 @@
 use std::fmt;
 use std::num::NonZeroU16;
 
-use snafu::{OptionExt, Snafu};
+use snafu::{OptionExt, Snafu, ensure};
 
 /// Why an integer is not a valid port.
 #[derive(Debug, Snafu)]
@@ -14,6 +14,14 @@ pub enum PortError {
     /// The value is outside 1..=65535.
     #[snafu(display("port {value} is out of range; ports are 1 to 65535"))]
     OutOfRange {
+        /// The rejected value.
+        value: i64,
+    },
+    /// The value is below 1024, which an unprivileged process may bind on every interface.
+    #[snafu(display(
+        "port {value} is privileged; Seatbelt cannot confine a listener to loopback, and any user can bind a port below 1024 on every interface. Use 1024 or above"
+    ))]
+    Privileged {
         /// The rejected value.
         value: i64,
     },
@@ -55,6 +63,56 @@ impl fmt::Display for Port {
     }
 }
 
+/// The lowest port a [`BindPort`] may name.
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
+/// A TCP port a server may listen on: 1024 to 65535.
+///
+/// macOS lets any user bind a port below 1024 on the wildcard address, and Seatbelt's
+/// `localhost:<port>` filter matches every local address, so a privileged bind would be a
+/// LAN-visible listener on a well-known port (design 7.1, D58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindPort(Port);
+
+impl BindPort {
+    /// The port number.
+    #[must_use]
+    pub fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// The same port as a plain [`Port`].
+    #[must_use]
+    pub fn port(self) -> Port {
+        self.0
+    }
+}
+
+impl From<BindPort> for Port {
+    fn from(port: BindPort) -> Self {
+        port.0
+    }
+}
+
+impl TryFrom<i64> for BindPort {
+    type Error = PortError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        let port = Port::try_from(value)?;
+        ensure!(
+            port.get() >= FIRST_UNPRIVILEGED_PORT,
+            PrivilegedSnafu { value }
+        );
+        Ok(Self(port))
+    }
+}
+
+impl fmt::Display for BindPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +145,51 @@ mod tests {
             assert_err!(Port::try_from(70000)).to_string(),
             "port 70000 is out of range; ports are 1 to 65535"
         );
+    }
+
+    #[test]
+    fn a_bind_port_accepts_1024_and_above() {
+        assert_eq!(assert_ok!(BindPort::try_from(1024)).get(), 1024);
+        assert_eq!(assert_ok!(BindPort::try_from(65535)).get(), 65535);
+        assert_eq!(assert_ok!(BindPort::try_from(24282)).port().get(), 24282);
+    }
+
+    #[test]
+    fn a_bind_port_rejects_every_privileged_port() {
+        for bad in [1, 22, 80, 443, 1023] {
+            let err = assert_err!(BindPort::try_from(bad), "{bad}");
+            assert!(
+                matches!(err, PortError::Privileged { value } if value == bad),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bind_port_keeps_the_range_errors_of_a_port() {
+        for bad in [0, -1, 65536] {
+            let err = assert_err!(BindPort::try_from(bad), "{bad}");
+            assert!(
+                matches!(err, PortError::OutOfRange { value } if value == bad),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_privileged_error_says_why_and_what_to_do() {
+        assert_eq!(
+            assert_err!(BindPort::try_from(80)).to_string(),
+            "port 80 is privileged; Seatbelt cannot confine a listener to loopback, and any user can \
+             bind a port below 1024 on every interface. Use 1024 or above"
+        );
+    }
+
+    #[test]
+    fn a_bind_port_converts_to_its_port_and_displays_as_a_number() {
+        let bind = assert_ok!(BindPort::try_from(8080));
+        assert_eq!(Port::from(bind), assert_ok!(Port::try_from(8080)));
+        assert_eq!(bind.to_string(), "8080");
     }
 
     #[test]

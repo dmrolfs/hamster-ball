@@ -26,9 +26,9 @@ pub use report::{
 };
 pub use text::render_text;
 
-use crate::config::{DiscoverError, LoadError, LoadRequest, discover, load};
+use crate::config::{ProjectError, load_project};
 use crate::policy::PathError;
-use crate::system::{Environment, PathResolver, UserConfigDir};
+use crate::system::{Environment, PathResolver};
 
 /// How to print the report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,18 +92,11 @@ impl<'a> ExplainRequest<'a> {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum ExplainError {
-    /// No usable project was found from the current directory.
-    #[snafu(display("no usable project here"))]
-    Discover {
+    /// The project could not be found or loaded.
+    #[snafu(display("the project could not be loaded"))]
+    Project {
         /// The underlying error.
-        source: DiscoverError,
-    },
-
-    /// The config could not be loaded.
-    #[snafu(display("the config could not be loaded"))]
-    Load {
-        /// The underlying error.
-        source: LoadError,
+        source: ProjectError,
     },
 
     /// The path given to `--path` could not be resolved.
@@ -127,15 +120,7 @@ pub enum ExplainError {
 /// See [`ExplainError`].
 pub fn explain(request: &ExplainRequest<'_>) -> Result<String, ExplainError> {
     let env = request.env;
-    let discovery = discover(&env.cwd, &env.home).context(DiscoverSnafu)?;
-    let user_config = UserConfigDir::locate(&env.home);
-    let loaded = load(&LoadRequest::new(
-        &env.home,
-        &discovery,
-        &user_config,
-        &env.floor,
-    ))
-    .context(LoadSnafu)?;
+    let (discovery, loaded) = load_project(env).context(ProjectSnafu)?;
 
     let resolved = request
         .path

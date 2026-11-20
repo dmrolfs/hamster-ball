@@ -12,7 +12,7 @@
 //! Whether a path is finally denied is decided by Seatbelt rule order (M2.1); the advisory
 //! query for tests and `explain` is [`Policy::decide`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use snafu::Snafu;
@@ -22,13 +22,19 @@ use super::location::FileLocation;
 use super::resolve::ResolvedMcpServer;
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
-    Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor, GuardException,
-    HostPattern, McpName, PathPattern, Port,
+    Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
+    GuardException, HostPattern, McpName, PathPattern, Port,
 };
 use crate::sys::path_preview;
 
 /// Most merge errors collected before the rest are summarized as truncated.
 pub const MAX_MERGE_ERRORS: usize = 64;
+
+/// The most distinct ports all MCP servers together may listen on.
+///
+/// Every server shares one profile, so each port is a LAN-visible listener the agent may open
+/// (design 7.1, D58). A real server needs one or two.
+pub const MAX_BIND_PORTS_TOTAL: usize = 64;
 
 /// The merged `[fs]` rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -163,6 +169,17 @@ pub enum MergeError {
         /// Where the file is.
         location: FileLocation,
     },
+
+    /// The MCP servers together may listen on more ports than the profile allows.
+    #[snafu(display(
+        "the MCP servers bind {count} distinct ports in total, more than the {max} allowed; remove `bind_ports` entries"
+    ))]
+    TooManyBindPorts {
+        /// The distinct ports across every server.
+        count: usize,
+        /// The limit, `MAX_BIND_PORTS_TOTAL`.
+        max: usize,
+    },
 }
 
 /// The merge errors found, in closure order, capped at [`MAX_MERGE_ERRORS`].
@@ -257,6 +274,7 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
         guard_exceptions: union(files, |c| positions(&c.guard.exceptions)),
         floor,
     };
+    check_bind_port_total(&policy, &mut collected);
     if collected.errors.is_empty() {
         Ok(policy)
     } else {
@@ -264,6 +282,21 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
             errors: collected.errors,
             truncated: collected.truncated,
         })
+    }
+}
+
+/// Records [`MergeError::TooManyBindPorts`] if the servers together bind too many distinct ports.
+fn check_bind_port_total(policy: &Policy, collected: &mut Collected) {
+    let distinct: BTreeSet<BindPort> = policy
+        .mcp
+        .values()
+        .flat_map(|server| server.value.bind_ports.iter().copied())
+        .collect();
+    if distinct.len() > MAX_BIND_PORTS_TOTAL {
+        collected.push(MergeError::TooManyBindPorts {
+            count: distinct.len(),
+            max: MAX_BIND_PORTS_TOTAL,
+        });
     }
 }
 
@@ -446,8 +479,8 @@ mod tests {
     use crate::config::{Indexed, ResolvedConfig, ResolvedMcpServer};
     use crate::origin::{FileId, Layer, Source};
     use crate::policy::{
-        ArgWord, Argv, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, GlobTail,
-        GuardException, HostPattern, McpName, PathPattern, Port, PresetName,
+        ArgWord, Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue,
+        GlobTail, GuardException, HostPattern, McpName, PathPattern, Port, PresetName,
     };
     use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
@@ -756,7 +789,7 @@ mod tests {
             server("npx", &["a"]),
             server("uvx", &["b"]),
             ResolvedMcpServer {
-                bind_loopback: Some(false),
+                bind_ports: vec![assert_ok!(BindPort::try_from(24282))],
                 ..server("uvx", &["a"])
             },
             ResolvedMcpServer {
@@ -784,6 +817,70 @@ mod tests {
             project(with_mcp("other", server("npx", &[]))),
         ]);
         assert_eq!(policy.mcp.len(), 2);
+    }
+
+    fn binding(first: i64, count: i64) -> ResolvedMcpServer {
+        ResolvedMcpServer {
+            bind_ports: (first..first + count)
+                .map(|p| assert_ok!(BindPort::try_from(p)))
+                .collect(),
+            ..ResolvedMcpServer::default()
+        }
+    }
+
+    fn with_servers(servers: Vec<(&str, ResolvedMcpServer)>) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        for (name, server) in servers {
+            config.mcp.insert(assert_ok!(McpName::parse(name)), server);
+        }
+        config
+    }
+
+    #[test]
+    fn the_profile_wide_bind_port_total_may_reach_the_maximum() {
+        let config = with_servers(
+            ["a", "b", "c", "d"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (*name, binding(20_000 + 16 * i as i64, 16)))
+                .collect(),
+        );
+        assert_eq!(MAX_BIND_PORTS_TOTAL, 64);
+        let _ = merged(vec![project(config)]);
+    }
+
+    #[test]
+    fn one_distinct_bind_port_over_the_total_is_an_error_naming_the_limit() {
+        let config = with_servers(vec![
+            ("a", binding(20_000, 16)),
+            ("b", binding(20_100, 16)),
+            ("c", binding(20_200, 16)),
+            ("d", binding(20_300, 16)),
+            ("e", binding(20_400, 1)),
+        ]);
+        let errors = assert_err!(merge(&closure(vec![project(config)]), Floor::empty()));
+        assert_eq!(errors.errors.len(), 1);
+        assert!(matches!(
+            errors.errors[0],
+            MergeError::TooManyBindPorts { count: 65, max: 64 }
+        ));
+        let message = errors.errors[0].to_string();
+        assert!(
+            message.contains("65") && message.contains("64"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_port_shared_by_two_servers_counts_once_toward_the_total() {
+        let config = with_servers(vec![
+            ("a", binding(20_000, 16)),
+            ("b", binding(20_100, 16)),
+            ("c", binding(20_200, 16)),
+            ("d", binding(20_300, 16)),
+            ("e", binding(20_000, 16)),
+        ]);
+        let _ = merged(vec![project(config)]);
     }
 
     // ====================================================================================

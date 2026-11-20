@@ -30,7 +30,7 @@ use strum::IntoStaticStr;
 
 use super::resolver::{DenyResolution, PathResolver};
 use crate::policy::floor::{
-    GIT_DIR_TAILS, PATH_DIR as REASON_PATH, TABLE, TableRule, USER_TEMP_PODMAN,
+    GIT_DIR_TAILS, PATH_DIR as REASON_PATH, TABLE, TableRule, USER_TEMP_PODMAN, pin_ancestors,
 };
 use crate::policy::{
     CanonicalPath, Extent, Floor, FloorEffect, FloorGroup, FloorRule, FloorTooLarge, GitdirError,
@@ -1035,30 +1035,8 @@ impl<'a> Builder<'a> {
             .iter()
             .filter(|rule| rule.effect.protects_writes())
         {
-            let bases = std::iter::once(&rule.pattern.base).chain(rule.pattern.alias.as_ref());
-            for base in bases {
-                // A glob rule, and a children-only rule, leave their base unprotected, so the
-                // base needs a pin too.
-                let skip =
-                    usize::from(rule.pattern.tail.is_none() && rule.extent != Extent::Children);
-                for ancestor in base.as_path().ancestors().skip(skip) {
-                    if ancestor == Path::new("/") {
-                        continue;
-                    }
-                    let Some(text) = ancestor.to_str() else {
-                        continue;
-                    };
-                    let Ok(path) = CanonicalPath::from_canonical(ancestor) else {
-                        continue;
-                    };
-                    if self
-                        .writable
-                        .iter()
-                        .any(|grant| grant.is_same_or_ancestor_of(&path))
-                    {
-                        pins.insert(text.to_owned());
-                    }
-                }
+            for pin in pin_ancestors(&rule.pattern, rule.extent, &self.writable) {
+                pins.insert(pin.as_str().to_owned());
             }
         }
         for text in pins {

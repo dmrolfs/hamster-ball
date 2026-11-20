@@ -551,6 +551,46 @@ pub(crate) const TABLE: &[TableRule] = &[
 ];
 
 // ======================================================================================
+// Pins
+// ======================================================================================
+
+/// The directories to unlink-pin so `pattern` (at `extent`) cannot be moved aside.
+///
+/// Denying a path does not stop renaming one of its ancestors: `mv secrets secrets-old` moves a
+/// denied file somewhere no rule covers. So every ancestor of the protected path that a writable
+/// root reaches needs a pin. A glob rule, and a children-only rule, leave their own base
+/// unprotected, so the base is pinned too; a plain subtree or node rule already protects its own
+/// node. The symlink alias gets the same treatment. `/` is never pinned.
+///
+/// The floor builder and the renderer's user denies both use this, so they cannot diverge.
+pub(crate) fn pin_ancestors(
+    pattern: &PathPattern,
+    extent: Extent,
+    writable: &[&CanonicalPath],
+) -> Vec<CanonicalPath> {
+    let skip = usize::from(pattern.tail.is_none() && extent != Extent::Children);
+    let bases = std::iter::once(&pattern.base).chain(pattern.alias.as_ref());
+    let mut pins = Vec::new();
+    for base in bases {
+        for ancestor in base.as_path().ancestors().skip(skip) {
+            if ancestor == std::path::Path::new("/") {
+                continue;
+            }
+            let Ok(path) = CanonicalPath::from_canonical(ancestor) else {
+                continue;
+            };
+            if writable
+                .iter()
+                .any(|root| root.is_same_or_ancestor_of(&path))
+            {
+                pins.push(path);
+            }
+        }
+    }
+    pins
+}
+
+// ======================================================================================
 // PATH
 // ======================================================================================
 
@@ -1205,6 +1245,80 @@ mod tests {
         assert_eq!(effect("npmrc"), Some(FloorEffect::DenyReadWrite));
         assert_eq!(effect("zshrc"), Some(FloorEffect::DenyWrite));
         assert_eq!(effect("gitconfig"), Some(FloorEffect::DenyWrite));
+    }
+
+    // ----- pin_ancestors -----
+
+    fn pattern_at(base: &str) -> PathPattern {
+        PathPattern {
+            base: cp(base),
+            alias: None,
+            tail: None,
+        }
+    }
+
+    fn pin_texts(pattern: &PathPattern, extent: Extent, roots: &[&str]) -> Vec<String> {
+        let roots: Vec<CanonicalPath> = roots.iter().map(|r| cp(r)).collect();
+        let refs: Vec<&CanonicalPath> = roots.iter().collect();
+        pin_ancestors(pattern, extent, &refs)
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_subtree_rule_pins_its_ancestors_inside_a_writable_root_but_not_itself_or_the_root_above() {
+        let pins = pin_texts(
+            &pattern_at("/Users/me/p/a/b"),
+            Extent::Subtree,
+            &["/Users/me/p"],
+        );
+        assert_eq!(pins, ["/Users/me/p/a", "/Users/me/p"]);
+    }
+
+    #[test]
+    fn nothing_is_pinned_when_no_writable_root_reaches_the_path() {
+        assert!(
+            pin_texts(
+                &pattern_at("/Users/me/p/a"),
+                Extent::Subtree,
+                &["/Users/me/other"]
+            )
+            .is_empty()
+        );
+        assert!(pin_texts(&pattern_at("/Users/me/p/a"), Extent::Subtree, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_glob_or_children_rule_also_pins_its_own_base() {
+        let glob = PathPattern {
+            tail: Some(assert_ok!(GlobTail::parse(&["*.yaml"]))),
+            ..pattern_at("/Users/me/p/secrets")
+        };
+        assert_eq!(
+            pin_texts(&glob, Extent::Subtree, &["/Users/me/p"]),
+            ["/Users/me/p/secrets", "/Users/me/p"]
+        );
+        assert_eq!(
+            pin_texts(
+                &pattern_at("/Users/me/p/bin"),
+                Extent::Children,
+                &["/Users/me/p"]
+            ),
+            ["/Users/me/p/bin", "/Users/me/p"]
+        );
+    }
+
+    #[test]
+    fn a_symlink_alias_is_pinned_like_the_base_and_the_filesystem_root_never() {
+        let aliased = PathPattern {
+            alias: Some(cp("/Users/me/p/link")),
+            ..pattern_at("/Users/me/p/real/target")
+        };
+        let pins = pin_texts(&aliased, Extent::Subtree, &["/Users/me/p"]);
+        assert!(pins.contains(&"/Users/me/p/real".to_owned()), "{pins:?}");
+        assert!(pins.contains(&"/Users/me/p".to_owned()));
+        assert!(!pin_texts(&pattern_at("/a"), Extent::Subtree, &["/"]).contains(&"/".to_owned()));
     }
 
     // ----- PATH -----

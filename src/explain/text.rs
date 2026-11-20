@@ -274,9 +274,14 @@ fn mcp_line(server: &McpRow, t: &Tilde<'_>) -> String {
                 .join(", ")
         )
     };
-    let bind = match server.bind_loopback {
-        Some(true) => "  binds loopback",
-        _ => "",
+    let bind = if server.bind_ports.is_empty() {
+        String::new()
+    } else {
+        let ports: Vec<String> = server.bind_ports.iter().map(ToString::to_string).collect();
+        format!(
+            "  may listen on {} (profile-wide, not loopback-only)",
+            ports.join(", ")
+        )
     };
     format!(
         "{}: {} {args}{net}{bind}  {}",

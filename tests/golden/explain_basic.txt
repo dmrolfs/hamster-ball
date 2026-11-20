@@ -141,7 +141,7 @@ ctl
   label = com.docker.compose.project=demo  <- [2] ctl.label
 
 mcp
-  serena: uvx 3 args hidden  binds loopback  <- [2] mcp.serena
+  serena: uvx 3 args hidden  may listen on 24282 (profile-wide, not loopback-only)  <- [2] mcp.serena
 
 hooks (run on the host, in order)
   notify 2 args hidden  <- [0] hooks[0]

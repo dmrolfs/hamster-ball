@@ -13,10 +13,11 @@ use snafu::Snafu;
 
 use crate::origin::{KeyPath, Located, Origin};
 use crate::policy::{
-    ArgWord, ArgWordError, Argv, ArgvError, CanonicalPath, ContainerLabel, ContainerLabelError,
-    ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue, EnvValueError, ExtendRef,
-    GuardException, HomeDir, HostPattern, HostPatternError, McpName, McpNameError, PathError,
-    PathPattern, PathPatternError, Port, PortError, ProjectRoot, RefTextError,
+    ArgWord, ArgWordError, Argv, ArgvError, BindPort, CanonicalPath, ContainerLabel,
+    ContainerLabelError, ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue,
+    EnvValueError, ExtendRef, GuardException, HomeDir, HostPattern, HostPatternError, McpName,
+    McpNameError, PathError, PathPattern, PathPatternError, Port, PortError, ProjectRoot,
+    RefTextError,
 };
 use crate::system::{AllowOutcome, PathResolver, SkippedPath};
 use crate::text::EscapedBounded;
@@ -33,6 +34,9 @@ const PARSE_MESSAGE_PREVIEW_CHARS: usize = 200;
 /// entries are resolved, so an oversized list cannot trigger thousands of filesystem or
 /// validation calls.
 const MAX_LIST_ENTRIES: usize = 4096;
+
+/// The most ports one `[mcp.<name>]` server may listen on. Real servers need one or two.
+pub const MAX_BIND_PORTS_PER_SERVER: usize = 16;
 
 /// Most entry errors collected before giving up and reporting [`ResolveErrors::truncated`].
 ///
@@ -320,8 +324,9 @@ pub struct ResolvedMcpServer {
     pub args: Vec<ArgWord>,
     /// Hosts this server needs at run time.
     pub net: Vec<HostPattern>,
-    /// Whether this server may bind a loopback port.
-    pub bind_loopback: Option<bool>,
+    /// Loopback ports this server may listen on. The rule is profile-wide, and Seatbelt cannot
+    /// confine the listener to the loopback interface (design 7.1, D58).
+    pub bind_ports: Vec<BindPort>,
 }
 
 /// `[guard]`.
@@ -457,13 +462,15 @@ impl<'a> Resolution<'a> {
     ///
     /// Called before any entry of the list is touched.
     fn over_cap(&mut self, key: &KeyPath, len: usize) -> bool {
-        if len <= MAX_LIST_ENTRIES {
+        self.over_cap_at(key, len, MAX_LIST_ENTRIES)
+    }
+
+    /// [`Self::over_cap`] with a limit of `max` entries.
+    fn over_cap_at(&mut self, key: &KeyPath, len: usize, max: usize) -> bool {
+        if len <= max {
             return false;
         }
-        let error = EntryError::TooManyEntries {
-            count: len,
-            max: MAX_LIST_ENTRIES,
-        };
+        let error = EntryError::TooManyEntries { count: len, max };
         self.push(key.clone(), error);
         true
     }
@@ -493,12 +500,24 @@ impl<'a> Resolution<'a> {
     }
 
     fn ports(&mut self, key: KeyPath, items: &[i64]) -> Vec<Port> {
-        if self.over_cap(&key, items.len()) {
+        self.port_list(key, items, MAX_LIST_ENTRIES)
+    }
+
+    fn bind_ports(&mut self, key: KeyPath, items: &[i64]) -> Vec<BindPort> {
+        self.port_list(key, items, MAX_BIND_PORTS_PER_SERVER)
+    }
+
+    /// Caps at `max`, then converts each entry, collecting every failure.
+    fn port_list<P>(&mut self, key: KeyPath, items: &[i64], max: usize) -> Vec<P>
+    where
+        P: TryFrom<i64, Error = PortError>,
+    {
+        if self.over_cap_at(&key, items.len(), max) {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            match Port::try_from(*item) {
+            match P::try_from(*item) {
                 Ok(port) => out.push(port),
                 Err(error) => self.push(key.clone().index(index), error),
             }
@@ -617,7 +636,12 @@ impl<'a> Resolution<'a> {
                 &server.args,
                 ArgWord::parse,
             );
-            let net = self.list(entry_key.field("net"), &server.net, HostPattern::parse);
+            let net = self.list(
+                entry_key.clone().field("net"),
+                &server.net,
+                HostPattern::parse,
+            );
+            let bind_ports = self.bind_ports(entry_key.field("bind_ports"), &server.bind_ports);
             if let Some(valid_name) = valid_name {
                 resolved.insert(
                     valid_name,
@@ -625,7 +649,7 @@ impl<'a> Resolution<'a> {
                         command,
                         args,
                         net,
-                        bind_loopback: server.bind_loopback,
+                        bind_ports,
                     },
                 );
             }
@@ -762,7 +786,7 @@ mod tests {
              command = \"uvx\"\n\
              args = [\"--from\", \"git+https://x\", \"serena\"]\n\
              net = [\"pypi.org\"]\n\
-             bind_loopback = true\n",
+             bind_ports = [24282, 24283]\n",
         );
         let config = &resolved.config;
         let extends: Vec<&str> = config.extends.iter().map(ExtendRef::as_str).collect();
@@ -783,7 +807,8 @@ mod tests {
         let args: Vec<&str> = serena.args.iter().map(ArgWord::as_str).collect();
         assert_eq!(args, vec!["--from", "git+https://x", "serena"]);
         assert_eq!(serena.net.len(), 1);
-        assert_eq!(serena.bind_loopback, Some(true));
+        let ports: Vec<u16> = serena.bind_ports.iter().map(|p| p.get()).collect();
+        assert_eq!(ports, vec![24282, 24283]);
         assert_eq!(config.hooks.len(), 2);
         assert_eq!(config.hooks[0].program().as_str(), "echo");
         assert_eq!(config.hooks[0].words()[1].as_str(), "hi there");
@@ -1461,5 +1486,72 @@ mod tests {
             let fx = Fixture::new();
             let _ = resolve_file(&fx.write_config(&doc), &fx.ctx());
         }
+    }
+
+    #[test]
+    fn mcp_bind_ports_reject_out_of_range_and_privileged_values() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[mcp.s]\nbind_ports = [80, 0, 70000, 1023, 1024]\n");
+        let keys: Vec<String> = (0..errors.errors.len())
+            .map(|i| key_of(&errors, i))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "mcp.s.bind_ports[0]",
+                "mcp.s.bind_ports[1]",
+                "mcp.s.bind_ports[2]",
+                "mcp.s.bind_ports[3]"
+            ]
+        );
+        let message = errors.errors[0].value.to_string();
+        assert!(message.contains("privileged"), "{message}");
+    }
+
+    #[test]
+    fn loopback_ports_may_still_be_privileged() {
+        let fx = Fixture::new();
+        let resolved = fx.resolved("[net]\nloopback_ports = [80, 443]\n");
+        assert_eq!(resolved.config.net.loopback_ports.len(), 2);
+    }
+
+    #[test]
+    fn a_server_may_bind_exactly_the_per_server_maximum_of_ports() {
+        let fx = Fixture::new();
+        let ports: Vec<String> = (0..MAX_BIND_PORTS_PER_SERVER)
+            .map(|i| (20_000 + i).to_string())
+            .collect();
+        let resolved = fx.resolved(&format!("[mcp.s]\nbind_ports = [{}]\n", ports.join(", ")));
+        assert_eq!(
+            assert_some!(resolved.config.mcp.get("s")).bind_ports.len(),
+            MAX_BIND_PORTS_PER_SERVER
+        );
+    }
+
+    #[test]
+    fn a_server_over_the_per_server_maximum_is_one_error_naming_the_limit() {
+        let fx = Fixture::new();
+        let ports: Vec<String> = (0..=MAX_BIND_PORTS_PER_SERVER)
+            .map(|i| (20_000 + i).to_string())
+            .collect();
+        let errors = fx.errors(&format!("[mcp.s]\nbind_ports = [{}]\n", ports.join(", ")));
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(key_of(&errors, 0), "mcp.s.bind_ports");
+        let message = errors.errors[0].value.to_string();
+        assert!(
+            message.contains(&format!(
+                "more than the {MAX_BIND_PORTS_PER_SERVER} allowed"
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_old_bind_loopback_boolean_is_an_unknown_field() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[mcp.s]\nbind_loopback = true\n");
+        assert_eq!(errors.errors.len(), 1);
+        let message = errors.errors[0].value.to_string();
+        assert!(message.contains("bind_loopback"), "{message}");
     }
 }

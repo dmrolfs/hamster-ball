@@ -216,8 +216,8 @@ pub struct McpRow {
     pub args: Option<Vec<String>>,
     /// Hosts it needs.
     pub net: Vec<String>,
-    /// Whether it may bind a loopback port.
-    pub bind_loopback: Option<bool>,
+    /// Loopback ports it may listen on. The rule is profile-wide and does not confine the listener to loopback.
+    pub bind_ports: Vec<u16>,
     /// Where it is declared.
     pub origins: Vec<OriginRow>,
 }
@@ -457,7 +457,7 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
                         .collect()
                 }),
                 net: server.value.net.iter().map(ToString::to_string).collect(),
-                bind_loopback: server.value.bind_loopback,
+                bind_ports: server.value.bind_ports.iter().map(|p| p.get()).collect(),
                 origins: b.origins(&server.sources, &format!("mcp.{}", name.as_str())),
             })
             .collect(),
