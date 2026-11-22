@@ -39,6 +39,12 @@ impl LogTag {
         Ok(Self(hex.to_owned()))
     }
 
+    /// A tag made of `bits` as 16 hexadecimal digits. It always satisfies [`LogTag::new`].
+    #[must_use]
+    pub fn from_bits(bits: u64) -> Self {
+        Self(format!("{bits:016x}"))
+    }
+
     /// The tag text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -210,6 +216,16 @@ mod tests {
 
     fn pv(kind: ParamKind, text: &str) -> ParamValue {
         ParamValue::new(kind, text)
+    }
+
+    #[test]
+    fn a_tag_from_bits_is_sixteen_hex_digits_and_passes_the_same_check_as_new() {
+        for bits in [0, 1, 0xdead_beef, u64::MAX] {
+            let tag = LogTag::from_bits(bits);
+            assert_eq!(tag.as_str().len(), 16);
+            assert_eq!(assert_ok!(LogTag::new(tag.as_str())), tag);
+        }
+        assert_eq!(LogTag::from_bits(255).as_str(), "00000000000000ff");
     }
 
     #[test]

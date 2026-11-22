@@ -9,13 +9,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
+use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu, ensure};
 
+use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
+use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
@@ -27,6 +31,27 @@ const ARG_MAX: usize = 1_048_576;
 const ARG_MARGIN: usize = 32 * 1024;
 /// Bytes one pointer takes in the argument block.
 const POINTER_BYTES: usize = 8;
+
+/// How long hb waits after the first signal before it kills the child.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+
+/// What `hb` does about INT, TERM and HUP while the child runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SignalMode {
+    /// Nothing. The caller's signal handling is left alone; the child starts directly under
+    /// `sandbox-exec` and inherits the caller's blocked signals. For the harness and tests.
+    #[default]
+    Off,
+    /// Forward them to the child and escalate to SIGKILL after `grace` or on a second signal.
+    ///
+    /// The three signals must already be blocked in the calling thread (see
+    /// [`block_supervised`](super::signals::block_supervised)). The child starts through `hb __child`, which clears the mask.
+    Forward {
+        /// How long the child may take to end after the first signal.
+        grace: Duration,
+    },
+}
 
 /// What to do with the child's standard streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +80,10 @@ pub struct RunSpec {
     pub stdio: StdioMode,
     /// The pty.
     pub pty: PtyMode,
+    /// What to do about INT, TERM and HUP.
+    pub signals: SignalMode,
+    /// Where denial lines go, or `None` to not log them.
+    pub denials: Option<DenialSink>,
 }
 
 impl RunSpec {
@@ -65,7 +94,23 @@ impl RunSpec {
             argv: argv.into_iter().map(Into::into).collect(),
             stdio: StdioMode::Capture,
             pty: PtyMode::Off,
+            signals: SignalMode::Off,
+            denials: None,
         }
+    }
+
+    /// Logs what the profile denies during this run, to `sink`.
+    #[must_use]
+    pub fn denials(mut self, sink: DenialSink) -> Self {
+        self.denials = Some(sink);
+        self
+    }
+
+    /// Sets what to do about signals.
+    #[must_use]
+    pub fn signals(mut self, signals: SignalMode) -> Self {
+        self.signals = signals;
+        self
     }
 
     /// Sets the standard stream mode.
@@ -116,6 +161,8 @@ pub struct Outcome {
     pub stderr: Vec<u8>,
     /// Things worth telling the user, in order.
     pub warnings: Vec<String>,
+    /// What the profile denied, when [`RunSpec::denials`] was [`DenialSink::Collect`].
+    pub denials: Denials,
 }
 
 /// Why a run could not start.
@@ -212,6 +259,26 @@ pub enum RunError {
         command: usize,
     },
 
+    /// Signal supervision could not be set up.
+    #[snafu(transparent)]
+    Signals {
+        /// The underlying error.
+        source: SignalError,
+    },
+
+    /// The denial log could not be started.
+    #[snafu(transparent)]
+    Denials {
+        /// The underlying error.
+        source: DenialsError,
+    },
+
+    /// The path of the running `hb` is unknown, and the child helper needs it.
+    #[snafu(display(
+        "the path of the running hb is unknown, so the child helper cannot be started"
+    ))]
+    NoHbExe,
+
     /// `sandbox-exec` could not be started.
     #[snafu(display("{SANDBOX_EXEC} could not be started"))]
     Spawn {
@@ -254,9 +321,13 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let session = SessionDir::create(&temp)?;
 
     let tool_dirs = tools.dirs();
-    let inputs = RenderInputs::new()
+    let tag = spec.denials.as_ref().map(|_| generate_tag());
+    let mut inputs = RenderInputs::new()
         .with_session_dir(session.path().clone())
         .with_exec_dirs(tool_dirs.clone());
+    if let Some(tag) = &tag {
+        inputs = inputs.with_log_tag(tag.clone());
+    }
     let profile = render(&loaded.policy, &inputs)?;
     warnings.extend(profile.warnings.iter().map(ToString::to_string));
 
@@ -270,34 +341,43 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         env: &loaded.policy.env,
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
-    check_size(&profile, &child_env, &spec.argv)?;
+    let helper = match spec.signals {
+        SignalMode::Off => None,
+        SignalMode::Forward { .. } => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
+    };
+    let launcher = launcher_words(helper);
+    check_size(&profile, &child_env, &spec.argv, &launcher)?;
+    let watch = match spec.signals {
+        SignalMode::Off => None,
+        SignalMode::Forward { .. } => Some(Watch::prepare()?),
+    };
 
-    let mut command = command_for(&profile, &child_env, spec, &env.cwd);
+    let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper);
     // A child in its own group is a background group to a terminal and cannot read it, so it
     // gets one only when stdin is not a tty (hb-ghd.2.3 decision 1; the pty of 2.4 replaces this).
     if !stdin_is_tty {
         command.process_group(0);
     }
-    let (exit, stdout, stderr) = match spec.stdio {
-        StdioMode::Capture => {
-            let output = command.output().context(SpawnSnafu)?;
-            (
-                ExitKind::from_status(output.status),
-                output.stdout,
-                output.stderr,
-            )
-        }
-        StdioMode::Inherit => {
-            let status = command.status().context(SpawnSnafu)?;
-            (ExitKind::from_status(status), Vec::new(), Vec::new())
-        }
+    if spec.stdio == StdioMode::Capture {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+    // The log is listening before the child starts, so its first denials are not missed.
+    let log = match (&tag, &spec.denials) {
+        (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
+        _ => None,
     };
+    let child = command.spawn().context(SpawnSnafu)?;
+    let supervisor = start_supervisor(child, watch, spec.signals, stdin_is_tty)?;
+    let waited = supervisor.wait_for_exit(spec.stdio);
+    let denials = log.map(LogStream::finish).unwrap_or_default();
+    let (exit, stdout, stderr) = waited?;
     drop(session);
     Ok(Outcome {
         exit,
         stdout,
         stderr,
         warnings,
+        denials,
     })
 }
 
@@ -305,6 +385,76 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
 /// stdin is one. Captured runs close stdin.
 fn stdin_is_tty(stdio: StdioMode, own_stdin_is_terminal: bool) -> bool {
     stdio == StdioMode::Inherit && own_stdin_is_terminal
+}
+
+/// A spawned child, with the signal thread that watches over it if there is one.
+struct Running {
+    child: Child,
+    supervisor: Option<Supervisor>,
+}
+
+/// Starts forwarding signals to `child`, if `watch` was prepared. If that fails the child is
+/// killed and reaped first, so a failed start never leaves an unsupervised agent running.
+fn start_supervisor(
+    mut child: Child,
+    watch: Option<Watch>,
+    mode: SignalMode,
+    stdin_is_tty: bool,
+) -> Result<Running, RunError> {
+    let (Some(watch), SignalMode::Forward { grace }) = (watch, mode) else {
+        return Ok(Running {
+            child,
+            supervisor: None,
+        });
+    };
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+    // The child shares hb's group when stdin is a terminal, so a group signal would hit hb too.
+    let target = if stdin_is_tty {
+        Target::Child(pid)
+    } else {
+        Target::Group(pid)
+    };
+    match watch.start(target, Escalation::new(grace, stdin_is_tty)) {
+        Ok(supervisor) => Ok(Running {
+            child,
+            supervisor: Some(supervisor),
+        }),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error.into())
+        }
+    }
+}
+
+impl Running {
+    /// Waits for the child, then stops the signal thread, and returns how it ended.
+    fn wait_for_exit(self, stdio: StdioMode) -> Result<(ExitKind, Vec<u8>, Vec<u8>), RunError> {
+        let Self { child, supervisor } = self;
+        let result = match stdio {
+            StdioMode::Capture => child
+                .wait_with_output()
+                .map(|o| (ExitKind::from_status(o.status), o.stdout, o.stderr)),
+            StdioMode::Inherit => {
+                let mut child = child;
+                child
+                    .wait()
+                    .map(|status| (ExitKind::from_status(status), Vec::new(), Vec::new()))
+            }
+        };
+        if let Some(supervisor) = supervisor {
+            supervisor.finish();
+        }
+        result.context(SpawnSnafu)
+    }
+}
+
+/// The words that start the command: `sandbox-exec`, or the helper that execs it.
+fn launcher_words(helper: Option<&Path>) -> Vec<OsString> {
+    match helper {
+        None => vec![OsString::from(SANDBOX_EXEC)],
+        Some(hb) => vec![hb.as_os_str().to_owned(), "__child".into(), "--".into()],
+    }
 }
 
 /// The canonical per-user temporary directory, where session directories live.
@@ -320,9 +470,17 @@ fn temp_parent(env: &Environment) -> Result<CanonicalPath, RunError> {
     CanonicalPath::from_canonical(real).context(TempDirPathSnafu)
 }
 
-fn command_for(profile: &Profile, child_env: &ChildEnv, spec: &RunSpec, cwd: &Path) -> Command {
-    let mut command = Command::new(SANDBOX_EXEC);
+fn command_for(
+    profile: &Profile,
+    child_env: &ChildEnv,
+    spec: &RunSpec,
+    cwd: &Path,
+    helper: Option<&Path>,
+) -> Command {
+    let mut words = launcher_words(helper).into_iter();
+    let mut command = Command::new(words.next().unwrap_or_default());
     command
+        .args(words)
         .arg("-p")
         .arg(&profile.text)
         .args(profile.define_args())
@@ -363,12 +521,19 @@ fn exec_bytes<'a>(words: impl IntoIterator<Item = &'a OsStr>) -> usize {
 }
 
 /// Checks the whole `sandbox-exec` command line and the environment against what `exec` accepts.
-fn check_size(profile: &Profile, child_env: &ChildEnv, argv: &[OsString]) -> Result<(), RunError> {
+fn check_size(
+    profile: &Profile,
+    child_env: &ChildEnv,
+    argv: &[OsString],
+    launcher: &[OsString],
+) -> Result<(), RunError> {
     let params = exec_bytes(profile.define_args().iter().map(OsStr::new));
     let profile_bytes = exec_bytes([OsStr::new(&profile.text)]);
     let command = exec_bytes(
-        [OsStr::new(SANDBOX_EXEC), OsStr::new("-p"), OsStr::new("--")]
-            .into_iter()
+        launcher
+            .iter()
+            .map(OsString::as_os_str)
+            .chain([OsStr::new("-p"), OsStr::new("--")])
             .chain(argv.iter().map(OsString::as_os_str)),
     );
     let env = child_env.exec_bytes();
@@ -485,16 +650,26 @@ mod tests {
             params: Vec::new(),
             warnings: Vec::new(),
         };
-        assert_ok!(check_size(&profile, &env, &[OsString::from("ls")]));
+        assert_ok!(check_size(
+            &profile,
+            &env,
+            &[OsString::from("ls")],
+            &launcher()
+        ));
         let big = OsString::from("x".repeat(ARG_MAX));
-        let err = assert_err!(check_size(&profile, &env, &[big]));
+        let err = assert_err!(check_size(&profile, &env, &[big], &launcher()));
         let text = err.to_string();
         assert!(
             text.contains("the limit is") && text.contains("environment"),
             "{text}"
         );
         let just_fits = "x".repeat(ARG_MAX - ARG_MARGIN - 4096);
-        assert_ok!(check_size(&profile, &env, &[OsString::from(just_fits)]));
+        assert_ok!(check_size(
+            &profile,
+            &env,
+            &[OsString::from(just_fits)],
+            &launcher()
+        ));
     }
 
     #[test]
@@ -527,6 +702,10 @@ mod tests {
         assert!(is_executable(&file), "any execute bit counts");
     }
 
+    fn launcher() -> Vec<OsString> {
+        launcher_words(None)
+    }
+
     fn empty_profile() -> Profile {
         Profile {
             text: String::new(),
@@ -549,9 +728,9 @@ mod tests {
         // One command word of `len` bytes adds `len + 1 + POINTER_BYTES`.
         let word_len = max - fixed_bytes(&env) - (1 + POINTER_BYTES);
         let at_limit = [OsString::from("x".repeat(word_len))];
-        assert_ok!(check_size(&empty_profile(), &env, &at_limit));
+        assert_ok!(check_size(&empty_profile(), &env, &at_limit, &launcher()));
         let over = [OsString::from("x".repeat(word_len + 1))];
-        let err = assert_err!(check_size(&empty_profile(), &env, &over));
+        let err = assert_err!(check_size(&empty_profile(), &env, &over, &launcher()));
         assert!(
             matches!(err, RunError::TooLarge { total, max: m, .. } if total == max + 1 && m == max),
             "{err}"

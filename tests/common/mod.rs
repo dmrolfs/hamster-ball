@@ -94,6 +94,34 @@ impl World {
         ))
     }
 
+    /// A command that runs the test-only `hb-testdrive` binary in this world: same code as `hb`,
+    /// but its home, project, tool `PATH` and temp directory come from variables, because the real
+    /// `hb` takes its home from the passwd database (D28) and so cannot load a fixture project.
+    pub fn drive(&self, testdrive: &str, args: &[&str]) -> Command {
+        // A process started from a background job or under `nohup` has INT, QUIT or HUP ignored,
+        // and an ignored signal stays ignored through exec. perl resets them first, so what the
+        // test sees does not depend on how cargo was started; perl then becomes the driver.
+        let mut cmd = Command::new("/usr/bin/perl");
+        cmd.args([
+            "-e",
+            "$SIG{$_}='DEFAULT' for qw(INT QUIT HUP TERM); exec @ARGV or die qq(exec: $!)",
+            testdrive,
+        ])
+        .args(args)
+        .env_clear()
+        .current_dir(&self.project);
+        self.drive_env(&mut cmd);
+        cmd
+    }
+
+    /// Sets the variables `hb-testdrive` reads on `cmd`, for a command that starts it indirectly.
+    pub fn drive_env(&self, cmd: &mut Command) {
+        cmd.env("HB_TD_HOME", self.home_dir())
+            .env("HB_TD_CWD", &self.project)
+            .env("HB_TD_PATH", self.base.join("bin"))
+            .env("HB_TD_TMP", self.base.join("tmp"));
+    }
+
     pub fn render(&self, inputs: &RenderInputs) -> Profile {
         assert_ok!(render(&self.loaded().policy, inputs))
     }

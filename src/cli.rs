@@ -14,16 +14,22 @@
 //! | 78 | reserved for an unapproved config (milestone 4) |
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use nix::sys::signal::{Signal, raise};
 use snafu::Report;
 
 use crate::config::load_project;
 use crate::explain::{ExplainRequest, Format, explain};
 use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
-use crate::session::{self, ExitKind, RunError, RunSpec, SESSION_MARKER, StdioMode, check_nesting};
+use crate::session::signals::{block_supervised, unblock_supervised};
+use crate::session::{
+    self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, RunError, RunSpec, SESSION_MARKER,
+    SignalMode, StdioMode, check_nesting, exec_sandbox_exec,
+};
 use crate::system::{Environment, UserConfigDir};
 use crate::text::Escaped;
 
@@ -50,10 +56,28 @@ enum Command {
     /// The command starts with an empty environment: only HOME, PATH, TMPDIR, TERM and the names
     /// in `[env] pass` and `[env] set` reach it. A program found through `[env] tools` is on its PATH.
     Run(RunArgs),
+    /// Internal: clear the signal mask and exec sandbox-exec. Started by `hb run`, never by hand.
+    #[command(name = "__child", hide = true)]
+    Child(ChildArgs),
+}
+
+#[derive(Debug, Args)]
+struct ChildArgs {
+    /// The arguments for `sandbox-exec`.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
+    /// Show what the sandbox denied during this run.
+    ///
+    /// Redirected stderr gets each denial as it happens; on a terminal they are printed after the
+    /// command ends, so they cannot corrupt an interactive screen. The system log is not complete:
+    /// treat the lines as hints, and put this flag before the command.
+    #[arg(long)]
+    log_denials: bool,
+
     /// The command and its arguments (a `--` before it is optional).
     #[arg(
         required = true,
@@ -103,11 +127,109 @@ impl From<FormatArg> for Format {
 ///
 /// `env` is the environment to use; `None` reads the current process, and only if a command
 /// needs it. Output goes to `out`, errors and usage problems to `err`.
+///
+/// This is the in-process entry point: it never touches the signal mask, so tests and embedders
+/// can call it freely. A child that died of a signal gives `128 + signal`. The `hb` binary uses
+/// [`main`], which takes over INT, TERM and HUP and re-raises (design D60).
 pub fn run<I, T>(
     args: I,
     env: Option<&Environment>,
     out: &mut dyn Write,
     err: &mut dyn Write,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    execute(args, env, out, err, None).code
+}
+
+/// How a command ended: the exit code, and a signal `hb` must now raise on itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CliExit {
+    /// What to exit with when there is no signal to raise.
+    pub code: ExitCode,
+    /// Set when the child died of INT, TERM, HUP or KILL: after cleanup `hb` dies of the same
+    /// signal, so a calling shell or script sees a signalled child (design D60).
+    pub reraise: Option<Signal>,
+}
+
+/// The process-level entry point of the `hb` binary.
+///
+/// For `hb run` it blocks INT, TERM and HUP first (this must be the main thread, before any
+/// other thread exists), forwards them to the child and, if the child died of one, raises it on
+/// this process after everything has been cleaned up.
+pub fn main<I, T>(
+    args: I,
+    env: Option<&Environment>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    main_with_grace(args, env, out, err, DEFAULT_GRACE)
+}
+
+/// [`main`] with the time a child gets after the first signal before it is killed.
+pub fn main_with_grace<I, T>(
+    args: I,
+    env: Option<&Environment>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    grace: Duration,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let exit = execute(args, env, out, err, Some(grace));
+    if let Some(signal) = exit.reraise {
+        // The default action now runs. KILL cannot be blocked, and for the others the mask is
+        // lifted first. If the process is still here, fall back to the shell convention.
+        let _ = unblock_supervised();
+        let _ = raise(signal);
+    }
+    exit.code
+}
+
+/// The signal to raise on `hb` for a child that ended this way, if any (D60).
+fn reraise_for(exit: ExitKind) -> Option<Signal> {
+    match exit {
+        ExitKind::Signalled(n) => match Signal::try_from(n).ok()? {
+            signal @ (Signal::SIGHUP | Signal::SIGINT | Signal::SIGKILL | Signal::SIGTERM) => {
+                Some(signal)
+            }
+            _ => None,
+        },
+        ExitKind::Exited(_) => None,
+    }
+}
+
+fn execute<I, T>(
+    args: I,
+    env: Option<&Environment>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    supervise: Option<Duration>,
+) -> CliExit
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut reraise = None;
+    let code = dispatch(args, env, out, err, supervise, &mut reraise);
+    CliExit { code, reraise }
+}
+
+fn dispatch<I, T>(
+    args: I,
+    env: Option<&Environment>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    supervise: Option<Duration>,
+    reraise: &mut Option<Signal>,
 ) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -132,6 +254,11 @@ where
         );
         return ExitCode::SUCCESS;
     };
+
+    // The helper replaces this process, so it needs neither the environment nor the project.
+    if let Command::Child(child) = &command {
+        return fail(err, crate::Error::from(exec_sandbox_exec(&child.argv)));
+    }
 
     let owned;
     let env = match env {
@@ -160,7 +287,8 @@ where
             }
             Err(error) => fail(err, error),
         },
-        Command::Run(args) => run_command(env, args.command, err),
+        Command::Run(args) => run_command(env, args, err, supervise, reraise),
+        Command::Child(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())
@@ -184,7 +312,59 @@ where
 /// The nesting check comes first, so a nested `hb` says so even where the project cannot be
 /// loaded. [`session::run`] checks again; that costs about 60 ms and keeps the library entry
 /// point safe to call on its own.
-fn run_command(env: &Environment, command: Vec<OsString>, err: &mut dyn Write) -> ExitCode {
+fn run_command(
+    env: &Environment,
+    args: RunArgs,
+    err: &mut dyn Write,
+    supervise: Option<Duration>,
+    reraise: &mut Option<Signal>,
+) -> ExitCode {
+    let at_terminal = std::io::stderr().is_terminal();
+    let sink = args.log_denials.then(|| denial_sink(at_terminal));
+    run_command_with(env, args.command, sink, err, supervise, reraise)
+}
+
+/// Where denial lines go: collected for printing after the run when stderr is a terminal, or
+/// written live to stderr when it has been redirected.
+fn denial_sink(stderr_is_terminal: bool) -> DenialSink {
+    if stderr_is_terminal {
+        DenialSink::Collect
+    } else {
+        DenialSink::Stream(std::sync::Arc::new(|line| {
+            let _ = writeln!(std::io::stderr(), "hb: denied: {line}");
+        }))
+    }
+}
+
+/// The lines printed after the run for collected denials.
+fn denial_summary(denials: &Denials) -> Vec<String> {
+    if denials.lines.is_empty() && denials.dropped == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "hb: the sandbox denied {} operation(s) (the system log is not complete, so there may be more):",
+        denials.lines.len() + denials.dropped
+    )];
+    out.extend(denials.lines.iter().map(|l| format!("hb: denied: {l}")));
+    if denials.dropped > 0 {
+        out.push(format!("hb: ... and {} more not shown", denials.dropped));
+    }
+    out
+}
+
+fn run_command_with(
+    env: &Environment,
+    command: Vec<OsString>,
+    sink: Option<DenialSink>,
+    err: &mut dyn Write,
+    supervise: Option<Duration>,
+    reraise: &mut Option<Signal>,
+) -> ExitCode {
+    if supervise.is_some() {
+        if let Err(error) = block_supervised() {
+            return fail(err, crate::Error::from(RunError::from(error)));
+        }
+    }
     let inside_hb = env.vars.get(SESSION_MARKER).is_some();
     if let Err(error) = check_nesting(inside_hb) {
         return fail(err, crate::Error::from(RunError::from(error)));
@@ -193,11 +373,21 @@ fn run_command(env: &Environment, command: Vec<OsString>, err: &mut dyn Write) -
         Ok((_, loaded)) => loaded,
         Err(error) => return fail(err, crate::Error::from(error)),
     };
-    let spec = RunSpec::new(command).stdio(StdioMode::Inherit);
+    let signals = supervise.map_or(SignalMode::Off, |grace| SignalMode::Forward { grace });
+    let mut spec = RunSpec::new(command)
+        .stdio(StdioMode::Inherit)
+        .signals(signals);
+    spec.denials = sink;
     match session::run(env, &loaded, &spec) {
         Ok(outcome) => {
             for warning in &outcome.warnings {
                 let _ = writeln!(err, "warning: {warning}");
+            }
+            for line in denial_summary(&outcome.denials) {
+                let _ = writeln!(err, "{line}");
+            }
+            if supervise.is_some() {
+                *reraise = reraise_for(outcome.exit);
             }
             exit_code(outcome.exit)
         }
@@ -292,6 +482,93 @@ mod tests {
             param_line("PROXY", "localhost:1"),
             "; -D PROXY=localhost:1  (placeholder until the proxy exists)\n"
         );
+    }
+
+    #[test]
+    fn the_denial_summary_is_empty_for_no_denials_and_counts_and_lists_otherwise() {
+        assert!(denial_summary(&Denials::default()).is_empty());
+        let some = Denials {
+            lines: vec!["cat(1) deny(1) file-read-data /a".to_owned()],
+            dropped: 0,
+        };
+        let text = denial_summary(&some);
+        assert_eq!(text.len(), 2, "{text:?}");
+        assert!(
+            text[0].contains("denied 1 operation(s)") && text[0].contains("not complete"),
+            "{text:?}"
+        );
+        assert_eq!(text[1], "hb: denied: cat(1) deny(1) file-read-data /a");
+    }
+
+    #[test]
+    fn the_denial_summary_counts_the_dropped_ones_and_says_so_only_when_there_are_some() {
+        let over = Denials {
+            lines: vec!["x".to_owned()],
+            dropped: 4,
+        };
+        let text = denial_summary(&over);
+        assert!(text[0].contains("denied 5 operation(s)"), "{text:?}");
+        assert_eq!(
+            text.last().map(String::as_str),
+            Some("hb: ... and 4 more not shown")
+        );
+        let none_dropped = denial_summary(&Denials {
+            lines: vec!["x".to_owned()],
+            dropped: 0,
+        });
+        assert!(none_dropped.iter().all(|l| !l.contains("more not shown")));
+        let only_dropped = denial_summary(&Denials {
+            lines: Vec::new(),
+            dropped: 2,
+        });
+        assert_eq!(only_dropped.len(), 2, "{only_dropped:?}");
+    }
+
+    #[test]
+    fn denials_go_live_to_stderr_when_it_is_redirected_and_are_collected_on_a_terminal() {
+        assert!(matches!(denial_sink(true), DenialSink::Collect));
+        assert!(matches!(denial_sink(false), DenialSink::Stream(_)));
+    }
+
+    #[test]
+    fn a_child_killed_by_int_term_hup_or_kill_is_reraised_and_any_other_signal_is_not() {
+        for (n, signal) in [
+            (1, Signal::SIGHUP),
+            (2, Signal::SIGINT),
+            (9, Signal::SIGKILL),
+            (15, Signal::SIGTERM),
+        ] {
+            assert_eq!(reraise_for(ExitKind::Signalled(n)), Some(signal));
+        }
+        for n in [3, 6, 11, 13, 14, 30] {
+            assert_eq!(reraise_for(ExitKind::Signalled(n)), None, "signal {n}");
+        }
+        assert_eq!(reraise_for(ExitKind::Exited(130)), None);
+        assert_eq!(reraise_for(ExitKind::Exited(0)), None);
+    }
+
+    #[test]
+    fn the_child_helper_is_hidden_from_help_but_still_parses() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = run(["hb", "--help"], None, &mut out, &mut err);
+        let help = String::from_utf8_lossy(&out);
+        assert!(!help.contains("__child"), "{help}");
+        assert!(help.contains("run"), "{help}");
+        assert_ok!(Cli::try_parse_from([
+            "hb",
+            "__child",
+            "--",
+            "-p",
+            "(version 1)",
+            "--",
+            "ls"
+        ]));
+    }
+
+    #[test]
+    fn the_helper_needs_at_least_one_argument() {
+        assert!(Cli::try_parse_from(["hb", "__child"]).is_err());
     }
 
     /// The exit code as a number; `ExitCode` has no accessor.

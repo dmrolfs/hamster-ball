@@ -481,3 +481,97 @@ fn a_capture_run_gives_the_child_a_closed_stdin_even_when_ours_is_an_open_pipe()
     );
     assert!(text.contains("STDINPROBE:done"), "{text}");
 }
+
+// ====================================================================================
+// --log-denials
+// ====================================================================================
+
+use hamster_ball::session::DenialSink;
+
+/// Reads `path` several times: the log is not complete, so one read could be one of the missed ones.
+fn read_repeatedly(path: &std::path::Path) -> String {
+    let p = common::quote(path);
+    format!("for i in 1 2 3 4 5; do /bin/cat {p} > /dev/null 2>&1; done; true")
+}
+
+#[test]
+fn a_denied_read_shows_up_with_its_path_and_a_denial_from_another_sandbox_does_not() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let secret = w.home_dir().join(".ssh/id_denied_by_the_floor");
+    common::write(&secret, "key\n");
+    let other_dir = assert_ok!(tempfile::TempDir::new());
+    let other_file = other_dir.path().join("unrelated_denied_file");
+    common::write(&other_file, "x\n");
+
+    let spec =
+        RunSpec::new(["/bin/sh", "-c", &read_repeatedly(&secret)]).denials(DenialSink::Collect);
+    // An unrelated sandbox, with its own tag, denies a read at the same time.
+    let unrelated = {
+        let profile = "(version 1)(deny default (with message \"other-tool\"))(import \"system.sb\")(allow process-exec*)(allow file-read* (subpath \"/bin\") (subpath \"/usr\"))".to_owned();
+        let file = other_file.clone();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let _ = Command::new("/usr/bin/sandbox-exec")
+                    .args(["-p", &profile, "/bin/cat"])
+                    .arg(&file)
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    };
+    let out = assert_ok!(run(&w.env, &w.loaded(), &spec));
+    let _ = unrelated.join();
+    assert_eq!(out.exit, ExitKind::Exited(0));
+    let all = out.denials.lines.join("\n");
+    assert!(
+        all.contains("id_denied_by_the_floor") && all.contains("file-read-data"),
+        "the denied read is missing: {:?}",
+        out.denials
+    );
+    assert!(
+        all.contains("[floor]"),
+        "the rule's label is missing: {all}"
+    );
+    assert!(
+        !all.contains("unrelated_denied_file"),
+        "a denial from another sandbox leaked in: {all}"
+    );
+    assert_eq!(out.denials.dropped, 0);
+}
+
+#[test]
+fn without_the_option_nothing_is_collected() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let secret = w.home_dir().join(".ssh/id_denied_by_the_floor");
+    common::write(&secret, "key\n");
+    let spec = RunSpec::new(["/bin/sh", "-c", &read_repeatedly(&secret)]);
+    let out = assert_ok!(run(&w.env, &w.loaded(), &spec));
+    assert!(out.denials.lines.is_empty() && out.denials.dropped == 0);
+}
+
+#[test]
+fn a_stream_sink_receives_each_denial_as_it_is_complete_and_nothing_is_kept() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let secret = w.home_dir().join(".ssh/id_denied_by_the_floor");
+    common::write(&secret, "key\n");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = {
+        let seen = std::sync::Arc::clone(&seen);
+        DenialSink::Stream(std::sync::Arc::new(move |line: &str| {
+            if let Ok(mut seen) = seen.lock() {
+                seen.push(line.to_owned());
+            }
+        }))
+    };
+    let spec = RunSpec::new(["/bin/sh", "-c", &read_repeatedly(&secret)]).denials(sink);
+    let out = assert_ok!(run(&w.env, &w.loaded(), &spec));
+    assert!(
+        out.denials.lines.is_empty(),
+        "a streamed denial must not also be kept"
+    );
+    let seen = assert_ok!(seen.lock()).join("\n");
+    assert!(seen.contains("id_denied_by_the_floor"), "{seen}");
+}

@@ -6,12 +6,14 @@ use std::io::{stderr, stdout};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // stderr is passed unlocked on purpose: the thread that streams `--log-denials` writes to it
+    // while this thread waits, and a held lock would deadlock the two.
     // Before anything opens a file: nothing the launching shell left open may reach the agent.
     let _ = hamster_ball::session::close_inherited_fds();
-    hamster_ball::cli::run(
+    hamster_ball::cli::main(
         std::env::args_os(),
         None,
         &mut stdout().lock(),
-        &mut stderr().lock(),
+        &mut stderr(),
     )
 }

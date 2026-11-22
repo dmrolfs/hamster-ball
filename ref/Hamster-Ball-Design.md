@@ -479,12 +479,33 @@ terminal) and then re-raises that signal on itself for INT, TERM, HUP and KILL, 
 script aborts on Ctrl-C (measured: with `exit 130` a bash loop kept going; with a re-raise it stopped). Other signals (SEGV, ABRT)
 return `128+n`, so `hb` does not leave core files.
 
+**Signals** (D64, hb-ghd.2.3b). The `hb` binary blocks INT, TERM and HUP in its main thread before any other thread exists, and
+receives them through a kqueue (`EVFILT_SIGNAL`; `sigwait` never gets SIGWINCH on macOS, and kqueue was measured to work).
+They are forwarded to the child's process group (own group, stdin not a tty) or to the child alone (shared group). The first
+signal starts a 5 s clock; a second signal, or the clock running out, sends SIGKILL. When the child shares `hb`'s group and stdin is
+a terminal, the terminal already sends INT and HUP to the child (measured: one Ctrl-C reaches both once, so forwarding gives the
+child two), so `hb` is passive for them: no forward and no clock, or it would kill an agent that handles its own Ctrl-C. TERM is still
+forwarded. Rust's `Command` passes the parent's blocked set to the child, so `hb` starts itself as `hb __child -- <sandbox-exec
+arguments>`, a hidden subcommand that empties the mask and execs `/usr/bin/sandbox-exec` (only that), and the child's blocked set is
+empty (tested with perl `sigprocmask`). The re-raise lives in `cli::main`, never in the library: when the child died of INT, TERM,
+HUP or KILL `hb` finishes cleanup, lifts the mask and raises the same signal on itself. A signal the caller sent to `hb` is still
+pending then, so `hb` dies of that one (a TERM sent to `hb` whose child was then killed ends as TERM, not KILL). Tests run the
+real process through `hb-testdrive`, a test-only binary (feature `test-support`) that is `hb` with an `Environment` from `HB_TD_*`
+variables, because the real `hb` takes its home from the passwd database (D28).
+
+**`--log-denials`** (D64). The profile's `(deny default (with message "hb-<tag>"))` tags this run's denials; `log stream` is started
+first, with a predicate on that tag, and confirmed listening by its header line (about 200 ms). When stderr is redirected each denial
+is written live as `hb: denied: ...`; on a terminal the denials are collected (1000 at most) and printed after the command ends, so
+they cannot corrupt an interactive screen. After the child ends `hb` waits for 300 ms of quiet on the stream (2 s at most). Measured:
+90 of 90 reads seen for `sh` and `perl`, 0.12 s at most behind the event, also under 24 CPU hogs; Python and Node were incomplete
+before, so the lines are hints for a person, never input to rule generation.
+
 ### 7.3 Terminal
 
 Measured during the M2 analysis, and to be re-run as the regression probe of hb-ghd.2.4 (D54): `TIOCSTI` injects keystrokes into a controlling tty when run unsandboxed. Under any deny-default profile it
 fails with EPERM, even with `file-ioctl` granted on the real tty. The gate is the `hid-control` operation, which
 `system.sb` does not grant. Until 2.4 there is no pty: `hb run` gives the child its own process group only when stdin is not a tty (a child in its own group while stdin is a
-terminal is a background group and could not read it, measured on a real pty); on a tty it shares `hb`'s group, so Ctrl-C reaches both. So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
+terminal is a background group and could not read it, measured on a real pty); on a tty it shares `hb`'s group, so Ctrl-C reaches both, and `hb` leaves INT and HUP to the terminal (7.2). So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
 whenever stdin is a tty, so `/dev/tty` and re-opens name the child's own slave, `^C` and job control work, and a child that
 changes terminal modes cannot leave your shell raw. The profile grants `file-ioctl` on that one slave only, and must never
 gain `hid-control` (an invariant, checked on the rendered text; the real `TIOCSTI` regression probe is hb-ghd.2.4). The terminal is restored on exit, panic, SIGINT, SIGTERM and SIGHUP. Restoring after a
@@ -657,8 +678,8 @@ All measured under the deny-default profile with proxy-only network. Home-relati
 | codex, omp | | | | **Not installed here; no preset until tested.** |
 
 Presets are hand-written. Measured: Seatbelt denial logs are incomplete (40 of 40 reported for `sh` and
-Python, 32 of 40 for Node), so no allow rules are generated from logs. `hb run --log-denials` streams
-denials as hints for you to read.
+Python, 32 of 40 for Node), so no allow rules are generated from logs. `hb run --log-denials` shows
+denials as hints for you to read (7.2).
 
 ## 14. Architecture (Rust)
 
@@ -807,3 +828,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D61 | The config's own `deny_read`/`deny_write` entries get unlink pins by the same computation as the floor (`pin_ancestors`); the template re-allow names the guard deny's operations; `render_filtered` exists only under `cfg(test)` or the `test-support` feature, so a release build cannot render a floor-less profile; the `hb ctl` socket allow is a `path-literal` | review of hb-ghd.2.1 |
 | D62 | `system_trust` grants exactly the measured minimum: `SecurityServer` and `configd` lookups, and reads of the `System.keychain` and `System.keychain-db` files (no `trustd`, `securityd`, `securityd.xpc`, `mds`, preference domain or keychain directory); a `BindPort` is 1024-65535, at most 16 per server and 64 distinct in all (`MergeError::TooManyBindPorts`); `file-map-executable` joins the floor's read set; the floor stays the keychain control and `securityd` is documented as not a gate; `hb profile` marks a `-D` value it had to escape as not copy-exact | owner (high-confidence items), oracle `hb-ghd.2.1_oracle-tls-ports-keychain.md` |
 | D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (until the pty of 2.4); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum with only `Off` until 2.4 | owner, hb-ghd.2.3 |
+| D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |

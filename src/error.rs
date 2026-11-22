@@ -15,7 +15,7 @@ use crate::policy::{
     PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
 use crate::seatbelt::RenderError;
-use crate::session::RunError;
+use crate::session::{HelperError, RunError};
 use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 
 /// Any error produced by this crate.
@@ -219,6 +219,13 @@ pub enum Error {
     Run {
         /// The underlying error.
         source: RunError,
+    },
+
+    /// The child helper could not hand over to `sandbox-exec`.
+    #[snafu(transparent)]
+    Helper {
+        /// The underlying error.
+        source: HelperError,
     },
 
     /// `hb explain` failed.
