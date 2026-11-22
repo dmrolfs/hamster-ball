@@ -49,15 +49,21 @@ pub enum SignalError {
     },
 }
 
+/// The window-size signal. It is received through the same kqueue (a `sigwait` never sees it on
+/// macOS) and tells `hb` to copy the new size to the child's pty.
+pub const WINCH: Signal = Signal::SIGWINCH;
+
+/// The signals `hb` blocks: the three it forwards, and the window-size one.
 fn supervised_set() -> SigSet {
     let mut set = SigSet::empty();
     for signal in SUPERVISED {
         set.add(signal);
     }
+    set.add(WINCH);
     set
 }
 
-/// Blocks INT, TERM and HUP in the calling thread, and so in every thread it starts afterwards.
+/// Blocks INT, TERM, HUP and WINCH in the calling thread, and so in every thread it starts afterwards.
 ///
 /// Call it first thing in the main thread, before any other thread exists.
 ///
@@ -67,7 +73,7 @@ pub fn block_supervised() -> Result<(), SignalError> {
     supervised_set().thread_block().context(MaskSnafu)
 }
 
-/// Unblocks INT, TERM and HUP in the calling thread, so their default action can run again.
+/// Unblocks INT, TERM, HUP and WINCH in the calling thread, so their default action can run again.
 ///
 /// # Errors
 /// [`SignalError::Mask`] if the mask cannot be changed.
@@ -75,10 +81,11 @@ pub fn unblock_supervised() -> Result<(), SignalError> {
     supervised_set().thread_unblock().context(MaskSnafu)
 }
 
-/// Whether INT, TERM and HUP are all blocked in the calling thread.
+/// Whether INT, TERM, HUP and WINCH are all blocked in the calling thread.
 #[must_use]
 pub fn supervised_blocked() -> bool {
-    SigSet::thread_get_mask().is_ok_and(|mask| SUPERVISED.iter().all(|s| mask.contains(*s)))
+    SigSet::thread_get_mask()
+        .is_ok_and(|mask| SUPERVISED.iter().chain([&WINCH]).all(|s| mask.contains(*s)))
 }
 
 /// Empties the calling thread's blocked set. The `hb __child` helper does this before it execs,
@@ -122,16 +129,16 @@ pub struct Watch {
 const STOP_ID: usize = 0;
 
 impl Watch {
-    /// Registers INT, TERM and HUP with a new kernel event queue.
+    /// Registers INT, TERM and HUP (and WINCH when `window` is set) with a new kernel event queue.
     ///
     /// # Errors
-    /// [`SignalError::NotBlocked`] unless the three are blocked in this thread;
+    /// [`SignalError::NotBlocked`] unless they are blocked in this thread;
     /// [`SignalError::Kqueue`] if the queue cannot be set up.
-    pub fn prepare() -> Result<Self, SignalError> {
+    pub fn prepare(window: bool) -> Result<Self, SignalError> {
         ensure!(supervised_blocked(), NotBlockedSnafu);
         let queue = Kqueue::new().context(KqueueSnafu)?;
-        let mut changes: Vec<KEvent> = SUPERVISED
-            .iter()
+        let watched = SUPERVISED.iter().chain(window.then_some(&WINCH));
+        let mut changes: Vec<KEvent> = watched
             .map(|signal| {
                 KEvent::new(
                     *signal as usize,
@@ -157,15 +164,21 @@ impl Watch {
         })
     }
 
-    /// Starts forwarding to `target`, with the escalation rule `rule`.
+    /// Starts forwarding to `target`, with the escalation rule `rule`. `on_winch` is called for each
+    /// window-size signal (only if the watch was prepared for it).
     ///
     /// # Errors
     /// [`SignalError::Thread`] if the thread cannot be started.
-    pub fn start(self, target: Target, rule: Escalation) -> Result<Supervisor, SignalError> {
+    pub fn start(
+        self,
+        target: Target,
+        rule: Escalation,
+        on_winch: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Supervisor, SignalError> {
         let queue = Arc::clone(&self.queue);
         let handle = thread::Builder::new()
             .name("hb-signals".to_owned())
-            .spawn(move || supervise(&queue, target, rule))
+            .spawn(move || supervise(&queue, target, rule, on_winch.as_deref()))
             .context(ThreadSnafu)?;
         Ok(Supervisor {
             queue: self.queue,
@@ -200,7 +213,12 @@ impl Supervisor {
 }
 
 /// The thread body: wait for a signal or the escalation deadline, and act.
-fn supervise(queue: &Kqueue, target: Target, mut rule: Escalation) {
+fn supervise(
+    queue: &Kqueue,
+    target: Target,
+    mut rule: Escalation,
+    on_winch: Option<&(dyn Fn() + Send + Sync)>,
+) {
     let blank = KEvent::new(
         0,
         EventFilter::EVFILT_USER,
@@ -233,6 +251,12 @@ fn supervise(queue: &Kqueue, target: Target, mut rule: Escalation) {
                     else {
                         continue;
                     };
+                    if signal == WINCH {
+                        if let Some(callback) = on_winch {
+                            callback();
+                        }
+                        continue;
+                    }
                     // Several signals can arrive before the thread looks; two is enough to escalate.
                     for _ in 0..event.data().clamp(1, 2) {
                         apply(rule.on_signal(signal, Instant::now()), target);
@@ -376,7 +400,7 @@ mod tests {
     #[test]
     fn preparing_a_watch_needs_the_signals_blocked_first() {
         let outcome =
-            thread::spawn(|| matches!(Watch::prepare(), Err(SignalError::NotBlocked))).join();
+            thread::spawn(|| matches!(Watch::prepare(false), Err(SignalError::NotBlocked))).join();
         assert!(outcome.unwrap_or(false));
     }
 
@@ -384,18 +408,75 @@ mod tests {
     fn a_prepared_watch_starts_and_finishes_without_any_signal() {
         let ok = thread::spawn(|| {
             let _ = block_supervised();
-            let Ok(watch) = Watch::prepare() else {
+            let Ok(watch) = Watch::prepare(false) else {
                 return false;
             };
             let rule = Escalation::new(Duration::from_secs(5), false);
             // Not a real child: the thread must end on the stop event alone.
-            match watch.start(Target::Child(Pid::from_raw(i32::MAX)), rule) {
+            match watch.start(Target::Child(Pid::from_raw(i32::MAX)), rule, None) {
                 Ok(supervisor) => {
                     supervisor.finish();
                     true
                 }
                 Err(_) => false,
             }
+        })
+        .join();
+        assert!(ok.unwrap_or(false));
+    }
+
+    #[test]
+    fn a_window_size_signal_is_reported_to_the_callback_and_nothing_else_is_forwarded() {
+        let ok = thread::spawn(|| {
+            let _ = block_supervised();
+            let Ok(watch) = Watch::prepare(true) else {
+                return false;
+            };
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = Arc::clone(&count);
+            let on_winch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            let rule = Escalation::new(Duration::from_secs(5), false);
+            let Ok(supervisor) =
+                watch.start(Target::Child(Pid::from_raw(i32::MAX)), rule, Some(on_winch))
+            else {
+                return false;
+            };
+            let _ = kill(nix::unistd::getpid(), Signal::SIGWINCH);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while count.load(std::sync::atomic::Ordering::Relaxed) == 0 && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            supervisor.finish();
+            count.load(std::sync::atomic::Ordering::Relaxed) >= 1
+        })
+        .join();
+        assert!(ok.unwrap_or(false));
+    }
+
+    #[test]
+    fn without_the_window_option_the_watch_does_not_need_it_blocked_or_registered() {
+        let ok = thread::spawn(|| {
+            let _ = block_supervised();
+            Watch::prepare(false).is_ok()
+        })
+        .join();
+        assert!(ok.unwrap_or(false));
+    }
+
+    #[test]
+    fn the_window_signal_counts_as_part_of_the_blocked_set() {
+        let ok = thread::spawn(|| {
+            let mut three = SigSet::empty();
+            for signal in SUPERVISED {
+                three.add(signal);
+            }
+            let _ = three.thread_block();
+            let without_winch = supervised_blocked();
+            let _ = block_supervised();
+            !without_winch && supervised_blocked()
         })
         .join();
         assert!(ok.unwrap_or(false));

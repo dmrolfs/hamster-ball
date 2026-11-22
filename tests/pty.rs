@@ -1,0 +1,458 @@
+// ABOUTME: `hb run` on a terminal: the agent's own pty, the relay, resize, restore, suspend and keystroke injection.
+// ABOUTME: Each case runs hb-testdrive under expect, so hb sees a real terminal; injection runs on sacrificial ptys only.
+//! Black-box tests of terminal isolation (hb-ghd.2.4).
+
+#![cfg(target_os = "macos")]
+
+mod common;
+
+use std::process::Command;
+
+use claims::assert_ok;
+use common::{World, sandbox_available};
+
+const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
+const PROJECT: &str = "[fs]\nwrite = [\".\"]\n";
+
+macro_rules! sandboxed {
+    () => {
+        if !sandbox_available() || !std::path::Path::new("/usr/bin/expect").exists() {
+            eprintln!("SKIP: no sandbox-exec or no expect");
+            return;
+        }
+    };
+}
+
+/// Quotes a word for Tcl.
+fn tcl(word: &str) -> String {
+    format!("{{{word}}}")
+}
+
+/// Runs `body` (Tcl) after setting up the world's variables, with `spawn` available as
+/// `spawn_hb ARGS...`, and returns what expect printed.
+fn expect(w: &World, extra_env: &[(&str, &str)], body: &str) -> String {
+    let mut script = format!(
+        "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
+         set env(HB_TD_GRACE_MS) 500\nset env(TERM) xterm-256color\nset timeout 20\nset stty_init {{rows 24 columns 80}}\n",
+        home = tcl(&w.home_dir().to_string_lossy()),
+        cwd = tcl(&w.project.to_string_lossy()),
+        path = tcl(&w.base.join("bin").to_string_lossy()),
+        tmp = tcl(&w.base.join("tmp").to_string_lossy()),
+    );
+    for (k, v) in extra_env {
+        script.push_str(&format!("set env({k}) {}\n", tcl(v)));
+    }
+    script.push_str(&format!("set drive {}\n", tcl(DRIVE)));
+    script.push_str(body);
+    let file = w.base.join("case.exp");
+    common::write(&file, &script);
+    let out = assert_ok!(Command::new("/usr/bin/expect").arg(&file).output());
+    let mut text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
+}
+
+/// A perl program written into the project, so the sandboxed child can run it.
+fn program(w: &World, name: &str, source: &str) -> String {
+    let path = w.project.join(name);
+    common::write(&path, source);
+    path.to_string_lossy().into_owned()
+}
+
+// ====================================================================================
+// The child's terminal
+// ====================================================================================
+
+#[test]
+fn the_child_has_a_terminal_of_its_own_and_leads_its_own_session() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let prog = program(
+        &w,
+        "who.pl",
+        "use POSIX; $|=1;\n\
+         my @t = (-t STDIN ? 1:0, -t STDOUT ? 1:0, -t STDERR ? 1:0);\n\
+         my $me = POSIX::ttyname(0) // 'unknown';\n\
+         print \"tty=@t leader=\", (getpgrp() == $$ ? 1:0), \" fg=\", (POSIX::tcgetpgrp(0) == getpgrp() ? 1:0), \" term=$ENV{TERM}\\n\";\n\
+         print \"childtty=$me\\n\";\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\nputs \"usertty=$spawn_out(slave,name)\"\n",
+            tcl(&prog)
+        ),
+    );
+    assert!(
+        out.contains("tty=1 1 1 leader=1 fg=1 term=xterm-256color"),
+        "{out}"
+    );
+    let user = out
+        .lines()
+        .find_map(|l| l.strip_prefix("usertty="))
+        .unwrap_or("");
+    let child = out
+        .lines()
+        .find_map(|l| l.strip_prefix("childtty="))
+        .unwrap_or("");
+    assert!(user.starts_with("/dev/ttys"), "{out}");
+    assert!(
+        child.is_empty() || child == "unknown" || child != user,
+        "the child was given the user's own terminal: {out}"
+    );
+}
+
+#[test]
+fn the_child_sees_the_users_window_size_and_every_resize() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let prog = program(
+        &w,
+        "winch.pl",
+        "$|=1; $SIG{INT}=sub{exit 0};\n\
+         my $s=`/bin/stty size`; chomp $s; print \"start $s\\n\";\n\
+         $SIG{WINCH}=sub{ my $s=`/bin/stty size`; chomp $s; print \"winch $s\\n\" };\n\
+         print \"ready\\n\"; sleep 1 for 1..60;\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect \"ready\"\n\
+             exec /bin/stty rows 33 columns 101 < $spawn_out(slave,name)\nexpect \"winch 33 101\"\n\
+             exec /bin/stty rows 20 columns 70 < $spawn_out(slave,name)\nexpect \"winch 20 70\"\n\
+             send \"\\003\"\nexpect eof\n",
+            tcl(&prog)
+        ),
+    );
+    assert!(
+        out.contains("start 24 80"),
+        "the initial size was not copied: {out}"
+    );
+    assert!(
+        out.contains("winch 33 101") && out.contains("winch 20 70"),
+        "{out}"
+    );
+}
+
+#[test]
+fn no_descriptor_above_two_reaches_the_child_and_that_includes_the_pty_master() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let prog = program(
+        &w,
+        "fds.pl",
+        "$|=1; my @open = grep { open(my $fh, \"<&=$_\") } 3..40; print \"open=[@open]\\n\";\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\n",
+            tcl(&prog)
+        ),
+    );
+    assert!(out.contains("open=[]"), "{out}");
+}
+
+#[test]
+fn one_ctrl_c_typed_on_the_terminal_reaches_the_child_once_through_the_relay() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let prog = program(
+        &w,
+        "int.pl",
+        "$|=1; my $n=0; $SIG{INT}=sub{ $n++; print \"int-$n\\n\" };\n\
+         print \"ready\\n\"; select(undef,undef,undef,0.1) for 1..30; print \"finished-$n\\n\";\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect \"ready\"\nsleep 0.5\nsend \"\\003\"\nexpect eof\n",
+            tcl(&prog)
+        ),
+    );
+    assert!(out.contains("int-1") && !out.contains("int-2"), "{out}");
+    assert!(
+        out.contains("finished-1"),
+        "hb killed a child that handled its own Ctrl-C: {out}"
+    );
+}
+
+// ====================================================================================
+// The user's terminal after the run
+// ====================================================================================
+
+/// Starts an interactive bash whose prompt carries the command number (`<2>PROMPT> `), so a wait
+/// for "the next prompt" cannot be satisfied by an earlier one, then runs `body` and exits.
+///
+/// In `body`, `cmd LINE` runs a line and waits for the prompt after it; `next_prompt` only waits
+/// (for a command already sent, or one that was stopped).
+fn in_a_shell(w: &World, body: &str) -> String {
+    let preamble = "spawn -noecho /bin/bash --norc --noprofile -i\nexpect {$ }\n\
+                    send {PS1='<\\#>PROMPT> '}\nsend \"\\r\"\nset n 2\nexpect \"<2>PROMPT> \"\n\
+                    proc next_prompt {} { global n; incr n; expect \"<$n>PROMPT> \" }\n\
+                    proc cmd {line} { send \"$line\\r\"; next_prompt }\n";
+    expect(
+        w,
+        &[],
+        &format!("{preamble}{body}\nsend \"exit\\r\"\nexpect eof\n"),
+    )
+}
+
+/// The Tcl that has the shell print the terminal's settings as one `STATE:` line. It must be a
+/// command the shell runs: while bash waits at its prompt, readline itself puts the terminal in
+/// raw mode, so reading the settings from outside would say nothing about `hb`.
+const SHOW_STATE: &str = "cmd {stty -a | tr '\\n' ' ' | sed 's/^/STATE:/'; echo}";
+
+/// Whether a `STATE:` line from `stty -a` describes a normal (cooked) terminal.
+fn cooked(state: &str) -> bool {
+    let words: Vec<&str> = state.split_whitespace().collect();
+    ["icanon", "echo", "isig"]
+        .iter()
+        .all(|flag| words.contains(flag))
+}
+
+#[test]
+fn the_terminal_is_cooked_again_after_a_normal_exit_a_child_sigkill_and_a_term_to_hb() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let killed = program(
+        &w,
+        "kill9.pl",
+        "$|=1; print \"child up\\n\"; kill 9, $$; sleep 5;\n",
+    );
+    let waits = program(
+        &w,
+        "wait.pl",
+        "$|=1; print \"hbpid=\", getppid(), \"\\nready\\n\"; sleep 1 for 1..60;\n",
+    );
+    let body = format!(
+        "cmd \"$drive run -- /usr/bin/true\"\n{show}\n\
+         cmd \"$drive run -- /usr/bin/perl {killed}\"\n{show}\n\
+         send \"$drive run -- /usr/bin/perl {waits}\\r\"\nexpect -re {{hbpid=([0-9]+)}}\nset hbpid $expect_out(1,string)\nexpect \"ready\"\n\
+         exec /bin/kill -TERM $hbpid\nnext_prompt\n{show}",
+        show = SHOW_STATE,
+    );
+    let out = in_a_shell(&w, &body);
+    let states: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("STATE:"))
+        .collect();
+    assert_eq!(states.len(), 3, "{out}");
+    for (i, state) in states.iter().enumerate() {
+        assert!(
+            cooked(state),
+            "case {i}: the terminal was left raw: {state}"
+        );
+    }
+}
+
+#[test]
+fn everything_the_child_wrote_before_it_exited_reaches_the_screen() {
+    // A lot of output right before exit: if `hb` returned before the relay had drained the pty,
+    // the tail would be lost.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let prog = program(
+        &w,
+        "burst.pl",
+        "$|=1; for my $i (1..4000) { printf \"line-%04d %s\\n\", $i, 'x' x 60 } print \"END-MARKER\\n\";\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\n",
+            tcl(&prog)
+        ),
+    );
+    assert_eq!(out.matches("line-").count(), 4000, "lines were lost");
+    assert!(out.contains("END-MARKER"), "the tail was lost");
+}
+
+// ====================================================================================
+// Ctrl-Z
+// ====================================================================================
+
+#[test]
+fn ctrl_z_in_an_agent_that_stops_itself_suspends_the_job_and_fg_resumes_it() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let tui = program(
+        &w,
+        "tui.pl",
+        "$|=1; $SIG{TSTP}=sub{ print \"got-TSTP\\n\"; kill 'STOP', $$ };\n\
+         $SIG{CONT}=sub{ print \"got-CONT\\n\" };\n\
+         print \"ready\\n\"; for my $i (1..40) { select(undef,undef,undef,0.25); print \"tick-$i\\n\" if $i % 10 == 0 } print \"tui-finished\\n\";\n",
+    );
+    let body = format!(
+        "send \"$drive run -- /usr/bin/perl {tui}\\r\"\nexpect \"ready\"\nsleep 0.6\nsend \"\\032\"\nexpect \"Stopped\"\nnext_prompt\n{show}\n\
+         send \"fg\\r\"\nexpect \"tui-finished\"\nnext_prompt",
+        show = SHOW_STATE,
+    );
+    let out = in_a_shell(&w, &body);
+    assert!(
+        out.contains("got-TSTP"),
+        "the agent never saw Ctrl-Z: {out}"
+    );
+    assert!(
+        out.contains("Stopped"),
+        "the shell did not show a suspended job: {out}"
+    );
+    assert!(
+        out.contains("got-CONT") && out.contains("tui-finished"),
+        "the agent did not continue after fg: {out}"
+    );
+    let states: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("STATE:"))
+        .collect();
+    // While suspended the shell has the terminal and it is cooked. (That it is cooked again after
+    // the run ends is the restore test above.)
+    assert_eq!(states.len(), 1, "{out}");
+    assert!(
+        cooked(states[0]),
+        "the terminal stayed raw while hb was suspended: {states:?}"
+    );
+}
+
+#[test]
+fn fg_typed_the_instant_the_prompt_appears_still_resumes_the_agent() {
+    // Regression: input typed right after the prompt was flushed away under the relay's pending
+    // read, which then blocked and left the child unable to finish its output.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let tui = program(
+        &w,
+        "tui.pl",
+        "$|=1; $SIG{TSTP}=sub{ print \"got-TSTP\\n\"; kill 'STOP', $$ };\n\
+         $SIG{CONT}=sub{ print \"got-CONT\\n\" };\n\
+         print \"ready\\n\"; for my $i (1..12) { select(undef,undef,undef,0.25); print \"tick-$i\\n\" } print \"tui-finished\\n\";\n",
+    );
+    let round =
+        "send \"\\032\"\nexpect \"Stopped\"\nnext_prompt\nsend \"fg\\r\"\nexpect \"got-CONT\"\n";
+    let body = format!(
+        "send \"$drive run -- /usr/bin/perl {tui}\\r\"\nexpect \"ready\"\nsleep 0.6\n{round}{round}{round}expect \"tui-finished\"\nnext_prompt",
+    );
+    let out = in_a_shell(&w, &body);
+    assert_eq!(out.matches("got-CONT").count(), 3, "{out}");
+    assert!(out.contains("tui-finished"), "{out}");
+}
+
+// ====================================================================================
+// Keystroke injection (TIOCSTI)
+// ====================================================================================
+
+/// Tries to push a byte into the terminal's input queue three ways: through descriptor 0, through
+/// the terminal's own path, and through `/dev/tty`. Prints one line for each. The ioctl number is
+/// the macOS value of `TIOCSTI`.
+///
+/// The path is built from the device number of descriptor 0 (`/dev/ttysNNN`), because `ttyname`
+/// needs to read `/dev`, which a sandbox may not allow. A last line says how many *other*
+/// terminals the program can open. It only opens them; it never injects into them, so running
+/// the control on a developer's machine cannot type into their other windows.
+const INJECT_PROBE: &str = "use strict; use warnings;\n\
+    $| = 1;\n\
+    my $TIOCSTI = 0x80017472;\n\
+    sub inject { my ($fh) = @_; my $c = 'Z'; return ioctl($fh, $TIOCSTI, $c) ? 'injected' : \"refused($!)\"; }\n\
+    my $rdev = (stat(STDIN))[6];\n\
+    my $own = sprintf('/dev/ttys%03d', $rdev & 0xffffff);\n\
+    print \"own=$own\\n\";\n\
+    print 'fd0=', inject(\\*STDIN), \"\\n\";\n\
+    if (open(my $p, '+<', $own)) { print 'path=', inject($p), \"\\n\"; } else { print \"path=open-refused($!)\\n\"; }\n\
+    if (open(my $d, '+<', '/dev/tty')) { print 'devtty=', inject($d), \"\\n\"; } else { print \"devtty=open-refused($!)\\n\"; }\n\
+    my $others = 0;\n\
+    for my $t (glob('/dev/ttys[0-9]*')) { next if $t eq $own; if (open(my $o, '+<', $t)) { $others++; close $o; } }\n\
+    print \"others-openable=$others\\n\";\n\
+    print \"probe-done\\n\";\n";
+
+/// The three result lines of the probe, as `(name, result)`.
+fn probe_results(out: &str) -> Vec<(String, String)> {
+    ["fd0", "path", "devtty"]
+        .iter()
+        .map(|name| {
+            let line = out
+                .lines()
+                .find_map(|l| l.find(&format!("{name}=")).map(|i| &l[i..]))
+                .unwrap_or("missing");
+            ((*name).to_owned(), line.trim().to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn the_probe_injects_on_a_pty_when_nothing_stops_it() {
+    // The control: without it, a "refused" below could mean the probe is broken.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let probe = program(&w, "inject.pl", INJECT_PROBE);
+    let out = expect(
+        &w,
+        &[],
+        &format!("spawn -noecho /usr/bin/perl {}\nexpect eof\n", tcl(&probe)),
+    );
+    for (name, result) in probe_results(&out) {
+        assert_eq!(result, format!("{name}=injected"), "{out}");
+    }
+}
+
+#[test]
+fn a_profile_without_hid_control_still_allows_injection_and_one_that_denies_it_does_not() {
+    // The probe tells the two apart, and the permission that matters is `hid-control`.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let probe = program(&w, "inject.pl", INJECT_PROBE);
+    for (profile, expected) in [
+        ("(version 1)(allow default)", "injected"),
+        (
+            "(version 1)(allow default)(deny hid-control)",
+            "refused(Operation not permitted)",
+        ),
+    ] {
+        let out = expect(
+            &w,
+            &[],
+            &format!(
+                "spawn -noecho /usr/bin/sandbox-exec -p {} /usr/bin/perl {}\nexpect eof\n",
+                tcl(profile),
+                tcl(&probe)
+            ),
+        );
+        for (name, result) in probe_results(&out) {
+            assert_eq!(result, format!("{name}={expected}"), "{profile}: {out}");
+        }
+    }
+}
+
+#[test]
+fn an_agent_under_hb_cannot_inject_keystrokes_through_any_route_to_its_terminal() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let probe = program(&w, "inject.pl", INJECT_PROBE);
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\n",
+            tcl(&probe)
+        ),
+    );
+    assert!(out.contains("probe-done"), "the probe did not run: {out}");
+    // The path route must have been tried against a real terminal path, not a name that does not
+    // exist, or "refused" would prove nothing.
+    assert!(out.contains("own=/dev/ttys"), "{out}");
+    for (name, result) in probe_results(&out) {
+        assert!(
+            result.starts_with(&format!("{name}=refused"))
+                || result.starts_with(&format!("{name}=open-refused(Operation not permitted")),
+            "{name} was not refused: {result}\n{out}"
+        );
+    }
+    assert!(
+        out.contains("others-openable=0"),
+        "the agent could open other terminals: {out}"
+    );
+}

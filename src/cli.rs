@@ -27,7 +27,7 @@ use crate::explain::{ExplainRequest, Format, explain};
 use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::session::signals::{block_supervised, unblock_supervised};
 use crate::session::{
-    self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, RunError, RunSpec, SESSION_MARKER,
+    self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, PtyMode, RunError, RunSpec, SESSION_MARKER,
     SignalMode, StdioMode, check_nesting, exec_sandbox_exec,
 };
 use crate::system::{Environment, UserConfigDir};
@@ -63,6 +63,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct ChildArgs {
+    /// Become a session leader and take stdin (the pty slave) as the controlling terminal first.
+    #[arg(long)]
+    controlling_tty: bool,
     /// The arguments for `sandbox-exec`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
@@ -169,22 +172,50 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    main_with_grace(args, env, out, err, DEFAULT_GRACE)
+    main_with_options(args, env, out, err, Supervision::default())
 }
 
-/// [`main`] with the time a child gets after the first signal before it is killed.
-pub fn main_with_grace<I, T>(
+/// Whether `hb run` gives the child a pty of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PtyChoice {
+    /// A pty exactly when `hb`'s stdin is a terminal.
+    #[default]
+    Auto,
+    /// Never: the child shares `hb`'s terminal and process group. For tests of that library path.
+    Off,
+}
+
+/// How [`main_with_options`] supervises a run.
+#[derive(Debug, Clone, Copy)]
+pub struct Supervision {
+    /// How long a child gets after the first signal before it is killed.
+    pub grace: Duration,
+    /// Whether the child gets a pty.
+    pub pty: PtyChoice,
+}
+
+impl Default for Supervision {
+    fn default() -> Self {
+        Self {
+            grace: DEFAULT_GRACE,
+            pty: PtyChoice::Auto,
+        }
+    }
+}
+
+/// [`main`] with the supervision settings spelled out.
+pub fn main_with_options<I, T>(
     args: I,
     env: Option<&Environment>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-    grace: Duration,
+    supervision: Supervision,
 ) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let exit = execute(args, env, out, err, Some(grace));
+    let exit = execute(args, env, out, err, Some(supervision));
     if let Some(signal) = exit.reraise {
         // The default action now runs. KILL cannot be blocked, and for the others the mask is
         // lifted first. If the process is still here, fall back to the shell convention.
@@ -212,7 +243,7 @@ fn execute<I, T>(
     env: Option<&Environment>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-    supervise: Option<Duration>,
+    supervise: Option<Supervision>,
 ) -> CliExit
 where
     I: IntoIterator<Item = T>,
@@ -228,7 +259,7 @@ fn dispatch<I, T>(
     env: Option<&Environment>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-    supervise: Option<Duration>,
+    supervise: Option<Supervision>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode
 where
@@ -257,7 +288,10 @@ where
 
     // The helper replaces this process, so it needs neither the environment nor the project.
     if let Command::Child(child) = &command {
-        return fail(err, crate::Error::from(exec_sandbox_exec(&child.argv)));
+        return fail(
+            err,
+            crate::Error::from(exec_sandbox_exec(&child.argv, child.controlling_tty)),
+        );
     }
 
     let owned;
@@ -316,7 +350,7 @@ fn run_command(
     env: &Environment,
     args: RunArgs,
     err: &mut dyn Write,
-    supervise: Option<Duration>,
+    supervise: Option<Supervision>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode {
     let at_terminal = std::io::stderr().is_terminal();
@@ -357,7 +391,7 @@ fn run_command_with(
     command: Vec<OsString>,
     sink: Option<DenialSink>,
     err: &mut dyn Write,
-    supervise: Option<Duration>,
+    supervise: Option<Supervision>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode {
     if supervise.is_some() {
@@ -373,10 +407,15 @@ fn run_command_with(
         Ok((_, loaded)) => loaded,
         Err(error) => return fail(err, crate::Error::from(error)),
     };
-    let signals = supervise.map_or(SignalMode::Off, |grace| SignalMode::Forward { grace });
+    let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let mut spec = RunSpec::new(command)
         .stdio(StdioMode::Inherit)
         .signals(signals);
+    // A pty exactly when hb is supervising and stdin is a terminal; the in-process entry point
+    // (`run`) never allocates one, so a developer running `cargo test` in a terminal is unaffected.
+    if supervise.is_some_and(|s| s.pty == PtyChoice::Auto) && std::io::stdin().is_terminal() {
+        spec.pty = PtyMode::On;
+    }
     spec.denials = sink;
     match session::run(env, &loaded, &spec) {
         Ok(outcome) => {

@@ -170,6 +170,7 @@ dependencies = [
  "nix",
  "pretty_assertions",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_path_to_error",

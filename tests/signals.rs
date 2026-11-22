@@ -254,11 +254,15 @@ fn the_probe_sees_a_blocked_set_when_there_is_one() {
     })
     .join()
     .unwrap_or_default();
-    assert_eq!(seen, "1,2,15", "std's Command passes the parent's mask on");
+    // INT, HUP and TERM for the supervisor, and WINCH for the window-size relay of a pty run.
+    assert_eq!(
+        seen, "1,2,15,28",
+        "std's Command passes the parent's mask on"
+    );
 }
 
 #[test]
-fn the_child_under_hb_has_an_empty_blocked_set_although_hb_blocked_the_three_signals() {
+fn the_child_under_hb_has_an_empty_blocked_set_although_hb_blocked_its_signals() {
     sandboxed!();
     let w = World::new(PROJECT);
     let out = assert_ok!(
@@ -369,7 +373,7 @@ fn a_bash_loop_around_hb_stops_on_ctrl_c_which_an_exit_130_would_not() {
 }
 
 // ====================================================================================
-// A terminal and no pty yet: the child shares hb's process group (decision 3)
+// A terminal and no pty (`HB_TD_PTY=off`): the child shares hb's process group (decision 3)
 // ====================================================================================
 
 /// Runs `hb run` under `expect` so stdin is a real terminal, types one Ctrl-C, and returns the output.
@@ -379,7 +383,7 @@ fn on_a_terminal(w: &World, script_name: &str, child_script: &str, ctrl_c_after_
     let td = w.base.join("drive.exp");
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
-         set env(HB_TD_GRACE_MS) 500\nset timeout 20\n\
+         set env(HB_TD_GRACE_MS) 500\nset env(HB_TD_PTY) off\nset timeout 20\n\
          spawn {drive} run -- /usr/bin/perl {script}\n\
          sleep {delay}\nsend \"\\003\"\nexpect eof\n",
         home = w.home_dir().display(),

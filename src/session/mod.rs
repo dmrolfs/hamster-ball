@@ -7,19 +7,27 @@ pub mod denials;
 pub mod dir;
 pub mod env;
 pub mod fds;
+mod interactive;
 pub mod preflight;
+pub mod pty;
+pub mod relay;
 pub mod run;
 pub mod signals;
+pub mod terminal;
 
 pub use child_helper::{HelperError, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
 pub use fds::close_inherited_fds;
+pub use interactive::InteractiveError;
 pub use preflight::{
     PreflightError, ProbeOutcome, SANDBOX_EXEC, check_nesting, classify, is_nested,
 };
+pub use pty::{Pty, PtyError, Winsize};
+pub use relay::Relay;
 pub use run::{
     DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, run,
 };
 pub use signals::{Escalation, Step};
+pub use terminal::{RawMode, TerminalError};

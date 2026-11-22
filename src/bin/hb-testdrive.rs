@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use hamster_ball::cli::{PtyChoice, Supervision};
 use hamster_ball::policy::{CanonicalPath, HomeDir};
 use hamster_ball::system::{Environment, FloorEnvironment, ParentVars};
 
@@ -47,11 +48,16 @@ fn main() -> ExitCode {
         eprintln!("hb-testdrive: the HB_TD_* variables are missing or unusable");
         return ExitCode::from(2);
     }
-    hamster_ball::cli::main_with_grace(
+    let pty = if var("HB_TD_PTY").is_some_and(|v| v == "off") {
+        PtyChoice::Off
+    } else {
+        PtyChoice::Auto
+    };
+    hamster_ball::cli::main_with_options(
         args,
         env.as_ref(),
-        &mut stdout().lock(),
+        &mut stdout(),
         &mut stderr(),
-        grace,
+        Supervision { grace, pty },
     )
 }

@@ -13,12 +13,15 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use nix::unistd::Pid;
+use rustix::process::Pid as RustixPid;
 use snafu::{ResultExt, Snafu, ensure};
 
 use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+use super::interactive::{Interactive, InteractiveError};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
+use super::pty::{Pty, PtyError};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
@@ -66,8 +69,12 @@ pub enum StdioMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PtyMode {
-    /// No pty. hb-ghd.2.4 adds `On`.
+    /// The child gets the caller's streams as they are.
     Off,
+    /// The child gets a pty of its own and leads its own session; `hb` relays the user's terminal
+    /// to it. Needs `hb`'s stdin to be a terminal, inherited streams and [`SignalMode::Forward`]
+    /// (window resizes and stops arrive as signals and are handled with the signal thread).
+    On,
 }
 
 /// What to run.
@@ -279,6 +286,26 @@ pub enum RunError {
     ))]
     NoHbExe,
 
+    /// A pty run was asked for without a terminal, without inherited streams or without signal forwarding.
+    #[snafu(display(
+        "a pty run needs hb's stdin to be a terminal, inherited streams and signal forwarding"
+    ))]
+    PtyUnavailable,
+
+    /// The pty could not be set up.
+    #[snafu(transparent)]
+    Pty {
+        /// The underlying error.
+        source: PtyError,
+    },
+
+    /// The user's terminal could not be set up for the pty.
+    #[snafu(transparent)]
+    Interactive {
+        /// The underlying error.
+        source: InteractiveError,
+    },
+
     /// `sandbox-exec` could not be started.
     #[snafu(display("{SANDBOX_EXEC} could not be started"))]
     Spawn {
@@ -301,6 +328,7 @@ pub enum RunError {
 pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome, RunError> {
     ensure!(!spec.argv.is_empty(), EmptyCommandSnafu);
     check_nesting(env.vars.get(SESSION_MARKER).is_some())?;
+    let pty = open_pty(spec)?;
 
     let names: Vec<ToolName> = loaded
         .policy
@@ -328,6 +356,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     if let Some(tag) = &tag {
         inputs = inputs.with_log_tag(tag.clone());
     }
+    if let Some(pty) = &pty {
+        inputs = inputs.with_tty(pty.slave_path().clone());
+    }
     let profile = render(&loaded.policy, &inputs)?;
     warnings.extend(profile.warnings.iter().map(ToString::to_string));
 
@@ -341,25 +372,36 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         env: &loaded.policy.env,
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
-    let helper = match spec.signals {
-        SignalMode::Off => None,
-        SignalMode::Forward { .. } => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
+    let helper = match (spec.signals, &pty) {
+        (SignalMode::Off, None) => None,
+        _ => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
     };
-    let launcher = launcher_words(helper);
+    let launcher = launcher_words(helper, pty.is_some());
     check_size(&profile, &child_env, &spec.argv, &launcher)?;
     let watch = match spec.signals {
         SignalMode::Off => None,
-        SignalMode::Forward { .. } => Some(Watch::prepare()?),
+        SignalMode::Forward { .. } => Some(Watch::prepare(pty.is_some())?),
     };
 
-    let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper);
-    // A child in its own group is a background group to a terminal and cannot read it, so it
-    // gets one only when stdin is not a tty (hb-ghd.2.3 decision 1; the pty of 2.4 replaces this).
-    if !stdin_is_tty {
-        command.process_group(0);
-    }
-    if spec.stdio == StdioMode::Capture {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
+    match &pty {
+        Some(pty) => {
+            // The helper's setsid makes the child leader of a new session and group, which it
+            // cannot do if it already leads a group, so no process_group here.
+            pty.copy_size_from(io::stdin());
+            let (stdin, stdout, stderr) = pty.child_stdio().context(SpawnSnafu)?;
+            command.stdin(stdin).stdout(stdout).stderr(stderr);
+        }
+        None => {
+            // A child in its own group is a background group to a terminal and cannot read it,
+            // so without a pty it gets one only when stdin is not a tty (hb-ghd.2.3 decision 1).
+            if !stdin_is_tty {
+                command.process_group(0);
+            }
+            if spec.stdio == StdioMode::Capture {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+        }
     }
     // The log is listening before the child starts, so its first denials are not missed.
     let log = match (&tag, &spec.denials) {
@@ -367,8 +409,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         _ => None,
     };
     let child = command.spawn().context(SpawnSnafu)?;
-    let supervisor = start_supervisor(child, watch, spec.signals, stdin_is_tty)?;
-    let waited = supervisor.wait_for_exit(spec.stdio);
+    let running = match pty {
+        Some(pty) => start_on_pty(child, pty, watch, spec.signals)?,
+        None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
+    };
+    let waited = running.wait_for_exit(spec.stdio);
     let denials = log.map(LogStream::finish).unwrap_or_default();
     let (exit, stdout, stderr) = waited?;
     drop(session);
@@ -391,6 +436,7 @@ fn stdin_is_tty(stdio: StdioMode, own_stdin_is_terminal: bool) -> bool {
 struct Running {
     child: Child,
     supervisor: Option<Supervisor>,
+    terminal: Option<Interactive>,
 }
 
 /// Starts forwarding signals to `child`, if `watch` was prepared. If that fails the child is
@@ -405,6 +451,7 @@ fn start_supervisor(
         return Ok(Running {
             child,
             supervisor: None,
+            terminal: None,
         });
     };
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
@@ -414,10 +461,11 @@ fn start_supervisor(
     } else {
         Target::Group(pid)
     };
-    match watch.start(target, Escalation::new(grace, stdin_is_tty)) {
+    match watch.start(target, Escalation::new(grace, stdin_is_tty), None) {
         Ok(supervisor) => Ok(Running {
             child,
             supervisor: Some(supervisor),
+            terminal: None,
         }),
         Err(error) => {
             let _ = child.kill();
@@ -427,10 +475,90 @@ fn start_supervisor(
     }
 }
 
+/// Kills and reaps a child that was started but cannot be supervised, so a failed start never
+/// leaves an agent running without its parent.
+fn abort_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Starts the user's side of a pty run (raw mode, relay) and the signal thread with the resize
+/// callback, after the child has been spawned.
+fn start_on_pty(
+    mut child: Child,
+    pty: Pty,
+    watch: Option<Watch>,
+    mode: SignalMode,
+) -> Result<Running, RunError> {
+    let (Some(watch), SignalMode::Forward { grace }) = (watch, mode) else {
+        abort_child(&mut child);
+        return Err(RunError::PtyUnavailable);
+    };
+    // Dropping hb's own copy of the slave lets the master see the end of the child's output.
+    let terminal = match Interactive::start(pty.release_slave()) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            abort_child(&mut child);
+            return Err(error.into());
+        }
+    };
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+    // The child leads its own session and group, and the terminal's keys reach it through the
+    // pty, so every signal hb gets is an explicit one: all are forwarded to the group.
+    match watch.start(
+        Target::Group(pid),
+        Escalation::new(grace, false),
+        Some(terminal.resize_callback()),
+    ) {
+        Ok(supervisor) => Ok(Running {
+            child,
+            supervisor: Some(supervisor),
+            terminal: Some(terminal),
+        }),
+        Err(error) => {
+            abort_child(&mut child);
+            terminal.finish();
+            Err(error.into())
+        }
+    }
+}
+
+/// Allocates the pty a run asks for, after checking what it needs.
+fn open_pty(spec: &RunSpec) -> Result<Option<Pty>, RunError> {
+    if spec.pty != PtyMode::On {
+        return Ok(None);
+    }
+    ensure!(
+        spec.stdio == StdioMode::Inherit
+            && io::stdin().is_terminal()
+            && matches!(spec.signals, SignalMode::Forward { .. }),
+        PtyUnavailableSnafu
+    );
+    Ok(Some(Pty::open()?))
+}
+
 impl Running {
     /// Waits for the child, then stops the signal thread, and returns how it ended.
     fn wait_for_exit(self, stdio: StdioMode) -> Result<(ExitKind, Vec<u8>, Vec<u8>), RunError> {
-        let Self { child, supervisor } = self;
+        let Self {
+            child,
+            supervisor,
+            terminal,
+        } = self;
+        if let Some(terminal) = terminal {
+            let pid = RustixPid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+            let exit = match pid {
+                Some(pid) => terminal.wait(pid),
+                None => Err(io::Error::other("the child has no valid pid")),
+            };
+            if let Some(supervisor) = supervisor {
+                supervisor.finish();
+            }
+            terminal.finish();
+            return exit
+                .map(|exit| (exit, Vec::new(), Vec::new()))
+                .context(SpawnSnafu);
+        }
         let result = match stdio {
             StdioMode::Capture => child
                 .wait_with_output()
@@ -450,10 +578,17 @@ impl Running {
 }
 
 /// The words that start the command: `sandbox-exec`, or the helper that execs it.
-fn launcher_words(helper: Option<&Path>) -> Vec<OsString> {
+fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString> {
     match helper {
         None => vec![OsString::from(SANDBOX_EXEC)],
-        Some(hb) => vec![hb.as_os_str().to_owned(), "__child".into(), "--".into()],
+        Some(hb) => {
+            let mut words = vec![hb.as_os_str().to_owned(), "__child".into()];
+            if controlling_tty {
+                words.push("--controlling-tty".into());
+            }
+            words.push("--".into());
+            words
+        }
     }
 }
 
@@ -476,8 +611,9 @@ fn command_for(
     spec: &RunSpec,
     cwd: &Path,
     helper: Option<&Path>,
+    controlling_tty: bool,
 ) -> Command {
-    let mut words = launcher_words(helper).into_iter();
+    let mut words = launcher_words(helper, controlling_tty).into_iter();
     let mut command = Command::new(words.next().unwrap_or_default());
     command
         .args(words)
@@ -672,6 +808,40 @@ mod tests {
         ));
     }
 
+    fn pty_spec(stdio: StdioMode, signals: SignalMode) -> RunSpec {
+        let mut spec = RunSpec::new(["true"]).stdio(stdio).signals(signals);
+        spec.pty = PtyMode::On;
+        spec
+    }
+
+    const FORWARD: SignalMode = SignalMode::Forward {
+        grace: Duration::from_secs(1),
+    };
+
+    #[test]
+    fn no_pty_is_opened_when_none_is_asked_for() {
+        let spec = RunSpec::new(["true"]).stdio(StdioMode::Inherit);
+        assert!(assert_ok!(open_pty(&spec)).is_none());
+    }
+
+    #[test]
+    fn a_pty_run_needs_inherited_streams() {
+        let spec = pty_spec(StdioMode::Capture, FORWARD);
+        assert!(matches!(
+            assert_err!(open_pty(&spec)),
+            RunError::PtyUnavailable
+        ));
+    }
+
+    #[test]
+    fn a_pty_run_needs_signals_to_be_forwarded() {
+        let spec = pty_spec(StdioMode::Inherit, SignalMode::Off);
+        assert!(matches!(
+            assert_err!(open_pty(&spec)),
+            RunError::PtyUnavailable
+        ));
+    }
+
     #[test]
     fn stdin_is_a_tty_only_when_shared_and_hbs_own_is_one() {
         assert!(stdin_is_tty(StdioMode::Inherit, true));
@@ -703,7 +873,7 @@ mod tests {
     }
 
     fn launcher() -> Vec<OsString> {
-        launcher_words(None)
+        launcher_words(None, false)
     }
 
     fn empty_profile() -> Profile {

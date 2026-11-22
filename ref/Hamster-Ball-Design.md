@@ -479,13 +479,13 @@ terminal) and then re-raises that signal on itself for INT, TERM, HUP and KILL, 
 script aborts on Ctrl-C (measured: with `exit 130` a bash loop kept going; with a re-raise it stopped). Other signals (SEGV, ABRT)
 return `128+n`, so `hb` does not leave core files.
 
-**Signals** (D64, hb-ghd.2.3b). The `hb` binary blocks INT, TERM and HUP in its main thread before any other thread exists, and
+**Signals** (D64, hb-ghd.2.3b). The `hb` binary blocks INT, TERM, HUP and WINCH in its main thread before any other thread exists, and
 receives them through a kqueue (`EVFILT_SIGNAL`; `sigwait` never gets SIGWINCH on macOS, and kqueue was measured to work).
 They are forwarded to the child's process group (own group, stdin not a tty) or to the child alone (shared group). The first
 signal starts a 5 s clock; a second signal, or the clock running out, sends SIGKILL. When the child shares `hb`'s group and stdin is
 a terminal, the terminal already sends INT and HUP to the child (measured: one Ctrl-C reaches both once, so forwarding gives the
 child two), so `hb` is passive for them: no forward and no clock, or it would kill an agent that handles its own Ctrl-C. TERM is still
-forwarded. Rust's `Command` passes the parent's blocked set to the child, so `hb` starts itself as `hb __child -- <sandbox-exec
+forwarded. With a pty (7.3) the child is its own session, none of this applies, and every signal is forwarded to its group. Rust's `Command` passes the parent's blocked set to the child, so `hb` starts itself as `hb __child -- <sandbox-exec
 arguments>`, a hidden subcommand that empties the mask and execs `/usr/bin/sandbox-exec` (only that), and the child's blocked set is
 empty (tested with perl `sigprocmask`). The re-raise lives in `cli::main`, never in the library: when the child died of INT, TERM,
 HUP or KILL `hb` finishes cleanup, lifts the mask and raises the same signal on itself. A signal the caller sent to `hb` is still
@@ -502,15 +502,53 @@ before, so the lines are hints for a person, never input to rule generation.
 
 ### 7.3 Terminal
 
-Measured during the M2 analysis, and to be re-run as the regression probe of hb-ghd.2.4 (D54): `TIOCSTI` injects keystrokes into a controlling tty when run unsandboxed. Under any deny-default profile it
-fails with EPERM, even with `file-ioctl` granted on the real tty. The gate is the `hid-control` operation, which
-`system.sb` does not grant. Until 2.4 there is no pty: `hb run` gives the child its own process group only when stdin is not a tty (a child in its own group while stdin is a
-terminal is a background group and could not read it, measured on a real pty); on a tty it shares `hb`'s group, so Ctrl-C reaches both, and `hb` leaves INT and HUP to the terminal (7.2). So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
-whenever stdin is a tty, so `/dev/tty` and re-opens name the child's own slave, `^C` and job control work, and a child that
-changes terminal modes cannot leave your shell raw. The profile grants `file-ioctl` on that one slave only, and must never
-gain `hid-control` (an invariant, checked on the rendered text; the real `TIOCSTI` regression probe is hb-ghd.2.4). The terminal is restored on exit, panic, SIGINT, SIGTERM and SIGHUP. Restoring after a
-SIGKILL of `hb` is impossible by construction; raw mode is therefore entered as late as possible and `reset` is the cure.
-Escape sequences in the child's output still reach your terminal through the relay (UNVERIFIED).
+**What stops keystroke injection** (measured on macOS 15.7, a regression probe in `tests/pty.rs`). `TIOCSTI` pushes bytes into a
+terminal's input queue. The probe tries it three ways: through descriptor 0, by re-opening the terminal's path, and through
+`/dev/tty`.
+
+| Run | fd 0 | path | `/dev/tty` |
+|---|---|---|---|
+| unsandboxed, on a pty | injected | injected | injected |
+| `(allow default)` profile | injected | injected | injected |
+| `(allow default)(deny hid-control)` | refused | refused | refused |
+| `hb`'s profile (`file-ioctl` on the slave, no `hid-control`) | refused | open refused | open refused |
+| `hb`'s profile plus a hand-added `(allow hid-control)` | injected | open refused | open refused |
+
+The gate is the `hid-control` operation, which `system.sb` does not grant. The profile never gains it (a static check on the
+rendered text, and the last row above shows the probe test fails if it did, through descriptor 0). So the pty is **hygiene and job control, not the
+injection control**.
+
+**The pty** (D65, hb-ghd.2.4). `hb run` allocates a fresh pty when it supervises the run and its stdin is a terminal. The child
+starts through `hb __child --controlling-tty`, which calls `setsid` and takes the slave as its controlling terminal, so the child
+leads its own session and group and is that terminal's foreground group. Its three standard streams are the slave. The profile
+grants `file-ioctl` on that one slave path only. Re-opening the slave by path, opening `/dev/tty` and opening other terminals are all refused, so the child works through the descriptors it was given. The master is close-on-exec, and `hb` drops its own copy of the
+slave once the child has started, so no descriptor above 2 reaches the child and the master sees the end of the child's output. If
+the pty cannot be set up the run fails with `PtyUnavailable`. There is no fallback to the user's terminal. When stdin is not a
+terminal there is no pty, and the child has its own process group as before (7.2).
+
+**Relay.** `hb` puts the user's terminal in raw mode only after the child has started. One thread copies the user's keystrokes to
+the master and the master's output to the screen byte for byte. When the child ends, the thread drains what it last wrote (150 ms
+of quiet, 2 s at most). `hb` copies the user's window size to the pty at start and on every SIGWINCH. Every signal `hb` receives
+is an explicit one, because the terminal's keys now reach the child through the pty, so all of INT, TERM and HUP are forwarded to
+the child's group with the 5 s escalation (7.2).
+
+**Ctrl-Z.** The child's terminal driver turns Ctrl-Z into SIGTSTP for the child, and an agent that handles it stops itself. `hb`
+sees the stop, pauses the relay, gives the user's terminal back in its original mode, and stops itself with SIGSTOP, so the shell
+shows a suspended job. On `fg` it returns to raw mode, copies the window size, resumes the relay, and sends SIGCONT to the child.
+The relay is paused first because the terminal restore flushes the input queue. A relay that had already seen bytes there would
+block in its next read, and the child could never finish its output (found with `fg` typed at once, fixed, with a regression
+test). A child stopped by `hb`'s SIGSTOP is stopped too, which is the point.
+
+**Restore.** The terminal's original settings are put back by `Drop`, with `TCSAFLUSH`, so keys typed after the child ended are
+discarded and not read by the shell (measured: with a plain restore, late input reached the shell). That covers a normal exit, a
+child that is killed, and SIGINT, SIGTERM or SIGHUP to `hb`, and `hb` has no `panic = "abort"` profile so an unwinding panic runs
+it as well (no panic hook is installed). SIGKILL of `hb` cannot be handled; raw mode is entered as late as possible, and `reset`
+is the cure. Escape sequences in the child's output reach the user's terminal through the relay, as they do for any terminal
+program (UNVERIFIED: that a terminal's reply to such a sequence cannot be turned into a typed command).
+
+**Shared group (no pty).** A library caller that asks for no pty while its stdin is a terminal still gets the child in `hb`'s
+group, so Ctrl-C reaches both and `hb` is passive for INT and HUP (7.2). The CLI does not take this path. `hb` does not block
+QUIT (Ctrl-backslash) there.
 
 ### 7.4 Nesting
 
@@ -704,7 +742,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 
 ## 15. Open items (decide or verify before or during implementation)
 
-1. **Terminal isolation** (7.3): allocate a pty for the child; verify keystroke injection is closed.
+1. ~~**Terminal isolation** (7.3)~~ Done in hb-ghd.2.4 (D65): the pty is allocated and `TIOCSTI` is measured to be closed by the missing `hid-control`. Still open under it: whether an agent's TUI behaves on the pty is checked per agent in M3 (3.5, 3.6 and the claude and opencode presets).
 2. **Proxy credentials in the URL** (12): confirm kiro-cli, pi, claude and opencode accept them.
 3. **Narrow `/private/tmp`**: claude needs `/tmp/claude-<uid>` and `/tmp/cc-socks`. Seatbelt has no private `/tmp`,
    so allow only named subpaths per agent, and give every other tool a per-session `TMPDIR`. Verify claude still works.
@@ -827,5 +865,6 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D60 | A signal-killed child makes `hb` clean up and re-raise INT, TERM, HUP or KILL on itself; other signals exit `128+n` | owner, hb-ghd.2; measured with a real Ctrl-C in a pty |
 | D61 | The config's own `deny_read`/`deny_write` entries get unlink pins by the same computation as the floor (`pin_ancestors`); the template re-allow names the guard deny's operations; `render_filtered` exists only under `cfg(test)` or the `test-support` feature, so a release build cannot render a floor-less profile; the `hb ctl` socket allow is a `path-literal` | review of hb-ghd.2.1 |
 | D62 | `system_trust` grants exactly the measured minimum: `SecurityServer` and `configd` lookups, and reads of the `System.keychain` and `System.keychain-db` files (no `trustd`, `securityd`, `securityd.xpc`, `mds`, preference domain or keychain directory); a `BindPort` is 1024-65535, at most 16 per server and 64 distinct in all (`MergeError::TooManyBindPorts`); `file-map-executable` joins the floor's read set; the floor stays the keychain control and `securityd` is documented as not a gate; `hb profile` marks a `-D` value it had to escape as not copy-exact | owner (high-confidence items), oracle `hb-ghd.2.1_oracle-tls-ports-keychain.md` |
-| D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (until the pty of 2.4); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum with only `Off` until 2.4 | owner, hb-ghd.2.3 |
+| D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (with a pty, D65, it leads its own session); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum (`Off`, and `On` from D65) | owner, hb-ghd.2.3 |
 | D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |
+| D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
