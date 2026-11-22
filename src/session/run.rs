@@ -1,0 +1,566 @@
+// ABOUTME: session::run: render the profile, build the environment and session dir, spawn sandbox-exec, wait, clean up.
+// ABOUTME: The one library entry point that `hb run` and the probe-matrix harness share, so they cannot run differently.
+//! Running a command under the profile (design 7.2, 7.4; hb-ghd.2.3a).
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, IsTerminal};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
+use std::process::{Command, ExitStatus, Stdio};
+
+use snafu::{ResultExt, Snafu, ensure};
+
+use super::dir::{SessionDir, SessionDirError, sweep_stale};
+use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
+use crate::config::Loaded;
+use crate::policy::{CanonicalPath, PathError, ToolName};
+use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
+use crate::system::{Environment, ToolsError, find_tools};
+
+/// What the kernel accepts for `argv` plus `envp` on macOS (`kern.argmax`).
+const ARG_MAX: usize = 1_048_576;
+/// Left unused for the kernel's own bookkeeping and for the platform's variance.
+const ARG_MARGIN: usize = 32 * 1024;
+/// Bytes one pointer takes in the argument block.
+const POINTER_BYTES: usize = 8;
+
+/// What to do with the child's standard streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioMode {
+    /// Capture stdout and stderr; stdin is closed. For the probe harness and tests.
+    Capture,
+    /// The child shares `hb`'s terminal and streams. For `hb run`.
+    Inherit,
+}
+
+/// Whether the child gets a pty of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PtyMode {
+    /// No pty. hb-ghd.2.4 adds `On`.
+    Off,
+}
+
+/// What to run.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RunSpec {
+    /// The command and its arguments. The first word is looked up on the child's `PATH`.
+    pub argv: Vec<OsString>,
+    /// The standard streams.
+    pub stdio: StdioMode,
+    /// The pty.
+    pub pty: PtyMode,
+}
+
+impl RunSpec {
+    /// A run of `argv` with captured output and no pty.
+    #[must_use]
+    pub fn new(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
+        Self {
+            argv: argv.into_iter().map(Into::into).collect(),
+            stdio: StdioMode::Capture,
+            pty: PtyMode::Off,
+        }
+    }
+
+    /// Sets the standard stream mode.
+    #[must_use]
+    pub fn stdio(mut self, stdio: StdioMode) -> Self {
+        self.stdio = stdio;
+        self
+    }
+}
+
+/// How the child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// It exited with this code.
+    Exited(i32),
+    /// A signal killed it.
+    Signalled(i32),
+}
+
+impl ExitKind {
+    /// What a shell would report: the code, or `128 + signal`.
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Exited(code) => code,
+            Self::Signalled(signal) => 128 + signal,
+        }
+    }
+
+    fn from_status(status: ExitStatus) -> Self {
+        status
+            .code()
+            .map(Self::Exited)
+            .or_else(|| status.signal().map(Self::Signalled))
+            .unwrap_or(Self::Exited(1))
+    }
+}
+
+/// The result of a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Outcome {
+    /// How the child ended.
+    pub exit: ExitKind,
+    /// Captured stdout (empty when the child shared the terminal).
+    pub stdout: Vec<u8>,
+    /// Captured stderr (empty when the child shared the terminal).
+    pub stderr: Vec<u8>,
+    /// Things worth telling the user, in order.
+    pub warnings: Vec<String>,
+}
+
+/// Why a run could not start.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum RunError {
+    /// There was no command to run.
+    #[snafu(display("there is no command to run"))]
+    EmptyCommand,
+
+    /// `hb` is inside another sandbox, or `sandbox-exec` does not work.
+    #[snafu(transparent)]
+    Preflight {
+        /// The underlying error.
+        source: PreflightError,
+    },
+
+    /// The `[env] tools` could not be looked up.
+    #[snafu(transparent)]
+    Tools {
+        /// The underlying error.
+        source: ToolsError,
+    },
+
+    /// The per-user temporary directory is not known.
+    #[snafu(display(
+        "the per-user temporary directory is unknown, so there is nowhere for the session directory"
+    ))]
+    NoTempDir,
+
+    /// The per-user temporary directory could not be resolved.
+    #[snafu(display("the per-user temporary directory {dir} could not be resolved"))]
+    TempDir {
+        /// The directory as reported.
+        dir: String,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The temporary directory is not a clean canonical path.
+    #[snafu(display("the per-user temporary directory is not usable"))]
+    TempDirPath {
+        /// The underlying error.
+        source: PathError,
+    },
+
+    /// The session directory could not be created.
+    #[snafu(transparent)]
+    Session {
+        /// The underlying error.
+        source: SessionDirError,
+    },
+
+    /// The profile could not be rendered.
+    #[snafu(transparent)]
+    Render {
+        /// The underlying error.
+        source: RenderError,
+    },
+
+    /// The child's environment could not be built.
+    #[snafu(transparent)]
+    Env {
+        /// The underlying error.
+        source: EnvBuildError,
+    },
+
+    /// The command is not on the child's `PATH`.
+    #[snafu(display(
+        "`{}` was not found on the PATH the program will have; add it to `[env] tools` or use its full path",
+        name.to_string_lossy()
+    ))]
+    CommandNotFound {
+        /// The first word of the command.
+        name: OsString,
+    },
+
+    /// The command line and environment would not fit in what the kernel accepts.
+    #[snafu(display(
+        "the command line is {total} bytes (profile {profile}, parameters {params}, environment {env}, command {command}); the limit is {max}"
+    ))]
+    TooLarge {
+        /// The whole size.
+        total: usize,
+        /// The limit.
+        max: usize,
+        /// The profile text.
+        profile: usize,
+        /// The `-D` parameters.
+        params: usize,
+        /// The environment.
+        env: usize,
+        /// The command and the fixed words.
+        command: usize,
+    },
+
+    /// `sandbox-exec` could not be started.
+    #[snafu(display("{SANDBOX_EXEC} could not be started"))]
+    Spawn {
+        /// The underlying error.
+        source: io::Error,
+    },
+}
+
+/// Runs `spec` under the profile for `loaded`, and waits for it.
+///
+/// Checks that `sandbox-exec` works here, resolves `[env] tools`, sweeps stale session
+/// directories, makes a new one, renders the profile, builds the child's environment from empty
+/// and spawns. The session directory is removed when this returns, or unwinds.
+///
+/// Build `loaded` after the last interactive step: the profile is rendered here, and spawn follows
+/// within milliseconds (design D52).
+///
+/// # Errors
+/// [`RunError`] if the run could not start. A child that fails is an [`Outcome`], not an error.
+pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome, RunError> {
+    ensure!(!spec.argv.is_empty(), EmptyCommandSnafu);
+    check_nesting(env.vars.get(SESSION_MARKER).is_some())?;
+
+    let names: Vec<ToolName> = loaded
+        .policy
+        .env
+        .tools
+        .iter()
+        .map(|t| t.value.clone())
+        .collect();
+    let tools = find_tools(&names, env.floor.path_var.as_deref())?;
+    let mut warnings: Vec<String> = tools
+        .missing
+        .iter()
+        .map(|name| format!("tool `{name}` from [env] tools was not found on your PATH"))
+        .collect();
+
+    let temp = temp_parent(env)?;
+    sweep_stale(temp.as_path());
+    let session = SessionDir::create(&temp)?;
+
+    let tool_dirs = tools.dirs();
+    let inputs = RenderInputs::new()
+        .with_session_dir(session.path().clone())
+        .with_exec_dirs(tool_dirs.clone());
+    let profile = render(&loaded.policy, &inputs)?;
+    warnings.extend(profile.warnings.iter().map(ToString::to_string));
+
+    let stdin_is_tty = stdin_is_tty(spec.stdio, io::stdin().is_terminal());
+    let child_env = ChildEnv::build(&EnvInputs {
+        parent: &env.vars,
+        home: &env.home,
+        session_dir: session.path(),
+        tool_dirs: &tool_dirs,
+        stdin_is_tty,
+        env: &loaded.policy.env,
+    })?;
+    ensure_command_exists(&spec.argv[0], &child_env)?;
+    check_size(&profile, &child_env, &spec.argv)?;
+
+    let mut command = command_for(&profile, &child_env, spec, &env.cwd);
+    // A child in its own group is a background group to a terminal and cannot read it, so it
+    // gets one only when stdin is not a tty (hb-ghd.2.3 decision 1; the pty of 2.4 replaces this).
+    if !stdin_is_tty {
+        command.process_group(0);
+    }
+    let (exit, stdout, stderr) = match spec.stdio {
+        StdioMode::Capture => {
+            let output = command.output().context(SpawnSnafu)?;
+            (
+                ExitKind::from_status(output.status),
+                output.stdout,
+                output.stderr,
+            )
+        }
+        StdioMode::Inherit => {
+            let status = command.status().context(SpawnSnafu)?;
+            (ExitKind::from_status(status), Vec::new(), Vec::new())
+        }
+    };
+    drop(session);
+    Ok(Outcome {
+        exit,
+        stdout,
+        stderr,
+        warnings,
+    })
+}
+
+/// Whether the child's stdin is a terminal: only when it shares `hb`'s streams and `hb`'s own
+/// stdin is one. Captured runs close stdin.
+fn stdin_is_tty(stdio: StdioMode, own_stdin_is_terminal: bool) -> bool {
+    stdio == StdioMode::Inherit && own_stdin_is_terminal
+}
+
+/// The canonical per-user temporary directory, where session directories live.
+fn temp_parent(env: &Environment) -> Result<CanonicalPath, RunError> {
+    let dir = env
+        .floor
+        .user_temp_dir
+        .as_deref()
+        .ok_or(RunError::NoTempDir)?;
+    let real = fs::canonicalize(dir).context(TempDirSnafu {
+        dir: dir.to_string_lossy().into_owned(),
+    })?;
+    CanonicalPath::from_canonical(real).context(TempDirPathSnafu)
+}
+
+fn command_for(profile: &Profile, child_env: &ChildEnv, spec: &RunSpec, cwd: &Path) -> Command {
+    let mut command = Command::new(SANDBOX_EXEC);
+    command
+        .arg("-p")
+        .arg(&profile.text)
+        .args(profile.define_args())
+        .arg("--")
+        .args(&spec.argv)
+        .env_clear()
+        .envs(child_env.iter())
+        .current_dir(cwd);
+    if spec.stdio == StdioMode::Capture {
+        command.stdin(Stdio::null());
+    }
+    command
+}
+
+/// Fails with a clear message when the command is not there, because `sandbox-exec` reports that
+/// with exit 71, the code it also uses for "already sandboxed".
+fn ensure_command_exists(word: &OsStr, child_env: &ChildEnv) -> Result<(), RunError> {
+    let found = if word.as_bytes().contains(&b'/') {
+        is_executable(Path::new(word))
+    } else {
+        let path = child_env.get("PATH").unwrap_or_default();
+        path.as_bytes()
+            .split(|b| *b == b':')
+            .any(|dir| is_executable(&Path::new(OsStr::from_bytes(dir)).join(word)))
+    };
+    ensure!(found, CommandNotFoundSnafu { name: word });
+    Ok(())
+}
+
+/// Whether `path` is a regular file (or a link to one) with an execute bit.
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Bytes `words` add to an `exec`: each string, its terminator and a pointer.
+fn exec_bytes<'a>(words: impl IntoIterator<Item = &'a OsStr>) -> usize {
+    words.into_iter().map(|w| w.len() + 1 + POINTER_BYTES).sum()
+}
+
+/// Checks the whole `sandbox-exec` command line and the environment against what `exec` accepts.
+fn check_size(profile: &Profile, child_env: &ChildEnv, argv: &[OsString]) -> Result<(), RunError> {
+    let params = exec_bytes(profile.define_args().iter().map(OsStr::new));
+    let profile_bytes = exec_bytes([OsStr::new(&profile.text)]);
+    let command = exec_bytes(
+        [OsStr::new(SANDBOX_EXEC), OsStr::new("-p"), OsStr::new("--")]
+            .into_iter()
+            .chain(argv.iter().map(OsString::as_os_str)),
+    );
+    let env = child_env.exec_bytes();
+    let total = params + profile_bytes + command + env;
+    let max = ARG_MAX - ARG_MARGIN;
+    ensure!(
+        total <= max,
+        TooLargeSnafu {
+            total,
+            max,
+            profile: profile_bytes,
+            params,
+            env,
+            command
+        }
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::HomeDir;
+    use crate::system::ParentVars;
+    use claims::{assert_err, assert_ok};
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    fn status(raw: i32) -> ExitStatus {
+        ExitStatus::from_raw(raw)
+    }
+
+    #[test]
+    fn an_exit_is_its_code_and_a_signal_death_is_128_plus_the_signal() {
+        assert_eq!(ExitKind::from_status(status(0)), ExitKind::Exited(0));
+        assert_eq!(ExitKind::from_status(status(42 << 8)), ExitKind::Exited(42));
+        assert_eq!(ExitKind::from_status(status(15)), ExitKind::Signalled(15));
+        assert_eq!(ExitKind::Exited(42).code(), 42);
+        assert_eq!(ExitKind::Signalled(15).code(), 143);
+        assert_eq!(ExitKind::Signalled(9).code(), 137);
+    }
+
+    #[test]
+    fn exec_bytes_counts_each_string_its_terminator_and_a_pointer() {
+        assert_eq!(
+            exec_bytes([OsStr::new("ab"), OsStr::new("")]),
+            2 + 1 + 8 + 1 + 8
+        );
+        assert_eq!(exec_bytes([]), 0);
+    }
+
+    fn child_env_with_path(path_dirs: &[CanonicalPath]) -> ChildEnv {
+        let home = HomeDir::new(assert_ok!(CanonicalPath::from_canonical("/Users/me")));
+        let session = assert_ok!(CanonicalPath::from_canonical("/private/tmp/hb-1-2-3"));
+        let policy_env = crate::config::MergedEnv::default();
+        assert_ok!(ChildEnv::build(&EnvInputs {
+            parent: &ParentVars::default(),
+            home: &home,
+            session_dir: &session,
+            tool_dirs: path_dirs,
+            stdin_is_tty: false,
+            env: &policy_env,
+        }))
+    }
+
+    #[test]
+    fn a_bare_command_is_found_on_the_system_path_and_a_missing_one_is_a_clear_error() {
+        let env = child_env_with_path(&[]);
+        assert_ok!(ensure_command_exists(OsStr::new("ls"), &env));
+        let err = assert_err!(ensure_command_exists(
+            OsStr::new("no-such-command-xyz"),
+            &env
+        ));
+        assert!(matches!(err, RunError::CommandNotFound { .. }));
+        let text = err.to_string();
+        assert!(
+            text.contains("no-such-command-xyz") && text.contains("[env] tools"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_command_in_a_tool_directory_is_found_only_when_that_directory_is_on_the_path() {
+        let dir = assert_ok!(TempDir::new());
+        let real = assert_ok!(fs::canonicalize(dir.path()));
+        let tool = real.join("mytool");
+        assert_ok!(fs::write(&tool, "#!/bin/sh\n"));
+        assert_ok!(fs::set_permissions(
+            &tool,
+            fs::Permissions::from_mode(0o755)
+        ));
+        let without = child_env_with_path(&[]);
+        assert_err!(ensure_command_exists(OsStr::new("mytool"), &without));
+        let with = child_env_with_path(&[assert_ok!(CanonicalPath::from_canonical(&real))]);
+        assert_ok!(ensure_command_exists(OsStr::new("mytool"), &with));
+    }
+
+    #[test]
+    fn a_command_with_a_slash_is_checked_as_a_path() {
+        let env = child_env_with_path(&[]);
+        assert_ok!(ensure_command_exists(OsStr::new("/usr/bin/true"), &env));
+        assert_err!(ensure_command_exists(
+            OsStr::new("/usr/bin/no-such-xyz"),
+            &env
+        ));
+        assert_err!(ensure_command_exists(OsStr::new("/usr"), &env));
+    }
+
+    #[test]
+    fn the_size_check_passes_a_normal_command_and_refuses_one_over_the_limit() {
+        let env = child_env_with_path(&[]);
+        let profile = Profile {
+            text: "(version 1)".to_owned(),
+            params: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert_ok!(check_size(&profile, &env, &[OsString::from("ls")]));
+        let big = OsString::from("x".repeat(ARG_MAX));
+        let err = assert_err!(check_size(&profile, &env, &[big]));
+        let text = err.to_string();
+        assert!(
+            text.contains("the limit is") && text.contains("environment"),
+            "{text}"
+        );
+        let just_fits = "x".repeat(ARG_MAX - ARG_MARGIN - 4096);
+        assert_ok!(check_size(&profile, &env, &[OsString::from(just_fits)]));
+    }
+
+    #[test]
+    fn stdin_is_a_tty_only_when_shared_and_hbs_own_is_one() {
+        assert!(stdin_is_tty(StdioMode::Inherit, true));
+        assert!(!stdin_is_tty(StdioMode::Inherit, false));
+        assert!(!stdin_is_tty(StdioMode::Capture, true));
+        assert!(!stdin_is_tty(StdioMode::Capture, false));
+    }
+
+    #[test]
+    fn a_file_without_an_execute_bit_is_not_an_executable_command() {
+        let dir = assert_ok!(TempDir::new());
+        let file = dir.path().join("plain");
+        assert_ok!(fs::write(&file, "x"));
+        assert_ok!(fs::set_permissions(
+            &file,
+            fs::Permissions::from_mode(0o644)
+        ));
+        assert!(!is_executable(&file));
+        assert_ok!(fs::set_permissions(
+            &file,
+            fs::Permissions::from_mode(0o700)
+        ));
+        assert!(is_executable(&file));
+        assert_ok!(fs::set_permissions(
+            &file,
+            fs::Permissions::from_mode(0o001)
+        ));
+        assert!(is_executable(&file), "any execute bit counts");
+    }
+
+    fn empty_profile() -> Profile {
+        Profile {
+            text: String::new(),
+            params: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// The size of everything but the user's command, for exact boundary tests.
+    fn fixed_bytes(env: &ChildEnv) -> usize {
+        exec_bytes([OsStr::new(SANDBOX_EXEC), OsStr::new("-p"), OsStr::new("--")])
+            + exec_bytes([OsStr::new("")])
+            + env.exec_bytes()
+    }
+
+    #[test]
+    fn the_size_limit_is_exact_at_arg_max_minus_the_margin() {
+        let env = child_env_with_path(&[]);
+        let max = ARG_MAX - ARG_MARGIN;
+        // One command word of `len` bytes adds `len + 1 + POINTER_BYTES`.
+        let word_len = max - fixed_bytes(&env) - (1 + POINTER_BYTES);
+        let at_limit = [OsString::from("x".repeat(word_len))];
+        assert_ok!(check_size(&empty_profile(), &env, &at_limit));
+        let over = [OsString::from("x".repeat(word_len + 1))];
+        let err = assert_err!(check_size(&empty_profile(), &env, &over));
+        assert!(
+            matches!(err, RunError::TooLarge { total, max: m, .. } if total == max + 1 && m == max),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_margin_and_limit_have_their_documented_values() {
+        assert_eq!(ARG_MAX, 1_048_576);
+        assert_eq!(ARG_MARGIN, 32_768);
+    }
+}

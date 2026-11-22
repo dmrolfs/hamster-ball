@@ -7,8 +7,10 @@
 //! only weaken the coverage derived from it, never move a fixed rule. `XDG_STATE_HOME` is kept
 //! only so `hb explain` can say it was ignored (see [`crate::system::StateDir`]).
 
+use std::collections::BTreeMap;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
@@ -22,6 +24,32 @@ use crate::policy::HomeDir;
 /// Where `getconf` is on macOS; an absolute path, so `PATH` cannot substitute it.
 const GETCONF: &str = "/usr/bin/getconf";
 
+/// The parent's environment variables, captured once.
+///
+/// Values can be secrets (`GITHUB_TOKEN`), so `Debug` lists names only. The child's environment
+/// is built from this snapshot, never from the live process.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ParentVars(BTreeMap<OsString, OsString>);
+
+impl ParentVars {
+    /// A snapshot of `pairs`.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+
+    /// The value of `name`, if set.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&OsStr> {
+        self.0.get(OsStr::new(name)).map(OsString::as_os_str)
+    }
+}
+
+impl fmt::Debug for ParentVars {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
 /// What `hb` knows about the process it runs in.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -34,6 +62,8 @@ pub struct Environment {
     pub floor: FloorEnvironment,
     /// `XDG_STATE_HOME`, which `hb` ignores.
     pub xdg_state_home: Option<OsString>,
+    /// The parent's variables, from which `[env] pass` copies.
+    pub vars: ParentVars,
 }
 
 /// Why the environment could not be read.
@@ -65,6 +95,7 @@ impl Environment {
             home,
             floor: FloorEnvironment::new(),
             xdg_state_home: None,
+            vars: ParentVars::default(),
         }
     }
 
@@ -86,6 +117,7 @@ impl Environment {
             home,
             floor,
             xdg_state_home: env::var_os("XDG_STATE_HOME"),
+            vars: ParentVars::from_pairs(env::vars_os()),
         })
     }
 }
@@ -113,6 +145,7 @@ fn user_temp_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::testutil::Tree;
+    use claims::assert_ok;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -135,5 +168,39 @@ mod tests {
         );
         assert!(dir.is_dir());
         assert!(!dir.to_string_lossy().ends_with('/'));
+    }
+
+    #[test]
+    fn parent_vars_look_up_by_name_and_debug_shows_names_never_values() {
+        let vars = ParentVars::from_pairs([
+            (
+                OsString::from("GITHUB_TOKEN"),
+                OsString::from("ghp_secretvalue"),
+            ),
+            (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+        ]);
+        assert_eq!(vars.get("LANG"), Some(OsStr::new("en_US.UTF-8")));
+        assert_eq!(vars.get("MISSING"), None);
+        let shown = format!("{vars:?}");
+        assert!(shown.contains("GITHUB_TOKEN"), "{shown}");
+        assert!(!shown.contains("ghp_secretvalue"), "{shown}");
+        assert!(!shown.contains("en_US"), "{shown}");
+    }
+
+    #[test]
+    fn an_environment_debug_does_not_leak_a_parent_variable_value() {
+        let tree = Tree::new();
+        let mut env = Environment::new(tree.home_path(), tree.home().clone());
+        env.vars = ParentVars::from_pairs([(
+            OsString::from("AWS_SECRET_ACCESS_KEY"),
+            OsString::from("wJalrXUtnFEMI"),
+        )]);
+        assert!(!format!("{env:?}").contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn from_process_snapshots_the_current_variables() {
+        let env = assert_ok!(Environment::from_process());
+        assert_eq!(env.vars.get("PATH"), std::env::var_os("PATH").as_deref(),);
     }
 }

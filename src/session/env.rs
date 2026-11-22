@@ -1,0 +1,381 @@
+// ABOUTME: ChildEnv: the child's environment, built from empty so no token in the parent shell reaches the agent.
+// ABOUTME: A pure function of the parent snapshot, the policy's [env] section and a few facts about this run.
+//! The child's environment (design 7.2).
+//!
+//! Built from nothing. The old `sb` exported a few variables on top of the parent's environment,
+//! so every token in the shell reached the agent. This builder never reads the process; it
+//! takes a snapshot ([`ParentVars`]) and copies only the names the config lists.
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+
+use snafu::{Snafu, ensure};
+
+use crate::config::MergedEnv;
+use crate::policy::{CanonicalPath, EnvName, HomeDir};
+use crate::system::ParentVars;
+
+/// The directories every program needs, always first on the child's `PATH`.
+pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// Set in the child so a nested `hb` can say it is inside one (design 7.4). It proves nothing:
+/// other sandboxes leave no marker, and the preflight is what decides.
+pub const SESSION_MARKER: &str = "HB_SESSION";
+/// `TERM` when stdin is not a terminal, or the parent has none.
+pub const DUMB_TERM: &str = "dumb";
+
+/// Why the environment could not be built.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum EnvBuildError {
+    /// A config listed a name `hb` sets itself. `resolve` rejects these; this is the second check.
+    #[snafu(display("environment variable {name} is set by hb and cannot be passed or set"))]
+    Reserved {
+        /// The name.
+        name: EnvName,
+    },
+
+    /// A tool directory contains `:`, which would split it in two inside `PATH`.
+    #[snafu(display("the tool directory {dir} contains a `:` and cannot go on PATH"))]
+    ColonInToolDir {
+        /// The directory.
+        dir: String,
+    },
+}
+
+/// What the child's environment is built from.
+#[derive(Debug, Clone, Copy)]
+pub struct EnvInputs<'a> {
+    /// The parent's variables, from which `pass` copies.
+    pub parent: &'a ParentVars,
+    /// The real home directory.
+    pub home: &'a HomeDir,
+    /// This run's private directory, which becomes `TMPDIR`.
+    pub session_dir: &'a CanonicalPath,
+    /// Directories of `[env] tools`, appended to `PATH` in this order.
+    pub tool_dirs: &'a [CanonicalPath],
+    /// Whether stdin is a terminal, which decides `TERM`.
+    pub stdin_is_tty: bool,
+    /// The merged `[env]` section.
+    pub env: &'a MergedEnv,
+}
+
+/// The environment the child starts with, and nothing else.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChildEnv(BTreeMap<OsString, OsString>);
+
+impl ChildEnv {
+    /// Builds the child's environment.
+    ///
+    /// # Errors
+    /// [`EnvBuildError::Reserved`] if the config names a variable `hb` sets, or
+    /// [`EnvBuildError::ColonInToolDir`] if a tool directory cannot go on `PATH`.
+    pub fn build(inputs: &EnvInputs<'_>) -> Result<Self, EnvBuildError> {
+        let mut vars: BTreeMap<OsString, OsString> = BTreeMap::new();
+        for pass in &inputs.env.pass {
+            ensure!(
+                !pass.value.is_reserved(),
+                ReservedSnafu {
+                    name: pass.value.clone()
+                }
+            );
+            if let Some(value) = inputs.parent.get(pass.value.as_str()) {
+                vars.insert(OsString::from(pass.value.as_str()), value.to_owned());
+            }
+        }
+        for (name, value) in &inputs.env.set {
+            ensure!(!name.is_reserved(), ReservedSnafu { name: name.clone() });
+            vars.insert(
+                OsString::from(name.as_str()),
+                OsString::from(value.value.as_str()),
+            );
+        }
+        vars.insert(SESSION_MARKER.into(), "1".into());
+        vars.insert("HOME".into(), inputs.home.path().as_str().into());
+        vars.insert("TMPDIR".into(), inputs.session_dir.as_str().into());
+        vars.insert("PATH".into(), path_value(inputs.tool_dirs)?);
+        vars.insert("TERM".into(), term_value(inputs));
+        Ok(Self(vars))
+    }
+
+    /// The value of `name`, if the child will have it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&OsStr> {
+        self.0.get(OsStr::new(name)).map(OsString::as_os_str)
+    }
+
+    /// The variable names, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().filter_map(|k| k.to_str())
+    }
+
+    /// Every variable, sorted by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.0.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str()))
+    }
+
+    /// What this environment adds to the size of an `exec`: each `name=value` string with its
+    /// terminator and a pointer.
+    #[must_use]
+    pub fn exec_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(k, v)| k.len() + 1 + v.len() + 1 + POINTER_BYTES)
+            .sum()
+    }
+}
+
+/// Bytes one pointer takes in the argument block.
+const POINTER_BYTES: usize = 8;
+
+// Values can be secrets, so `Debug` lists names only.
+impl fmt::Debug for ChildEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+fn path_value(tool_dirs: &[CanonicalPath]) -> Result<OsString, EnvBuildError> {
+    let mut path = String::from(SYSTEM_PATH);
+    for dir in tool_dirs {
+        ensure!(
+            !dir.as_str().contains(':'),
+            ColonInToolDirSnafu {
+                dir: dir.as_str().to_owned()
+            }
+        );
+        path.push(':');
+        path.push_str(dir.as_str());
+    }
+    Ok(path.into())
+}
+
+/// The parent's `TERM` when stdin is a terminal, else `dumb`.
+fn term_value(inputs: &EnvInputs<'_>) -> OsString {
+    let parent = inputs.parent.get("TERM").filter(|t| !t.is_empty());
+    match parent {
+        Some(term) if inputs.stdin_is_tty => term.to_owned(),
+        _ => OsString::from(DUMB_TERM),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::origin::{FileId, Source, Sourced};
+    use crate::policy::EnvValue;
+    use claims::{assert_err, assert_ok};
+    use pretty_assertions::assert_eq;
+
+    fn cp(path: &str) -> CanonicalPath {
+        assert_ok!(CanonicalPath::from_canonical(path))
+    }
+
+    fn name(n: &str) -> EnvName {
+        assert_ok!(EnvName::parse(n))
+    }
+
+    fn src() -> Source {
+        Source::value(FileId::new(0))
+    }
+
+    fn parent(pairs: &[(&str, &str)]) -> ParentVars {
+        ParentVars::from_pairs(
+            pairs
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+        )
+    }
+
+    fn merged(pass: &[&str], set: &[(&str, &str)]) -> MergedEnv {
+        let mut env = MergedEnv {
+            pass: pass.iter().map(|n| Sourced::new(name(n), src())).collect(),
+            ..MergedEnv::default()
+        };
+        for (k, v) in set {
+            env.set
+                .insert(name(k), Sourced::new(assert_ok!(EnvValue::parse(v)), src()));
+        }
+        env
+    }
+
+    struct Case {
+        parent: ParentVars,
+        home: HomeDir,
+        session: CanonicalPath,
+        tools: Vec<CanonicalPath>,
+        tty: bool,
+        env: MergedEnv,
+    }
+
+    impl Case {
+        fn new() -> Self {
+            Self {
+                parent: ParentVars::default(),
+                home: HomeDir::new(cp("/Users/me")),
+                session: cp("/private/var/folders/x/T/hb-1-2-3"),
+                tools: Vec::new(),
+                tty: false,
+                env: MergedEnv::default(),
+            }
+        }
+
+        fn build(&self) -> Result<ChildEnv, EnvBuildError> {
+            ChildEnv::build(&EnvInputs {
+                parent: &self.parent,
+                home: &self.home,
+                session_dir: &self.session,
+                tool_dirs: &self.tools,
+                stdin_is_tty: self.tty,
+                env: &self.env,
+            })
+        }
+
+        fn ok(&self) -> ChildEnv {
+            assert_ok!(self.build())
+        }
+    }
+
+    fn get<'a>(env: &'a ChildEnv, key: &str) -> Option<&'a OsStr> {
+        env.get(key)
+    }
+
+    #[test]
+    fn nothing_from_the_parent_survives_unless_named() {
+        let mut case = Case::new();
+        case.parent = parent(&[
+            ("GITHUB_TOKEN", "ghp_x"),
+            ("AWS_SECRET_ACCESS_KEY", "k"),
+            ("LANG", "en_US.UTF-8"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+        ]);
+        let names: Vec<String> = case.ok().names().map(str::to_owned).collect();
+        assert_eq!(names, vec!["HB_SESSION", "HOME", "PATH", "TERM", "TMPDIR"]);
+    }
+
+    #[test]
+    fn the_fixed_variables_have_their_documented_values() {
+        let env = Case::new().ok();
+        assert_eq!(get(&env, "HOME"), Some(OsStr::new("/Users/me")));
+        assert_eq!(
+            get(&env, "TMPDIR"),
+            Some(OsStr::new("/private/var/folders/x/T/hb-1-2-3"))
+        );
+        assert_eq!(get(&env, "PATH"), Some(OsStr::new(SYSTEM_PATH)));
+        assert_eq!(get(&env, "TERM"), Some(OsStr::new("dumb")));
+        assert_eq!(get(&env, "HB_SESSION"), Some(OsStr::new("1")));
+    }
+
+    #[test]
+    fn pass_copies_only_names_that_are_set_in_the_parent() {
+        let mut case = Case::new();
+        case.parent = parent(&[("LANG", "en_US.UTF-8"), ("GITHUB_TOKEN", "ghp_x")]);
+        case.env = merged(&["LANG", "COLORTERM"], &[]);
+        let env = case.ok();
+        assert_eq!(get(&env, "LANG"), Some(OsStr::new("en_US.UTF-8")));
+        assert_eq!(get(&env, "COLORTERM"), None);
+        assert_eq!(get(&env, "GITHUB_TOKEN"), None);
+    }
+
+    #[test]
+    fn set_adds_a_literal_and_wins_over_pass() {
+        let mut case = Case::new();
+        case.parent = parent(&[("RUST_LOG", "from-parent")]);
+        case.env = merged(
+            &["RUST_LOG"],
+            &[("RUST_LOG", "debug"), ("RUST_BACKTRACE", "1")],
+        );
+        let env = case.ok();
+        assert_eq!(get(&env, "RUST_LOG"), Some(OsStr::new("debug")));
+        assert_eq!(get(&env, "RUST_BACKTRACE"), Some(OsStr::new("1")));
+    }
+
+    #[test]
+    fn term_is_the_parents_on_a_tty_and_dumb_otherwise() {
+        let mut case = Case::new();
+        case.parent = parent(&[("TERM", "xterm-256color")]);
+        case.tty = true;
+        assert_eq!(get(&case.ok(), "TERM"), Some(OsStr::new("xterm-256color")));
+        case.tty = false;
+        assert_eq!(get(&case.ok(), "TERM"), Some(OsStr::new("dumb")));
+        case.tty = true;
+        case.parent = ParentVars::default();
+        assert_eq!(get(&case.ok(), "TERM"), Some(OsStr::new("dumb")));
+    }
+
+    #[test]
+    fn tool_directories_follow_the_system_path_in_order() {
+        let mut case = Case::new();
+        case.tools = vec![cp("/Users/me/.nvm/bin"), cp("/opt/homebrew/bin")];
+        assert_eq!(
+            get(&case.ok(), "PATH"),
+            Some(OsStr::new(&format!(
+                "{SYSTEM_PATH}:/Users/me/.nvm/bin:/opt/homebrew/bin"
+            )))
+        );
+    }
+
+    #[test]
+    fn a_tool_directory_with_a_colon_is_refused() {
+        let mut case = Case::new();
+        case.tools = vec![cp("/Users/me/odd:dir")];
+        assert!(matches!(
+            assert_err!(case.build()),
+            EnvBuildError::ColonInToolDir { .. }
+        ));
+    }
+
+    #[test]
+    fn reserved_names_are_refused_again_whatever_resolve_did() {
+        for reserved in [
+            "HOME",
+            "PATH",
+            "TERM",
+            "TMPDIR",
+            "HTTPS_PROXY",
+            "DYLD_X",
+            "HB_Y",
+        ] {
+            let mut case = Case::new();
+            case.env = merged(&[reserved], &[]);
+            assert!(
+                matches!(assert_err!(case.build()), EnvBuildError::Reserved { .. }),
+                "pass {reserved}"
+            );
+            let mut case = Case::new();
+            case.env = merged(&[], &[(reserved, "x")]);
+            assert!(
+                matches!(assert_err!(case.build()), EnvBuildError::Reserved { .. }),
+                "set {reserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn building_twice_gives_the_same_environment_and_debug_hides_values() {
+        let mut case = Case::new();
+        case.parent = parent(&[("LANG", "secret-looking-value")]);
+        case.env = merged(&["LANG"], &[("API_KEY", "hunter2")]);
+        assert_eq!(case.ok(), case.ok());
+        let shown = format!("{:?}", case.ok());
+        assert!(
+            shown.contains("API_KEY") && shown.contains("LANG"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("secret-looking"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_byte_size_counts_names_values_separators_and_pointers() {
+        let env = Case::new().ok();
+        let expected: usize = env
+            .iter()
+            .map(|(k, v)| k.len() + 1 + v.len() + 1 + 8)
+            .sum::<usize>();
+        assert_eq!(env.exec_bytes(), expected);
+        assert!(expected > 0);
+    }
+}

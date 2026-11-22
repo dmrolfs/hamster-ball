@@ -128,8 +128,12 @@ net.loopback_ports
   5432  <- [2] net.loopback_ports[0]
 
 env.pass
+  COLORTERM  <- [0] env.pass[0]
   LANG  <- [0] env.pass[1]
-  TERM  <- [0] env.pass[0]
+
+env.tools
+  ghost  (not found on PATH)  <- [0] env.tools[1]
+  mytool  <FIX>/bin  <- [0] env.tools[0]
 
 env.set (values are never shown)
   API_TOKEN  (value hidden)  <- [2] env.set.API_TOKEN

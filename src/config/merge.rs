@@ -23,7 +23,7 @@ use super::resolve::ResolvedMcpServer;
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
     Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
-    GuardException, HostPattern, McpName, PathPattern, Port,
+    GuardException, HostPattern, McpName, PathPattern, Port, ToolName,
 };
 use crate::sys::path_preview;
 
@@ -68,6 +68,9 @@ pub struct MergedEnv {
     pub pass: Vec<Sourced<EnvName>>,
     /// Variables set to a fixed value, in sorted name order.
     pub set: BTreeMap<EnvName, Sourced<EnvValue>>,
+    /// Programs to find on the child's `PATH`, sorted by name so the result does not depend on
+    /// the order of the files.
+    pub tools: Vec<Sourced<ToolName>>,
 }
 
 /// The merged `[tls]` rules.
@@ -243,6 +246,7 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
         },
         env: MergedEnv {
             pass: union(files, |c| positions(&c.env.pass)),
+            tools: union(files, |c| positions(&c.env.tools)),
             set: keyed(
                 files,
                 &mut collected,
@@ -649,6 +653,7 @@ mod tests {
         a.fs.deny_write = vec![deny("/p/w2")];
         a.net.loopback_ports = vec![assert_ok!(Port::try_from(3030))];
         a.env.pass = vec![assert_ok!(EnvName::parse("TERM"))];
+        a.env.tools = vec![assert_ok!(ToolName::parse("node"))];
         a.tls.extra_ca_files = vec![cpath("/p/ca.pem")];
         a.ctl.containers = vec![assert_ok!(ContainerName::parse("pg"))];
         a.guard.exceptions = vec![assert_ok!(GuardException::parse(".env.example"))];
@@ -658,9 +663,29 @@ mod tests {
         assert_eq!(policy.fs.deny_write.len(), 1);
         assert_eq!(policy.net.loopback_ports.len(), 1);
         assert_eq!(policy.env.pass.len(), 1);
+        assert_eq!(policy.env.tools.len(), 1);
         assert_eq!(policy.tls.extra_ca_files.len(), 1);
         assert_eq!(policy.ctl.containers.len(), 1);
         assert_eq!(policy.guard_exceptions.len(), 1);
+    }
+
+    #[test]
+    fn a_tool_named_in_two_files_is_one_entry_with_both_sources_in_closure_order() {
+        let tools = |names: &[&str]| {
+            let mut config = ResolvedConfig::default();
+            config.env.tools = names
+                .iter()
+                .map(|n| assert_ok!(ToolName::parse(n)))
+                .collect();
+            config
+        };
+        let policy = merged(vec![
+            user("base", tools(&["node", "npx"])),
+            project(tools(&["npx", "uvx"])),
+        ]);
+        let names: Vec<&str> = policy.env.tools.iter().map(|t| t.value.as_str()).collect();
+        assert_eq!(names, vec!["node", "npx", "uvx"]);
+        assert_eq!(policy.env.tools[1].sources.len(), 2);
     }
 
     #[test]

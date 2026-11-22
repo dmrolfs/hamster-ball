@@ -15,6 +15,7 @@ use crate::policy::{
     PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
 use crate::seatbelt::RenderError;
+use crate::session::RunError;
 use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 
 /// Any error produced by this crate.
@@ -211,6 +212,13 @@ pub enum Error {
     Render {
         /// The underlying error.
         source: RenderError,
+    },
+
+    /// A run could not start.
+    #[snafu(transparent)]
+    Run {
+        /// The underlying error.
+        source: RunError,
     },
 
     /// `hb explain` failed.

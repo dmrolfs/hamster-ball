@@ -35,8 +35,9 @@ pub const BASE_TEMPLATE: &str = "\
 system_trust = true
 
 [env]
-# Variables copied from your shell into every hamster ball.
-pass = [\"TERM\", \"LANG\", \"COLORTERM\"]
+# Variables copied from your shell into every hamster ball. HOME, PATH, TMPDIR, TERM and the proxy
+# and TLS variables are set by hb itself and cannot be listed here.
+pass = [\"LANG\", \"COLORTERM\"]
 ";
 
 /// Where `hb` keeps approvals: `<home>/.local/state/hamster-ball`.
@@ -389,7 +390,7 @@ mod tests {
             &ResolveContext::new(tree.home(), &root)
         ));
         assert_eq!(resolved.config.tls.system_trust, Some(true));
-        assert_eq!(resolved.config.env.pass.len(), 3);
+        assert_eq!(resolved.config.env.pass.len(), 2);
     }
 
     #[test]

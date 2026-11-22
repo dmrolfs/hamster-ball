@@ -973,6 +973,12 @@ fn a_declared_bind_port_can_be_listened_on_all_interfaces_which_the_design_says_
         eprintln!("SKIP: no LAN address on this machine");
         return;
     };
+    if !common::lan_loops_back(&lan) {
+        eprintln!(
+            "SKIP: this machine cannot reach its own listener at {lan} even without a sandbox"
+        );
+        return;
+    }
     let port = free_port();
     let w = World::new(&format!(
         "[fs]\nwrite = [\".\"]\n[mcp.serena]\ncommand = \"uvx\"\nbind_ports = [{port}]\n"

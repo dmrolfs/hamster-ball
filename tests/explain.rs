@@ -23,7 +23,8 @@ hooks = [["notify", "--token", "s3cret-hook-arg"]]
 system_trust = true
 
 [env]
-pass = ["TERM", "LANG"]
+pass = ["COLORTERM", "LANG"]
+tools = ["mytool", "ghost"]
 
 [fs]
 read = ["~/ref"]
@@ -86,6 +87,11 @@ impl World {
         assert_ok!(fs::create_dir_all(&project));
         assert_ok!(fs::create_dir_all(home_path.join("ref/private")));
         assert_ok!(fs::create_dir_all(base.join("bin")));
+        assert_ok!(fs::write(base.join("bin/mytool"), "#!/bin/sh\n"));
+        assert_ok!(fs::set_permissions(
+            base.join("bin/mytool"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755)
+        ));
         assert_ok!(fs::create_dir_all(base.join("tmp")));
         assert_ok!(fs::create_dir_all(base.join("install")));
         assert_ok!(fs::write(base.join("install/hb"), ""));
@@ -133,6 +139,7 @@ impl World {
             Path::new(&discovery.config),
         );
         options.show_args = show_args;
+        options.path_var = self.env.floor.path_var.as_deref();
         options.query = resolved
             .as_ref()
             .map(|(spelling, r)| (*spelling, &r.target, r.alias.as_ref()));
@@ -239,6 +246,22 @@ fn a_worktree_project_with_a_symlinked_path_entry_matches_its_golden_text_and_js
     );
     // The hostile name is escaped in the text and the JSON, never raw.
     assert!(!has_raw_hazard(&render_text(&report)));
+}
+
+#[test]
+fn each_tool_is_listed_with_its_directory_and_a_missing_one_says_so() {
+    let w = World::new(PROJECT);
+    let report = w.report(false, None);
+    let by_name = |name: &str| assert_some!(report.env.tools.iter().find(|t| t.name == name));
+    let found = by_name("mytool");
+    assert_eq!(
+        found.dir.as_deref(),
+        Some(w.base.join("bin").to_string_lossy().as_ref())
+    );
+    assert_eq!(by_name("ghost").dir, None);
+    let text = w.normalise(&render_text(&report));
+    assert!(text.contains("mytool  <FIX>/bin"), "{text}");
+    assert!(text.contains("ghost  (not found on PATH)"), "{text}");
 }
 
 #[test]

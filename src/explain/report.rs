@@ -15,6 +15,7 @@
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
 //! `hooks` keep first-seen order, which is meaningful. A value's origins are in closure order.
 
+use std::ffi::OsStr;
 use std::path::Path;
 
 use serde::Serialize;
@@ -24,6 +25,7 @@ use crate::origin::{KeyPath, Layer, Located, Origin, Source, Sourced};
 use crate::policy::{
     Argv, CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, PathPattern,
 };
+use crate::system::find_tools;
 
 /// The version of the JSON shape. Additive fields keep it; a rename or removal bumps it.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -51,6 +53,8 @@ pub struct ReportOptions<'a> {
     pub xdg_state_home_set: bool,
     /// A path to explain, as typed, and its canonical form.
     pub query: Option<(&'a str, &'a CanonicalPath, Option<&'a CanonicalPath>)>,
+    /// The invoking shell's `PATH`, which `[env] tools` are looked up in.
+    pub path_var: Option<&'a OsStr>,
 }
 
 impl<'a> ReportOptions<'a> {
@@ -64,6 +68,7 @@ impl<'a> ReportOptions<'a> {
             show_args: false,
             xdg_state_home_set: false,
             query: None,
+            path_var: None,
         }
     }
 }
@@ -176,11 +181,24 @@ pub struct EnvSetRow {
     pub origins: Vec<OriginRow>,
 }
 
+/// One `env.tools` entry and where `hb` found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolRow {
+    /// The program name.
+    pub name: String,
+    /// The canonical directory added to the child's `PATH`; `None` if not found.
+    pub dir: Option<String>,
+    /// Where it is listed.
+    pub origins: Vec<OriginRow>,
+}
+
 /// `[env]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnvReport {
     /// Variables copied from the invoking shell.
     pub pass: Vec<Row<String>>,
+    /// Programs made findable on the child's `PATH`, by name.
+    pub tools: Vec<ToolRow>,
     /// Variables set to a fixed value, by name.
     pub set: Vec<EnvSetRow>,
 }
@@ -402,6 +420,7 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         },
         env: EnvReport {
             pass: b.rows(&policy.env.pass, "env.pass", |n| n.as_str().to_owned()),
+            tools: tool_rows(&b, policy, options.path_var),
             set: policy
                 .env
                 .set
@@ -513,6 +532,28 @@ fn layer_name(layer: Layer) -> String {
 }
 
 /// Reads the closure; holds nothing else.
+/// The `env.tools` rows, each with the directory `hb` would add to the child's `PATH`.
+///
+/// A `PATH` that cannot be used leaves every directory unresolved; the report still renders.
+fn tool_rows(b: &Builder<'_>, policy: &Policy, path_var: Option<&OsStr>) -> Vec<ToolRow> {
+    let names: Vec<_> = policy.env.tools.iter().map(|t| t.value.clone()).collect();
+    let lookup = find_tools(&names, path_var).unwrap_or_default();
+    policy
+        .env
+        .tools
+        .iter()
+        .map(|tool| ToolRow {
+            name: tool.value.as_str().to_owned(),
+            dir: lookup
+                .found
+                .iter()
+                .find(|found| found.name == tool.value)
+                .map(|found| found.dir.as_str().to_owned()),
+            origins: b.origins(&tool.sources, "env.tools"),
+        })
+        .collect()
+}
+
 struct Builder<'a> {
     closure: &'a Closure,
 }

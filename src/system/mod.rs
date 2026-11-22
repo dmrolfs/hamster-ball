@@ -12,13 +12,15 @@ pub mod environment;
 pub mod floor;
 pub mod home;
 pub mod resolver;
+pub mod tools;
 pub mod userdir;
 
-pub use environment::{Environment, EnvironmentError};
+pub use environment::{Environment, EnvironmentError, ParentVars};
 pub use floor::{
     BuiltFloor, FloorDiagnostic, FloorEnvironment, FloorError, FloorInputs, MAX_PATH_TARGETS,
     build_floor,
 };
 pub use home::HomeError;
 pub use resolver::{AllowOutcome, DenyResolution, PathResolver, SkipReason, SkippedPath};
+pub use tools::{FoundTool, ToolLookup, ToolsError, find_tools};
 pub use userdir::{BASE_TEMPLATE, StateDir, UserConfigDir, UserConfigError};

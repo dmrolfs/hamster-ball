@@ -8,7 +8,8 @@
 //! | code | meaning |
 //! |---|---|
 //! | 0 | success (`explain` with warnings is still 0) |
-//! | 1 | config, load or floor error, printed with its cause chain |
+//! | 1 | config, load, floor or run-start error, printed with its cause chain |
+//! | n | `hb run`: the command's own exit code, or `128 + signal` |
 //! | 2 | usage error (clap's default) |
 //! | 78 | reserved for an unapproved config (milestone 4) |
 
@@ -22,6 +23,7 @@ use snafu::Report;
 use crate::config::load_project;
 use crate::explain::{ExplainRequest, Format, explain};
 use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
+use crate::session::{self, ExitKind, RunError, RunSpec, SESSION_MARKER, StdioMode, check_nesting};
 use crate::system::{Environment, UserConfigDir};
 use crate::text::Escaped;
 
@@ -43,6 +45,23 @@ enum Command {
     ///
     /// The proxy parameter is a placeholder until the proxy exists.
     Profile,
+    /// Run a command inside the hamster ball and exit with its status.
+    ///
+    /// The command starts with an empty environment: only HOME, PATH, TMPDIR, TERM and the names
+    /// in `[env] pass` and `[env] set` reach it. A program found through `[env] tools` is on its PATH.
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// The command and its arguments (a `--` before it is optional).
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +160,7 @@ where
             }
             Err(error) => fail(err, error),
         },
+        Command::Run(args) => run_command(env, args.command, err),
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())
@@ -157,6 +177,37 @@ where
             }
         }
     }
+}
+
+/// Runs a command under the project's profile and returns its status as the exit code.
+///
+/// The nesting check comes first, so a nested `hb` says so even where the project cannot be
+/// loaded. [`session::run`] checks again; that costs about 60 ms and keeps the library entry
+/// point safe to call on its own.
+fn run_command(env: &Environment, command: Vec<OsString>, err: &mut dyn Write) -> ExitCode {
+    let inside_hb = env.vars.get(SESSION_MARKER).is_some();
+    if let Err(error) = check_nesting(inside_hb) {
+        return fail(err, crate::Error::from(RunError::from(error)));
+    }
+    let loaded = match load_project(env) {
+        Ok((_, loaded)) => loaded,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    let spec = RunSpec::new(command).stdio(StdioMode::Inherit);
+    match session::run(env, &loaded, &spec) {
+        Ok(outcome) => {
+            for warning in &outcome.warnings {
+                let _ = writeln!(err, "warning: {warning}");
+            }
+            exit_code(outcome.exit)
+        }
+        Err(error) => fail(err, crate::Error::from(error)),
+    }
+}
+
+/// The process exit code for how a child ended; a shell's `128 + signal` for a signal.
+fn exit_code(exit: ExitKind) -> ExitCode {
+    ExitCode::from(u8::try_from(exit.code()).unwrap_or(1))
 }
 
 /// The profile for the current project, with its `-D` parameters as leading comments.

@@ -17,7 +17,7 @@ use crate::policy::{
     ContainerLabelError, ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue,
     EnvValueError, ExtendRef, GuardException, HomeDir, HostPattern, HostPatternError, McpName,
     McpNameError, PathError, PathPattern, PathPatternError, Port, PortError, ProjectRoot,
-    RefTextError,
+    RefTextError, ToolName, ToolNameError,
 };
 use crate::system::{AllowOutcome, PathResolver, SkippedPath};
 use crate::text::EscapedBounded;
@@ -146,6 +146,12 @@ pub enum EntryError {
     EnvName {
         /// The underlying error.
         source: EnvNameError,
+    },
+    /// An `env.tools` entry was not a bare program name.
+    #[snafu(transparent)]
+    ToolName {
+        /// The underlying error.
+        source: ToolNameError,
     },
     /// An `env.set` value was invalid.
     #[snafu(transparent)]
@@ -289,6 +295,8 @@ pub struct ResolvedEnv {
     pub pass: Vec<EnvName>,
     /// Variables set to a fixed value, in sorted name order.
     pub set: BTreeMap<EnvName, EnvValue>,
+    /// Programs to make findable on the child's `PATH`, in file order (design 7.2, D59).
+    pub tools: Vec<ToolName>,
 }
 
 /// `[tls]`.
@@ -404,8 +412,9 @@ impl<'a> Resolution<'a> {
                 loopback_ports: self.ports(net_key("loopback_ports"), &parsed.net.loopback_ports),
             },
             env: ResolvedEnv {
-                pass: self.list(env_key("pass"), &parsed.env.pass, EnvName::parse),
+                pass: self.list(env_key("pass"), &parsed.env.pass, EnvName::parse_user),
                 set: self.env_set(&parsed.env.set),
+                tools: self.list(env_key("tools"), &parsed.env.tools, ToolName::parse),
             },
             tls: ResolvedTls {
                 system_trust: parsed.tls.system_trust,
@@ -580,7 +589,7 @@ impl<'a> Resolution<'a> {
         let mut set = BTreeMap::new();
         for (raw_name, raw_value) in items {
             let entry_key = key.clone().key(raw_name.clone());
-            let name = EnvName::parse(raw_name);
+            let name = EnvName::parse_user(raw_name);
             let value = EnvValue::parse(raw_value);
             match (name, value) {
                 (Ok(name), Ok(value)) => {
@@ -772,7 +781,7 @@ mod tests {
              allow = [\"crates.io\"]\n\
              loopback_ports = [3030]\n\
              [env]\n\
-             pass = [\"TERM\"]\n\
+             pass = [\"COLORTERM\"]\n\
              [env.set]\n\
              RUST_BACKTRACE = \"1\"\n\
              [tls]\n\
@@ -794,7 +803,7 @@ mod tests {
         assert_eq!(config.fs.write.len(), 1);
         assert_eq!(config.net.loopback_ports[0].get(), 3030);
         assert_eq!(config.net.allow.len(), 1);
-        assert_eq!(config.env.pass[0].as_str(), "TERM");
+        assert_eq!(config.env.pass[0].as_str(), "COLORTERM");
         let name = assert_ok!(EnvName::parse("RUST_BACKTRACE"));
         assert_eq!(assert_some!(config.env.set.get(&name)).as_str(), "1");
         assert_eq!(config.tls.system_trust, Some(true));
@@ -975,6 +984,57 @@ mod tests {
             EntryError::EnvValue { .. }
         ));
         assert_eq!(key_of(&errors, 0), "env.set.1BAD");
+    }
+
+    #[test]
+    fn reserved_names_in_pass_and_set_are_errors_naming_the_key() {
+        let fx = Fixture::new();
+        let errors = fx.errors(
+            "[env]\npass = [\"RUST_LOG\", \"PATH\", \"DYLD_INSERT_LIBRARIES\"]\n\
+             [env.set]\nHOME = \"/x\"\nHB_X = \"1\"\nOK = \"1\"\n",
+        );
+        let keys: Vec<String> = (0..errors.errors.len())
+            .map(|i| key_of(&errors, i))
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["env.pass[1]", "env.pass[2]", "env.set.HB_X", "env.set.HOME"]
+        );
+        for error in &errors.errors {
+            assert!(
+                matches!(
+                    error.value,
+                    EntryError::EnvName {
+                        source: EnvNameError::Reserved { .. }
+                    }
+                ),
+                "{}",
+                error.value
+            );
+        }
+    }
+
+    #[test]
+    fn env_tools_are_parsed_in_order_and_each_bad_one_is_an_error() {
+        let fx = Fixture::new();
+        let resolved = fx.resolved("[env]\ntools = [\"node\", \"npx\"]\n");
+        let names: Vec<&str> = resolved
+            .config
+            .env
+            .tools
+            .iter()
+            .map(ToolName::as_str)
+            .collect();
+        assert_eq!(names, vec!["node", "npx"]);
+        let errors = fx.errors("[env]\ntools = [\"node\", \"/usr/bin/node\", \"..\"]\n");
+        let keys: Vec<String> = (0..errors.errors.len())
+            .map(|i| key_of(&errors, i))
+            .collect();
+        assert_eq!(keys, vec!["env.tools[1]", "env.tools[2]"]);
+        assert!(matches!(
+            errors.errors[0].value,
+            EntryError::ToolName { .. }
+        ));
     }
 
     #[test]

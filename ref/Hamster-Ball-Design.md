@@ -170,7 +170,7 @@ allow          = ["crates.io", "static.crates.io", "index.crates.io"]   # exact 
 loopback_ports = [3030, 3031, 3032, 5432, 9001, 9002]                   # services you started yourself
 
 [env]
-pass  = ["TERM", "LANG", "COLORTERM"]           # variable names copied from your shell
+pass  = ["LANG", "COLORTERM"]                   # names copied from your shell (not HOME, PATH, TMPDIR, TERM, proxy or TLS names, HB_*, DYLD_*, LD_*)
 set   = { RUST_BACKTRACE = "1" }
 tools = ["node", "git"]                         # programs found on your PATH when hb starts; see 7.2
 
@@ -449,7 +449,7 @@ is roughly quadratic: 0.06 s at 131, 1.5 s at 600, 36 s at 4096).
 ### 7.2 Environment
 
 The child starts with an empty environment (`env -i` semantics). `hb` sets `HOME` (real), `TMPDIR` (the session directory),
-`PATH`, `TERM`, proxy variables, TLS variables, and the names in `[env] pass` / values in `[env] set`. Measured gap in the
+`PATH`, `TERM`, `HB_SESSION=1` (so a nested `hb` can say it is inside one; other sandboxes leave no marker, so it never decides anything), proxy variables, TLS variables, and the names in `[env] pass` / values in `[env] set`. Measured gap in the
 old `sb`: it inherited every token in the parent shell. Static AWS keys are never passed (section 11).
 
 **`PATH`** (D59) is the fixed system directories `/usr/bin:/bin:/usr/sbin:/sbin`, then the directory of each program named in
@@ -457,11 +457,22 @@ old `sb`: it inherited every token in the parent shell. Static AWS keys are neve
 to the child's `PATH` and grants it read (a script on `PATH` needs the read; a binary does not). A name that is not found is a
 warning, like a skipped allow. This is how `pi` and `npx` (`#!/usr/bin/env node`) find node under nvm, whose directory changes
 with the version; an agent binary launched by absolute path needs nothing. A project that steers your `PATH` only changes which
-program runs inside the sandbox. `hb explain` shows each resolved directory.
+program runs inside the sandbox. `hb explain` shows each resolved directory. Tools are kept sorted by name, so the profile does not
+depend on file order. The command of `hb run` is looked up on that child `PATH` by `hb` itself, because `sandbox-exec` reports a
+missing command with exit 71, the code it also uses for "already sandboxed".
 
 **Reserved names** (D59): `[env] pass` and `[env] set` cannot name `HOME`, `PATH`, `TMPDIR`, `TERM`, the proxy and TLS variables,
 `HB_*`, `DYLD_*` or `LD_*`. The error names the file. `set` wins over `pass`. `TERM` is the parent's when stdin is a tty, else
 `dumb`.
+
+**Descriptors** (D63). `sandbox-exec` passes every open descriptor to the command and Rust's `Command` closes only the ones Rust opened,
+so `exec 3<~/.ssh/id_x; hb run agent` would hand the agent a readable key although the profile denies the path (Seatbelt checks a path when
+a file is opened). The `hb` binary closes every descriptor above 2 first thing in `main`. Library callers (`session::run`) do not, and must not
+close their host's descriptors; an embedder has to do it itself.
+
+**Size** (D63). The command line and environment together must fit in `kern.argmax` (1 MiB, measured: argv and env share it). `session::run`
+checks the whole `sandbox-exec` command line (profile text, `-D` parameters, the command) plus the environment against 1 MiB minus 32 KiB
+before it spawns, and names the parts in the error.
 
 **Exit status** (D60). `hb run` returns the child's exit code. If the child died of a signal, `hb` cleans up (session directory,
 terminal) and then re-raises that signal on itself for INT, TERM, HUP and KILL, so a calling shell sees a signalled child and a
@@ -472,7 +483,8 @@ return `128+n`, so `hb` does not leave core files.
 
 Measured during the M2 analysis, and to be re-run as the regression probe of hb-ghd.2.4 (D54): `TIOCSTI` injects keystrokes into a controlling tty when run unsandboxed. Under any deny-default profile it
 fails with EPERM, even with `file-ioctl` granted on the real tty. The gate is the `hid-control` operation, which
-`system.sb` does not grant. So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
+`system.sb` does not grant. Until 2.4 there is no pty: `hb run` gives the child its own process group only when stdin is not a tty (a child in its own group while stdin is a
+terminal is a background group and could not read it, measured on a real pty); on a tty it shares `hb`'s group, so Ctrl-C reaches both. So the pty is **hygiene and job control, not the injection control**: `hb` allocates a fresh pty
 whenever stdin is a tty, so `/dev/tty` and re-opens name the child's own slave, `^C` and job control work, and a child that
 changes terminal modes cannot leave your shell raw. The profile grants `file-ioctl` on that one slave only, and must never
 gain `hid-control` (an invariant, checked on the rendered text; the real `TIOCSTI` regression probe is hb-ghd.2.4). The terminal is restored on exit, panic, SIGINT, SIGTERM and SIGHUP. Restoring after a
@@ -794,3 +806,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D60 | A signal-killed child makes `hb` clean up and re-raise INT, TERM, HUP or KILL on itself; other signals exit `128+n` | owner, hb-ghd.2; measured with a real Ctrl-C in a pty |
 | D61 | The config's own `deny_read`/`deny_write` entries get unlink pins by the same computation as the floor (`pin_ancestors`); the template re-allow names the guard deny's operations; `render_filtered` exists only under `cfg(test)` or the `test-support` feature, so a release build cannot render a floor-less profile; the `hb ctl` socket allow is a `path-literal` | review of hb-ghd.2.1 |
 | D62 | `system_trust` grants exactly the measured minimum: `SecurityServer` and `configd` lookups, and reads of the `System.keychain` and `System.keychain-db` files (no `trustd`, `securityd`, `securityd.xpc`, `mds`, preference domain or keychain directory); a `BindPort` is 1024-65535, at most 16 per server and 64 distinct in all (`MergeError::TooManyBindPorts`); `file-map-executable` joins the floor's read set; the floor stays the keychain control and `securityd` is documented as not a gate; `hb profile` marks a `-D` value it had to escape as not copy-exact | owner (high-confidence items), oracle `hb-ghd.2.1_oracle-tls-ports-keychain.md` |
+| D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (until the pty of 2.4); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum with only `Off` until 2.4 | owner, hb-ghd.2.3 |

@@ -53,6 +53,7 @@ pub(crate) struct RawNet {
 pub(crate) struct RawEnv {
     pub(crate) pass: Vec<String>,
     pub(crate) set: BTreeMap<String, String>,
+    pub(crate) tools: Vec<String>,
 }
 
 /// `[tls]`.

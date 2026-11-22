@@ -104,6 +104,19 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
 
     section(out, "env.pass", report.env.pass.is_empty())?;
     rows(out, &report.env.pass, t, |v| cell(v))?;
+    section(out, "env.tools", report.env.tools.is_empty())?;
+    for tool in &report.env.tools {
+        let place = tool.dir.as_deref().map_or_else(
+            || "(not found on PATH)".to_owned(),
+            |dir| Escaped(dir).to_string(),
+        );
+        writeln!(
+            out,
+            "  {}  {place}  {}",
+            Escaped(&tool.name),
+            origins(&tool.origins, t)
+        )?;
+    }
     section(
         out,
         "env.set (values are never shown)",

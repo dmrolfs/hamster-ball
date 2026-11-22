@@ -20,7 +20,9 @@ pub mod port;
 
 pub use argv::{ArgWord, ArgWordError, Argv, ArgvError};
 pub use ctl::{ContainerLabel, ContainerLabelError, ContainerName, ContainerNameError};
-pub use env::{EnvName, EnvNameError, EnvValue, EnvValueError};
+pub use env::{
+    EnvName, EnvNameError, EnvValue, EnvValueError, MAX_TOOL_NAME_BYTES, ToolName, ToolNameError,
+};
 pub use extends::{
     ExtendTarget, ExtendTargetError, MAX_PRESET_NAME_BYTES, PresetName, PresetNameError,
 };

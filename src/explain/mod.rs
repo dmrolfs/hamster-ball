@@ -139,6 +139,7 @@ pub fn explain(request: &ExplainRequest<'_>) -> Result<String, ExplainError> {
     );
     options.show_args = request.show_args;
     options.xdg_state_home_set = env.xdg_state_home.is_some();
+    options.path_var = env.floor.path_var.as_deref();
     options.query = resolved
         .as_ref()
         .map(|(spelling, r)| (*spelling, &r.target, r.alias.as_ref()));

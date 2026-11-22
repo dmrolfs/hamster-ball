@@ -125,11 +125,7 @@ pub fn without_lines(profile: &Profile, needle: &str) -> Profile {
 
 /// Whether `sandbox-exec` works here: false when this process is already sandboxed.
 pub fn sandbox_available() -> bool {
-    let nested = Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true);
+    let nested = hamster_ball::session::is_nested();
     if nested {
         // CI sets HB_REQUIRE_SANDBOX so an environment that cannot sandbox fails loudly instead
         // of turning every Seatbelt test into a silent pass.
@@ -166,6 +162,43 @@ pub fn stderr(output: &Output) -> String {
 
 pub fn quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Whether this machine can reach a wildcard listener of its own at `address`.
+///
+/// A firewall or VPN can reset such connections even with no sandbox involved; a test about what
+/// the sandbox allows must skip then, because it could not tell the two causes apart.
+pub fn lan_loops_back(address: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    let Ok(listener) = TcpListener::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let Ok(port) = listener.local_addr().map(|a| a.port()) else {
+        return false;
+    };
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.write_all(b"hi");
+        }
+    });
+    let reached = (address, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .and_then(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok())
+        .and_then(|mut s| {
+            let mut text = String::new();
+            s.read_to_string(&mut text).ok().map(|_| text)
+        })
+        .is_some_and(|text| text == "hi");
+    if !reached {
+        // Unblock the accept so the thread can end.
+        let _ = TcpStream::connect(("127.0.0.1", port));
+    }
+    let _ = server.join();
+    reached
 }
 
 /// This machine's address on its local network, if it has one.

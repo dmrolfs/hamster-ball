@@ -6,6 +6,8 @@ use std::io::{stderr, stdout};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Before anything opens a file: nothing the launching shell left open may reach the agent.
+    let _ = hamster_ball::session::close_inherited_fds();
     hamster_ball::cli::run(
         std::env::args_os(),
         None,

@@ -2606,6 +2606,19 @@
   "env": {
     "pass": [
       {
+        "value": "COLORTERM",
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "env.pass[0]",
+            "floor_rule": null
+          }
+        ]
+      },
+      {
         "value": "LANG",
         "origins": [
           {
@@ -2617,16 +2630,33 @@
             "floor_rule": null
           }
         ]
-      },
+      }
+    ],
+    "tools": [
       {
-        "value": "TERM",
+        "name": "ghost",
+        "dir": null,
         "origins": [
           {
             "layer": "user_base",
             "file_index": 0,
             "name": null,
             "file": "<FIX>/home/.config/hamster-ball/base.toml",
-            "key": "env.pass[0]",
+            "key": "env.tools[1]",
+            "floor_rule": null
+          }
+        ]
+      },
+      {
+        "name": "mytool",
+        "dir": null,
+        "origins": [
+          {
+            "layer": "user_base",
+            "file_index": 0,
+            "name": null,
+            "file": "<FIX>/home/.config/hamster-ball/base.toml",
+            "key": "env.tools[0]",
             "floor_rule": null
           }
         ]

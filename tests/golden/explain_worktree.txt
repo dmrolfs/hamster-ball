@@ -141,8 +141,12 @@ net.loopback_ports
   (none)
 
 env.pass
+  COLORTERM  <- [0] env.pass[0]
   LANG  <- [0] env.pass[1]
-  TERM  <- [0] env.pass[0]
+
+env.tools
+  ghost  (not found on PATH)  <- [0] env.tools[1]
+  mytool  (not found on PATH)  <- [0] env.tools[0]
 
 env.set (values are never shown)
   (none)
