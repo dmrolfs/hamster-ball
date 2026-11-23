@@ -9,7 +9,7 @@ mod common;
 use std::process::Command;
 
 use claims::assert_ok;
-use common::{World, quote, sandbox_available};
+use common::{EXPECT_GUARD, World, assert_no_expect_timeout, quote, sandbox_available};
 
 const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
 const PROJECT: &str = "[fs]\nwrite = [\".\"]\n";
@@ -79,17 +79,19 @@ fn on_a_terminal_the_denials_are_printed_after_the_child_ends_not_in_the_middle_
     let exp = w.base.join("deny.exp");
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
-         set timeout 30\nspawn {drive} run --log-denials -- /bin/sh -c {script}\nexpect eof\n",
+         set timeout 30\n{guard}spawn {drive} run --log-denials -- /bin/sh -c {script}\nexpect eof\n",
         home = w.home_dir().display(),
         cwd = w.project.display(),
         path = w.base.join("bin").display(),
         tmp = w.base.join("tmp").display(),
         drive = DRIVE,
         script = tcl_quote(&script),
+        guard = EXPECT_GUARD,
     );
     common::write(&exp, &body);
     let out = assert_ok!(Command::new("/usr/bin/expect").arg(&exp).output());
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_no_expect_timeout(&text);
     let done = text.find("child-done");
     let first = text.find("hb: denied: ");
     assert!(done.is_some() && first.is_some(), "{text}");

@@ -19,6 +19,7 @@ use snafu::{ResultExt, Snafu, ensure};
 use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+use super::guardian::{Guardian, GuardianError};
 use super::interactive::{Interactive, InteractiveError};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::pty::{Pty, PtyError};
@@ -293,6 +294,13 @@ pub enum RunError {
     ))]
     PtyUnavailable,
 
+    /// The process that cleans up after a killed hb could not be started or told what to watch.
+    #[snafu(transparent)]
+    Guardian {
+        /// The underlying error.
+        source: GuardianError,
+    },
+
     /// The pty could not be set up.
     #[snafu(transparent)]
     Pty {
@@ -406,18 +414,40 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             }
         }
     }
+    // If hb is killed (SIGKILL cannot be handled) nothing in hb can end the agent or the log
+    // stream, so a guard process does. It exists whenever hb supervises the run.
+    let mut guard = helper.map(Guardian::start).transpose()?;
     // The log is listening before the child starts, so its first denials are not missed.
     let log = match (&tag, &spec.denials) {
         (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
         _ => None,
     };
-    let child = command.spawn().context(SpawnSnafu)?;
+    if let (Some(guard), Some(log)) = (guard.as_mut(), &log) {
+        guard.watch(Target::Child(pid_of(log.pid())))?;
+    }
+    let mut child = command.spawn().context(SpawnSnafu)?;
+    if let Some(guard) = guard.as_mut() {
+        // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
+        let target = if pty.is_some() || !stdin_is_tty {
+            Target::Group(pid_of(child.id()))
+        } else {
+            Target::Child(pid_of(child.id()))
+        };
+        if let Err(error) = guard.watch(target) {
+            abort_child(&mut child);
+            return Err(error.into());
+        }
+    }
     let running = match pty {
         Some(pty) => start_on_pty(child, pty, watch, spec.signals)?,
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
     let waited = running.wait_for_exit(spec.stdio);
     let denials = log.map(LogStream::finish).unwrap_or_default();
+    // Everything hb started has ended and been reaped, so the guard has nothing left to do.
+    if let Some(guard) = guard {
+        guard.release();
+    }
     let (exit, stdout, stderr) = waited?;
     drop(session);
     Ok(Outcome {
@@ -476,6 +506,11 @@ fn start_supervisor(
             Err(error.into())
         }
     }
+}
+
+/// A process number from the standard library's `u32` id.
+fn pid_of(id: u32) -> Pid {
+    Pid::from_raw(i32::try_from(id).unwrap_or(i32::MAX))
 }
 
 /// Kills and reaps a child that was started but cannot be supervised, so a failed start never

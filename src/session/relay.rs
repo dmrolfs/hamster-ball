@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
+use super::sanitize::Sanitizer;
+
 /// How often the thread looks at the stop flag when nothing arrives.
 const TICK_MS: u8 = 50;
 /// After the child has ended, how long the master may stay silent before the relay stops.
@@ -103,17 +105,37 @@ impl Relay {
     }
 }
 
-/// Copies one chunk from `from` to `to`. `false` means `from` has ended or failed.
-fn copy_chunk(from: &mut File, to: &mut File) -> bool {
+/// Copies one chunk from `from` to `to`, through `filter` if there is one. `false` means `from`
+/// has ended or failed.
+fn copy_chunk(from: &mut File, to: &mut File, filter: Option<&mut Sanitizer>) -> bool {
     let mut buffer = [0u8; BUFFER];
     match from.read(&mut buffer) {
         Ok(0) | Err(_) => false,
         Ok(n) => {
             // The other side may be gone (the child ended); nothing useful to do about that here.
-            let _ = to.write_all(&buffer[..n]);
+            match filter {
+                Some(filter) => {
+                    let mut clean = Vec::with_capacity(n);
+                    filter.feed(&buffer[..n], &mut clean);
+                    let _ = to.write_all(&clean);
+                }
+                None => {
+                    let _ = to.write_all(&buffer[..n]);
+                }
+            }
             let _ = to.flush();
             true
         }
+    }
+}
+
+/// Tells the terminal the agent's output is over: a sequence the agent left open is cancelled.
+fn end_of_output(filter: &mut Sanitizer, output: &mut File) {
+    let mut tail = Vec::new();
+    filter.finish(&mut tail);
+    if !tail.is_empty() {
+        let _ = output.write_all(&tail);
+        let _ = output.flush();
     }
 }
 
@@ -133,6 +155,7 @@ fn hold_while_paused(shared: &Shared) {
 }
 
 fn run(mut input: File, mut master: File, mut output: File, shared: &Shared) {
+    let mut filter = Sanitizer::new();
     let mut input_open = true;
     let mut draining_since: Option<Instant> = None;
     loop {
@@ -156,15 +179,17 @@ fn run(mut input: File, mut master: File, mut output: File, shared: &Shared) {
             };
             (ready(&fds[0]), fds.get(1).is_some_and(ready))
         };
-        if master_ready && !copy_chunk(&mut master, &mut output) {
+        if master_ready && !copy_chunk(&mut master, &mut output, Some(&mut filter)) {
             // End of the child's output: nothing more can come.
+            end_of_output(&mut filter, &mut output);
             return;
         }
-        if input_ready && !copy_chunk(&mut input, &mut master) {
+        if input_ready && !copy_chunk(&mut input, &mut master, None) {
             input_open = false;
         }
         if let Some(since) = draining_since {
             if !master_ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX {
+                end_of_output(&mut filter, &mut output);
                 return;
             }
         }
@@ -269,6 +294,38 @@ mod tests {
             "escape sequences must pass untouched: {got:?}"
         );
         rig.relay.finish();
+    }
+
+    #[test]
+    fn a_query_whose_reply_the_agent_could_shape_never_reaches_the_screen() {
+        let mut rig = rig();
+        assert_ok!(rig.child.write_all(b"a\x1b[21tb\x1b]52;c;?\x07c\xc2\x9bd"));
+        let got = read_some(&mut rig.user, b"cd");
+        assert_eq!(got, b"abcd");
+        rig.relay.finish();
+    }
+
+    #[test]
+    fn a_sequence_split_between_two_reads_is_filtered_all_the_same() {
+        let mut rig = rig();
+        assert_ok!(rig.child.write_all(b"x\x1b[2"));
+        thread::sleep(Duration::from_millis(120));
+        assert_ok!(rig.child.write_all(b"1ty"));
+        assert_eq!(read_some(&mut rig.user, b"xy"), b"xy");
+        rig.relay.finish();
+    }
+
+    #[test]
+    fn the_end_of_the_run_cancels_a_sequence_the_agent_left_open() {
+        let mut rig = rig();
+        assert_ok!(rig.child.write_all(b"\x1b]0;a title with no end"));
+        thread::sleep(Duration::from_millis(120));
+        rig.relay.finish();
+        let got = read_some(&mut rig.user, b"\x18");
+        assert!(
+            got.ends_with(b"\x18"),
+            "no cancel after an open title: {got:?}"
+        );
     }
 
     #[test]

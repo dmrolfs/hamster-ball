@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use claims::assert_ok;
-use common::{World, sandbox_available};
+use common::{EXPECT_GUARD, World, assert_no_expect_timeout, sandbox_available};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use pretty_assertions::assert_eq;
@@ -383,7 +383,7 @@ fn on_a_terminal(w: &World, script_name: &str, child_script: &str, ctrl_c_after_
     let td = w.base.join("drive.exp");
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
-         set env(HB_TD_GRACE_MS) 500\nset env(HB_TD_PTY) off\nset timeout 20\n\
+         set env(HB_TD_GRACE_MS) 500\nset env(HB_TD_PTY) off\nset timeout 20\n{guard}\
          spawn {drive} run -- /usr/bin/perl {script}\n\
          sleep {delay}\nsend \"\\003\"\nexpect eof\n",
         home = w.home_dir().display(),
@@ -393,10 +393,13 @@ fn on_a_terminal(w: &World, script_name: &str, child_script: &str, ctrl_c_after_
         drive = DRIVE,
         script = script.display(),
         delay = f64::from(ctrl_c_after_ms) / 1000.0,
+        guard = EXPECT_GUARD,
     );
     common::write(&td, &body);
     let out = assert_ok!(Command::new("/usr/bin/expect").arg(&td).output());
-    String::from_utf8_lossy(&out.stdout).replace('\r', "")
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_no_expect_timeout(&text);
+    text
 }
 
 #[test]

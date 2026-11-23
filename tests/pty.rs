@@ -9,7 +9,7 @@ mod common;
 use std::process::Command;
 
 use claims::assert_ok;
-use common::{World, sandbox_available};
+use common::{EXPECT_GUARD, World, assert_no_expect_timeout, sandbox_available};
 
 const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
 const PROJECT: &str = "[fs]\nwrite = [\".\"]\n";
@@ -23,6 +23,10 @@ macro_rules! sandboxed {
     };
 }
 
+/// Tcl that answers `CSI c` the way a terminal does, and lets the test carry on.
+const ANSWER_DEVICE_ATTRIBUTES: &str =
+    "expect_before -i any_spawn_id -re {\\x1b\\[c} {send -- \"\\033\\[?62;c\"; exp_continue}\n";
+
 /// Quotes a word for Tcl.
 fn tcl(word: &str) -> String {
     format!("{{{word}}}")
@@ -31,6 +35,11 @@ fn tcl(word: &str) -> String {
 /// Runs `body` (Tcl) after setting up the world's variables, with `spawn` available as
 /// `spawn_hb ARGS...`, and returns what expect printed.
 fn expect(w: &World, extra_env: &[(&str, &str)], body: &str) -> String {
+    expect_with(w, extra_env, true, body)
+}
+
+/// Like [`expect`]. With `answer_queries` false the script answers terminal queries itself.
+fn expect_with(w: &World, extra_env: &[(&str, &str)], answer_queries: bool, body: &str) -> String {
     let mut script = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
          set env(HB_TD_GRACE_MS) 500\nset env(TERM) xterm-256color\nset timeout 20\nset stty_init {{rows 24 columns 80}}\n",
@@ -42,6 +51,12 @@ fn expect(w: &World, extra_env: &[(&str, &str)], body: &str) -> String {
     for (k, v) in extra_env {
         script.push_str(&format!("set env({k}) {}\n", tcl(v)));
     }
+    script.push_str(EXPECT_GUARD);
+    // A terminal answers a primary device attributes query. hb asks one before it gives the
+    // terminal back, so a harness that stands in for the terminal has to answer it.
+    if answer_queries {
+        script.push_str(ANSWER_DEVICE_ATTRIBUTES);
+    }
     script.push_str(&format!("set drive {}\n", tcl(DRIVE)));
     script.push_str(body);
     let file = w.base.join("case.exp");
@@ -49,6 +64,7 @@ fn expect(w: &World, extra_env: &[(&str, &str)], body: &str) -> String {
     let out = assert_ok!(Command::new("/usr/bin/expect").arg(&file).output());
     let mut text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     text.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert_no_expect_timeout(&text);
     text
 }
 
@@ -80,7 +96,7 @@ fn the_child_has_a_terminal_of_its_own_and_leads_its_own_session() {
         &w,
         &[],
         &format!(
-            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\nputs \"usertty=$spawn_out(slave,name)\"\n",
+            "spawn -noecho $drive run -- /usr/bin/perl {}\nexpect eof\nputs \"\\nusertty=$spawn_out(slave,name)\"\n",
             tcl(&prog)
         ),
     );
@@ -271,6 +287,139 @@ fn everything_the_child_wrote_before_it_exited_reaches_the_screen() {
     );
     assert_eq!(out.matches("line-").count(), 4000, "lines were lost");
     assert!(out.contains("END-MARKER"), "the tail was lost");
+}
+
+// ====================================================================================
+// Replies the user's terminal sends after the child's output
+// ====================================================================================
+
+/// Tcl that makes the spawned shell's terminal answer queries the way a terminal emulator does,
+/// each `delay_ms` after it sees the query: a title report (`CSI 21 t`) is answered with
+/// `payload` (what a "full echo-back" terminal types into the shell: CVE-2003-0063,
+/// CVE-2022-45872, CVE-2024-56803; a cursor position report `CSI 6n` gets it too, standing in for
+/// a terminal bug in a query the filter lets through) and a primary device attributes query (`CSI c`) the way every
+/// terminal does. `serve_terminal PROMPT EXTRA_MS` then reads the screen until `PROMPT` and keeps
+/// answering for `EXTRA_MS` after it, which is how long a late reply has to arrive.
+fn emulator(payload: &str, delay_ms: u32) -> String {
+    format!(
+        r#"
+proc reply {{id text}} {{ catch {{send -i $id -- $text}} }}
+proc serve_terminal {{prompt extra_ms}} {{
+    global spawn_id settled
+    set id $spawn_id
+    expect {{
+        -re {{\x1b\[(21t|6n)}} {{ after {delay_ms} [list reply $id "{payload}\r"]; exp_continue }}
+        -re {{\x1b\[c}} {{ after {delay_ms} [list reply $id "\033\[?62;c"]; exp_continue }}
+        $prompt {{ }}
+    }}
+    after $extra_ms {{set settled 1}}
+    vwait settled
+    unset settled
+}}
+"#
+    )
+}
+
+#[test]
+fn a_reply_the_terminal_sends_after_the_agent_ended_is_never_typed_into_the_shell() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.base.join("typed-into-the-shell");
+    // The agent sets a title it chose, asks the terminal to report it, and ends at once.
+    let agent = program(
+        &w,
+        "echo.pl",
+        "$|=1; print \"\\e]0;payload\\a\\e[21t\"; print \"agent-done\\n\";\n",
+    );
+    let body = format!(
+        "{emulator}\n\
+         spawn -noecho /bin/bash --norc --noprofile -i\n\
+         expect {{$ }}\nsend {{PS1='<\\#>PROMPT> '}}\nsend \"\\r\"\nexpect \"<2>PROMPT> \"\n\
+         send \"$drive run -- /usr/bin/perl {agent}\\r\"\n\
+         serve_terminal \"<3>PROMPT> \" 1200\n\
+         send \"\\r\"\nexpect -re {{<[0-9]+>PROMPT> }}\n\
+         send \"printf 'VERDICT=%s\\\\n' \\$(test -e {marker} && echo typed || echo clean)\\r\"\n\
+         expect -re {{VERDICT=(typed|clean)\\r}}\n\
+         puts \"RESULT:$expect_out(1,string)\"\n\
+         send \"exit\\r\"\nexpect eof\n",
+        emulator = emulator(&format!("touch {}", marker.display()), 400),
+        agent = agent,
+        marker = marker.display(),
+    );
+    let out = expect_with(&w, &[], false, &body);
+    assert!(
+        out.contains("RESULT:clean"),
+        "the terminal's late reply ran in the user's shell: {out}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn a_late_reply_to_a_query_the_filter_lets_through_is_swallowed_too() {
+    // Defence in depth: the filter removes the queries whose answers an agent can shape, but a
+    // terminal bug in any other query would be the same attack. The reply is caught at the end.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.base.join("typed-into-the-shell");
+    let agent = program(
+        &w,
+        "position.pl",
+        "$|=1; print \"\\e[6n\"; print \"agent-done\\n\";\n",
+    );
+    let body = format!(
+        "{emulator}\n\
+         spawn -noecho /bin/bash --norc --noprofile -i\n\
+         expect {{$ }}\nsend {{PS1='<\\#>PROMPT> '}}\nsend \"\\r\"\nexpect \"<2>PROMPT> \"\n\
+         send \"$drive run -- /usr/bin/perl {agent}\\r\"\n\
+         serve_terminal \"<3>PROMPT> \" 1200\n\
+         send \"\\r\"\nexpect -re {{<[0-9]+>PROMPT> }}\n\
+         send \"printf 'VERDICT=%s\\\\n' \\$(test -e {marker} && echo typed || echo clean)\\r\"\n\
+         expect -re {{VERDICT=(typed|clean)\\r}}\n\
+         puts \"RESULT:$expect_out(1,string)\"\n\
+         send \"exit\\r\"\nexpect eof\n",
+        emulator = emulator(&format!("touch {}", marker.display()), 400),
+        agent = agent,
+        marker = marker.display(),
+    );
+    let out = expect_with(&w, &[], false, &body);
+    assert!(
+        out.contains("RESULT:clean"),
+        "a late reply to an ordinary query ran in the user's shell: {out}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn the_emulator_does_type_a_late_reply_into_a_shell_that_nothing_protects() {
+    // The control for the test above: with the agent run straight in the shell, the reply is typed.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.base.join("typed-into-the-shell");
+    let agent = program(
+        &w,
+        "echo.pl",
+        "$|=1; print \"\\e]0;payload\\a\\e[21t\"; print \"agent-done\\n\";\n",
+    );
+    let body = format!(
+        "{emulator}\n\
+         spawn -noecho /bin/bash --norc --noprofile -i\n\
+         expect {{$ }}\nsend {{PS1='<\\#>PROMPT> '}}\nsend \"\\r\"\nexpect \"<2>PROMPT> \"\n\
+         send \"/usr/bin/perl {agent}\\r\"\n\
+         serve_terminal \"<3>PROMPT> \" 1200\n\
+         send \"\\r\"\nexpect -re {{<[0-9]+>PROMPT> }}\n\
+         send \"printf 'VERDICT=%s\\\\n' \\$(test -e {marker} && echo typed || echo clean)\\r\"\n\
+         expect -re {{VERDICT=(typed|clean)\\r}}\n\
+         puts \"RESULT:$expect_out(1,string)\"\n\
+         send \"exit\\r\"\nexpect eof\n",
+        emulator = emulator(&format!("touch {}", marker.display()), 400),
+        agent = agent,
+        marker = marker.display(),
+    );
+    let out = expect_with(&w, &[], false, &body);
+    assert!(
+        out.contains("RESULT:typed"),
+        "the emulator did not deliver the reply, so the test above proves nothing: {out}"
+    );
 }
 
 // ====================================================================================

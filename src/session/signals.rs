@@ -107,7 +107,7 @@ pub enum Target {
 }
 
 impl Target {
-    fn send(self, signal: Signal) {
+    pub(super) fn send(self, signal: Signal) {
         // ESRCH only means the child is already gone.
         let _ = match self {
             Self::Group(pgid) => killpg(pgid, signal),

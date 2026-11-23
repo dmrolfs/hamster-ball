@@ -245,3 +245,18 @@ pub fn lan_address() -> Option<String> {
 pub fn toml_string(text: &str) -> String {
     toml::Value::String(text.to_owned()).to_string()
 }
+
+/// Tcl for the top of an `expect` script: a timeout becomes a marker and exit status 3.
+///
+/// Without it a timed-out `expect` just carries on, so a test can wait out its whole timeout and
+/// still pass on what it saw before.
+pub const EXPECT_GUARD: &str =
+    "expect_before -i any_spawn_id timeout {puts HB-EXPECT-TIMEOUT; exit 3}\n";
+
+/// Fails the test if the `expect` script timed out (see [`EXPECT_GUARD`]).
+pub fn assert_no_expect_timeout(output: &str) {
+    assert!(
+        !output.contains("HB-EXPECT-TIMEOUT"),
+        "an expect step timed out:\n{output}"
+    );
+}

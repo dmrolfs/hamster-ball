@@ -542,9 +542,47 @@ test). A child stopped by `hb`'s SIGSTOP is stopped too, which is the point.
 **Restore.** The terminal's original settings are put back by `Drop`, with `TCSAFLUSH`, so keys typed after the child ended are
 discarded and not read by the shell (measured: with a plain restore, late input reached the shell). That covers a normal exit, a
 child that is killed, and SIGINT, SIGTERM or SIGHUP to `hb`, and `hb` has no `panic = "abort"` profile so an unwinding panic runs
-it as well (no panic hook is installed). SIGKILL of `hb` cannot be handled; raw mode is entered as late as possible, and `reset`
-is the cure. Escape sequences in the child's output reach the user's terminal through the relay, as they do for any terminal
-program (UNVERIFIED: that a terminal's reply to such a sequence cannot be turned into a typed command).
+it as well (no panic hook is installed).
+
+**SIGKILL of `hb`** (D66). Nothing in `hb` can run when it is killed, so a second process does. `hb` starts `hb __guard` in a
+session of its own, registers the agent's process (or group) and the `log stream` helper with it, and holds the only write end of a
+pipe to it. A normal end sends `release` and the guard exits. If the pipe closes without one, the guard sends what is still
+running SIGTERM and, after 2 s, SIGKILL. It watches each registered process with a kernel exit notification, so a process that
+has ended is forgotten and its number, which the system may give to an unrelated program, is never signalled. Measured before the
+guard: with no terminal, a killed `hb` left both the agent and the `log stream` running (with a pty the kernel hangs up the agent,
+and `log stream` dies with the session). **The raw terminal is not repaired**: bash puts the terminal back itself, but zsh (the
+macOS login shell) reads the terminal's settings when it reaps the job and applies them to later commands, so a guard that restores
+the settings loses that race every time (0 of 8 in a trace that showed the guard restoring them first) and `reset` stays the cure.
+
+**What the agent can ask the user's terminal** (D67). The agent's output reaches the user's real terminal, and some terminals
+answer some queries with text the asker chose, typing the answer into the terminal's input: the title report (CVE-2003-0063
+xterm, CVE-2022-45872 iTerm2, CVE-2024-56803 Ghostty), kitty's colour-control and DCS handlers and iTerm2's graphics replies
+(2026). While `hb` runs, the answer goes back to the agent, which is harmless. It is dangerous when it arrives after `hb` has handed
+the terminal back: the shell reads it as typed commands, and `hb`'s old behaviour left a window of a drain period (150 ms) in
+which it was swallowed and a slow link (ssh) could miss it. This was reproduced with a terminal emulator in `tests/pty.rs`. Three
+measures:
+
+1. **A filter on the agent's output** (`session::sanitize`) removes what cannot be allowed, with an allowlist for the string
+   sequences, where the bugs are. OSC passes for 0, 1, 2, 4, 7, 8, 9, 10 to 12, 99, 104, 110 to 112, 133, 777 and 52 as a *write* (a
+   clipboard read is dropped; whether a write is allowed is the terminal's own policy). DCS passes for sixel and synchronized
+   output only. APC, PM and SOS are dropped (APC carries the kitty graphics protocol, whose error replies echo what the sender
+   wrote). `CSI 20 t` and `CSI 21 t` (title report) are dropped, as are `ENQ` and every C1 control in both its single-byte and
+   UTF-8 spelling, because terminals differ on whether they honour them. Queries whose answers are fixed numbers (device
+   attributes, cursor position, mode reports, colours) pass, because terminal programs need them. The parser is the DEC state
+   machine, works on chunks of any size (tested: the result does not depend on how the input is split), validates UTF-8 strictly,
+   and ends a string the agent cut off with its own terminator, so the terminal never decides what a cut-off string means. It
+   filters only the agent's output; what the user types is not touched.
+2. **A fence at the end.** Before `hb` gives the terminal back (at the end of a run and at Ctrl-Z), it switches off the input modes
+   an agent may have left on (mouse, focus events, bracketed paste) and asks the terminal for its primary device attributes. A terminal
+   answers in order, so when that answer arrives every earlier reply has, and everything read until then is discarded. A terminal
+   that never answers costs 750 ms. The fence is defence in depth for a terminal bug in a query the filter lets through, and it
+   also stops an ordinary late cursor-position report from showing up at the prompt.
+3. **No fallback.** There is no mode in which the agent's output reaches the terminal unfiltered with a pty. Without a pty (stdin
+   not a terminal) the agent writes to the user's streams directly and none of this applies; see 15.
+
+Measured on the four agents: they emit OSC 0, 4, 8, 10 to 12 and 112 and the other sequences above, all of which pass. Two capability
+probes are dropped (pi's `OSC 7501;?` and opencode's `OSC 66`, a kitty text-sizing probe followed by a cursor-position query), and
+both agents ran the same without them.
 
 **Shared group (no pty).** A library caller that asks for no pty while its stdin is a terminal still gets the child in `hb`'s
 group, so Ctrl-C reaches both and `hb` is passive for INT and HUP (7.2). The CLI does not take this path. `hb` does not block
@@ -757,6 +795,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
     open: the data-protection keychain, a real corporate TLS-inspecting proxy, and a system proxy or PAC that might need `configd`.
 11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
+12. **Output with no pty** (7.3, D67): when stdin is not a terminal but stdout or stderr is, the agent writes to the user's terminal directly. The output filter and the exit fence do not apply, and a terminal's reply to a query goes to the user's shell. Decide whether `hb` should pass such output through a filtering pipe (the agent then sees a stdout that is not a terminal) or leave it and document it.
 
 ## 16. Test plan
 
@@ -868,3 +907,5 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (with a pty, D65, it leads its own session); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum (`Off`, and `On` from D65) | owner, hb-ghd.2.3 |
 | D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |
 | D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
+| D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it watches each with a kernel exit notification so it never signals a reused number; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
+| D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout | owner, hb-ghd.2.4 follow-up |

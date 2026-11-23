@@ -15,7 +15,7 @@ use crate::policy::{
     PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
 use crate::seatbelt::RenderError;
-use crate::session::{HelperError, RunError};
+use crate::session::{GuardError, HelperError, RunError};
 use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 
 /// Any error produced by this crate.
@@ -226,6 +226,13 @@ pub enum Error {
     Helper {
         /// The underlying error.
         source: HelperError,
+    },
+
+    /// The cleanup guard process failed.
+    #[snafu(transparent)]
+    Guard {
+        /// The underlying error.
+        source: GuardError,
     },
 
     /// `hb explain` failed.

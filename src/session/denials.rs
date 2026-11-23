@@ -219,6 +219,12 @@ impl LogStream {
         })
     }
 
+    /// The process number of `log stream`, for the cleanup guard.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
     /// Waits for the stream to go quiet (the log lags the event a little), stops it, and returns
     /// what it kept.
     #[must_use]

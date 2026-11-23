@@ -28,7 +28,7 @@ use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::session::signals::{block_supervised, unblock_supervised};
 use crate::session::{
     self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, PtyMode, RunError, RunSpec, SESSION_MARKER,
-    SignalMode, StdioMode, check_nesting, exec_sandbox_exec,
+    SignalMode, StdioMode, check_nesting, exec_sandbox_exec, run_guard,
 };
 use crate::system::{Environment, UserConfigDir};
 use crate::text::Escaped;
@@ -59,6 +59,16 @@ enum Command {
     /// Internal: clear the signal mask and exec sandbox-exec. Started by `hb run`, never by hand.
     #[command(name = "__child", hide = true)]
     Child(ChildArgs),
+    /// Internal: end the agent and the log stream if hb is killed. Started by `hb run`, never by hand.
+    #[command(name = "__guard", hide = true)]
+    Guard(GuardArgs),
+}
+
+#[derive(Debug, Args)]
+struct GuardArgs {
+    /// Milliseconds between SIGTERM and SIGKILL when the guard has to end the processes.
+    #[arg(long, default_value_t = 2000)]
+    grace_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -294,6 +304,14 @@ where
         );
     }
 
+    // The guard needs nothing from the environment either; it reads its orders from stdin.
+    if let Command::Guard(guard) = &command {
+        return match run_guard(Duration::from_millis(guard.grace_ms)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(err, crate::Error::from(error)),
+        };
+    }
+
     let owned;
     let env = match env {
         Some(env) => env,
@@ -322,7 +340,7 @@ where
             Err(error) => fail(err, error),
         },
         Command::Run(args) => run_command(env, args, err, supervise, reraise),
-        Command::Child(_) => ExitCode::FAILURE,
+        Command::Child(_) | Command::Guard(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())

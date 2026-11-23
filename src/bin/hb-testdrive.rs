@@ -4,8 +4,8 @@
 //!
 //! The real `hb` takes its home from the passwd database (D28), so it cannot load a project that
 //! lives in a test's temporary home. This binary runs exactly the same `cli::main`, with an
-//! [`Environment`] built from `HB_TD_*` variables. It also acts as the `__child` helper, which `hb`
-//! starts with the agent's cleared environment, so that case needs no variables.
+//! [`Environment`] built from `HB_TD_*` variables. It also acts as the `__child` and `__guard`
+//! helpers, which `hb` starts without them, so those cases need no variables.
 
 use std::ffi::OsString;
 use std::io::{stderr, stdout};
@@ -42,7 +42,9 @@ fn main() -> ExitCode {
     let grace = var("HB_TD_GRACE_MS")
         .and_then(|v| v.to_str().and_then(|t| t.parse::<u64>().ok()))
         .map_or(hamster_ball::session::DEFAULT_GRACE, Duration::from_millis);
-    let helper = args.get(1).is_some_and(|a| a == "__child");
+    let helper = args
+        .get(1)
+        .is_some_and(|a| a == "__child" || a == "__guard");
     let env = if helper { None } else { fixture() };
     if env.is_none() && !helper {
         eprintln!("hb-testdrive: the HB_TD_* variables are missing or unusable");
