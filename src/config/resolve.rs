@@ -97,11 +97,20 @@ pub struct ResolveErrors {
     pub truncated: bool,
 }
 
+/// The count, then one line per entry (its key, its line when known, and what is wrong), then a
+/// note when the list was cut short. The file is named by the error that wraps this one.
 impl std::fmt::Display for ResolveErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} configuration error(s)", self.errors.len())?;
+        for located in &self.errors {
+            write!(f, "\n    {}", located.origin.key)?;
+            if let Some(line) = located.origin.line {
+                write!(f, " (line {line})")?;
+            }
+            write!(f, ": {}", located.value)?;
+        }
         if self.truncated {
-            write!(f, " (more exist past the first {ENTRY_ERROR_CAP})")?;
+            write!(f, "\n    (more exist past the first {ENTRY_ERROR_CAP})")?;
         }
         Ok(())
     }
@@ -1488,7 +1497,74 @@ mod tests {
         };
         assert_eq!(
             truncated.to_string(),
-            "0 configuration error(s) (more exist past the first 64)"
+            "0 configuration error(s)\n    (more exist past the first 64)"
+        );
+    }
+
+    #[test]
+    fn resolve_errors_display_names_every_entry_with_its_key_and_reason() {
+        let fx = Fixture::new();
+        let errors = fx.errors(
+            "[fs]\nread = [\"/\"]\n[net]\nallow = [\"not a host\"]\n[ctl]\nlabel = \"x\"\n",
+        );
+        let text = errors.to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "3 configuration error(s)", "{text}");
+        assert_eq!(lines.len(), 4, "{text}");
+        for (line, key) in lines[1..]
+            .iter()
+            .zip(["fs.read[0]", "net.allow[0]", "ctl.label"])
+        {
+            assert!(
+                line.trim_start().starts_with(key),
+                "expected {key} first in {line:?}"
+            );
+            // Each line says what is wrong, not only where.
+            assert!(
+                line.len() > key.len() + 6,
+                "no reason after {key}: {line:?}"
+            );
+        }
+        assert!(lines[1].contains("too broad"), "{text}");
+        assert!(lines[2].contains("not a host"), "{text}");
+    }
+
+    #[test]
+    fn a_line_number_is_shown_when_it_is_known() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[net]\nallow = [\"not a host\"]\n");
+        let text = errors.to_string();
+        let located = assert_some!(errors.errors.first());
+        match located.origin.line {
+            Some(line) => assert!(text.contains(&format!("line {line}")), "{text}"),
+            None => assert!(!text.contains("line "), "{text}"),
+        }
+    }
+
+    #[test]
+    fn what_an_entry_says_is_escaped_so_a_config_cannot_write_to_the_terminal() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[net]\nallow = [\"evil\\u001b]0;pwned\\u0007.example\"]\n");
+        let text = errors.to_string();
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n'),
+            "raw control characters in {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_cut_short_at_the_cap_says_so_after_the_entries() {
+        let fx = Fixture::new();
+        let hosts: Vec<String> = (0..ENTRY_ERROR_CAP + 5)
+            .map(|i| format!("\"bad host {i}\""))
+            .collect();
+        let errors = fx.errors(&format!("[net]\nallow = [{}]\n", hosts.join(",")));
+        assert!(errors.truncated);
+        let text = errors.to_string();
+        assert_eq!(text.lines().count(), 1 + ENTRY_ERROR_CAP + 1, "{text}");
+        assert!(
+            assert_some!(text.lines().last()).contains("more exist past the first 64"),
+            "{text}"
         );
     }
 

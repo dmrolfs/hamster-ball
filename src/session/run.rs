@@ -27,6 +27,7 @@ use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
 use crate::system::{Environment, ToolsError, find_tools};
+use crate::text::Escaped;
 
 /// What the kernel accepts for `argv` plus `envp` on macOS (`kern.argmax`).
 const ARG_MAX: usize = 1_048_576;
@@ -344,6 +345,8 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         .map(|name| format!("tool `{name}` from [env] tools was not found on your PATH"))
         .collect();
 
+    warnings.extend(skipped_allow_warnings(loaded));
+
     let temp = temp_parent(env)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
@@ -521,6 +524,24 @@ fn start_on_pty(
             Err(error.into())
         }
     }
+}
+
+/// One warning for each `fs.read`/`fs.write` entry that was left out, so a rule that has no effect
+/// is not discovered from the agent's own error.
+fn skipped_allow_warnings(loaded: &Loaded) -> impl Iterator<Item = String> + '_ {
+    loaded
+        .closure
+        .files()
+        .iter()
+        .flat_map(|file| file.diagnostics.skipped.iter())
+        .map(|skipped| {
+            format!(
+                "{}: `{}` was not granted: {}",
+                skipped.origin,
+                Escaped(&skipped.value.spelling),
+                skipped.value.reason.to_string().to_lowercase()
+            )
+        })
 }
 
 /// Allocates the pty a run asks for, after checking what it needs.

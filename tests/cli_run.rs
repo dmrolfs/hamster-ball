@@ -97,6 +97,45 @@ fn a_tool_that_is_not_on_path_is_a_warning_on_stderr_and_the_run_goes_on() {
 }
 
 #[test]
+fn an_allow_rule_that_was_skipped_is_a_warning_naming_the_entry_and_the_reason() {
+    sandboxed!();
+    let w = World::new("[fs]\nwrite = [\".\", \"~/no-such-dir\"]\n");
+    let (code, err) = hb(&w, &["run", "--", "/usr/bin/true"]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let line = err
+        .lines()
+        .find(|l| l.contains("no-such-dir"))
+        .unwrap_or_default();
+    assert!(line.starts_with("warning: "), "{err}");
+    assert!(
+        line.contains("fs.write[1]"),
+        "the entry is not named: {line}"
+    );
+    assert!(line.contains("missing"), "the reason is not given: {line}");
+    assert!(
+        !err.contains("fs.write[0]"),
+        "the granted entry was reported: {err}"
+    );
+}
+
+#[test]
+fn a_rejected_config_names_each_bad_entry_and_why() {
+    sandboxed!();
+    let w = World::new("[fs]\nwrite = [\".\"]\nread = [\"/\"]\n[net]\nallow = [\"not a host\"]\n");
+    let (code, err) = hb(&w, &["run", "--", "/usr/bin/true"]);
+    assert_eq!(code, ExitCode::from(1), "{err}");
+    assert!(err.contains("2 configuration error(s)"), "{err}");
+    assert!(
+        err.contains("fs.read[0]") && err.contains("too broad"),
+        "{err}"
+    );
+    assert!(
+        err.contains("net.allow[0]") && err.contains("not a host"),
+        "{err}"
+    );
+}
+
+#[test]
 fn hb_run_without_a_command_is_a_usage_error() {
     let w = World::new(PROJECT);
     assert_eq!(hb(&w, &["run"]).0, ExitCode::from(2));
