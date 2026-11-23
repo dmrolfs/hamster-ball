@@ -49,7 +49,7 @@ enum Command {
     Explain(ExplainArgs),
     /// Print the Seatbelt profile and parameters this project would run under.
     ///
-    /// The proxy parameter is a placeholder until the proxy exists.
+    /// The proxy parameter is a placeholder: each run's proxy listens on a port chosen at start.
     Profile,
     /// Run a command inside the hamster ball and exit with its status.
     ///
@@ -90,6 +90,19 @@ struct RunArgs {
     /// treat the lines as hints, and put this flag before the command.
     #[arg(long)]
     log_denials: bool,
+
+    /// Show every connection the proxy handled: host, port, whether it was allowed, and bytes.
+    ///
+    /// Shown like the denials: live when stderr is redirected, after the command ends on a
+    /// terminal. Put this flag before the command.
+    #[arg(long)]
+    log_proxy: bool,
+
+    /// Do not end the run with a warning that the proxy refused connections.
+    ///
+    /// The warning is also left out when `--log-denials` already shows them.
+    #[arg(long)]
+    no_proxy_summary: bool,
 
     /// The command and its arguments (a `--` before it is optional).
     #[arg(
@@ -372,8 +385,19 @@ fn run_command(
     reraise: &mut Option<Signal>,
 ) -> ExitCode {
     let at_terminal = std::io::stderr().is_terminal();
-    let sink = args.log_denials.then(|| denial_sink(at_terminal));
-    run_command_with(env, args.command, sink, err, supervise, reraise)
+    let logging = RunLogging {
+        denials: args.log_denials.then(|| denial_sink(at_terminal)),
+        proxy_log: args.log_proxy.then(|| proxy_log_sink(at_terminal)),
+        proxy_summary: !args.no_proxy_summary,
+    };
+    run_command_with(env, args.command, logging, err, supervise, reraise)
+}
+
+/// What `hb run` was asked to show about the run.
+struct RunLogging {
+    denials: Option<DenialSink>,
+    proxy_log: Option<DenialSink>,
+    proxy_summary: bool,
 }
 
 /// Where denial lines go: collected for printing after the run when stderr is a terminal, or
@@ -388,13 +412,40 @@ fn denial_sink(stderr_is_terminal: bool) -> DenialSink {
     }
 }
 
+/// Where the proxy's connection log goes: the same rule as [`denial_sink`].
+fn proxy_log_sink(stderr_is_terminal: bool) -> DenialSink {
+    if stderr_is_terminal {
+        DenialSink::Collect
+    } else {
+        DenialSink::Stream(std::sync::Arc::new(|line| {
+            let _ = writeln!(std::io::stderr(), "hb: proxy: {line}");
+        }))
+    }
+}
+
+/// The lines printed after the run for the collected proxy log.
+fn proxy_log_lines(log: &Denials) -> Vec<String> {
+    let mut out: Vec<String> = log
+        .lines
+        .iter()
+        .map(|l| format!("hb: proxy: {l}"))
+        .collect();
+    if log.dropped > 0 {
+        out.push(format!(
+            "hb: ... and {} more connections not shown",
+            log.dropped
+        ));
+    }
+    out
+}
+
 /// The lines printed after the run for collected denials.
 fn denial_summary(denials: &Denials) -> Vec<String> {
     if denials.lines.is_empty() && denials.dropped == 0 {
         return Vec::new();
     }
     let mut out = vec![format!(
-        "hb: the sandbox denied {} operation(s) (the system log is not complete, so there may be more):",
+        "hb: the sandbox and proxy denied {} operation(s) (the system log is not complete, so there may be more):",
         denials.lines.len() + denials.dropped
     )];
     out.extend(denials.lines.iter().map(|l| format!("hb: denied: {l}")));
@@ -407,7 +458,7 @@ fn denial_summary(denials: &Denials) -> Vec<String> {
 fn run_command_with(
     env: &Environment,
     command: Vec<OsString>,
-    sink: Option<DenialSink>,
+    logging: RunLogging,
     err: &mut dyn Write,
     supervise: Option<Supervision>,
     reraise: &mut Option<Signal>,
@@ -434,13 +485,18 @@ fn run_command_with(
     if supervise.is_some_and(|s| s.pty == PtyChoice::Auto) && std::io::stdin().is_terminal() {
         spec.pty = PtyMode::On;
     }
-    spec.denials = sink;
+    spec.denials = logging.denials;
+    spec.proxy_log = logging.proxy_log;
+    spec.proxy_summary = logging.proxy_summary;
     match session::run(env, &loaded, &spec) {
         Ok(outcome) => {
             for warning in &outcome.warnings {
                 let _ = writeln!(err, "warning: {warning}");
             }
-            for line in denial_summary(&outcome.denials) {
+            for line in denial_summary(&outcome.denials)
+                .into_iter()
+                .chain(proxy_log_lines(&outcome.proxy_log))
+            {
                 let _ = writeln!(err, "{line}");
             }
             if supervise.is_some() {
@@ -485,7 +541,7 @@ fn profile(env: &Environment) -> Result<String, crate::Error> {
 fn param_line(name: &str, value: &str) -> String {
     let shown = Escaped(value).to_string();
     let note = if name == "PROXY" {
-        "  (placeholder until the proxy exists)"
+        "  (placeholder: each run's proxy listens on a port chosen at start)"
     } else if shown != value {
         "  (escaped for display; not copy-exact)"
     } else {
@@ -537,7 +593,7 @@ mod tests {
     fn the_proxy_parameter_is_always_marked_a_placeholder() {
         assert_eq!(
             param_line("PROXY", "localhost:1"),
-            "; -D PROXY=localhost:1  (placeholder until the proxy exists)\n"
+            "; -D PROXY=localhost:1  (placeholder: each run's proxy listens on a port chosen at start)\n"
         );
     }
 
@@ -579,6 +635,28 @@ mod tests {
             dropped: 2,
         });
         assert_eq!(only_dropped.len(), 2, "{only_dropped:?}");
+    }
+
+    #[test]
+    fn the_proxy_log_lines_are_prefixed_and_say_how_many_more_there_were() {
+        assert!(proxy_log_lines(&Denials::default()).is_empty());
+        let log = Denials {
+            lines: vec!["allowed a.example.com:443 up=1 down=2".to_owned()],
+            dropped: 3,
+        };
+        assert_eq!(
+            proxy_log_lines(&log),
+            [
+                "hb: proxy: allowed a.example.com:443 up=1 down=2",
+                "hb: ... and 3 more connections not shown"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_proxy_log_goes_live_when_stderr_is_redirected_and_is_collected_on_a_terminal() {
+        assert!(matches!(proxy_log_sink(true), DenialSink::Collect));
+        assert!(matches!(proxy_log_sink(false), DenialSink::Stream(_)));
     }
 
     #[test]
@@ -781,7 +859,7 @@ mod tests {
         );
         assert!(
             ran.out
-                .contains("; -D PROXY=localhost:1  (placeholder until the proxy exists)"),
+                .contains("; -D PROXY=localhost:1  (placeholder: each run's proxy listens on a port chosen at start)"),
             "{}",
             ran.out
         );

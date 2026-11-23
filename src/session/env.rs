@@ -14,6 +14,7 @@ use snafu::{Snafu, ensure};
 
 use crate::config::MergedEnv;
 use crate::policy::{CanonicalPath, EnvName, HomeDir};
+use crate::proxy::ProxyUrl;
 use crate::system::ParentVars;
 
 /// The directories every program needs, always first on the child's `PATH`.
@@ -23,6 +24,19 @@ pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 pub const SESSION_MARKER: &str = "HB_SESSION";
 /// `TERM` when stdin is not a terminal, or the parent has none.
 pub const DUMB_TERM: &str = "dumb";
+
+/// The variables that point a client at the proxy: the forms tools read, upper and lower case.
+pub const PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+/// What bypasses the proxy: the loopback ports the policy lists are reached directly, because the
+/// profile allows nothing else on loopback and the proxy refuses `localhost` (design 12).
+pub const NO_PROXY_VALUE: &str = "localhost,127.0.0.1";
 
 /// Why the environment could not be built.
 #[derive(Debug, Snafu)]
@@ -69,6 +83,8 @@ pub struct EnvInputs<'a> {
     pub env: &'a MergedEnv,
     /// TLS trust settings.
     pub tls: TlsEnv<'a>,
+    /// The proxy the child must use. `None` only for a child that has no network at all.
+    pub proxy: Option<&'a ProxyUrl>,
 }
 
 /// The environment the child starts with, and nothing else.
@@ -113,6 +129,13 @@ impl ChildEnv {
         }
         if let Some(bundle) = inputs.tls.ca_bundle {
             vars.insert("NODE_EXTRA_CA_CERTS".into(), bundle.as_str().into());
+        }
+        if let Some(url) = inputs.proxy {
+            for name in PROXY_VARS {
+                vars.insert(name.into(), url.expose().into());
+            }
+            vars.insert("NO_PROXY".into(), NO_PROXY_VALUE.into());
+            vars.insert("no_proxy".into(), NO_PROXY_VALUE.into());
         }
         Ok(Self(vars))
     }
@@ -227,6 +250,7 @@ mod tests {
         env: MergedEnv,
         trust: bool,
         bundle: Option<CanonicalPath>,
+        proxy: Option<ProxyUrl>,
     }
 
     impl Case {
@@ -240,6 +264,7 @@ mod tests {
                 env: MergedEnv::default(),
                 trust: false,
                 bundle: None,
+                proxy: None,
             }
         }
 
@@ -255,6 +280,7 @@ mod tests {
                     system_trust: self.trust,
                     ca_bundle: self.bundle.as_ref(),
                 },
+                proxy: self.proxy.as_ref(),
             })
         }
 
@@ -265,6 +291,62 @@ mod tests {
 
     fn get<'a>(env: &'a ChildEnv, key: &str) -> Option<&'a OsStr> {
         env.get(key)
+    }
+
+    fn proxy_url() -> ProxyUrl {
+        let token = assert_ok!(crate::proxy::Token::generate());
+        ProxyUrl::new(51234, &token)
+    }
+
+    #[test]
+    fn a_proxy_sets_all_six_proxy_variables_to_its_url_and_no_proxy_to_loopback() {
+        let mut case = Case::new();
+        let url = proxy_url();
+        case.proxy = Some(url.clone());
+        let env = case.ok();
+        for name in PROXY_VARS {
+            assert_eq!(get(&env, name), Some(OsStr::new(url.expose())), "{name}");
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(
+                get(&env, name),
+                Some(OsStr::new("localhost,127.0.0.1")),
+                "{name}"
+            );
+        }
+        assert!(
+            url.expose().starts_with("http://hb:") && url.expose().ends_with("@127.0.0.1:51234")
+        );
+    }
+
+    #[test]
+    fn without_a_proxy_no_proxy_variable_is_set() {
+        let env = Case::new().ok();
+        for name in PROXY_VARS.iter().chain(["NO_PROXY", "no_proxy"].iter()) {
+            assert_eq!(get(&env, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_parent_cannot_pass_and_the_config_cannot_set_a_proxy_variable() {
+        for name in PROXY_VARS.iter().chain(["NO_PROXY", "no_proxy"].iter()) {
+            let mut case = Case::new();
+            case.proxy = Some(proxy_url());
+            case.parent = parent(&[(name, "http://evil.example.com:3128")]);
+            case.env = merged(&[name], &[]);
+            let error = assert_err!(case.build());
+            assert!(
+                matches!(error, EnvBuildError::Reserved { .. }),
+                "{name}: {error}"
+            );
+            let mut case = Case::new();
+            case.proxy = Some(proxy_url());
+            case.env = merged(&[], &[(name, "http://evil.example.com:3128")]);
+            assert!(
+                matches!(assert_err!(case.build()), EnvBuildError::Reserved { .. }),
+                "{name}"
+            );
+        }
     }
 
     #[test]

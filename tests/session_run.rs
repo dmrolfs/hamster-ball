@@ -82,6 +82,15 @@ fn the_child_environment_is_exactly_the_allowed_set_and_no_parent_token_reaches_
         "RUST_LOG",
         "TERM",
         "TMPDIR",
+        // The proxy the child must use, and what bypasses it.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
         // The shell adds these itself when it starts.
         "PWD",
         "SHLVL",
@@ -96,6 +105,8 @@ fn the_child_environment_is_exactly_the_allowed_set_and_no_parent_token_reaches_
         names.difference(&allowed)
     );
     for must in [
+        "HTTP_PROXY",
+        "NO_PROXY",
         "HOME",
         "PATH",
         "TMPDIR",
@@ -678,4 +689,245 @@ fn a_stream_sink_receives_each_denial_as_it_is_complete_and_nothing_is_kept() {
     );
     let seen = assert_ok!(seen.lock()).join("\n");
     assert!(seen.contains("id_denied_by_the_floor"), "{seen}");
+}
+
+// ====================================================================================
+// The proxy (design 12, hb-ghd.3.3)
+// ====================================================================================
+
+mod proxy {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
+    use super::{ExitKind, Outcome, RunSpec, World, run, sandbox_available, sh, stdout};
+    use crate::common::proxy::{Table, to_loopback};
+    use claims::assert_ok;
+    use hamster_ball::session::{DenialSink, ProxyTuning};
+    use pretty_assertions::assert_eq;
+
+    const PROJECT: &str = "[fs]\nwrite = [\".\"]\n";
+
+    fn run_spec(world: &World, spec: &RunSpec) -> Outcome {
+        assert_ok!(run(&world.env, &world.loaded(), spec))
+    }
+
+    /// An HTTP upstream on loopback that answers every request with `HELLO`.
+    fn upstream() -> u16 {
+        let listener = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
+        let port = assert_ok!(listener.local_addr()).port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO",
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    /// Resolves `allowed.test` to a public address and dials the upstream on loopback instead.
+    fn allowed_test_tuning() -> ProxyTuning {
+        ProxyTuning::new(|config| {
+            config
+                .with_resolver(Table::of(&["allowed.test"]))
+                .with_dial_map(to_loopback())
+        })
+    }
+
+    #[test]
+    fn the_child_gets_all_six_proxy_variables_with_the_same_credentialed_url_and_a_loopback_no_proxy()
+     {
+        sandboxed!();
+        let w = World::new(PROJECT);
+        let out = sh(&w, "/usr/bin/env");
+        let text = stdout(&out);
+        let value = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let url = value("HTTPS_PROXY");
+        assert!(
+            url.starts_with("http://hb:") && url.contains("@127.0.0.1:"),
+            "{url}"
+        );
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(value(name), url, "{name}");
+        }
+        assert_eq!(value("NO_PROXY"), "localhost,127.0.0.1");
+        assert_eq!(value("no_proxy"), "localhost,127.0.0.1");
+        // Two runs get two tokens.
+        assert_ne!(stdout(&sh(&w, "echo $HTTPS_PROXY")).trim(), url);
+    }
+
+    #[test]
+    fn an_allowed_host_is_reached_through_the_proxy_and_not_around_it() {
+        sandboxed!();
+        let port = upstream();
+        let w = World::new(&format!(
+            "[fs]\nwrite = [\".\"]\n[net]\nallow = [\"allowed.test:{port}\"]\n"
+        ));
+        let url = format!("http://allowed.test:{port}/x");
+        let spec = RunSpec::new(["/bin/sh", "-c", &format!(
+            "/usr/bin/curl -sS -m 10 {url}; echo \" rc=$?\"; /usr/bin/curl -sS -m 5 --noproxy '*' {url}; echo \" direct rc=$?\""
+        )])
+        .proxy_tuning(allowed_test_tuning());
+        let out = run_spec(&w, &spec);
+        let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("HELLO rc=0"), "through the proxy: {text}");
+        assert!(
+            text.contains("direct rc=") && !text.contains("HELLO direct"),
+            "around the proxy: {text}"
+        );
+        assert!(!text.contains("direct rc=0"), "{text}");
+        assert!(
+            out.warnings.iter().all(|w| !w.contains("proxy refused")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn a_host_that_is_not_allowed_is_a_403_from_the_proxy_a_summary_and_a_denial_line() {
+        sandboxed!();
+        let w = World::new(PROJECT);
+        let script = "/usr/bin/curl -sS -m 10 https://refused.example.org/ 2>&1; echo rc=$?";
+        let out = run_spec(&w, &RunSpec::new(["/bin/sh", "-c", script]));
+        let text = stdout(&out);
+        assert!(
+            text.contains("403") || text.contains("refused.example.org"),
+            "{text}"
+        );
+        let summary: Vec<&String> = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("proxy refused"))
+            .collect();
+        assert_eq!(summary.len(), 1, "{:?}", out.warnings);
+        assert!(
+            summary[0].contains("1 connection to 1 host"),
+            "{}",
+            summary[0]
+        );
+        assert!(summary[0].contains("--log-denials"));
+        assert!(
+            out.denials.lines.is_empty(),
+            "no denial sink, nothing collected"
+        );
+
+        // With the denial log on, the lines are shown and the summary is not repeated.
+        let spec = RunSpec::new(["/bin/sh", "-c", script]).denials(DenialSink::Collect);
+        let out = run_spec(&w, &spec);
+        assert!(
+            out.denials
+                .lines
+                .iter()
+                .any(|l| l.starts_with("proxy refused refused.example.org:443 not_allowed")),
+            "{:?}",
+            out.denials
+        );
+        assert!(
+            out.warnings.iter().all(|w| !w.contains("proxy refused")),
+            "{:?}",
+            out.warnings
+        );
+
+        // The summary can be switched off.
+        let spec = RunSpec::new(["/bin/sh", "-c", script]).proxy_summary(false);
+        let out = run_spec(&w, &spec);
+        assert!(
+            out.warnings.iter().all(|w| !w.contains("proxy refused")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn the_proxy_log_has_one_line_per_connection_with_bytes_for_the_ones_served() {
+        sandboxed!();
+        let port = upstream();
+        let w = World::new(&format!(
+            "[fs]\nwrite = [\".\"]\n[net]\nallow = [\"allowed.test:{port}\"]\n"
+        ));
+        let script = format!(
+            "/usr/bin/curl -sS -m 10 http://allowed.test:{port}/x >/dev/null; /usr/bin/curl -sS -m 10 https://refused.example.org/ >/dev/null 2>&1; true"
+        );
+        let spec = RunSpec::new(["/bin/sh", "-c", &script])
+            .proxy_tuning(allowed_test_tuning())
+            .proxy_log(DenialSink::Collect);
+        let out = run_spec(&w, &spec);
+        let lines = &out.proxy_log.lines;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(&format!("allowed allowed.test:{port} up="))),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("refused refused.example.org:443 not_allowed")),
+            "{lines:?}"
+        );
+        // Without the sink the log is empty.
+        let out = run_spec(&w, &RunSpec::new(["/bin/sh", "-c", "true"]));
+        assert!(out.proxy_log.lines.is_empty());
+    }
+
+    #[test]
+    fn a_listed_loopback_port_is_reached_directly_and_an_unlisted_one_is_not() {
+        sandboxed!();
+        let listed = upstream();
+        let unlisted = upstream();
+        let w = World::new(&format!(
+            "[fs]\nwrite = [\".\"]\n[net]\nloopback_ports = [{listed}]\n"
+        ));
+        let script = format!(
+            "/usr/bin/curl -sS -m 5 http://127.0.0.1:{listed}/; echo \" listed rc=$?\"; /usr/bin/curl -sS -m 5 http://127.0.0.1:{unlisted}/; echo \" unlisted rc=$?\""
+        );
+        let out = run_spec(&w, &RunSpec::new(["/bin/sh", "-c", &script]));
+        let text = stdout(&out);
+        assert!(text.contains("HELLO listed rc=0"), "{text}");
+        assert!(
+            text.contains("unlisted rc=") && !text.contains("unlisted rc=0"),
+            "{text}"
+        );
+        assert!(!text.contains("HELLO unlisted"), "{text}");
+    }
+
+    #[test]
+    fn a_loopback_port_nobody_listens_on_is_a_warning_and_a_listening_one_is_not() {
+        sandboxed!();
+        let open = upstream();
+        let closed = {
+            let l = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
+            assert_ok!(l.local_addr()).port()
+        };
+        let w = World::new(&format!(
+            "[fs]\nwrite = [\".\"]\n[net]\nloopback_ports = [{open}, {closed}]\n"
+        ));
+        let out = sh(&w, "true");
+        assert_eq!(out.exit, ExitKind::Exited(0));
+        let warning: Vec<&String> = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("not listening"))
+            .collect();
+        assert_eq!(warning.len(), 1, "{:?}", out.warnings);
+        assert!(warning[0].contains(&closed.to_string()), "{}", warning[0]);
+        assert!(!warning[0].contains(&open.to_string()), "{}", warning[0]);
+    }
 }

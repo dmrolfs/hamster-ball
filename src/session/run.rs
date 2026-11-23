@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nix::unistd::Pid;
@@ -24,13 +25,16 @@ use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
 use super::interactive::{Interactive, InteractiveError};
+use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
+use super::proxy::{ProxyRun, ProxyTrail, ProxyTuning};
 use super::pty::{Pty, PtyError};
 use super::pump::Pump;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
+use crate::proxy::ProxyError;
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
 use crate::system::{Environment, ToolsError, find_tools};
 use crate::text::Escaped;
@@ -96,8 +100,15 @@ pub struct RunSpec {
     pub pty: PtyMode,
     /// What to do about INT, TERM and HUP.
     pub signals: SignalMode,
-    /// Where denial lines go, or `None` to not log them.
+    /// Where denial lines go, or `None` to not log them. The proxy's refusals go here too.
     pub denials: Option<DenialSink>,
+    /// Where one line per proxy connection goes, or `None` to not log them.
+    pub proxy_log: Option<DenialSink>,
+    /// Whether a run that had proxy refusals ends with a warning that says so. The warning is
+    /// not given when [`RunSpec::denials`] is set, because the lines are shown then.
+    pub proxy_summary: bool,
+    /// Adjusts the proxy before it starts. For tests.
+    pub proxy_tuning: Option<ProxyTuning>,
 }
 
 impl RunSpec {
@@ -110,7 +121,31 @@ impl RunSpec {
             pty: PtyMode::Off,
             signals: SignalMode::Off,
             denials: None,
+            proxy_log: None,
+            proxy_summary: true,
+            proxy_tuning: None,
         }
+    }
+
+    /// Logs every proxy connection, to `sink`.
+    #[must_use]
+    pub fn proxy_log(mut self, sink: DenialSink) -> Self {
+        self.proxy_log = Some(sink);
+        self
+    }
+
+    /// Turns the end-of-run warning about refused proxy connections on or off.
+    #[must_use]
+    pub fn proxy_summary(mut self, on: bool) -> Self {
+        self.proxy_summary = on;
+        self
+    }
+
+    /// Adjusts the proxy's configuration before it starts. For tests.
+    #[must_use]
+    pub fn proxy_tuning(mut self, tuning: ProxyTuning) -> Self {
+        self.proxy_tuning = Some(tuning);
+        self
     }
 
     /// Logs what the profile denies during this run, to `sink`.
@@ -175,8 +210,11 @@ pub struct Outcome {
     pub stderr: Vec<u8>,
     /// Things worth telling the user, in order.
     pub warnings: Vec<String>,
-    /// What the profile denied, when [`RunSpec::denials`] was [`DenialSink::Collect`].
+    /// What the profile denied and the proxy refused, when [`RunSpec::denials`] was
+    /// [`DenialSink::Collect`].
     pub denials: Denials,
+    /// Every proxy connection, when [`RunSpec::proxy_log`] was [`DenialSink::Collect`].
+    pub proxy_log: Denials,
 }
 
 /// Why a run could not start.
@@ -186,6 +224,13 @@ pub enum RunError {
     /// There was no command to run.
     #[snafu(display("there is no command to run"))]
     EmptyCommand,
+
+    /// The proxy could not start.
+    #[snafu(transparent)]
+    Proxy {
+        /// The underlying error.
+        source: ProxyError,
+    },
 
     /// `hb` is inside another sandbox, or `sandbox-exec` does not work.
     #[snafu(transparent)]
@@ -378,11 +423,32 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
 
+    let loopback: Vec<_> = loaded
+        .policy
+        .net
+        .loopback_ports
+        .iter()
+        .map(|p| p.value)
+        .collect();
+    warnings.extend(closed_ports_warning(&closed_ports(&loopback)));
+
+    // The proxy lives as long as the child: started before the profile (which names its port)
+    // and stopped after the child has gone.
+    let trail = Arc::new(ProxyTrail::new(
+        spec.denials.as_ref(),
+        spec.proxy_log.as_ref(),
+    ));
+    let proxy = ProxyRun::start(&loaded.policy, trail, spec.proxy_tuning.as_ref())?;
+    let proxy_url = proxy.url();
+
     let tool_dirs = tools.dirs();
     let tag = spec.denials.as_ref().map(|_| generate_tag());
     let mut inputs = RenderInputs::new()
         .with_session_dir(session.path().clone())
         .with_exec_dirs(tool_dirs.clone());
+    if let Some(endpoint) = proxy.endpoint() {
+        inputs = inputs.with_proxy(endpoint);
+    }
     if let Some(tag) = &tag {
         inputs = inputs.with_log_tag(tag.clone());
     }
@@ -413,6 +479,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             system_trust: loaded.policy.tls.effective_system_trust(),
             ca_bundle: ca_bundle.as_ref(),
         },
+        proxy: Some(&proxy_url),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let helper = match (spec.signals, &pty) {
@@ -518,12 +585,20 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     } = waited?;
     drop(session);
     warnings.extend(clipboard_notices(clipboard));
+    let seen = proxy.finish();
+    if spec.proxy_summary && spec.denials.is_none() {
+        warnings.extend(seen.summary());
+    }
+    let mut denials = denials;
+    denials.lines.extend(seen.denials.lines);
+    denials.dropped += seen.denials.dropped;
     Ok(Outcome {
         exit,
         stdout,
         stderr,
         warnings,
         denials,
+        proxy_log: seen.log,
     })
 }
 
@@ -969,6 +1044,7 @@ mod tests {
             stdin_is_tty: false,
             env: &policy_env,
             tls: TlsEnv::default(),
+            proxy: None,
         }))
     }
 

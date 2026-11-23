@@ -865,7 +865,19 @@ Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen b
   environment, so it protects against other processes, not against the agent. Measured with the real proxy (`tests/proxy_agents.rs`, opt-in): claude 2.1.328,
   pi 1.6.0, opencode 1.2.0 and kiro-cli 3.5.0 all send Basic credentials from the URL on their first request; one opencode request
   (a `git`-style client) arrived without and was retried after the challenge.
-- Proxy variables: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and lowercase forms.
+- **Lifecycle (hb-ghd.3.3).** `session::run` starts the proxy for every run, even with an empty allowlist (D71), before the profile is rendered
+  (the profile names its port) and stops it after the child has ended, so a refusal is an HTTP `403` with a reason and not a refused
+  connection. The child's environment gets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lowercase forms, all the same credentialed URL,
+  and `NO_PROXY=no_proxy=localhost,127.0.0.1`: the policy's `loopback_ports` are reached directly because the profile allows nothing else on
+  loopback and the proxy refuses `localhost`. These names are reserved: no config can set or pass them. A new token and port per run.
+- **Closed loopback ports.** At start `hb` connects to each `net.loopback_ports` entry from outside the ball (IPv4 and IPv6 loopback, 250 ms) and
+  warns, without failing, which are not listening (`net.loopback_ports ports 3030, 5432 are not listening; start the service or remove the
+  port`). The probe sends nothing, but a service may log the connection. `hb explain` shows each port with its origin.
+- **What you see (D75).** `--log-denials` includes the proxy's refusals as `hb: denied: proxy refused host:port code (reason)`; `--log-proxy` shows
+  every connection as `hb: proxy: allowed host:port up=N down=M` or `refused ...`. Both follow the denial rule: live when stderr is redirected,
+  after the run on a terminal (capped at 1000 lines). A run that had refusals and no `--log-denials` ends with `warning: the proxy refused N
+  connections to M hosts; run with --log-denials to see them`; `--no-proxy-summary` hides it. A `407` is part of the credentials handshake
+  (curl and git) and counts as no refusal; it appears in `--log-proxy` only.
 - Measured: kiro-cli, pi, claude and opencode all honor these variables. A direct connection, and DNS
   resolution, fail inside the hamster ball. A connection to another loopback port fails.
 - Loopback connections to the hamster ball's own listeners are denied by default (measured). Only
@@ -1114,3 +1126,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D72 | `net.allow` entries are `host` or `host:port`, one (pattern, port) rule each, default port 443; a listed host on another port is `port_not_allowed` and the reply names the entry to add | owner, hb-ghd.3.2 |
 | D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
 | D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` warning when the system has a proxy or PAC | owner, hb-ghd.3 |
+| D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |

@@ -11,7 +11,9 @@ pub mod fds;
 mod fence;
 pub mod guardian;
 mod interactive;
+pub mod ports;
 pub mod preflight;
+pub mod proxy;
 pub mod pty;
 pub mod pump;
 pub mod relay;
@@ -31,6 +33,7 @@ pub use interactive::InteractiveError;
 pub use preflight::{
     PreflightError, ProbeOutcome, SANDBOX_EXEC, check_nesting, classify, is_nested,
 };
+pub use proxy::{ProxyReport, ProxyRun, ProxyTrail, ProxyTuning};
 pub use pty::{Pty, PtyError, Winsize};
 pub use pump::Pump;
 pub use relay::Relay;
