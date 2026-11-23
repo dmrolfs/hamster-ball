@@ -930,6 +930,34 @@ Presets are hand-written. Measured: Seatbelt denial logs are incomplete (40 of 4
 Python, 32 of 40 for Node), so no allow rules are generated from logs. `hb run --log-denials` shows
 denials as hints for you to read (7.2).
 
+### 13.1 Preset format and conformance (hb-ghd.3.4)
+
+A built-in preset is an ordinary config file (section 4) named `agent/<name>`, kept in `presets/agent/<name>.toml` and compiled in with
+`include_str!` through one line in `EMBEDDED` (`src/config/builtin.rs`); a test fails for an unregistered file, an unsorted table or a
+preset that is not valid config. It lists only what the agent needs for itself: its install tree (`fs.read`), its own state (`fs.write`,
+no wider than needed), its own hosts (`net.allow`, `host:port` for a port other than 443), `env.tools`, and a header with the version
+and date it was measured against. Provider hosts, MCP hosts, credentials and the user-only settings are not in one. `presets/README.md`
+is the how-to.
+
+The **conformance harness** (`hamster_ball::conformance`, behind `test-support`; `tests/conformance.rs` is the opt-in runner) proves a
+preset against the real agent. For each agent it builds a throwaway project that extends only `agent/<name>`, runs the agent's one
+question under the real profile and proxy, and returns a verdict:
+
+| Agent | Command | Passes when |
+|---|---|---|
+| kiro-cli | `chat --no-interactive "Reply with the single word OK"` | exit 0 and `OK` in the output |
+| pi | `--provider here --model claude-haiku-4-5 -p "..."` | exit 0 and `OK` in the output |
+| claude | `-p "..." --max-turns 1` | exit 0 and a served connection to `bedrock-runtime.*` |
+| opencode | `run "..."` | the same exit status as the same command without the sandbox |
+
+Every connection the proxy refuses (other than the credentials challenge) fails the check and names the host: the agent asked for
+something outside the allow set in force, which is the preset plus what the runner put in `HB_CONFORMANCE_PROJECT`. On a failure the
+verdict carries the agent's last lines and every denial as hints. The home directory is the real one, since the agent's login is there;
+the user's own `~/.config/hamster-ball` is not read, a private user config holds `HB_CONFORMANCE_BASE` (default: system trust on), so a
+result depends on the preset (D76). Each agent runs in its own process group under a wrapper that ends the whole group at the time limit
+(`HB_CONFORMANCE_TIMEOUT`, default 180 s), because an agent's children would otherwise hold the output open. Nothing runs without
+`HB_CONFORMANCE=1`; an agent that is not installed, or has no preset yet, is skipped. The checks spend real model requests.
+
 ## 14. Architecture (Rust)
 
 One crate with a library and a `hb` binary. Conventions: `snafu` errors, `strum` enums, newtypes for domain
@@ -1127,3 +1155,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
 | D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` warning when the system has a proxy or PAC | owner, hb-ghd.3 |
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
+| D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |

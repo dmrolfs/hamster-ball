@@ -149,6 +149,14 @@ impl UserConfigDir {
         }
     }
 
+    /// A user config directory kept somewhere else, for tools that must not read the real one
+    /// (the conformance harness). `hb` itself never calls this: its user directory is always
+    /// [`UserConfigDir::locate`], so no variable or flag can move it (D39).
+    #[must_use]
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
     /// The directory, spelled from the home directory.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -349,6 +357,17 @@ mod tests {
             dir.preset_file(&name),
             tree.home_path()
                 .join(".config/hamster-ball/presets/agent/mine.toml")
+        );
+    }
+
+    #[test]
+    fn a_directory_given_explicitly_is_used_for_the_base_and_the_presets() {
+        let dir = UserConfigDir::at("/tmp/elsewhere/hb");
+        assert_eq!(dir.dir(), Path::new("/tmp/elsewhere/hb"));
+        assert_eq!(dir.base_file(), Path::new("/tmp/elsewhere/hb/base.toml"));
+        assert_eq!(
+            dir.preset_file(&assert_ok!(PresetName::parse("mine"))),
+            Path::new("/tmp/elsewhere/hb/presets/mine.toml")
         );
     }
 

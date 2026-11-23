@@ -17,6 +17,8 @@
 
 pub mod cli;
 pub mod config;
+#[cfg(feature = "test-support")]
+pub mod conformance;
 pub mod error;
 pub mod explain;
 pub mod origin;

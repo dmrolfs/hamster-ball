@@ -86,6 +86,17 @@ pub trait AuditSink: Send + Sync + 'static {
     fn record(&self, event: &AuditEvent);
 }
 
+/// Sends each event to every sink in turn.
+pub(crate) struct Tee(pub(crate) Vec<std::sync::Arc<dyn AuditSink>>);
+
+impl AuditSink for Tee {
+    fn record(&self, event: &AuditEvent) {
+        for sink in &self.0 {
+            sink.record(event);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +110,28 @@ mod tests {
             decision,
             bytes_up: 12,
             bytes_down: 3400,
+        }
+    }
+
+    struct Count(std::sync::atomic::AtomicUsize);
+
+    impl AuditSink for Count {
+        fn record(&self, _: &AuditEvent) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_tee_gives_every_sink_every_event() {
+        let (a, b) = (
+            std::sync::Arc::new(Count(0.into())),
+            std::sync::Arc::new(Count(0.into())),
+        );
+        let tee = Tee(vec![a.clone(), b.clone()]);
+        tee.record(&event(Decision::Allowed));
+        tee.record(&event(Decision::Allowed));
+        for sink in [&a, &b] {
+            assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
     }
 

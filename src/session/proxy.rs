@@ -42,6 +42,14 @@ impl ProxyTuning {
     }
 }
 
+impl ProxyTuning {
+    /// The configuration after this tuning.
+    #[must_use]
+    pub fn apply(&self, config: ProxyConfig) -> ProxyConfig {
+        (self.0)(config)
+    }
+}
+
 impl std::fmt::Debug for ProxyTuning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ProxyTuning(..)")
@@ -230,7 +238,7 @@ impl ProxyRun {
                 )
                 .with_audit(Arc::clone(&trail) as Arc<dyn AuditSink>);
         if let Some(tune) = tuning {
-            config = (tune.0)(config);
+            config = tune.apply(config);
         }
         Ok(Self {
             handle: ProxyHandle::start(config)?,
@@ -347,6 +355,14 @@ mod tests {
         trail.record(&refused(Some("no.example.com"), "not_allowed"));
         assert_eq!(seen.lock().map(|s| s.len()).unwrap_or_default(), 1);
         assert!(trail.report().denials.lines.is_empty());
+    }
+
+    #[test]
+    fn a_tuning_applies_its_change_and_prints_without_its_closure() {
+        let tuning = ProxyTuning::new(|config| config.with_max_connections(7));
+        let config = tuning.apply(ProxyConfig::new(Vec::new()));
+        assert!(format!("{config:?}").contains("max_connections: 7"));
+        assert_eq!(format!("{tuning:?}"), "ProxyTuning(..)");
     }
 
     #[test]

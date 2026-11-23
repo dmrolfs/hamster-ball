@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use super::address::AddressPolicy;
-use super::audit::{AuditEvent, AuditSink, Decision};
+use super::audit::{AuditEvent, AuditSink, Decision, Tee};
 use super::auth::{Authorizer, ProxyUrl, Token};
 use super::authority::Authority;
 use super::refusal::Refusal;
@@ -127,10 +127,21 @@ impl ProxyConfig {
         self
     }
 
-    /// Sends one [`AuditEvent`] per connection to `sink`.
+    /// Sends one [`AuditEvent`] per connection to `sink`, instead of any sink set before.
     #[must_use]
     pub fn with_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.audit = Some(sink);
+        self
+    }
+
+    /// Sends each event to `sink` as well as to the sink already set, if any.
+    #[must_use]
+    pub fn with_extra_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        let sinks = match self.audit.take() {
+            Some(existing) => vec![existing, sink],
+            None => vec![sink],
+        };
+        self.audit = Some(Arc::new(Tee(sinks)));
         self
     }
 }

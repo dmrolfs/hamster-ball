@@ -17,8 +17,9 @@ pub trait BuiltinPresets {
 
 /// The presets compiled into this build of `hb`.
 ///
-/// Add a preset by adding a file under `presets/` and one line to the table below; the
-/// completeness test fails if a file is not registered.
+/// Add a preset by adding a file under `presets/` and one line to the table below, for example
+/// `("agent/kiro", include_str!("../../presets/agent/kiro.toml")),`; the completeness test fails
+/// if a file is not registered. `presets/README.md` says what belongs in one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmbeddedPresets;
 
