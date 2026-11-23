@@ -29,8 +29,7 @@ macro_rules! sandboxed {
 }
 
 fn sh(world: &World, script: &str) -> Outcome {
-    let spec = RunSpec::new(["/bin/sh", "-c", script]);
-    assert_ok!(run(&world.env, &world.loaded(), &spec))
+    common::sh_in_hb(world, script)
 }
 
 fn stdout(outcome: &Outcome) -> String {

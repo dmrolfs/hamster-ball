@@ -847,7 +847,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 8. **llm_gateway ledger port**: `justfile` and the running container use 15433; two `psql` probes in
    `just/analytics.just` use 15432. Report to that project; not a change for this repo.
 9. Presets for codex and omp once installed.
-10. **Unverified under the final profile**: AppleEvents (`osascript` driving Terminal) and `launchctl submit` (hb-ghd.2.5).
+10. **AppleEvents and LaunchServices** are measured and closed (16.1): no event reaches a running application and `open -a` starts nothing.
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
     open: the data-protection keychain and a system proxy or PAC actually being followed (`configd` gates the settings; see 4.5).
 11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
@@ -866,6 +866,40 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
   pass means a response through the proxy with no errors caused by the hamster ball. claude and opencode have different
   pass criteria (Bedrock request; reaches the model step).
 - **`hb ctl`**: policy table tests plus a test against real podman when available.
+
+### 16.1 Probe matrix (hb-ghd.2.5)
+
+Seatbelt is undocumented and changes between macOS releases, so each claim the design makes about what the ball blocks or allows
+is a test that runs a real program under the real `sandbox-exec`. `tests/probe_matrix.rs` goes through `session::run`
+(`tests/common`: `run_in_hb`, `sh_in_hb`); the older profile-level tests in `tests/seatbelt_render.rs` render with the real `render()` and
+edit the profile text for their controls. Every probe has an allowed twin in the same world or an unsandboxed control, and a test that
+cannot run (no login session, no DNS) prints `SKIP:` with the reason. `HB_REQUIRE_SANDBOX=1` turns "already sandboxed" from a skip into a failure.
+**After a macOS upgrade, or any change to the profile: `HB_REQUIRE_SANDBOX=1 cargo test --all-features`.**
+
+| Claim | Test (`tests/` file, function) |
+|---|---|
+| `~/.ssh`, `~/.aws`: no tool reads them, metadata included. `~/Documents`: contents refused, metadata visible (D51) | `probe_matrix` `credential_and_personal_directories_cannot_be_read_by_any_tool_while_the_project_can` |
+| `stat`, `ls -ld`, `test -e`, `xattr -l` on a floor path under a granted ancestor; the shorter deny form would leak (control) | `seatbelt_render` `a_granted_ancestor_cannot_reach_credentials_beneath_it_and_stat_does_not_leak`, `control_the_shorter_read_wildcard_deny_form_does_leak_stat_under_this_baseline` |
+| `~/.local/bin`, `~/.cargo/bin`, `~/.zshrc` unwritable beside writable siblings; project write works | `probe_matrix` `the_floor_keeps_the_path_directories_and_shell_startup_unwritable_beside_writable_siblings`; `seatbelt_render` `a_missing_floor_path_under_a_grant_cannot_be_created_in_any_case` |
+| Symlinked `/tmp`: working directory and grants spelled through the link | `probe_matrix` `a_tree_under_the_symlinked_tmp_works_whether_a_grant_is_spelled_through_the_link_or_not` |
+| Names: quotes and backslash; newline; case variant; NFD; regex metacharacters | `seatbelt_render` `a_directory_name_with_quotes_parentheses_and_a_backslash_is_granted_without_changing_the_profile`, `regex_metacharacters_in_a_denied_base_match_only_themselves_under_the_real_sandbox`; `probe_matrix` `a_file_name_with_a_newline_works_in_the_project_and_a_config_path_with_one_is_refused`, `a_case_variant_of_a_floor_path_is_denied_and_one_of_an_allowed_path_is_not`, `an_nfd_spelling_of_a_name_is_the_same_directory_for_a_grant_and_for_a_deny` |
+| Network: direct and unlisted loopback port refused, proxy and listed port reachable, no proxy means none | `seatbelt_render` `only_the_proxy_and_listed_loopback_ports_are_reachable`, `without_a_proxy_slot_no_network_is_reachable_at_all` |
+| DNS through the system resolver fails, `/etc/hosts` answers | `probe_matrix` `name_resolution_through_the_system_resolver_fails_while_the_hosts_file_still_answers` |
+| Unix sockets: only the `hb ctl` socket | `seatbelt_render` `the_ctl_socket_is_reachable_and_no_other_unix_socket_is`, `a_broad_network_allow_added_earlier_still_cannot_reach_a_container_socket` |
+| Later rule wins (template re-allow after guard deny); ancestor listing works, a sibling's contents do not | `seatbelt_render` `the_template_reallow_reopens_a_guard_deny_which_a_wildcard_allow_could_not`, `a_granted_ancestor_cannot_reach_credentials_beneath_it_and_stat_does_not_leak` |
+| Empty environment; descriptors 0 to 2 only | `session_run` `the_child_environment_is_exactly_the_allowed_set_and_no_parent_token_reaches_it`, `after_the_close_the_child_has_only_the_three_standard_descriptors` |
+| `ps`, `sudo` cannot start (setuid); own child can be signalled, an outside process cannot | `seatbelt_render` `setuid_programs_do_not_run`, `a_process_can_signal_its_own_children_but_not_other_processes`; `probe_matrix` `sudo_cannot_start_while_an_ordinary_program_can` |
+| Pasteboard tools, LaunchServices (`open -a`, application lookup) and Apple Events refused | `probe_matrix` `the_pasteboard_cannot_be_read_or_written_by_the_command_line_tools`, `launchservices_shows_no_applications_and_open_cannot_start_one`, `an_apple_event_cannot_be_delivered_to_a_running_application` |
+| `/dev/fd` and the standard stream nodes work | `seatbelt_render` `the_baseline_runs_ordinary_tools_and_the_standard_stream_nodes` |
+| Session directory is 0700 and gone after exit, SIGINT, SIGTERM, SIGHUP | `session_run` `tmpdir_is_a_private_0700_directory_the_child_can_use_and_it_is_gone_afterwards`; `signals` `each_of_int_term_and_hup_sent_to_hb_reaches_the_child_and_the_session_dir_is_removed` |
+| TLS trust and the keychain floor | `seatbelt_tls`, `tls_handshake`, opt-in `tls_inspection` |
+| The `xcrun` cache is readable, never writable | `seatbelt_render` `the_git_shim_reads_the_xcrun_cache_quietly_and_the_cache_stays_unwritable` |
+
+The Apple Event probe uses Finder because it is the one application nearly always running in a login session. The test sends an event
+with no parameters (`core/getd`), so the target changes nothing. Measured: outside the ball the event is delivered; inside it fails with
+`-600` (no such process), and still fails with every `mach-lookup` and `process-info` allowed, so delivery depends on much more than one
+missing rule. LaunchServices is probed with `lsappinfo`, which only asks: it lists no applications inside the ball. (An AppleScript
+`path to application "X"` looks harmless but starts the application when run outside, so the matrix does not use it.)
 
 ## 17. Alternatives considered
 

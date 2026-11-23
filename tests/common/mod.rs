@@ -12,6 +12,7 @@ use claims::assert_ok;
 use hamster_ball::config::{LoadRequest, Loaded, StaticPresets, discover, load};
 use hamster_ball::policy::{CanonicalPath, HomeDir};
 use hamster_ball::seatbelt::{Profile, RenderInputs, render, render_filtered};
+use hamster_ball::session::{Outcome, RunSpec, run as session_run};
 use hamster_ball::system::{Environment, FloorEnvironment, UserConfigDir};
 use tempfile::TempDir;
 
@@ -44,7 +45,23 @@ pub fn write(path: &Path, text: &str) {
 impl World {
     /// A world whose project config is `project_toml` and whose base config is `base_toml`.
     pub fn with_base(base_toml: &str, project_toml: &str) -> Self {
-        let dir = assert_ok!(TempDir::new());
+        Self::build(assert_ok!(TempDir::new()), base_toml, project_toml)
+    }
+
+    /// A world whose tree sits under `/tmp`, which is a symlink to `/private/tmp`, so a path
+    /// spelled through `/tmp` differs from its resolved form (the case the spike hit).
+    pub fn under_symlinked_tmp(base_toml: &str, project_toml: &str) -> Self {
+        Self::build(assert_ok!(TempDir::new_in("/tmp")), base_toml, project_toml)
+    }
+
+    /// The same tree as [`World::base`], spelled through the symlink it was created under.
+    pub fn spelled(&self, path: &Path) -> PathBuf {
+        let real = Path::new("/private/tmp");
+        path.strip_prefix(real)
+            .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/tmp").join(rest))
+    }
+
+    fn build(dir: TempDir, base_toml: &str, project_toml: &str) -> Self {
         let base = assert_ok!(fs::canonicalize(dir.path()));
         let home_path = base.join("home");
         let project = home_path.join("work/proj");
@@ -88,12 +105,17 @@ impl World {
 
     /// Loads the policy (the real discover + load + floor).
     pub fn loaded(&self) -> Loaded {
+        assert_ok!(self.try_loaded())
+    }
+
+    /// Like [`World::loaded`], but hands back the error for a config that must be refused.
+    pub fn try_loaded(&self) -> Result<Loaded, hamster_ball::config::LoadError> {
         let discovery = assert_ok!(discover(&self.project, &self.home));
         let user = UserConfigDir::locate(&self.home);
-        assert_ok!(load(
+        load(
             &LoadRequest::new(&self.home, &discovery, &user, &self.env.floor)
-                .with_builtins(&NO_PRESETS)
-        ))
+                .with_builtins(&NO_PRESETS),
+        )
     }
 
     /// A command that runs the test-only `hb-testdrive` binary in this world: same code as `hb`,
@@ -151,6 +173,35 @@ pub fn without_lines(profile: &Profile, needle: &str) -> Profile {
         params: profile.params.clone(),
         warnings: profile.warnings.clone(),
     }
+}
+
+/// Runs `argv` in the world through [`session::run`](hamster_ball::session::run): the real
+/// policy, the real renderer, the empty environment, the session directory and the child helper.
+///
+/// Call it only after [`sandbox_available`] said yes; the nesting preflight inside `run` would
+/// otherwise turn a skip into an error.
+pub fn run_in_hb(world: &World, argv: &[&str]) -> Outcome {
+    let spec = RunSpec::new(argv.iter().copied());
+    assert_ok!(session_run(&world.env, &world.loaded(), &spec))
+}
+
+/// `run_in_hb` of `/bin/sh -c script`.
+pub fn sh_in_hb(world: &World, script: &str) -> Outcome {
+    run_in_hb(world, &["/bin/sh", "-c", script])
+}
+
+/// Whether the child exited with code 0.
+pub fn hb_succeeds(outcome: &Outcome) -> bool {
+    outcome.exit == hamster_ball::session::ExitKind::Exited(0)
+}
+
+/// Captured stdout then stderr, lossily decoded.
+pub fn hb_text(outcome: &Outcome) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&outcome.stdout),
+        String::from_utf8_lossy(&outcome.stderr)
+    )
 }
 
 /// Whether `sandbox-exec` works here: false when this process is already sandboxed.
