@@ -3,8 +3,8 @@
 //! Invariants over the typed rule list (design 7.1).
 //!
 //! 1. Sections are non-decreasing, so the floor and pins really come last.
-//! 2. Each section allows or denies, not both: the guard, policy-deny, floor and pin sections
-//!    only deny. An allow of `file-write-unlink`, or of any specific write operation, would
+//! 2. Each section allows or denies, not both: the host-services, guard, policy-deny, floor and
+//!    pin sections only deny. An allow of `file-write-unlink`, or of any specific write operation, would
 //!    override a `file-write*` deny regardless of order, so none is accepted.
 //! 3. A deny never uses the `file-read*` wildcard, and a deny of any specific read operation
 //!    names all four. Seatbelt resolves the most specific operation first, so a wildcard deny
@@ -170,7 +170,11 @@ pub fn check(rules: &[Rule]) -> Result<(), InvariantViolation> {
 fn section_allows(section: Section) -> bool {
     !matches!(
         section,
-        Section::Guard | Section::PolicyDeny | Section::Floor | Section::Pins
+        Section::HostServices
+            | Section::Guard
+            | Section::PolicyDeny
+            | Section::Floor
+            | Section::Pins
     )
 }
 
@@ -256,7 +260,8 @@ fn fits(op: Op, filter: &Filter) -> bool {
                 | Filter::StaticLiteral(_)
                 | Filter::StaticRegex(_)
         ),
-        Op::ProcessExec | Op::ProcessFork | Op::IpcPosixShm | Op::IpcPosixSem => false,
+        Op::ProcessExec => matches!(filter, Filter::StaticLiteral(_)),
+        Op::ProcessFork | Op::IpcPosixShm | Op::IpcPosixSem => false,
     }
 }
 
@@ -577,8 +582,32 @@ mod tests {
     }
 
     #[test]
+    fn an_exec_rule_may_name_only_a_literal_written_in_this_crate() {
+        let literal = Rule::deny(
+            Section::HostServices,
+            &[Op::ProcessExec],
+            vec![Filter::StaticLiteral("/bin/launchctl")],
+        );
+        assert_ok!(check(&[literal]));
+        // A path from the policy is never an exec target.
+        let from_policy = Rule::deny(
+            Section::HostServices,
+            &[Op::ProcessExec],
+            vec![sub(ParamKind::Read, "/bin/launchctl")],
+        );
+        assert_eq!(
+            assert_err!(check(&[from_policy])),
+            InvariantViolation::WrongFilterForOperation {
+                index: 0,
+                op: Op::ProcessExec
+            }
+        );
+    }
+
+    #[test]
     fn each_section_allows_or_denies_but_not_both() {
         for section in [
+            Section::HostServices,
             Section::Guard,
             Section::PolicyDeny,
             Section::Floor,

@@ -53,6 +53,7 @@ Attack paths the design must close, each backed by a measurement or a decision:
 | DNS exfiltration | No resolver access in the hamster ball; the proxy resolves names. Measured: direct DNS fails inside |
 | Read secrets in the project (`.env`, `*.secrets.yaml`) | Secrets guard (section 8) |
 | Tokens in the environment | Environment starts empty; only named variables pass |
+| Start, unload or disable your launch agents (`launchctl`) | `system.launchctl` is off unless your own config turns it on (section 4.6); the profile denies exec of `/bin/launchctl` |
 | Edit its own hamster ball config | `hamster-ball.toml` is write-denied inside the hamster ball; approval by hash (section 5) |
 | Escape through podman | Floor denies podman paths; `hb ctl` is the only container channel (section 9) |
 
@@ -121,10 +122,10 @@ config never applies silently.
 - `deny` rules from every layer apply, and **deny wins** over any allow. A read-deny (`fs.deny_read`) also denies
   write, delete and rename; a write-deny denies only those (D34).
 - There is no syntax to remove or narrow an entry that a lower layer added. A project can only add.
-- Scalars (few exist) never loosen: `tls.system_trust` and `terminal.clipboard_write` take `false` if any file says `false` (D35, D67), and
+- Scalars (few exist) never loosen: `tls.system_trust`, `terminal.clipboard_write` and `system.launchctl` take `false` if any file says `false` (D35, D67, D70), and
   `ctl.label` must be the same in every file that sets it, because a project label would otherwise replace the base's
   scope (D33). The earlier "otherwise the highest layer" fallback is removed.
-- Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`) are accepted **only**
+- Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`, and `system.launchctl = true`; a `false` is accepted anywhere) are accepted **only**
   from files that physically are the user's own: the base, files under `~/.config/hamster-ball` (with no other hard
   link), and built-in presets (D36). The rule is by where the file really is (its canonical path), not by how it was
   reached, so a path alias of a user preset behaves exactly like the name, and a symlinked or hard-linked user file
@@ -152,7 +153,7 @@ config never applies silently.
   location is inside the project or elsewhere (anything the ball could write), in closure order.
 - Every closure file must belong to you and not be world-writable (D31), starting with the base.
 - A missing `~/.config/hamster-ball/base.toml` is an error that says to run `hb init`, which writes a commented
-  template with mode 0600 and never overwrites (D39). `XDG_CONFIG_HOME` is ignored (D39).
+  template with mode 0600 and never overwrites (D39). `XDG_CONFIG_HOME` is ignored (D39). The template lists `[system] launchctl = false`, commented out, so the one switch only your own files can turn on is easy to find (4.6).
 
 ### 4.3 Schema (draft)
 
@@ -180,6 +181,9 @@ extra_ca_files = []
 
 [terminal]
 clipboard_write = true                          # false: remove the agent's OSC 52 clipboard writes; see 7.3
+
+[system]
+launchctl = false                               # default off; only your own files may say true; see 4.6
 
 [ctl]                                           # section 9
 label      = "com.docker.compose.project=icehouse"
@@ -297,6 +301,45 @@ the host's proxy configuration while `system_trust` is on; M3 should show that t
 
 These settings add trusted roots only. They work with Zscaler off, because hosts then present
 public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
+
+### 4.6 Host services
+
+What the agent may do with the machine around it is a small set of named levels. Each row says the default, who may change it, what
+it does, what enforces it and which test pins it. Rows in the first group are switches; the second group is never available.
+Everything else in the profile (paths, hosts, ports) is the grant model of 4.2 to 4.4.
+
+| Service | Default | Who may change it | What it gives the agent | Enforced by | Test |
+|---|---|---|---|---|---|
+| Network | none | any file adds hosts and loopback ports; MCP `bind_ports` | the proxy port and the listed loopback ports | `network-outbound` and `network-bind` rules (7.1 step 5) | `seatbelt_render` network tests |
+| System trust store (`tls.system_trust`) | on in the base | any file may turn it off | TLS verification against the system roots. Also lets `configd` answer, which shows the host's proxy and PAC settings | Mach lookups and the keychain read (4.5) | `seatbelt_tls`, `tls_handshake` |
+| Clipboard writes (`terminal.clipboard_write`) | on | any file may turn it off | OSC 52 writes reach your clipboard | the output filter (7.3) | `pty` |
+| Container control (`ctl`) | none | any file lists containers | `hb ctl` on a labelled or named container (9.3) | the broker | M8 |
+| **`launchctl` (`system.launchctl`)** | **off** | **only your own files may say `true`; any file may say `false`** | run `/bin/launchctl`: see below | `(deny process-exec (literal "/bin/launchctl"))` | `probe_matrix` |
+
+**`system.launchctl`.** Measured on macOS 15.7 with a throwaway job loaded from outside the ball: launchd refuses a sandboxed caller
+anything that creates a job or touches a running process (`bootstrap`, `load`, `submit`, `setenv`, `start`, `stop`, `kill`,
+`kickstart -k`, `bootout` of a running job). It allows `kickstart` of a job that is not running (the job runs outside the ball),
+`bootout` and `unload` of a job that is not running, `disable` and `enable` (a disable persists across logins), and
+`print` of the whole service list, the launchd user environment and the names of installed software. Nothing is logged as a denial,
+and the requests go over the bootstrap port, so no `mach-lookup` rule can tell them apart. The profile therefore denies running the
+program unless you turn it on. A copy of `launchctl` in the project does not help the agent: it is killed at exec (a plain copy, a
+copy re-signed ad hoc, and thinned x86_64 and arm64e copies were tried), because macOS kills a platform-signed binary that is not on
+the system volume. **Not tested:** an Intel Mac, other macOS versions, and a program that speaks launchd's private XPC protocol
+itself (that is work against macOS, which section 2 puts out of scope). With it on, treat every LaunchAgent you have as something
+the agent can start. `brew services` and a job that needs `bootstrap` do not work either way. A scoped form (`kickstart` for listed
+labels through `hb ctl`) belongs to M8. `hb doctor` (M5) should warn when `launchctl print gui/<uid>` shows a secret-looking name in
+the launchd environment, because the agent could read it if `launchctl` is on.
+
+Never available, with no switch (measured, `probe_matrix`): LaunchServices (`open -a` starts nothing, `lsappinfo` lists no
+applications), Apple Events (an event to a running application fails with `-600`, and still fails with every Mach lookup allowed),
+setuid programs (`sudo`, `ps`, `top`, `crontab`), the pasteboard command-line tools (`pbcopy`, `pbpaste`), keystroke injection
+(`hid-control` is not representable), `log show`, and signalling a process outside the ball. `pgrep`, `diskutil`, `dscl`,
+`caffeinate`, `pmset -g`, `networksetup` and `defaults read` fail too; nothing asked for them, so there is no switch.
+
+Machine information the agent can read, which no setting controls: `ioreg` and `system_profiler` (hardware serial number and platform
+UUID), `ifconfig` (MAC addresses), `netstat -an` (every process's connections), `lsof`, `mount`, `hostname`, `id`, `sw_vers` and the
+host's proxy settings through `configd`. None is a path in the threat model (credentials, planted code, exfiltration, tokens); they
+tell the agent about the machine, and with the proxy as the only way out they cannot leave it.
 
 ## 5. Trust and approval
 
@@ -465,13 +508,15 @@ reopened the file; placed before, it did not). Generated order:
    address. `hb explain` and the approval summary list every bind port with that caveat.
 6. Secrets guard denies (section 8): `file-read-data file-read-xattr` plus the write class, so file names stay visible.
 7. Template re-allow (`*.example`, `*.sample`, `*.template`), naming the same operations the guard deny names (a wildcard `file-read*` allow cannot reopen a specific-operation deny; measured).
+7a. Host services: unless `system.launchctl` is on, `(deny process-exec (literal "/bin/launchctl"))` (4.6). After every allow, because a
+   later rule on the same operation wins.
 8. Floor (all four effects, 6), pins and `deny_*` rules last, so nothing re-allows them. Read-class denies list the full
    read set: `file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable`, plus `file-write*`
    (`file-map-executable` is a child of `file-read-data`; naming it closes mapping a denied file as code through a descriptor
    opened before the sandbox, D62).
 
 Invariants checked on the typed rule list before any text is written (`check.rs`): sections are non-decreasing; each section
-allows or denies, not both (the guard, policy-deny, floor and pin sections only deny); no allow of `file-write-unlink` or any
+allows or denies, not both (the host-services, guard, policy-deny, floor and pin sections only deny); an exec rule names only a literal written in the crate; no allow of `file-write-unlink` or any
 specific write operation (it would override a `file-write*` deny regardless of order); a deny never uses `file-read*`, and a
 floor or policy deny that names reads names all five and `file-write*` (the guard may name a subset so file names stay visible,
 but must name the write class); a specific read allow appears only in the metadata section and the template re-allow;
@@ -848,6 +893,8 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
    `just/analytics.just` use 15432. Report to that project; not a change for this repo.
 9. Presets for codex and omp once installed.
 10. **AppleEvents and LaunchServices** are measured and closed (16.1): no event reaches a running application and `open -a` starts nothing.
+    **launchd** is measured (4.6): job creation is refused from inside, starting and disabling existing jobs is not, so `launchctl` is off unless
+    the user's own config turns it on (D70).
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
     open: the data-protection keychain and a system proxy or PAC actually being followed (`configd` gates the settings; see 4.5).
 11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
@@ -893,6 +940,7 @@ cannot run (no login session, no DNS) prints `SKIP:` with the reason. `HB_REQUIR
 | `/dev/fd` and the standard stream nodes work | `seatbelt_render` `the_baseline_runs_ordinary_tools_and_the_standard_stream_nodes` |
 | Session directory is 0700 and gone after exit, SIGINT, SIGTERM, SIGHUP | `session_run` `tmpdir_is_a_private_0700_directory_the_child_can_use_and_it_is_gone_afterwards`; `signals` `each_of_int_term_and_hup_sent_to_hb_reaches_the_child_and_the_session_dir_is_removed` |
 | TLS trust and the keychain floor | `seatbelt_tls`, `tls_handshake`, opt-in `tls_inspection` |
+| `launchctl` cannot run unless the user's own config turns it on; a project cannot turn it on; a copy is killed; a job cannot be created from inside; with it on, a job that is not running can be started and a running one cannot be touched (opt-in) | `probe_matrix` `launchctl_cannot_run_unless_the_users_own_config_turns_it_on`, `a_project_file_cannot_turn_launchctl_on`, `a_job_cannot_be_created_from_inside_even_when_launchctl_is_on`, `with_launchctl_on_the_agent_can_start_a_job_that_is_not_running_but_not_restart_or_unload_a_running_one` (`--ignored`) |
 | The `xcrun` cache is readable, never writable | `seatbelt_render` `the_git_shim_reads_the_xcrun_cache_quietly_and_the_cache_stays_unwritable` |
 
 The Apple Event probe uses Finder because it is the one application nearly always running in a login session. The test sends an event
@@ -1001,3 +1049,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard, and `[terminal] clipboard_write = false` (any file wins) removes the writes and says it did; after a no-pty run `hb` runs the same mode reset and device-attributes fence on the terminal; the guard prints a one-line hint when a killed `hb` left the terminal raw | owner, hb-ghd.2.4 follow-up |
 | D68 | `session::env` sets `NODE_USE_SYSTEM_CA=1` with `system_trust` and `NODE_EXTRA_CA_CERTS` to a per-session `ca-bundle.pem` (only the PEM certificates of `tls.extra_ca_files`, 0600, size-capped; a file with no certificate stops the run); no other CA variable is set; `com.apple.TrustEvaluationAgent` joins the system-trust grants because curl and git fail against a TLS-inspected host without it | owner, hb-ghd.2.2 |
 | D69 | The profile allows `file-read*` on `^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$` and never a write: `/usr/bin/git` and the other developer-tool shims read that cache to find the real tool and print two error lines per call without it; the user's own unsandboxed `xcrun` trusts the same file, so a write grant would let the agent redirect `git` for the user's shells. If the cache has no entry for a tool the first call still fails to write it and prints once | owner, hb-ghd.2.2 |
+| D70 | `[system] launchctl` (default off) decides whether `/bin/launchctl` may run: `false` from any file wins and `true` is accepted only from the user's own files (the D36 rule); the profile denies exec of the program otherwise (section 4.6). Chosen over leaving it open because launchd lets a sandboxed caller start, unload and disable jobs that are not running, which no profile rule can separate, and over a hard-coded deny so a user who runs services can opt in | owner, hb-ghd.2.5 |

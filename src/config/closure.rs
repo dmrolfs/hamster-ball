@@ -172,7 +172,7 @@ pub enum LoadError {
     UserOnlySection {
         /// The file that defines the section.
         path: PathBuf,
-        /// The section: `hooks` or `guard.exceptions`.
+        /// The section: `hooks`, `guard.exceptions` or `system.launchctl = true`.
         section: &'static str,
         /// Where the file is.
         location: FileLocation,
@@ -623,8 +623,10 @@ impl<'a> Loader<'a> {
         }
         let section = if found.hooks {
             "hooks"
-        } else {
+        } else if found.guard_exceptions {
             "guard.exceptions"
+        } else {
+            "system.launchctl = true"
         };
         Err(LoadError::UserOnlySection {
             path: path.to_path_buf(),
@@ -1459,6 +1461,45 @@ mod tests {
             !shown.contains("evil"),
             "the hook's argv is untrusted and must not be echoed"
         );
+    }
+
+    #[test]
+    fn launchctl_true_in_the_project_file_is_an_error_but_false_is_not() {
+        let w = World::new();
+        w.base("");
+        let project = w.project("[system]\nlaunchctl = true\n");
+        let err = assert_err!(w.load());
+        let (path, section, location) = user_only_error(&err);
+        assert_eq!(path, assert_ok!(fs::canonicalize(&project)));
+        assert_eq!(section, "system.launchctl = true");
+        assert_eq!(location, FileLocation::InProject);
+        assert!(err.to_string().contains("system.launchctl = true"));
+        // A project may refuse what the user allowed; saying `false` is harmless anywhere.
+        w.project("[system]\nlaunchctl = false\n");
+        assert_ok!(w.load());
+    }
+
+    #[test]
+    fn launchctl_true_in_the_users_base_is_accepted() {
+        let w = World::new();
+        w.base("[system]\nlaunchctl = true\n");
+        w.project("");
+        assert_ok!(w.load());
+    }
+
+    #[test]
+    fn launchctl_true_in_an_in_project_preset_is_an_error_naming_the_preset() {
+        let w = World::new();
+        w.base("");
+        w.write(
+            &w.project_dir().join("p.toml"),
+            "[system]\nlaunchctl = true\n",
+        );
+        w.project("extends = [\"./p.toml\"]\n");
+        let err = assert_err!(w.load());
+        let (path, section, _) = user_only_error(&err);
+        assert!(path.ends_with("p.toml"), "{path:?}");
+        assert_eq!(section, "system.launchctl = true");
     }
 
     #[test]

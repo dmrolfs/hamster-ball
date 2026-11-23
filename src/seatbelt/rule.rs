@@ -30,6 +30,8 @@ pub enum Section {
     Guard,
     /// Template re-allow, after the guard denies.
     TemplateAllow,
+    /// Denies of host services the policy has not turned on (`launchctl`). After every allow.
+    HostServices,
     /// `fs.deny_read` and `fs.deny_write` from config.
     PolicyDeny,
     /// The floor.
@@ -352,6 +354,7 @@ mod tests {
             Section::Network,
             Section::Guard,
             Section::TemplateAllow,
+            Section::HostServices,
             Section::PolicyDeny,
             Section::Floor,
             Section::Pins,

@@ -25,6 +25,7 @@ pub(crate) struct RawConfig {
     pub(crate) tls: RawTls,
     pub(crate) terminal: RawTerminal,
     pub(crate) ctl: RawCtl,
+    pub(crate) system: RawSystem,
     pub(crate) mcp: BTreeMap<String, RawMcpServer>,
     pub(crate) hooks: Vec<Vec<String>>,
     pub(crate) guard: RawGuard,
@@ -70,6 +71,13 @@ pub(crate) struct RawTls {
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct RawTerminal {
     pub(crate) clipboard_write: Option<bool>,
+}
+
+/// `[system]`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct RawSystem {
+    pub(crate) launchctl: Option<bool>,
 }
 
 /// `[ctl]`.
@@ -138,7 +146,8 @@ pub(crate) fn parse_str(source: &str, file: &Path) -> Result<RawConfig, ParseErr
 
 /// Which user-only sections a file mentions, whatever their value.
 ///
-/// `hooks` run unsandboxed on the host and `guard.exceptions` switch secret protection off, so
+/// `hooks` run unsandboxed on the host, `guard.exceptions` switch secret protection off and
+/// `system.launchctl = true` lets the agent start, unload and disable the user's launchd jobs, so
 /// only files the user controls may carry them (see `closure`). This probe answers "does the
 /// key appear" without depending on the sections' shape, so it keeps working when the hooks
 /// schema changes, and it sees `hooks = []` that the typed schema cannot tell from absence.
@@ -148,12 +157,14 @@ pub(crate) struct UserOnlySections {
     pub(crate) hooks: bool,
     /// `guard.exceptions` appears in any TOML spelling.
     pub(crate) guard_exceptions: bool,
+    /// `system.launchctl` is `true` (a `false` only tightens, so any file may say it).
+    pub(crate) launchctl_on: bool,
 }
 
 impl UserOnlySections {
     /// Whether any user-only section is present.
     pub(crate) fn any(self) -> bool {
-        self.hooks || self.guard_exceptions
+        self.hooks || self.guard_exceptions || self.launchctl_on
     }
 }
 
@@ -161,6 +172,12 @@ impl UserOnlySections {
 struct UserOnlyProbe {
     hooks: Option<serde::de::IgnoredAny>,
     guard: Option<GuardProbe>,
+    system: Option<SystemProbe>,
+}
+
+#[derive(Deserialize, Default)]
+struct SystemProbe {
+    launchctl: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -177,6 +194,9 @@ pub(crate) fn user_only_sections(source: &str) -> UserOnlySections {
     UserOnlySections {
         hooks: probe.hooks.is_some(),
         guard_exceptions: probe.guard.is_some_and(|guard| guard.exceptions.is_some()),
+        launchctl_on: probe
+            .system
+            .is_some_and(|system| system.launchctl == Some(true)),
     }
 }
 
@@ -449,6 +469,34 @@ mod tests {
         }
         assert!(!probe("[guard]\n").guard_exceptions);
         assert!(!probe("guard = {}\n").guard_exceptions);
+    }
+
+    #[test]
+    fn the_probe_flags_system_launchctl_only_when_it_is_true() {
+        for spelling in [
+            "[system]\nlaunchctl = true\n",
+            "system.launchctl = true\n",
+            "system = { launchctl = true }\n",
+            "[system]\n\"launchctl\" = true\n",
+        ] {
+            assert!(probe(spelling).launchctl_on, "{spelling:?} was not flagged");
+        }
+        // `false` only tightens, so any file may say it.
+        for harmless in [
+            "[system]\nlaunchctl = false\n",
+            "[system]\n",
+            "system = {}\n",
+            "[terminal]\nclipboard_write = true\n",
+            "x = \"launchctl\"\n",
+        ] {
+            assert!(!probe(harmless).launchctl_on, "{harmless:?} was flagged");
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_launchctl_is_left_to_the_real_parse_to_reject() {
+        assert!(!probe("[system]\nlaunchctl = \"yes\"\n").launchctl_on);
+        assert_err!(parsed("[system]\nlaunchctl = \"yes\"\n"));
     }
 
     #[test]

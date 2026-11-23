@@ -2686,6 +2686,12 @@
       "origins": []
     }
   },
+  "system": {
+    "launchctl": {
+      "value": false,
+      "origins": []
+    }
+  },
   "ctl": {
     "label": null,
     "containers": []

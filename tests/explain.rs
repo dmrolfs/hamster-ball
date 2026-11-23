@@ -116,6 +116,14 @@ impl World {
         }
     }
 
+    /// Adds `text` to the user's base config.
+    fn append_to_base(&self, text: &str) {
+        let path = self.home.path().as_str().to_owned() + "/.config/hamster-ball/base.toml";
+        let mut current = assert_ok!(fs::read_to_string(&path));
+        current.push_str(text);
+        assert_ok!(fs::write(&path, current));
+    }
+
     fn load(&self) -> (Loaded, hamster_ball::config::Discovery) {
         let discovery = assert_ok!(discover(&self.project, &self.home));
         let user = UserConfigDir::locate(&self.home);
@@ -289,6 +297,7 @@ fn the_json_parses_and_has_a_schema_version_and_the_groups_in_order() {
             "env",
             "tls",
             "terminal",
+            "system",
             "ctl",
             "mcp",
             "hooks",
@@ -314,6 +323,29 @@ fn the_terminal_group_says_clipboard_writes_are_allowed_until_a_file_denies_them
         "{text}"
     );
     assert!(text.contains("terminal.clipboard_write"), "{text}");
+}
+
+#[test]
+fn the_system_group_says_launchctl_is_off_until_a_user_file_turns_it_on() {
+    let off = World::new(PROJECT);
+    let report = off.report(false, None);
+    assert!(!report.system.launchctl.value);
+    assert!(report.system.launchctl.origins.is_empty());
+    let on = World::new(PROJECT);
+    on.append_to_base("\n[system]\nlaunchctl = true\n");
+    let report = on.report(false, None);
+    assert!(report.system.launchctl.value);
+    assert_eq!(report.system.launchctl.origins.len(), 1);
+    assert_eq!(
+        report.system.launchctl.origins[0].layer.as_str(),
+        "user_base"
+    );
+    let text = on.normalise(&render_text(&report));
+    assert!(text.contains("system\n  launchctl = true"), "{text}");
+    assert!(text.contains("system.launchctl"), "{text}");
+    // The text view says so for the default too, so the setting is never invisible.
+    let text = off.normalise(&render_text(&off.report(false, None)));
+    assert!(text.contains("system\n  launchctl = false"), "{text}");
 }
 
 // ====================================================================================

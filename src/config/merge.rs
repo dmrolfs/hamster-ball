@@ -114,6 +114,25 @@ impl MergedTerminal {
     }
 }
 
+/// The merged `[system]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedSystem {
+    /// `Some(false)` if any file says `false` (the stricter value), else `Some(true)` if any
+    /// says `true`, else `None`. Only the user's own files can say `true`.
+    pub launchctl: Option<Sourced<bool>>,
+}
+
+impl MergedSystem {
+    /// Whether the agent may run `launchctl`: only if a user-owned file says so and no file
+    /// refuses. The default is no, because `launchctl` lets the agent start, unload and disable
+    /// the user's launchd jobs (design 4.6).
+    #[must_use]
+    pub fn effective_launchctl(&self) -> bool {
+        self.launchctl.as_ref().is_some_and(|setting| setting.value)
+    }
+}
+
 /// The merged `[ctl]` rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -142,6 +161,8 @@ pub struct Policy {
     pub terminal: MergedTerminal,
     /// `[ctl]`.
     pub ctl: MergedCtl,
+    /// `[system]`.
+    pub system: MergedSystem,
     /// `[mcp.<name>]`, in sorted name order; every file naming a server must agree on it.
     pub mcp: BTreeMap<McpName, Sourced<ResolvedMcpServer>>,
     /// Host-side commands, in closure order, equal commands collapsed.
@@ -189,7 +210,7 @@ pub enum MergeError {
     UserOnlySection {
         /// The file.
         origin: Origin,
-        /// The section: `hooks` or `guard.exceptions`.
+        /// The section: `hooks`, `guard.exceptions` or `system.launchctl = true`.
         section: &'static str,
         /// Where the file is.
         location: FileLocation,
@@ -288,6 +309,9 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
         },
         terminal: MergedTerminal {
             clipboard_write: stricter_flag(files, |c| c.terminal.clipboard_write),
+        },
+        system: MergedSystem {
+            launchctl: stricter_flag(files, |c| c.system.launchctl),
         },
         ctl: MergedCtl {
             label: label(files, &mut collected),
@@ -492,6 +516,10 @@ fn reassert_user_only(files: &[ClosureFile], collected: &mut Collected) {
         }
         for (section, present) in [
             ("hooks", !file.resolved.hooks.is_empty()),
+            (
+                "system.launchctl = true",
+                file.resolved.system.launchctl == Some(true),
+            ),
             (
                 "guard.exceptions",
                 !file.resolved.guard.exceptions.is_empty(),
@@ -1034,6 +1062,57 @@ mod tests {
         ]);
         assert!(assert_some!(on.terminal.clipboard_write.clone()).value);
         assert!(on.terminal.effective_clipboard_write());
+    }
+
+    fn with_launchctl(value: Option<bool>) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.system.launchctl = value;
+        config
+    }
+
+    #[test]
+    fn launchctl_is_off_unless_a_user_file_says_true_and_no_file_says_false() {
+        let unset = merged(vec![user("base", with_launchctl(None))]);
+        assert_eq!(unset.system.launchctl, None);
+        assert!(!unset.system.effective_launchctl());
+        let on = merged(vec![
+            user("base", with_launchctl(Some(true))),
+            project(with_launchctl(None)),
+        ]);
+        assert!(on.system.effective_launchctl());
+        let refused = merged(vec![
+            user("base", with_launchctl(Some(true))),
+            project(with_launchctl(Some(false))),
+        ]);
+        let setting = assert_some!(refused.system.launchctl.clone());
+        assert!(!setting.value);
+        assert_eq!(setting.sources, vec![Source::value(FileId::new(1))]);
+        assert!(!refused.system.effective_launchctl());
+    }
+
+    #[test]
+    fn a_project_file_that_says_launchctl_true_is_a_merge_error_naming_the_file() {
+        let files = closure(vec![
+            user("base", with_launchctl(None)),
+            project(with_launchctl(Some(true))),
+        ]);
+        let errors = assert_err!(merge(&files, Floor::empty()));
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                error,
+                MergeError::UserOnlySection { section, .. } if *section == "system.launchctl = true"
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_file_that_says_launchctl_false_is_fine() {
+        let policy = merged(vec![
+            user("base", with_launchctl(Some(true))),
+            project(with_launchctl(Some(false))),
+        ]);
+        assert!(!policy.system.effective_launchctl());
     }
 
     fn with_label(label: Option<&str>) -> ResolvedConfig {

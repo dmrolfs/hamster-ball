@@ -90,9 +90,34 @@ pub(crate) fn plan(
     tls(&mut rules, policy);
     network(&mut rules, policy, inputs);
     template_allow(&mut rules, inputs);
+    host_services(&mut rules, policy);
     policy_denies(&mut rules, policy);
     floor(&mut rules, policy, inputs, keep_floor);
     rules
+}
+
+/// The one program that talks to launchd, `/bin/launchctl` (design 4.6).
+///
+/// Measured: launchd refuses a sandboxed caller anything that creates a job or touches a running
+/// process, but it lets the caller start, unload and disable jobs that are not running, and print
+/// the whole service list. No profile rule can separate those requests (they go over the
+/// bootstrap port and nothing is logged), so the profile denies running the program. A copy in
+/// the project is killed at exec: macOS kills a platform-signed binary that is not on the system
+/// volume (checked for a plain copy, a re-signed one and thinned x86_64 and arm64e copies).
+const LAUNCHCTL: &str = "/bin/launchctl";
+
+/// Denies the host services the policy has not turned on.
+fn host_services(rules: &mut Vec<Rule>, policy: &Policy) {
+    if !policy.system.effective_launchctl() {
+        rules.push(
+            Rule::deny(
+                Section::HostServices,
+                &[Op::ProcessExec],
+                vec![Filter::StaticLiteral(LAUNCHCTL)],
+            )
+            .labelled("launchctl"),
+        );
+    }
 }
 
 fn process(rules: &mut Vec<Rule>) {
@@ -583,6 +608,48 @@ mod tests {
         assert!(texts.contains(&"/usr") && texts.contains(&"/private/var/select"));
         assert!(texts.contains(&"/Library/Developer/CommandLineTools"));
         assert!(!texts.contains(&"/Library"));
+    }
+
+    #[test]
+    fn launchctl_cannot_be_executed_unless_a_user_file_turned_it_on() {
+        let mut policy = policy_with(vec![]);
+        let denies = |policy: &Policy| {
+            let rules = rendered(policy, &RenderInputs::new());
+            assert_ok!(check(&rules));
+            find(&rules, Section::HostServices, Op::ProcessExec)
+                .into_iter()
+                .map(|rule| {
+                    let texts: Vec<String> =
+                        static_texts(rule).into_iter().map(str::to_owned).collect();
+                    (rule.action, texts)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            denies(&policy),
+            [(Action::Deny, vec!["/bin/launchctl".to_owned()])],
+            "off by default"
+        );
+        policy.system.launchctl = Some(Sourced::new(true, src()));
+        assert!(denies(&policy).is_empty(), "turned on");
+        policy.system.launchctl = Some(Sourced::new(false, src()));
+        assert_eq!(denies(&policy).len(), 1, "refused again");
+    }
+
+    #[test]
+    fn the_launchctl_deny_comes_after_the_exec_allow_it_overrides() {
+        let rules = rendered(&policy_with(vec![]), &RenderInputs::new());
+        let allow = assert_some!(
+            rules
+                .iter()
+                .position(|r| { r.section == Section::Process && r.ops == [Op::ProcessExec] })
+        );
+        let deny = assert_some!(
+            rules
+                .iter()
+                .position(|r| r.section == Section::HostServices)
+        );
+        assert!(allow < deny);
     }
 
     #[test]

@@ -251,6 +251,8 @@ pub struct ResolvedConfig {
     pub terminal: ResolvedTerminal,
     /// `[ctl]`.
     pub ctl: ResolvedCtl,
+    /// `[system]`.
+    pub system: ResolvedSystem,
     /// `[mcp.<name>]`, keyed by name, in sorted order.
     pub mcp: BTreeMap<McpName, ResolvedMcpServer>,
     /// Each `hooks` entry, as an argv array. Shape-only: whether a project file may declare
@@ -316,6 +318,15 @@ pub struct ResolvedEnv {
 pub struct ResolvedTerminal {
     /// Whether the agent may set the clipboard; `None` means this file did not say.
     pub clipboard_write: Option<bool>,
+}
+
+/// `[system]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedSystem {
+    /// Whether the agent may run `launchctl`; `None` means this file did not say. Only the
+    /// user's own files may say `true` (the loader refuses it elsewhere).
+    pub launchctl: Option<bool>,
 }
 
 /// `[tls]`.
@@ -441,6 +452,9 @@ impl<'a> Resolution<'a> {
             },
             terminal: ResolvedTerminal {
                 clipboard_write: parsed.terminal.clipboard_write,
+            },
+            system: ResolvedSystem {
+                launchctl: parsed.system.launchctl,
             },
             ctl: ResolvedCtl {
                 label: self.label(parsed.ctl.label.as_deref()),
@@ -876,6 +890,26 @@ mod tests {
         assert_eq!(off.config.terminal.clipboard_write, Some(false));
         let on = fx.resolved("[terminal]\nclipboard_write = true\n");
         assert_eq!(on.config.terminal.clipboard_write, Some(true));
+    }
+
+    #[test]
+    fn system_launchctl_is_read_as_given_and_stays_unset_when_absent() {
+        let fx = Fixture::new();
+        assert_eq!(fx.resolved("").config.system.launchctl, None);
+        assert_eq!(fx.resolved("[system]\n").config.system.launchctl, None);
+        let on = fx.resolved("[system]\nlaunchctl = true\n");
+        assert_eq!(on.config.system.launchctl, Some(true));
+        let off = fx.resolved("[system]\nlaunchctl = false\n");
+        assert_eq!(off.config.system.launchctl, Some(false));
+    }
+
+    #[test]
+    fn an_unknown_system_key_or_a_wrong_type_is_a_parse_error_naming_the_key() {
+        let fx = Fixture::new();
+        let unknown = fx.errors("[system]\nlaunchd = true\n");
+        assert_eq!(key_of(&unknown, 0), "system.launchd");
+        let wrong = fx.errors("[system]\nlaunchctl = \"yes\"\n");
+        assert_eq!(key_of(&wrong, 0), "system.launchctl");
     }
 
     #[test]

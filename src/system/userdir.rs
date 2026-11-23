@@ -39,6 +39,12 @@ system_trust = true
 # Uncomment to refuse: the write is removed and hb says it tried.
 # clipboard_write = false
 
+[system]
+# The agent cannot run launchctl. Turning it on lets the agent start, unload and disable your
+# launchd jobs that are not running, and read your launchd service list. Only this file and
+# your presets can say true; any file can say false.
+# launchctl = true
+
 [env]
 # Variables copied from your shell into every hamster ball. HOME, PATH, TMPDIR, TERM and the proxy
 # and TLS variables are set by hb itself and cannot be listed here.
@@ -396,6 +402,11 @@ mod tests {
         ));
         assert_eq!(resolved.config.tls.system_trust, Some(true));
         assert_eq!(resolved.config.env.pass.len(), 2);
+        assert!(BASE_TEMPLATE.contains("# launchctl = true"));
+        assert_eq!(
+            resolved.config.system.launchctl, None,
+            "the template must not turn launchctl on"
+        );
     }
 
     #[test]

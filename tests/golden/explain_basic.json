@@ -2421,6 +2421,12 @@
       "origins": []
     }
   },
+  "system": {
+    "launchctl": {
+      "value": false,
+      "origins": []
+    }
+  },
   "ctl": {
     "label": {
       "value": "com.docker.compose.project=demo",

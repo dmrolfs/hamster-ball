@@ -151,6 +151,14 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
         origins(&report.terminal.clipboard_write.origins, t)
     )?;
 
+    writeln!(out, "\nsystem")?;
+    writeln!(
+        out,
+        "  launchctl = {}  {}",
+        report.system.launchctl.value,
+        origins(&report.system.launchctl.origins, t)
+    )?;
+
     section(
         out,
         "ctl",

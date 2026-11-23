@@ -144,6 +144,9 @@ tls
 terminal
   clipboard_write = true  
 
+system
+  launchctl = false  
+
 ctl
   label = com.docker.compose.project=demo  <- [2] ctl.label
 

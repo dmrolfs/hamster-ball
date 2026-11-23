@@ -9,7 +9,7 @@
 //! counted, not shown, unless [`ReportOptions::show_args`] is set; then each is bounded.
 //! Values that can carry a secret therefore cannot reach a renderer by accident.
 //!
-//! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `terminal`, `ctl`, `mcp`,
+//! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `terminal`, `system`, `ctl`, `mcp`,
 //! `hooks`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
 //! higher precedence). Sets are value-sorted, which is the order [`Sourced`] lists already
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
@@ -219,6 +219,13 @@ pub struct TerminalReport {
     pub clipboard_write: Row<bool>,
 }
 
+/// `[system]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SystemReport {
+    /// Whether the agent may run `launchctl`, and who said so. Off when no file says.
+    pub launchctl: Row<bool>,
+}
+
 /// `[ctl]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CtlReport {
@@ -324,6 +331,8 @@ pub struct Report {
     pub tls: TlsReport,
     /// Terminal.
     pub terminal: TerminalReport,
+    /// Host services.
+    pub system: SystemReport,
     /// `hb ctl`.
     pub ctl: CtlReport,
     /// MCP servers.
@@ -465,6 +474,18 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
                 |setting| Row {
                     value: setting.value,
                     origins: b.origins(&setting.sources, "terminal.clipboard_write"),
+                },
+            ),
+        },
+        system: SystemReport {
+            launchctl: policy.system.launchctl.as_ref().map_or_else(
+                || Row {
+                    value: false,
+                    origins: Vec::new(),
+                },
+                |setting| Row {
+                    value: setting.value,
+                    origins: b.origins(&setting.sources, "system.launchctl"),
                 },
             ),
         },

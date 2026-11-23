@@ -157,6 +157,9 @@ tls
 terminal
   clipboard_write = true  
 
+system
+  launchctl = false  
+
 ctl
   (none)
 

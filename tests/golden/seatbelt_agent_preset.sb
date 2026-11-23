@@ -27,6 +27,8 @@
 (allow network-outbound (remote ip (param "PROXY")))
 (allow network-bind (local ip (param "B0")) (local ip (param "B1")))
 (allow network-inbound (local ip (param "B0")) (local ip (param "B1")))
+; host_services
+(deny process-exec (with message "hb-0123abcd launchctl") (literal "/bin/launchctl"))
 ; floor
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F1")))

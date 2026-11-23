@@ -18,6 +18,8 @@
 (allow file-read* file-write* (subpath (param "W0")) (subpath (param "W1")))
 ; template_allow
 (allow file-read-data file-read-xattr file-write* (literal (param "W2")))
+; host_services
+(deny process-exec (literal "/bin/launchctl"))
 ; policy_deny
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F1")))

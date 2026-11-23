@@ -23,6 +23,8 @@
 ; network
 (allow network-outbound (remote ip (param "PROXY")))
 (allow network-outbound (remote ip (param "L0")) (remote ip (param "L1")))
+; host_services
+(deny process-exec (literal "/bin/launchctl"))
 ; floor
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F1")))

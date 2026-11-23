@@ -420,3 +420,151 @@ fn an_apple_event_cannot_be_delivered_to_a_running_application() {
     );
     assert!(!hb_succeeds(&finder_says), "{}", hb_text(&finder_says));
 }
+
+// ====================================================================================
+// launchd (design 4.6)
+// ====================================================================================
+
+const BASE_ON: &str = "[system]\nlaunchctl = true\n";
+
+fn uid() -> String {
+    let out = outside("/usr/bin/id", &["-u"]);
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[test]
+fn launchctl_cannot_run_unless_the_users_own_config_turns_it_on() {
+    sandboxed!();
+    // Control: `launchctl version` changes nothing and works outside.
+    assert!(outside("/bin/launchctl", &["version"]).status.success());
+    let off = World::new(PROJECT);
+    assert!(works(&off, "/usr/bin/true"));
+    assert!(!works(&off, "/bin/launchctl version"), "off by default");
+    let on = World::with_base(BASE_ON, PROJECT);
+    assert!(
+        works(&on, "/bin/launchctl version"),
+        "turned on in the base"
+    );
+    // A project may refuse what the user allowed.
+    let refused = World::with_base(
+        BASE_ON,
+        "[fs]\nwrite = [\".\"]\n[system]\nlaunchctl = false\n",
+    );
+    assert!(!works(&refused, "/bin/launchctl version"));
+    // A copy in the project does not get around the denial: macOS kills a platform binary that
+    // is not on the system volume. (Checked on arm64; see design 4.6 for what is not.)
+    let copy = sh_in_hb(&off, "/bin/cp /bin/launchctl ./lc && ./lc version");
+    assert!(!hb_succeeds(&copy), "{}", hb_text(&copy));
+}
+
+#[test]
+fn a_project_file_cannot_turn_launchctl_on() {
+    sandboxed!();
+    let w = World::with_base(
+        BASE_ON,
+        "[fs]\nwrite = [\".\"]\n[system]\nlaunchctl = true\n",
+    );
+    let error = assert_err!(w.try_loaded()).to_string();
+    assert!(error.contains("system.launchctl = true"), "{error}");
+}
+
+#[test]
+fn a_job_cannot_be_created_from_inside_even_when_launchctl_is_on() {
+    sandboxed!();
+    let w = World::with_base(BASE_ON, PROJECT);
+    let uid = uid();
+    let label = format!("hb.probe.create.{}", std::process::id());
+    let plist = w.project.join("job.plist");
+    write(
+        &plist,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n</dict></plist>\n"
+        ),
+    );
+    // Whatever happens, leave no job behind in the user's launchd.
+    let _cleanup = Unload(format!("gui/{uid}/{label}"));
+    let boot = sh_in_hb(
+        &w,
+        &format!("/bin/launchctl bootstrap gui/{uid} {}", quote(&plist)),
+    );
+    assert!(
+        !hb_succeeds(&boot),
+        "launchd accepted a job from inside the ball"
+    );
+    let listed = outside("/bin/launchctl", &["print", &format!("gui/{uid}/{label}")]);
+    assert!(!listed.status.success(), "the job exists");
+    // Control: the same plist loads from outside.
+    let control = outside(
+        "/bin/launchctl",
+        &["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()],
+    );
+    assert!(
+        control.status.success(),
+        "{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+/// Unloads a launchd service when dropped, whether or not the test got that far.
+struct Unload(String);
+
+impl Drop for Unload {
+    fn drop(&mut self) {
+        let _ = Command::new("/bin/launchctl")
+            .args(["bootout", &self.0])
+            .output();
+    }
+}
+
+/// What `system.launchctl = true` lets the agent do to jobs that already exist (design 4.6).
+///
+/// `disable` and `unload` of a job that is not running also work (measured by hand, see 4.6); they
+/// are not run here because launchd keeps a record of every enable and disable.
+///
+/// Opt-in because it loads a throwaway job into your launchd (removed afterwards). Run it with
+/// `cargo test --features test-support --test probe_matrix -- --ignored launchctl`.
+#[test]
+#[ignore = "loads a throwaway job into the user's launchd"]
+fn with_launchctl_on_the_agent_can_start_a_job_that_is_not_running_but_not_restart_or_unload_a_running_one()
+ {
+    sandboxed!();
+    let w = World::with_base(BASE_ON, PROJECT);
+    let uid = uid();
+    let label = format!("hb.probe.gap.{}", std::process::id());
+    let service = format!("gui/{uid}/{label}");
+    let marker = w.base.join("ran");
+    let plist = w.base.join("gap.plist");
+    write(
+        &plist,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>touch {m}; sleep 30</string></array>\n</dict></plist>\n",
+            m = marker.display()
+        ),
+    );
+    let _cleanup = Unload(service.clone());
+    let load = outside(
+        "/bin/launchctl",
+        &["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()],
+    );
+    assert!(
+        load.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    // Start a job that is not running: it runs outside the ball.
+    assert!(works(&w, &format!("/bin/launchctl kickstart {service}")));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(marker.exists(), "the job did not run");
+    // A running job is out of reach: no restart, no unload.
+    assert!(!works(
+        &w,
+        &format!("/bin/launchctl kickstart -k {service}")
+    ));
+    assert!(!works(&w, &format!("/bin/launchctl bootout {service}")));
+    // Control: the same bootout works outside.
+    assert!(
+        outside("/bin/launchctl", &["bootout", &service])
+            .status
+            .success()
+    );
+}
