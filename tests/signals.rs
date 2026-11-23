@@ -376,8 +376,9 @@ fn a_bash_loop_around_hb_stops_on_ctrl_c_which_an_exit_130_would_not() {
 // A terminal and no pty (`HB_TD_PTY=off`): the child shares hb's process group (decision 3)
 // ====================================================================================
 
-/// Runs `hb run` under `expect` so stdin is a real terminal, types one Ctrl-C, and returns the output.
-fn on_a_terminal(w: &World, script_name: &str, child_script: &str, ctrl_c_after_ms: u32) -> String {
+/// Runs `hb run` under `expect` so stdin is a real terminal, types one Ctrl-C once the child prints
+/// `ready` (its handler is installed by then), and returns the output.
+fn on_a_terminal(w: &World, script_name: &str, child_script: &str) -> String {
     let script = w.project.join(script_name);
     common::write(&script, child_script);
     let td = w.base.join("drive.exp");
@@ -385,14 +386,13 @@ fn on_a_terminal(w: &World, script_name: &str, child_script: &str, ctrl_c_after_
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
          set env(HB_TD_GRACE_MS) 500\nset env(HB_TD_PTY) off\nset timeout 20\n{guard}\
          spawn {drive} run -- /usr/bin/perl {script}\n\
-         sleep {delay}\nsend \"\\003\"\nexpect eof\n",
+         expect \"ready\"\nsend \"\\003\"\nexpect eof\n",
         home = w.home_dir().display(),
         cwd = w.project.display(),
         path = w.base.join("bin").display(),
         tmp = w.base.join("tmp").display(),
         drive = DRIVE,
         script = script.display(),
-        delay = f64::from(ctrl_c_after_ms) / 1000.0,
         guard = EXPECT_GUARD,
     );
     common::write(&td, &body);
@@ -414,7 +414,7 @@ fn one_ctrl_c_on_a_terminal_reaches_the_child_once_and_hb_does_not_kill_a_child_
     // (500 ms), so a kill clock started by hb would show up as a missing "finished" line.
     let child = "$|=1; my $n=0; $SIG{INT}=sub{ $n++; print \"int-$n\\n\" };\n\
                  print \"ready\\n\"; select(undef,undef,undef,0.1) for 1..30; print \"finished-$n\\n\";\n";
-    let text = on_a_terminal(&w, "catch.pl", child, 1200);
+    let text = on_a_terminal(&w, "catch.pl", child);
     assert!(
         text.contains("int-1"),
         "the child never saw the Ctrl-C: {text}"
