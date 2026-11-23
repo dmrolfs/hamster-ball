@@ -135,7 +135,10 @@ deny (120 from the floor, which no config can change; 0 from config)
   floor  pin                          pin_unlink       ~/work/proj [node only]  (keeps a protected path from being moved aside by renaming an ancestor)
 
 net.allow
-  api.example.com  <- [0] net.allow[0]
+  api.example.com:443  <- [0] net.allow[0]
+
+net.internal_hosts (may resolve to private addresses)
+  (none)
 
 net.loopback_ports
   (none)

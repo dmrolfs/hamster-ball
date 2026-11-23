@@ -60,14 +60,9 @@ impl Authority {
 }
 
 fn parse_port(text: &str) -> Result<Port, AuthorityError> {
-    let bad = || AuthorityError::BadPort {
+    Port::from_decimal(text).ok_or_else(|| AuthorityError::BadPort {
         text: text.to_owned(),
-    };
-    if text.is_empty() || text.len() > 5 || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad());
-    }
-    let number: i64 = text.parse().map_err(|_| bad())?;
-    Port::try_from(number).map_err(|_| bad())
+    })
 }
 
 /// Why a request's target is not acceptable.

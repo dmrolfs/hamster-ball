@@ -15,9 +15,9 @@ use crate::origin::{KeyPath, Located, Origin};
 use crate::policy::{
     ArgWord, ArgWordError, Argv, ArgvError, BindPort, CanonicalPath, ContainerLabel,
     ContainerLabelError, ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue,
-    EnvValueError, ExtendRef, GuardException, HomeDir, HostPattern, HostPatternError, McpName,
-    McpNameError, PathError, PathPattern, PathPatternError, Port, PortError, ProjectRoot,
-    RefTextError, ToolName, ToolNameError,
+    EnvValueError, ExtendRef, GuardException, HomeDir, HostPattern, HostPatternError, HostRule,
+    HostRuleError, McpName, McpNameError, PathError, PathPattern, PathPatternError, Port,
+    PortError, ProjectRoot, RefTextError, ToolName, ToolNameError,
 };
 use crate::system::{AllowOutcome, PathResolver, SkippedPath};
 use crate::text::EscapedBounded;
@@ -138,11 +138,17 @@ pub enum EntryError {
         /// The underlying error.
         source: PathPatternError,
     },
-    /// A `net.allow` host pattern was invalid.
+    /// A `net.internal_hosts` or MCP `net` host pattern was invalid.
     #[snafu(transparent)]
     Host {
         /// The underlying error.
         source: HostPatternError,
+    },
+    /// A `net.allow` rule was invalid.
+    #[snafu(transparent)]
+    Rule {
+        /// The underlying error.
+        source: HostRuleError,
     },
     /// A `net.loopback_ports` entry was out of range.
     #[snafu(transparent)]
@@ -294,8 +300,11 @@ pub struct ResolvedFs {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedNet {
-    /// Allowed outbound hosts.
-    pub allow: Vec<HostPattern>,
+    /// Allowed outbound hosts, each with the one port it allows.
+    pub allow: Vec<HostRule>,
+    /// Hosts that may resolve to private, unique-local and tunnel addresses. Only the user's own
+    /// files may list any (design 12.1).
+    pub internal_hosts: Vec<HostPattern>,
     /// Loopback ports the hamster ball may reach.
     pub loopback_ports: Vec<Port>,
 }
@@ -438,7 +447,12 @@ impl<'a> Resolution<'a> {
             ),
             fs: self.fs(&parsed.fs),
             net: ResolvedNet {
-                allow: self.list(net_key("allow"), &parsed.net.allow, HostPattern::parse),
+                allow: self.list(net_key("allow"), &parsed.net.allow, HostRule::parse),
+                internal_hosts: self.list(
+                    net_key("internal_hosts"),
+                    &parsed.net.internal_hosts,
+                    HostPattern::parse,
+                ),
                 loopback_ports: self.ports(net_key("loopback_ports"), &parsed.net.loopback_ports),
             },
             env: ResolvedEnv {
@@ -1016,6 +1030,48 @@ mod tests {
         let errors = fx.errors("[net]\nallow = [\"crates.io\", \"not a host\", \"pypi.org\"]\n");
         assert_eq!(errors.errors.len(), 1);
         assert_eq!(key_of(&errors, 0), "net.allow[1]");
+        assert!(matches!(errors.errors[0].value, EntryError::Rule { .. }));
+    }
+
+    #[test]
+    fn allow_entries_carry_a_port_that_defaults_to_443() {
+        let fx = Fixture::new();
+        let resolved = fx.resolved(
+            "[net]\nallow = [\"crates.io\", \"registry.corp.example.com:8443\", \"*.kiro.dev:443\"]\n",
+        );
+        let ports: Vec<(String, u16)> = resolved
+            .config
+            .net
+            .allow
+            .iter()
+            .map(|r| (r.pattern.to_string(), r.port.get()))
+            .collect();
+        assert_eq!(
+            ports,
+            [
+                ("crates.io".to_owned(), 443),
+                ("registry.corp.example.com".to_owned(), 8443),
+                ("*.kiro.dev".to_owned(), 443),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bad_port_in_an_allow_entry_names_the_entry() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[net]\nallow = [\"crates.io\", \"crates.io:99999\"]\n");
+        assert_eq!(key_of(&errors, 0), "net.allow[1]");
+        assert!(matches!(errors.errors[0].value, EntryError::Rule { .. }));
+    }
+
+    #[test]
+    fn internal_hosts_are_patterns_and_a_bad_one_names_its_key() {
+        let fx = Fixture::new();
+        let resolved =
+            fx.resolved("[net]\ninternal_hosts = [\"github.com\", \"*.in.example.com\"]\n");
+        assert_eq!(resolved.config.net.internal_hosts.len(), 2);
+        let errors = fx.errors("[net]\ninternal_hosts = [\"github.com\", \"10.0.0.1\"]\n");
+        assert_eq!(key_of(&errors, 0), "net.internal_hosts[1]");
         assert!(matches!(errors.errors[0].value, EntryError::Host { .. }));
     }
 
@@ -1384,7 +1440,7 @@ mod tests {
         let errors = fx.errors("[net]\nallow = [\"a\\u0000b\"]\n");
         assert_eq!(errors.errors.len(), 1);
         assert_eq!(key_of(&errors, 0), "net.allow[0]");
-        assert!(matches!(errors.errors[0].value, EntryError::Host { .. }));
+        assert!(matches!(errors.errors[0].value, EntryError::Rule { .. }));
     }
 
     #[test]

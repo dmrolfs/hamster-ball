@@ -116,6 +116,13 @@ impl World {
         }
     }
 
+    /// Rewrites the user's base config.
+    fn edit_base(&self, edit: impl FnOnce(&str) -> String) {
+        let path = self.home.path().as_str().to_owned() + "/.config/hamster-ball/base.toml";
+        let current = assert_ok!(fs::read_to_string(&path));
+        assert_ok!(fs::write(&path, edit(&current)));
+    }
+
     /// Adds `text` to the user's base config.
     fn append_to_base(&self, text: &str) {
         let path = self.home.path().as_str().to_owned() + "/.config/hamster-ball/base.toml";
@@ -326,6 +333,36 @@ fn the_terminal_group_says_clipboard_writes_are_allowed_until_a_file_denies_them
 }
 
 #[test]
+fn net_allow_rows_show_their_port_and_internal_hosts_have_their_own_group() {
+    let w = World::new("[net]\nallow = [\"registry.corp.example.com:8443\", \"crates.io\"]\n");
+    w.edit_base(|text| {
+        text.replacen(
+            "[net]\n",
+            "[net]\ninternal_hosts = [\"*.corp.example.com\"]\n",
+            1,
+        )
+    });
+    let report = w.report(false, None);
+    let hosts: Vec<&str> = report.net.hosts.iter().map(|r| r.value.as_str()).collect();
+    assert!(
+        hosts.contains(&"registry.corp.example.com:8443"),
+        "{hosts:?}"
+    );
+    assert!(hosts.contains(&"crates.io:443"), "{hosts:?}");
+    assert_eq!(report.net.internal_hosts.len(), 1);
+    assert_eq!(report.net.internal_hosts[0].value, "*.corp.example.com");
+    assert_eq!(
+        report.net.internal_hosts[0].origins[0].layer.as_str(),
+        "user_base"
+    );
+    let text = w.normalise(&render_text(&report));
+    assert!(
+        text.contains("net.internal_hosts (may resolve to private addresses)"),
+        "{text}"
+    );
+}
+
+#[test]
 fn the_system_group_says_launchctl_is_off_until_a_user_file_turns_it_on() {
     let off = World::new(PROJECT);
     let report = off.report(false, None);
@@ -356,7 +393,7 @@ fn the_system_group_says_launchctl_is_off_until_a_user_file_turns_it_on() {
 fn a_value_declared_twice_lists_both_origins_in_closure_order() {
     let w = World::new(PROJECT);
     let report = w.report(false, None);
-    let row = assert_some!(report.net.hosts.iter().find(|r| r.value == "crates.io"));
+    let row = assert_some!(report.net.hosts.iter().find(|r| r.value == "crates.io:443"));
     let layers: Vec<&str> = row.origins.iter().map(|o| o.layer.as_str()).collect();
     assert_eq!(layers, ["preset", "project"]);
     let ref_row = assert_some!(report.fs.read.iter().find(|r| r.value.ends_with("/ref")));

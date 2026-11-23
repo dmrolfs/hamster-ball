@@ -8,6 +8,9 @@
 
 use snafu::{Report, Snafu};
 
+use std::net::IpAddr;
+
+use super::address::{AddressRefusal, Internal, Never};
 use super::authority::AuthorityError;
 use super::request::RequestError;
 use crate::policy::{HostName, Port};
@@ -23,11 +26,50 @@ pub enum Refusal {
         source: RequestError,
     },
 
+    /// The request carried no valid proxy credentials.
+    #[snafu(display("proxy authentication required"))]
+    ProxyAuthRequired,
+
     /// The host is not on the allowlist.
     #[snafu(display("{host} is not on the allowlist"))]
     NotAllowed {
         /// The host that was asked for.
         host: HostName,
+    },
+
+    /// The host is on the allowlist, but not for this port.
+    #[snafu(display(
+        "{host} is allowed on other ports but not on {port}; to allow it, add \"{host}:{port}\" to net.allow"
+    ))]
+    PortNotAllowed {
+        /// The host.
+        host: HostName,
+        /// The port that was asked for.
+        port: Port,
+    },
+
+    /// The host resolved only to addresses that are never allowed.
+    #[snafu(display("{host} resolved to {address}, which is {kind}; that is never allowed"))]
+    ForbiddenAddress {
+        /// The host.
+        host: HostName,
+        /// The address it resolved to.
+        address: IpAddr,
+        /// What the address is.
+        kind: Never,
+    },
+
+    /// The host resolved only to private or tunnel addresses and is not an internal host.
+    #[snafu(display(
+        "{host} resolved to {address}, which is {kind}; to allow it, add \"{host}\" to net.internal_hosts in your own config"
+    ))]
+    InternalAddress {
+        /// The host.
+        host: HostName,
+        /// The address it resolved to.
+        address: IpAddr,
+        /// What the address is.
+        kind: Internal,
     },
 
     /// The client did not finish its request in time.
@@ -65,6 +107,23 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// The refusal for the addresses of `host` that `refusal` rejected.
+    #[must_use]
+    pub fn for_address(host: HostName, refusal: AddressRefusal) -> Self {
+        match refusal {
+            AddressRefusal::Never { address, kind } => Self::ForbiddenAddress {
+                host,
+                address,
+                kind,
+            },
+            AddressRefusal::Internal { address, kind } => Self::InternalAddress {
+                host,
+                address,
+                kind,
+            },
+        }
+    }
+
     /// The HTTP status code and reason phrase.
     #[must_use]
     pub fn status(&self) -> (u16, &'static str) {
@@ -76,7 +135,11 @@ impl Refusal {
                 } => (403, "Forbidden"),
                 _ => (400, "Bad Request"),
             },
-            Self::NotAllowed { .. } => (403, "Forbidden"),
+            Self::ProxyAuthRequired => (407, "Proxy Authentication Required"),
+            Self::NotAllowed { .. }
+            | Self::PortNotAllowed { .. }
+            | Self::ForbiddenAddress { .. }
+            | Self::InternalAddress { .. } => (403, "Forbidden"),
             Self::HeadTimeout => (408, "Request Timeout"),
             Self::Unresolved { .. } | Self::Unreachable { .. } => (502, "Bad Gateway"),
             Self::TimedOut { .. } => (504, "Gateway Timeout"),
@@ -98,7 +161,11 @@ impl Refusal {
                 } => "ip_literal",
                 RequestError::BadTarget { .. } => "bad_target",
             },
+            Self::ProxyAuthRequired => "proxy_auth_required",
             Self::NotAllowed { .. } => "not_allowed",
+            Self::PortNotAllowed { .. } => "port_not_allowed",
+            Self::ForbiddenAddress { .. } => "address_refused",
+            Self::InternalAddress { .. } => "internal_address",
             Self::HeadTimeout => "head_timeout",
             Self::Unresolved { .. } => "unresolved",
             Self::TimedOut { .. } => "timed_out",
@@ -118,8 +185,13 @@ impl Refusal {
     pub fn response(&self) -> Vec<u8> {
         let (code, phrase) = self.status();
         let body = format!("hb proxy: {}\n", self.reason());
+        let challenge = if code == 407 {
+            "Proxy-Authenticate: Basic realm=\"hb\"\r\n"
+        } else {
+            ""
+        };
         format!(
-            "HTTP/1.1 {code} {phrase}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nX-Hb-Refusal: {}\r\n\r\n{body}",
+            "HTTP/1.1 {code} {phrase}\r\n{challenge}Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nX-Hb-Refusal: {}\r\n\r\n{body}",
             body.len(),
             self.code()
         )
@@ -151,6 +223,70 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn a_407_challenges_with_basic_and_no_other_refusal_does() {
+        let text = String::from_utf8_lossy(&Refusal::ProxyAuthRequired.response()).into_owned();
+        assert!(
+            text.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Proxy-Authenticate: Basic realm=\"hb\"\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("X-Hb-Refusal: proxy_auth_required\r\n"));
+        let other = String::from_utf8_lossy(&Refusal::Busy.response()).into_owned();
+        assert!(!other.contains("Proxy-Authenticate"));
+    }
+
+    #[test]
+    fn the_port_and_address_refusals_say_what_to_write_in_the_config() {
+        let port = Refusal::PortNotAllowed {
+            host: host("api.example.com"),
+            port: assert_ok!(Port::try_from(8443)),
+        };
+        assert_eq!(port.status().0, 403);
+        assert_eq!(port.code(), "port_not_allowed");
+        assert!(
+            port.reason()
+                .contains("add \"api.example.com:8443\" to net.allow"),
+            "{}",
+            port.reason()
+        );
+        let internal = Refusal::for_address(
+            host("github.com"),
+            AddressRefusal::Internal {
+                address: assert_ok!("100.64.1.3".parse::<IpAddr>()),
+                kind: Internal::SharedAddressSpace,
+            },
+        );
+        assert_eq!(internal.code(), "internal_address");
+        let reason = internal.reason();
+        assert!(reason.contains("100.64.1.3"), "{reason}");
+        assert!(
+            reason.contains("tunnel or shared address space"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("add \"github.com\" to net.internal_hosts"),
+            "{reason}"
+        );
+        let never = Refusal::for_address(
+            host("a.example.com"),
+            AddressRefusal::Never {
+                address: assert_ok!("127.0.0.1".parse::<IpAddr>()),
+                kind: Never::Loopback,
+            },
+        );
+        assert_eq!(never.code(), "address_refused");
+        assert!(
+            never.reason().contains("never allowed"),
+            "{}",
+            never.reason()
+        );
+        assert!(!never.reason().contains("net.internal_hosts"));
     }
 
     #[test]

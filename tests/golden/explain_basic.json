@@ -2260,7 +2260,7 @@
   "net": {
     "hosts": [
       {
-        "value": "api.example.com",
+        "value": "api.example.com:443",
         "origins": [
           {
             "layer": "user_base",
@@ -2273,7 +2273,7 @@
         ]
       },
       {
-        "value": "crates.io",
+        "value": "crates.io:443",
         "origins": [
           {
             "layer": "preset",
@@ -2294,7 +2294,7 @@
         ]
       },
       {
-        "value": "github.com",
+        "value": "github.com:443",
         "origins": [
           {
             "layer": "project",
@@ -2307,6 +2307,7 @@
         ]
       }
     ],
+    "internal_hosts": [],
     "loopback_ports": [
       {
         "value": 5432,

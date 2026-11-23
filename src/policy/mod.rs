@@ -34,7 +34,8 @@ pub use floor::{
 };
 pub use home::{HomeDir, ProjectRoot, RootError, broadness};
 pub use host::{
-    HostName, HostNameError, HostPattern, HostPatternError, protected_suffix_list_version,
+    HostName, HostNameError, HostPattern, HostPatternError, HostRule, HostRuleError,
+    protected_suffix_list_version,
 };
 pub use names::{ExtendRef, GuardException, McpName, McpNameError, RefTextError};
 pub use path::{BroadRoot, CanonicalPath, PathError};

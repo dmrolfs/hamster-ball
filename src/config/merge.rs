@@ -23,7 +23,7 @@ use super::resolve::{ResolvedConfig, ResolvedMcpServer};
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
     Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
-    GuardException, HostPattern, McpName, PathPattern, Port, ToolName,
+    GuardException, HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
 };
 use crate::sys::path_preview;
 
@@ -54,8 +54,10 @@ pub struct MergedFs {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MergedNet {
-    /// Allowed hosts.
-    pub allow: Vec<Sourced<HostPattern>>,
+    /// Allowed hosts, each with the one port it allows.
+    pub allow: Vec<Sourced<HostRule>>,
+    /// Hosts that may resolve to private, unique-local and tunnel addresses (design 12.1).
+    pub internal_hosts: Vec<Sourced<HostPattern>>,
     /// Reachable loopback ports.
     pub loopback_ports: Vec<Sourced<Port>>,
 }
@@ -210,7 +212,8 @@ pub enum MergeError {
     UserOnlySection {
         /// The file.
         origin: Origin,
-        /// The section: `hooks`, `guard.exceptions` or `system.launchctl = true`.
+        /// The section: `hooks`, `guard.exceptions`, `system.launchctl = true` or
+        /// `net.internal_hosts`.
         section: &'static str,
         /// Where the file is.
         location: FileLocation,
@@ -285,6 +288,7 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
         },
         net: MergedNet {
             allow: union(files, |c| positions(&c.net.allow)),
+            internal_hosts: union(files, |c| positions(&c.net.internal_hosts)),
             loopback_ports: union(files, |c| positions(&c.net.loopback_ports)),
         },
         env: MergedEnv {
@@ -521,6 +525,10 @@ fn reassert_user_only(files: &[ClosureFile], collected: &mut Collected) {
                 file.resolved.system.launchctl == Some(true),
             ),
             (
+                "net.internal_hosts",
+                !file.resolved.net.internal_hosts.is_empty(),
+            ),
+            (
                 "guard.exceptions",
                 !file.resolved.guard.exceptions.is_empty(),
             ),
@@ -554,8 +562,8 @@ mod tests {
         assert_ok!(CanonicalPath::from_canonical(p))
     }
 
-    fn host(h: &str) -> HostPattern {
-        assert_ok!(HostPattern::parse(h))
+    fn host(h: &str) -> HostRule {
+        assert_ok!(HostRule::parse(h))
     }
 
     fn argv(words: &[&str]) -> Argv {
@@ -879,7 +887,7 @@ mod tests {
                 ..server("uvx", &["a"])
             },
             ResolvedMcpServer {
-                net: vec![host("x.example.com")],
+                net: vec![assert_ok!(HostPattern::parse("x.example.com"))],
                 ..server("uvx", &["a"])
             },
         ] {
@@ -1062,6 +1070,51 @@ mod tests {
         ]);
         assert!(assert_some!(on.terminal.clipboard_write.clone()).value);
         assert!(on.terminal.effective_clipboard_write());
+    }
+
+    fn with_internal_hosts(hosts: &[&str]) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.net.internal_hosts = hosts
+            .iter()
+            .map(|h| assert_ok!(HostPattern::parse(h)))
+            .collect();
+        config
+    }
+
+    #[test]
+    fn internal_hosts_are_unioned_across_user_files_and_keep_their_origins() {
+        let policy = merged(vec![
+            user(
+                "base",
+                with_internal_hosts(&["github.com", "*.in.example.com"]),
+            ),
+            user("preset", with_internal_hosts(&["github.com"])),
+        ]);
+        assert_eq!(policy.net.internal_hosts.len(), 2);
+        let github = assert_some!(
+            policy
+                .net
+                .internal_hosts
+                .iter()
+                .find(|h| h.value.to_string() == "github.com")
+        );
+        assert_eq!(github.sources.len(), 2);
+    }
+
+    #[test]
+    fn a_project_file_that_lists_internal_hosts_is_a_merge_error_naming_the_file() {
+        let files = closure(vec![
+            user("base", with_internal_hosts(&[])),
+            project(with_internal_hosts(&["evil.example.com"])),
+        ]);
+        let errors = assert_err!(merge(&files, Floor::empty()));
+        assert!(
+            errors.errors.iter().any(|error| matches!(
+                error,
+                MergeError::UserOnlySection { section, .. } if *section == "net.internal_hosts"
+            )),
+            "{errors:?}"
+        );
     }
 
     fn with_launchctl(value: Option<bool>) -> ResolvedConfig {

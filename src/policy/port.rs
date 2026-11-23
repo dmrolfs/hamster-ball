@@ -45,6 +45,23 @@ impl From<Port> for u16 {
     }
 }
 
+impl Port {
+    /// 443, the port an allowlist entry without one allows.
+    pub const HTTPS: Self = Self(match NonZeroU16::new(443) {
+        Some(port) => port,
+        None => NonZeroU16::MIN,
+    });
+
+    /// Parses a port written as one to five ASCII digits (no sign, no `0x`), from 1 to 65535.
+    #[must_use]
+    pub fn from_decimal(text: &str) -> Option<Self> {
+        if text.is_empty() || text.len() > 5 || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<u16>().ok().and_then(NonZeroU16::new).map(Self)
+    }
+}
+
 impl TryFrom<i64> for Port {
     type Error = PortError;
 

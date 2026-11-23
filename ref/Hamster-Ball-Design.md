@@ -125,7 +125,7 @@ config never applies silently.
 - Scalars (few exist) never loosen: `tls.system_trust`, `terminal.clipboard_write` and `system.launchctl` take `false` if any file says `false` (D35, D67, D70), and
   `ctl.label` must be the same in every file that sets it, because a project label would otherwise replace the base's
   scope (D33). The earlier "otherwise the highest layer" fallback is removed.
-- Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`, and `system.launchctl = true`; a `false` is accepted anywhere) are accepted **only**
+- Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`, `net.internal_hosts` in any form, and `system.launchctl = true`; a `false` is accepted anywhere) are accepted **only**
   from files that physically are the user's own: the base, files under `~/.config/hamster-ball` (with no other hard
   link), and built-in presets (D36). The rule is by where the file really is (its canonical path), not by how it was
   reached, so a path alias of a user preset behaves exactly like the name, and a symlinked or hard-linked user file
@@ -167,8 +167,9 @@ write      = ["."]                              # relative to the project root (
 deny_read  = ["config/*.secrets.yaml"]          # project-specific secrets (section 8)
 
 [net]
-allow          = ["crates.io", "static.crates.io", "index.crates.io"]   # exact or "*.suffix"
-loopback_ports = [3030, 3031, 3032, 5432, 9001, 9002]                   # services you started yourself
+allow          = ["crates.io", "static.crates.io", "registry.corp.example.com:8443"]   # exact or "*.suffix", optional :port (default 443)
+internal_hosts = ["github.com", "*.in.example.com"]                                    # only your own files; may resolve to private addresses (12.1)
+loopback_ports = [3030, 3031, 3032, 5432, 9001, 9002]                                  # services you started yourself
 
 [env]
 pass  = ["LANG", "COLORTERM"]                   # names copied from your shell (not HOME, PATH, TMPDIR, TERM, proxy or TLS names, HB_*, DYLD_*, LD_*)
@@ -314,6 +315,7 @@ Everything else in the profile (paths, hosts, ports) is the grant model of 4.2 t
 | System trust store (`tls.system_trust`) | on in the base | any file may turn it off | TLS verification against the system roots. Also lets `configd` answer, which shows the host's proxy and PAC settings | Mach lookups and the keychain read (4.5) | `seatbelt_tls`, `tls_handshake` |
 | Clipboard writes (`terminal.clipboard_write`) | on | any file may turn it off | OSC 52 writes reach your clipboard | the output filter (7.3) | `pty` |
 | Container control (`ctl`) | none | any file lists containers | `hb ctl` on a labelled or named container (9.3) | the broker | M8 |
+| **Internal addresses (`net.internal_hosts`)** | **none** | **only your own files, in any form** | the listed hosts may resolve to private, unique-local and tunnel addresses (12.1) | proxy address classes (12) | `proxy_hardening` |
 | **`launchctl` (`system.launchctl`)** | **off** | **only your own files may say `true`; any file may say `false`** | run `/bin/launchctl`: see below | `(deny process-exec (literal "/bin/launchctl"))` | `probe_matrix` |
 
 **`system.launchctl`.** Measured on macOS 15.7 with a throwaway job loaded from outside the ball: launchd refuses a sandboxed caller
@@ -846,17 +848,59 @@ Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen b
   (`*.github.io`, `*.co.uk`, `*.cloudfront.net`, and also `*.amazonaws.com`, which is not itself listed but
   covers every `*.s3.amazonaws.com` tenant). List exact hosts instead. The list is vendored (MPL-2.0, unmodified)
   and compiled into a protected set by `build.rs`; no runtime network is used.
-- The proxy resolves names and refuses to connect to loopback, link-local or private addresses for allowed
-  names (prevents DNS rebinding into local services). Default port: 443 only.
-- Auth: the proxy URL carries a random per-session credential
-  (`http://hb:<token>@127.0.0.1:<port>`) so other local processes cannot use the proxy.
-  **Unverified** that all four agents accept credentials in the proxy URL.
+- **Rules and ports.** An allow entry is `host` or `host:port` and means one (pattern, port) rule; `host` is `host:443`. Rules from every
+  file are unioned, so `x.com` and `x.com:8443` allow both ports. A listed host on another port is `port_not_allowed` and the reply says
+  which entry to add; an unlisted host is `not_allowed` whatever the port (D72).
+- **Addresses.** The proxy resolves names itself and connects to the address it chose (no second lookup). It classifies every address
+  (`proxy::classify`; IPv4-mapped, NAT64 `64:ff9b::/96` and 6to4 addresses by the IPv4 address they carry):
+  *never allowed*: loopback, `0.0.0.0/8` and `::`, link-local (including 169.254.169.254), multicast, `240/4`, `192.0.0.0/24`
+  (includes the NAT64 probe address 192.0.0.170), documentation ranges, Teredo and any IPv6 outside `2000::/3` that is not one of the
+  carrying forms; *internal*: RFC 1918, `fc00::/7`, `fec0::/10`, `100.64.0.0/10` and `198.18.0.0/15`, allowed only for hosts in
+  `net.internal_hosts`; everything else is global. Forbidden addresses are dropped and the rest tried; if none is left the reply names the
+  class and, for an internal address, the exact line to add (D73).
+- **Auth.** The proxy URL carries a random per-session credential (`http://hb:<token>@127.0.0.1:<port>`; 128 bits from the OS, 32 hex
+  digits) so other local processes cannot use the proxy. It is checked before the allowlist and before any lookup, in constant time, so a
+  caller without it learns nothing about the allowlist; a missing or wrong credential, or two credential headers, is `407` with
+  `Proxy-Authenticate: Basic realm="hb"` (curl and git only send credentials after that challenge). The agent holds the token in its
+  environment, so it protects against other processes, not against the agent. Measured with the real proxy (`tests/proxy_agents.rs`, opt-in): claude 2.1.328,
+  pi 1.6.0, opencode 1.2.0 and kiro-cli 3.5.0 all send Basic credentials from the URL on their first request; one opencode request
+  (a `git`-style client) arrived without and was retried after the challenge.
 - Proxy variables: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and lowercase forms.
 - Measured: kiro-cli, pi, claude and opencode all honor these variables. A direct connection, and DNS
   resolution, fail inside the hamster ball. A connection to another loopback port fails.
 - Loopback connections to the hamster ball's own listeners are denied by default (measured). Only
   `net.loopback_ports` are reachable.
-- The proxy logs host, port, decision and byte counts. It never logs bodies.
+- **Audit.** One event per connection (`AuditEvent`: host and port when the request named a valid one, served or refused with the code and
+  reason, bytes each way). No headers, no bodies, no token: nothing from the request but the validated host and port is recorded. Events
+  go to an optional sink; hb-ghd.3.3 connects it to `--log-denials` (refusals), `--log-proxy` (everything) and a one-line end-of-run
+  summary of refusals that `--no-proxy-summary` hides.
+
+### 12.1 Corporate networks
+
+Measured on a corporate network with a Zscaler client tunnel (macOS 15.7; nothing about it is Zscaler-specific in `hb`): no system proxy or
+PAC; direct egress through the tunnel (`utun4`); split DNS (three corporate domains go to an internal resolver, the rest to the
+tunnel's); corporate internal names such as an Artifactory or Confluence host, and some public ones (`github.com`, `api.github.com`)
+resolve into `100.64.0.0/10`, which the tunnel hands out. A name may also return one tunnel address and several public ones.
+
+| Need | Support |
+|---|---|
+| TLS inspection (re-signed hosts) | yes: `tls.system_trust`, `tls.extra_ca_files` (4.5) |
+| Split DNS, search domains | yes: the proxy resolves with the system resolver |
+| Internal hosts that resolve to private, unique-local or tunnel addresses | yes, per host: `net.internal_hosts` (only your own files) |
+| IPv6-only networks with NAT64 | yes: the embedded IPv4 address is classified |
+| Explicit HTTP proxy or PAC required for egress | **no**: the proxy connects directly (D74) |
+| NTLM or Kerberos proxy authentication | no |
+
+`net.internal_hosts` lists host patterns (exact or `*.suffix`, like `net.allow`) whose names may resolve to internal addresses. It is a
+per-host list because a global switch would let any allowed name that rebinds into the corporate private-app space reach it. Only
+your own files may set it, in any form, even `[]`; a project file that does is an error naming the file. On the measured network you
+would list `github.com`, `api.github.com` and `*.in.<company>.com` once in the base config. Loopback, link-local, multicast and the
+reserved ranges stay refused for listed hosts.
+
+Not supported, and what `hb` does about it (D74): an upstream proxy would resolve names itself, so `hb` could no longer pin the address or enforce the
+rebinding checks; it is not built until there is a concrete network to test it against. If every connection fails and the system
+has a proxy or PAC enabled, `hb doctor` (M5, hb-ghd.5) warns that the proxy connects directly, and a connection failure
+is reported as `unreachable` or `timed_out` with the host and port.
 
 ## 13. Agent presets (initial contents)
 
@@ -898,7 +942,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 ## 15. Open items (decide or verify before or during implementation)
 
 1. ~~**Terminal isolation** (7.3)~~ Done in hb-ghd.2.4 (D65): the pty is allocated and `TIOCSTI` is measured to be closed by the missing `hid-control`. Still open under it: whether an agent's TUI behaves on the pty is checked per agent in M3 (3.5, 3.6 and the claude and opencode presets).
-2. **Proxy credentials in the URL** (12): confirm kiro-cli, pi, claude and opencode accept them.
+2. ~~**Proxy credentials in the URL** (12)~~ Measured (hb-ghd.3.2): all four accept them and send them on the first request; see 12.
 3. **Narrow `/private/tmp`**: claude needs `/tmp/claude-<uid>` and `/tmp/cc-socks`. Seatbelt has no private `/tmp`,
    so allow only named subpaths per agent, and give every other tool a per-session `TMPDIR`. Verify claude still works.
 4. **`.git/config` write-deny** (6): blocks `git push -u`. Keep as default and revisit after dogfooding.
@@ -1067,3 +1111,6 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D69 | The profile allows `file-read*` on `^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$` and never a write: `/usr/bin/git` and the other developer-tool shims read that cache to find the real tool and print two error lines per call without it; the user's own unsandboxed `xcrun` trusts the same file, so a write grant would let the agent redirect `git` for the user's shells. If the cache has no entry for a tool the first call still fails to write it and prints once | owner, hb-ghd.2.2 |
 | D70 | `[system] launchctl` (default off) decides whether `/bin/launchctl` may run: `false` from any file wins and `true` is accepted only from the user's own files (the D36 rule); the profile denies exec of the program otherwise (section 4.6). Chosen over leaving it open because launchd lets a sandboxed caller start, unload and disable jobs that are not running, which no profile rule can separate, and over a hard-coded deny so a user who runs services can opt in | owner, hb-ghd.2.5 |
 | D71 | The proxy (`src/proxy`, hb-ghd.3.1) runs on tokio (`rt`, `net`, `io-util`, `time`, `sync`, `macros`) with `httparse`, on its own thread behind `ProxyHandle`; plain HTTP is one request per connection with `Connection: close`; address-literal targets are always refused; the proxy starts for every run, even with an empty allowlist, so the agent gets a `403` with a reason rather than a refused connection | owner, hb-ghd.3 |
+| D72 | `net.allow` entries are `host` or `host:port`, one (pattern, port) rule each, default port 443; a listed host on another port is `port_not_allowed` and the reply names the entry to add | owner, hb-ghd.3.2 |
+| D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
+| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` warning when the system has a proxy or PAC | owner, hb-ghd.3 |

@@ -35,6 +35,26 @@ pub enum Request {
     },
 }
 
+/// The `Proxy-Authorization` header of a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyAuthorization {
+    /// There is none.
+    Absent,
+    /// There is one; this is its value.
+    One(Vec<u8>),
+    /// There are several, which is ambiguous and never accepted.
+    Several,
+}
+
+/// A parsed request head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    /// What the request asks for.
+    pub request: Request,
+    /// The credentials it sent to the proxy.
+    pub proxy_authorization: ProxyAuthorization,
+}
+
 /// Headers a proxy must not pass on, or that this proxy replaces.
 const DROPPED_HEADERS: [&str; 8] = [
     "host",
@@ -54,7 +74,7 @@ const DROPPED_HEADERS: [&str; 8] = [
 ///
 /// # Errors
 /// See [`RequestError`].
-pub fn parse_head(buf: &[u8]) -> Result<Option<(Request, usize)>, RequestError> {
+pub fn parse_head(buf: &[u8]) -> Result<Option<(Head, usize)>, RequestError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut parsed = httparse::Request::new(&mut headers);
     let used = match parsed.parse(buf) {
@@ -75,12 +95,27 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<(Request, usize)>, RequestError> 
     let (Some(method), Some(target)) = (parsed.method, parsed.path) else {
         return Err(RequestError::Malformed);
     };
-    if method == "CONNECT" {
-        let authority = Authority::parse(target, None).context(BadTargetSnafu)?;
-        return Ok(Some((Request::Connect(authority), used)));
-    }
-    let forward = forward(method, target, parsed.headers)?;
-    Ok(Some((forward, used)))
+    let mut credentials = parsed
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("proxy-authorization"));
+    let proxy_authorization = match (credentials.next(), credentials.next()) {
+        (None, _) => ProxyAuthorization::Absent,
+        (Some(one), None) => ProxyAuthorization::One(one.value.to_vec()),
+        (Some(_), Some(_)) => ProxyAuthorization::Several,
+    };
+    let request = if method == "CONNECT" {
+        Request::Connect(Authority::parse(target, None).context(BadTargetSnafu)?)
+    } else {
+        forward(method, target, parsed.headers)?
+    };
+    Ok(Some((
+        Head {
+            request,
+            proxy_authorization,
+        },
+        used,
+    )))
 }
 
 fn forward(
@@ -204,7 +239,39 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn parse(text: &str) -> (Request, usize) {
-        assert_some!(assert_ok!(parse_head(text.as_bytes())))
+        let (head, used) = assert_some!(assert_ok!(parse_head(text.as_bytes())));
+        (head.request, used)
+    }
+
+    fn credentials(text: &str) -> ProxyAuthorization {
+        let (head, _) = assert_some!(assert_ok!(parse_head(text.as_bytes())));
+        head.proxy_authorization
+    }
+
+    #[test]
+    fn the_proxy_credentials_are_reported_as_absent_one_or_several() {
+        assert_eq!(
+            credentials("CONNECT a.example.com:443 HTTP/1.1\r\n\r\n"),
+            ProxyAuthorization::Absent
+        );
+        assert_eq!(
+            credentials(
+                "CONNECT a.example.com:443 HTTP/1.1\r\nproxy-authorization: Basic eDp5\r\n\r\n"
+            ),
+            ProxyAuthorization::One(b"Basic eDp5".to_vec())
+        );
+        assert_eq!(
+            credentials(
+                "GET http://a.example.com/ HTTP/1.1\r\nProxy-Authorization: Basic eDp5\r\n\r\n"
+            ),
+            ProxyAuthorization::One(b"Basic eDp5".to_vec())
+        );
+        assert_eq!(
+            credentials(
+                "CONNECT a.example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic eDp5\r\nProxy-Authorization: Basic eDp6\r\n\r\n"
+            ),
+            ProxyAuthorization::Several
+        );
     }
 
     #[test]

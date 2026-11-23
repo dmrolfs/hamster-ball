@@ -164,8 +164,10 @@ pub struct DenyRow {
 /// `[net]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetReport {
-    /// Allowed hosts.
+    /// Allowed hosts, each as `host:port` (a port is always shown).
     pub hosts: Vec<Row<String>>,
+    /// Hosts that may resolve to private, unique-local and tunnel addresses.
+    pub internal_hosts: Vec<Row<String>>,
     /// Reachable loopback ports.
     pub loopback_ports: Vec<Row<u16>>,
 }
@@ -431,7 +433,14 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         },
         deny,
         net: NetReport {
-            hosts: b.rows(&policy.net.allow, "net.allow", ToString::to_string),
+            hosts: b.rows(&policy.net.allow, "net.allow", |rule| {
+                format!("{}:{}", rule.pattern, rule.port)
+            }),
+            internal_hosts: b.rows(
+                &policy.net.internal_hosts,
+                "net.internal_hosts",
+                ToString::to_string,
+            ),
             loopback_ports: b.rows(&policy.net.loopback_ports, "net.loopback_ports", |p| {
                 p.get()
             }),

@@ -6,6 +6,7 @@ use std::fmt;
 
 use snafu::{Snafu, ensure};
 
+use super::port::Port;
 use crate::text::EscapedBounded;
 
 include!(concat!(env!("OUT_DIR"), "/psl_generated.rs"));
@@ -408,6 +409,176 @@ impl fmt::Display for HostPattern {
         match self {
             Self::Exact(host) => write!(f, "{host}"),
             Self::Wildcard { suffix } => write!(f, "*.{suffix}"),
+        }
+    }
+}
+
+/// Why an allowlist entry is not a valid `host` or `host:port` rule.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum HostRuleError {
+    /// The host part is not a valid pattern.
+    #[snafu(transparent)]
+    Pattern {
+        /// Why.
+        source: HostPatternError,
+    },
+
+    /// The part after the last colon is not a port.
+    #[snafu(display(
+        "the port {} is not a number from 1 to 65535",
+        EscapedBounded::new(text, ERROR_PREVIEW_CHARS)
+    ))]
+    BadPort {
+        /// The port as written.
+        text: String,
+    },
+}
+
+/// One allowlist rule: hosts matching a pattern, on one port.
+///
+/// Written `host` (port 443) or `host:port`, for example `*.kiro.dev` or
+/// `registry.corp.example.com:8443`. Several entries for one pattern allow several ports.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostRule {
+    /// The hosts the rule covers.
+    pub pattern: HostPattern,
+    /// The one port it allows on them.
+    pub port: Port,
+}
+
+impl HostRule {
+    /// The port an entry without one allows.
+    #[must_use]
+    pub fn default_port() -> Port {
+        Port::HTTPS
+    }
+
+    /// Parses `host` or `host:port`.
+    ///
+    /// # Errors
+    /// See [`HostRuleError`].
+    pub fn parse(entry: &str) -> Result<Self, HostRuleError> {
+        let (pattern_text, port) = match entry.rsplit_once(':') {
+            Some((pattern, port_text)) => {
+                let port = Port::from_decimal(port_text).ok_or_else(|| HostRuleError::BadPort {
+                    text: port_text.to_owned(),
+                })?;
+                (pattern, port)
+            }
+            None => (entry, Self::default_port()),
+        };
+        Ok(Self {
+            pattern: HostPattern::parse(pattern_text)?,
+            port,
+        })
+    }
+
+    /// Whether the rule covers `host`, whatever the port.
+    #[must_use]
+    pub fn covers_host(&self, host: &HostName) -> bool {
+        self.pattern.matches(host)
+    }
+
+    /// Whether the rule allows `host` on `port`.
+    #[must_use]
+    pub fn allows(&self, host: &HostName, port: Port) -> bool {
+        self.port == port && self.pattern.matches(host)
+    }
+}
+
+impl fmt::Display for HostRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port == Self::default_port() {
+            write!(f, "{}", self.pattern)
+        } else {
+            write!(f, "{}:{}", self.pattern, self.port)
+        }
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+    use claims::{assert_err, assert_ok};
+    use pretty_assertions::assert_eq;
+
+    fn port(n: i64) -> Port {
+        assert_ok!(Port::try_from(n))
+    }
+
+    fn host(text: &str) -> HostName {
+        assert_ok!(HostName::parse(text))
+    }
+
+    #[test]
+    fn an_entry_without_a_port_allows_443_and_one_with_a_port_allows_that_port() {
+        let plain = assert_ok!(HostRule::parse("api.kiro.dev"));
+        assert_eq!(plain.port, port(443));
+        let odd = assert_ok!(HostRule::parse("registry.corp.example.com:8443"));
+        assert_eq!(odd.port, port(8443));
+        let wild = assert_ok!(HostRule::parse("*.kiro.dev:8080"));
+        assert_eq!(wild.port, port(8080));
+        assert_eq!(wild.pattern, assert_ok!(HostPattern::parse("*.kiro.dev")));
+    }
+
+    #[test]
+    fn a_rule_allows_its_own_port_only_and_covers_the_host_on_any_port() {
+        let rule = assert_ok!(HostRule::parse("*.kiro.dev:8080"));
+        assert!(rule.allows(&host("a.kiro.dev"), port(8080)));
+        assert!(!rule.allows(&host("a.kiro.dev"), port(443)));
+        assert!(!rule.allows(&host("kiro.dev"), port(8080)));
+        assert!(rule.covers_host(&host("a.b.kiro.dev")));
+        assert!(!rule.covers_host(&host("evil-kiro.dev")));
+    }
+
+    #[test]
+    fn bad_ports_and_bad_hosts_are_refused_with_the_part_that_is_wrong() {
+        for entry in [
+            "a.kiro.dev:0",
+            "a.kiro.dev:65536",
+            "a.kiro.dev:",
+            "a.kiro.dev:+1",
+            "a.kiro.dev:44 3",
+            "a.kiro.dev:000443",
+        ] {
+            assert!(
+                matches!(
+                    assert_err!(HostRule::parse(entry)),
+                    HostRuleError::BadPort { .. }
+                ),
+                "{entry}"
+            );
+        }
+        for entry in [
+            "",
+            ":443",
+            "127.0.0.1:443",
+            "*.com:443",
+            "https://a.kiro.dev",
+            "a.kiro.dev:443:443",
+            "*.*.kiro.dev",
+        ] {
+            assert!(
+                matches!(
+                    assert_err!(HostRule::parse(entry)),
+                    HostRuleError::Pattern { .. } | HostRuleError::BadPort { .. }
+                ),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_omits_443_and_round_trips() {
+        for (entry, shown) in [
+            ("a.kiro.dev", "a.kiro.dev"),
+            ("a.kiro.dev:443", "a.kiro.dev"),
+            ("*.kiro.dev:8443", "*.kiro.dev:8443"),
+        ] {
+            let rule = assert_ok!(HostRule::parse(entry));
+            assert_eq!(rule.to_string(), shown);
+            assert_eq!(assert_ok!(HostRule::parse(&rule.to_string())), rule);
         }
     }
 }

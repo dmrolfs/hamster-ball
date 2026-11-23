@@ -12,18 +12,27 @@
 //! thread with a single-threaded tokio runtime. Dropping the handle (or [`ProxyHandle::stop`])
 //! ends every open connection and joins the thread.
 //!
-//! Scope of this module as built so far (hb-ghd.3.1): the allowlist, `CONNECT`, one-request
-//! plain HTTP, streaming with half-close, limits and shutdown. Address checks, port policy,
-//! credentials and the audit trail follow in hb-ghd.3.2.
+//! Every connection goes through, in order: the request head, the proxy credential
+//! ([`Authorizer`]; a missing or wrong one is a `407` before anything else is said), the allowlist
+//! rules ([`crate::policy::HostRule`]: host and port), name resolution, the address classes
+//! ([`classify`], [`AddressPolicy`]) and the connection to the address chosen. One
+//! [`AuditEvent`] is sent per connection to the optional [`AuditSink`]. Starting the proxy from
+//! `session::run`, the proxy variables and the user-visible summary are hb-ghd.3.3.
 
+mod address;
+mod audit;
+mod auth;
 mod authority;
 mod refusal;
 mod request;
 mod resolve;
 mod server;
 
+pub use address::{AddressPolicy, AddressRefusal, Class, Internal, Never, classify};
+pub use audit::{AuditEvent, AuditSink, Decision};
+pub use auth::{Authorizer, ProxyUrl, Token, USER};
 pub use authority::{Authority, AuthorityError};
 pub use refusal::Refusal;
-pub use request::{MAX_HEAD_BYTES, Request, RequestError, parse_head};
+pub use request::{Head, MAX_HEAD_BYTES, ProxyAuthorization, Request, RequestError, parse_head};
 pub use resolve::{Resolver, SystemResolver};
-pub use server::{ProxyConfig, ProxyError, ProxyHandle, Timeouts};
+pub use server::{DialMap, ProxyConfig, ProxyError, ProxyHandle, Timeouts};

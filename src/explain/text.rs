@@ -97,6 +97,12 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
     rows(out, &report.net.hosts, t, |v| cell(v))?;
     section(
         out,
+        "net.internal_hosts (may resolve to private addresses)",
+        report.net.internal_hosts.is_empty(),
+    )?;
+    rows(out, &report.net.internal_hosts, t, |v| cell(v))?;
+    section(
+        out,
         "net.loopback_ports",
         report.net.loopback_ports.is_empty(),
     )?;

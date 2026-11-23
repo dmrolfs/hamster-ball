@@ -120,9 +120,12 @@ deny (102 from the floor, which no config can change; 2 from config)
   config                           deny_write       ~/work/proj/secrets/*.yaml  <- [2] fs.deny_write[0]
 
 net.allow
-  api.example.com  <- [0] net.allow[0]
-  crates.io  <- [1] net.allow[0]; [2] net.allow[1]
-  github.com  <- [2] net.allow[0]
+  api.example.com:443  <- [0] net.allow[0]
+  crates.io:443  <- [1] net.allow[0]; [2] net.allow[1]
+  github.com:443  <- [2] net.allow[0]
+
+net.internal_hosts (may resolve to private addresses)
+  (none)
 
 net.loopback_ports
   5432  <- [2] net.loopback_ports[0]

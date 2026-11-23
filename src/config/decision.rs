@@ -684,7 +684,7 @@ mod tests {
                 c.fs.deny_write = deny_write.iter().map(|&p| deny(PATHS[p])).collect();
                 c.net.allow = hosts
                     .iter()
-                    .map(|&h| assert_ok!(crate::policy::HostPattern::parse(HOSTS[h])))
+                    .map(|&h| assert_ok!(crate::policy::HostRule::parse(HOSTS[h])))
                     .collect();
                 c.tls.system_trust = trust;
                 c

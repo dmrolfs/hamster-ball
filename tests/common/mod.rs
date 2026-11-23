@@ -16,6 +16,7 @@ use hamster_ball::session::{Outcome, RunSpec, run as session_run};
 use hamster_ball::system::{Environment, FloorEnvironment, UserConfigDir};
 use tempfile::TempDir;
 
+pub mod proxy;
 pub mod tls;
 
 /// A canonical, throwaway tree: `home/`, a project at `home/work/proj`, and a PATH.

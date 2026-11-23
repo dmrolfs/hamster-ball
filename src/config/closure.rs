@@ -172,7 +172,7 @@ pub enum LoadError {
     UserOnlySection {
         /// The file that defines the section.
         path: PathBuf,
-        /// The section: `hooks`, `guard.exceptions` or `system.launchctl = true`.
+        /// The section: `hooks`, `guard.exceptions`, `system.launchctl = true` or `net.internal_hosts`.
         section: &'static str,
         /// Where the file is.
         location: FileLocation,
@@ -625,8 +625,10 @@ impl<'a> Loader<'a> {
             "hooks"
         } else if found.guard_exceptions {
             "guard.exceptions"
-        } else {
+        } else if found.launchctl_on {
             "system.launchctl = true"
+        } else {
+            "net.internal_hosts"
         };
         Err(LoadError::UserOnlySection {
             path: path.to_path_buf(),
@@ -1477,6 +1479,20 @@ mod tests {
         // A project may refuse what the user allowed; saying `false` is harmless anywhere.
         w.project("[system]\nlaunchctl = false\n");
         assert_ok!(w.load());
+    }
+
+    #[test]
+    fn internal_hosts_in_a_project_file_are_an_error_even_when_empty_but_fine_in_the_base() {
+        let w = World::new();
+        w.base("[net]\ninternal_hosts = [\"github.com\"]\n");
+        w.project("");
+        assert_ok!(w.load());
+        let project = w.project("[net]\ninternal_hosts = []\n");
+        let err = assert_err!(w.load());
+        let (path, section, location) = user_only_error(&err);
+        assert_eq!(path, assert_ok!(fs::canonicalize(&project)));
+        assert_eq!(section, "net.internal_hosts");
+        assert_eq!(location, FileLocation::InProject);
     }
 
     #[test]

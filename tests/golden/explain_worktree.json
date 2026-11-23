@@ -2588,7 +2588,7 @@
   "net": {
     "hosts": [
       {
-        "value": "api.example.com",
+        "value": "api.example.com:443",
         "origins": [
           {
             "layer": "user_base",
@@ -2601,6 +2601,7 @@
         ]
       }
     ],
+    "internal_hosts": [],
     "loopback_ports": []
   },
   "env": {

@@ -17,11 +17,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use super::address::AddressPolicy;
+use super::audit::{AuditEvent, AuditSink, Decision};
+use super::auth::{Authorizer, ProxyUrl, Token};
 use super::authority::Authority;
 use super::refusal::Refusal;
-use super::request::{Request, parse_head};
+use super::request::{Head, ProxyAuthorization, Request, RequestError, parse_head};
 use super::resolve::{Resolver, SystemResolver};
-use crate::policy::HostPattern;
+use crate::policy::{HostPattern, HostRule};
 
 /// The most connections served at once; more are answered `503` and closed.
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
@@ -56,25 +59,44 @@ impl Default for Timeouts {
     }
 }
 
+/// Maps the address the proxy chose to the one it dials. Production never sets one; tests use it
+/// to send a global-looking address to a local upstream while the real classification and
+/// connection path run.
+pub type DialMap = Arc<dyn Fn(SocketAddr) -> SocketAddr + Send + Sync>;
+
 /// What the proxy allows and how it behaves.
 #[derive(Clone)]
 pub struct ProxyConfig {
-    allow: Vec<HostPattern>,
+    rules: Vec<HostRule>,
+    addresses: AddressPolicy,
     resolver: Arc<dyn Resolver>,
     timeouts: Timeouts,
     max_connections: usize,
+    dial_map: Option<DialMap>,
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl ProxyConfig {
-    /// A config that allows `allow` and nothing else, using the system resolver.
+    /// A config that allows `rules` and nothing else, using the system resolver, with no
+    /// internal hosts.
     #[must_use]
-    pub fn new(allow: Vec<HostPattern>) -> Self {
+    pub fn new(rules: Vec<HostRule>) -> Self {
         Self {
-            allow,
+            rules,
+            addresses: AddressPolicy::default(),
             resolver: Arc::new(SystemResolver),
             timeouts: Timeouts::default(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            dial_map: None,
+            audit: None,
         }
+    }
+
+    /// Lets the hosts matching `hosts` resolve to private, unique-local and tunnel addresses.
+    #[must_use]
+    pub fn with_internal_hosts(mut self, hosts: Vec<HostPattern>) -> Self {
+        self.addresses = AddressPolicy::new(hosts);
+        self
     }
 
     /// Uses `resolver` instead of the system's.
@@ -97,12 +119,27 @@ impl ProxyConfig {
         self.max_connections = max.max(1);
         self
     }
+
+    /// Dials `map(address)` instead of the address the proxy chose. For tests.
+    #[must_use]
+    pub fn with_dial_map(mut self, map: DialMap) -> Self {
+        self.dial_map = Some(map);
+        self
+    }
+
+    /// Sends one [`AuditEvent`] per connection to `sink`.
+    #[must_use]
+    pub fn with_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
+    }
 }
 
 impl std::fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyConfig")
-            .field("allow", &self.allow)
+            .field("rules", &self.rules)
+            .field("addresses", &self.addresses)
             .field("timeouts", &self.timeouts)
             .field("max_connections", &self.max_connections)
             .finish_non_exhaustive()
@@ -126,19 +163,31 @@ pub enum ProxyError {
         /// The OS error.
         source: io::Error,
     },
+
+    /// The session token could not be made.
+    #[snafu(display("could not read random bytes for the proxy token"))]
+    Random {
+        /// The OS error.
+        source: io::Error,
+    },
 }
 
 /// State shared by every connection.
 struct Shared {
-    allow: Vec<HostPattern>,
+    rules: Vec<HostRule>,
+    addresses: AddressPolicy,
     resolver: Arc<dyn Resolver>,
     timeouts: Timeouts,
+    authorizer: Authorizer,
+    dial_map: Option<DialMap>,
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 /// A running proxy. Dropping it stops it.
 #[derive(Debug)]
 pub struct ProxyHandle {
     addr: SocketAddr,
+    token: Token,
     live: Arc<AtomicUsize>,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -151,6 +200,7 @@ impl ProxyHandle {
     /// See [`ProxyError`].
     pub fn start(config: ProxyConfig) -> Result<Self, ProxyError> {
         raise_fd_limit();
+        let token = Token::generate().context(RandomSnafu)?;
         let listener = StdListener::bind((Ipv4Addr::LOCALHOST, 0)).context(BindSnafu)?;
         listener.set_nonblocking(true).context(BindSnafu)?;
         let addr = listener.local_addr().context(BindSnafu)?;
@@ -161,15 +211,26 @@ impl ProxyHandle {
             .enable_time()
             .build()
             .context(ThreadSnafu)?;
+        let shared = Arc::new(Shared {
+            rules: config.rules,
+            addresses: config.addresses,
+            resolver: config.resolver,
+            timeouts: config.timeouts,
+            authorizer: Authorizer::new(&token),
+            dial_map: config.dial_map,
+            audit: config.audit,
+        });
+        let limits = config.max_connections;
         let thread_live = Arc::clone(&live);
         let thread = std::thread::Builder::new()
             .name("hb-proxy".to_owned())
             .spawn(move || {
-                runtime.block_on(serve(listener, config, thread_live, stopped));
+                runtime.block_on(serve(listener, shared, limits, thread_live, stopped));
             })
             .context(ThreadSnafu)?;
         Ok(Self {
             addr,
+            token,
             live,
             stop: Some(stop),
             thread: Some(thread),
@@ -186,6 +247,18 @@ impl ProxyHandle {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// The session token. A secret: it belongs in the agent's environment and nowhere else.
+    #[must_use]
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    /// The proxy URL with the token in it, for the agent's proxy variables.
+    #[must_use]
+    pub fn url(&self) -> ProxyUrl {
+        ProxyUrl::new(self.port(), &self.token)
     }
 
     /// How many connections are open right now.
@@ -230,19 +303,15 @@ impl Drop for LiveGuard {
 
 async fn serve(
     std_listener: StdListener,
-    config: ProxyConfig,
+    shared: Arc<Shared>,
+    max_connections: usize,
     live: Arc<AtomicUsize>,
     mut stopped: oneshot::Receiver<()>,
 ) {
     let Ok(listener) = TcpListener::from_std(std_listener) else {
         return;
     };
-    let shared = Arc::new(Shared {
-        allow: config.allow,
-        resolver: config.resolver,
-        timeouts: config.timeouts,
-    });
-    let permits = Arc::new(Semaphore::new(config.max_connections));
+    let permits = Arc::new(Semaphore::new(max_connections));
     let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
@@ -256,7 +325,7 @@ async fn serve(
                             tasks.spawn(connection(stream, Arc::clone(&shared), permit, guard));
                         }
                         Err(_) => {
-                            tasks.spawn(refuse_busy(stream, guard));
+                            tasks.spawn(refuse_busy(stream, Arc::clone(&shared), guard));
                         }
                     }
                 }
@@ -269,8 +338,10 @@ async fn serve(
     while tasks.join_next().await.is_some() {}
 }
 
-async fn refuse_busy(mut client: TcpStream, _live: LiveGuard) {
-    reply(&mut client, &Refusal::Busy).await;
+async fn refuse_busy(mut client: TcpStream, shared: Arc<Shared>, _live: LiveGuard) {
+    let refusal = Refusal::Busy;
+    record(&shared, None, Decision::refused(&refusal), 0, 0);
+    reply(&mut client, &refusal).await;
 }
 
 async fn connection(
@@ -280,8 +351,43 @@ async fn connection(
     _live: LiveGuard,
 ) {
     let _ = client.set_nodelay(true);
-    if let Err(refusal) = serve_connection(&mut client, &shared).await {
-        reply(&mut client, &refusal).await;
+    match serve_connection(&mut client, &shared).await {
+        Ok(served) => record(
+            &shared,
+            Some(&served.authority),
+            Decision::Allowed,
+            served.bytes_up,
+            served.bytes_down,
+        ),
+        Err(failure) => {
+            record(
+                &shared,
+                failure.authority.as_ref(),
+                Decision::refused(&failure.refusal),
+                0,
+                0,
+            );
+            reply(&mut client, &failure.refusal).await;
+        }
+    }
+}
+
+/// Sends an audit event, if there is a sink.
+fn record(
+    shared: &Shared,
+    authority: Option<&Authority>,
+    decision: Decision,
+    bytes_up: u64,
+    bytes_down: u64,
+) {
+    if let Some(sink) = &shared.audit {
+        sink.record(&AuditEvent {
+            host: authority.map(|a| a.host.clone()),
+            port: authority.map(|a| a.port),
+            decision,
+            bytes_up,
+            bytes_down,
+        });
     }
 }
 
@@ -293,19 +399,60 @@ async fn reply(client: &mut TcpStream, refusal: &Refusal) {
     .await;
 }
 
-/// Serves one connection: read the head, decide, connect, then copy both ways until either ends.
-async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<(), Refusal> {
-    let (request, leftover) = read_head(client, shared.timeouts.head).await?;
-    let (authority, opening) = match &request {
-        Request::Connect(authority) => (authority, None),
-        Request::Forward { authority, head } => (authority, Some(head)),
-    };
-    if !shared.allow.iter().any(|p| p.matches(&authority.host)) {
-        return Err(Refusal::NotAllowed {
-            host: authority.host.clone(),
-        });
+/// A connection that was served.
+struct Served {
+    authority: Authority,
+    bytes_up: u64,
+    bytes_down: u64,
+}
+
+/// A connection that was refused, and what its request named, if anything valid.
+struct Failure {
+    authority: Option<Authority>,
+    refusal: Refusal,
+}
+
+impl Failure {
+    fn before_target(refusal: impl Into<Refusal>) -> Self {
+        Self {
+            authority: None,
+            refusal: refusal.into(),
+        }
     }
-    let mut upstream = connect(shared, authority).await?;
+
+    fn at(authority: &Authority, refusal: Refusal) -> Self {
+        Self {
+            authority: Some(authority.clone()),
+            refusal,
+        }
+    }
+}
+
+/// Serves one connection: read the head, authenticate, decide, connect, then copy both ways
+/// until either ends.
+async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<Served, Failure> {
+    let (head, leftover) = read_head(client, shared.timeouts.head)
+        .await
+        .map_err(Failure::before_target)?;
+    let (authority, opening) = match &head.request {
+        Request::Connect(authority) => (authority.clone(), None),
+        Request::Forward { authority, head } => (authority.clone(), Some(head)),
+    };
+    let fail = |refusal: Refusal| Failure::at(&authority, refusal);
+
+    // Authentication comes first, so a process that is not the agent learns nothing about the
+    // allowlist from the answer.
+    match &head.proxy_authorization {
+        ProxyAuthorization::One(value) if shared.authorizer.accepts(value) => {}
+        _ => return Err(fail(Refusal::ProxyAuthRequired)),
+    }
+    check_rules(&shared.rules, &authority).map_err(fail)?;
+    let mut upstream = connect(shared, &authority).await.map_err(fail)?;
+    let served = |bytes_up, bytes_down| Served {
+        authority: authority.clone(),
+        bytes_up,
+        bytes_down,
+    };
     match opening {
         None => {
             if client
@@ -313,36 +460,57 @@ async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<(),
                 .await
                 .is_err()
             {
-                return Ok(());
+                return Ok(served(0, 0));
             }
         }
         Some(head) => {
             if upstream.write_all(head).await.is_err() {
-                return Ok(());
+                return Ok(served(0, 0));
             }
         }
     }
     if !leftover.is_empty() && upstream.write_all(&leftover).await.is_err() {
-        return Ok(());
+        return Ok(served(0, 0));
     }
-    let _ = copy_bidirectional(client, &mut upstream).await;
-    Ok(())
+    let (up, down) = copy_bidirectional(client, &mut upstream)
+        .await
+        .unwrap_or((0, 0));
+    Ok(served(up + leftover.len() as u64, down))
+}
+
+/// Whether some rule allows the host on the port, and if not, which refusal says why.
+fn check_rules(rules: &[HostRule], authority: &Authority) -> Result<(), Refusal> {
+    if rules
+        .iter()
+        .any(|r| r.allows(&authority.host, authority.port))
+    {
+        Ok(())
+    } else if rules.iter().any(|r| r.covers_host(&authority.host)) {
+        Err(Refusal::PortNotAllowed {
+            host: authority.host.clone(),
+            port: authority.port,
+        })
+    } else {
+        Err(Refusal::NotAllowed {
+            host: authority.host.clone(),
+        })
+    }
 }
 
 /// Reads until the request head is complete; returns it with any bytes read past it.
-async fn read_head(client: &mut TcpStream, limit: Duration) -> Result<(Request, Vec<u8>), Refusal> {
+async fn read_head(client: &mut TcpStream, limit: Duration) -> Result<(Head, Vec<u8>), Refusal> {
     let read = async {
         let mut buf: Vec<u8> = Vec::with_capacity(2048);
         loop {
-            if let Some((request, used)) = parse_head(&buf)? {
-                return Ok((request, buf.split_off(used)));
+            if let Some((head, used)) = parse_head(&buf)? {
+                return Ok((head, buf.split_off(used)));
             }
             let n = client
                 .read_buf(&mut buf)
                 .await
-                .map_err(|_| super::request::RequestError::Malformed)?;
+                .map_err(|_| RequestError::Malformed)?;
             if n == 0 {
-                return Err(Refusal::from(super::request::RequestError::Malformed));
+                return Err(Refusal::from(RequestError::Malformed));
             }
         }
     };
@@ -351,7 +519,9 @@ async fn read_head(client: &mut TcpStream, limit: Duration) -> Result<(Request, 
         .map_err(|_| Refusal::HeadTimeout)?
 }
 
-/// Resolves the host and connects to the first address that answers.
+/// Resolves the host, drops the addresses its class does not allow, and connects to the first
+/// of the rest that answers. The address connected to is the one chosen here: there is no
+/// second lookup.
 async fn connect(shared: &Shared, authority: &Authority) -> Result<TcpStream, Refusal> {
     let resolver = Arc::clone(&shared.resolver);
     let (host, port) = (authority.host.clone(), authority.port);
@@ -370,9 +540,14 @@ async fn connect(shared: &Shared, authority: &Authority) -> Result<TcpStream, Re
             });
         }
     };
+    let addrs = shared
+        .addresses
+        .filter(&authority.host, addrs)
+        .map_err(|refusal| Refusal::for_address(authority.host.clone(), refusal))?;
     let mut timed_out = false;
     for addr in addrs.into_iter().take(MAX_ADDRESSES_TRIED) {
-        match timeout(shared.timeouts.connect, TcpStream::connect(addr)).await {
+        let target = shared.dial_map.as_ref().map_or(addr, |map| map(addr));
+        match timeout(shared.timeouts.connect, TcpStream::connect(target)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
@@ -434,11 +609,11 @@ mod tests {
     }
 
     #[test]
-    fn the_config_debug_output_names_its_allowlist_and_limits_but_not_the_resolver() {
+    fn the_config_debug_output_names_its_rules_and_limits_but_not_the_resolver() {
         let config = ProxyConfig::new(Vec::new()).with_max_connections(0);
         let shown = format!("{config:?}");
         assert!(
-            shown.contains("allow") && shown.contains("max_connections: 1"),
+            shown.contains("rules") && shown.contains("max_connections: 1"),
             "{shown}"
         );
     }

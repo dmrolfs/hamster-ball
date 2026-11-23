@@ -46,6 +46,7 @@ pub(crate) struct RawFs {
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct RawNet {
     pub(crate) allow: Vec<String>,
+    pub(crate) internal_hosts: Vec<String>,
     pub(crate) loopback_ports: Vec<i64>,
 }
 
@@ -147,7 +148,8 @@ pub(crate) fn parse_str(source: &str, file: &Path) -> Result<RawConfig, ParseErr
 /// Which user-only sections a file mentions, whatever their value.
 ///
 /// `hooks` run unsandboxed on the host, `guard.exceptions` switch secret protection off and
-/// `system.launchctl = true` lets the agent start, unload and disable the user's launchd jobs, so
+/// `system.launchctl = true` lets the agent start, unload and disable the user's launchd jobs and
+/// `net.internal_hosts` lets named hosts resolve into private networks, so
 /// only files the user controls may carry them (see `closure`). This probe answers "does the
 /// key appear" without depending on the sections' shape, so it keeps working when the hooks
 /// schema changes, and it sees `hooks = []` that the typed schema cannot tell from absence.
@@ -159,12 +161,14 @@ pub(crate) struct UserOnlySections {
     pub(crate) guard_exceptions: bool,
     /// `system.launchctl` is `true` (a `false` only tightens, so any file may say it).
     pub(crate) launchctl_on: bool,
+    /// `net.internal_hosts` appears in any TOML spelling (it widens what a name may resolve to).
+    pub(crate) internal_hosts: bool,
 }
 
 impl UserOnlySections {
     /// Whether any user-only section is present.
     pub(crate) fn any(self) -> bool {
-        self.hooks || self.guard_exceptions || self.launchctl_on
+        self.hooks || self.guard_exceptions || self.launchctl_on || self.internal_hosts
     }
 }
 
@@ -173,6 +177,12 @@ struct UserOnlyProbe {
     hooks: Option<serde::de::IgnoredAny>,
     guard: Option<GuardProbe>,
     system: Option<SystemProbe>,
+    net: Option<NetProbe>,
+}
+
+#[derive(Deserialize, Default)]
+struct NetProbe {
+    internal_hosts: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize, Default)]
@@ -197,6 +207,7 @@ pub(crate) fn user_only_sections(source: &str) -> UserOnlySections {
         launchctl_on: probe
             .system
             .is_some_and(|system| system.launchctl == Some(true)),
+        internal_hosts: probe.net.is_some_and(|net| net.internal_hosts.is_some()),
     }
 }
 
@@ -490,6 +501,29 @@ mod tests {
             "x = \"launchctl\"\n",
         ] {
             assert!(!probe(harmless).launchctl_on, "{harmless:?} was flagged");
+        }
+    }
+
+    #[test]
+    fn the_probe_flags_net_internal_hosts_in_any_spelling_even_when_empty() {
+        for spelling in [
+            "[net]\ninternal_hosts = []\n",
+            "[net]\ninternal_hosts = [\"a.example.com\"]\n",
+            "net.internal_hosts = [\"a.example.com\"]\n",
+            "net = { internal_hosts = [] }\n",
+            "[net]\n\"internal_hosts\" = []\n",
+        ] {
+            assert!(
+                probe(spelling).internal_hosts,
+                "{spelling:?} was not flagged"
+            );
+        }
+        for harmless in [
+            "[net]\nallow = [\"a.example.com\"]\n",
+            "[net]\n",
+            "x = \"internal_hosts\"\n",
+        ] {
+            assert!(!probe(harmless).internal_hosts, "{harmless:?} was flagged");
         }
     }
 

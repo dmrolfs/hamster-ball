@@ -7,132 +7,23 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::HashMap;
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use claims::assert_ok;
-use hamster_ball::policy::{HostName, HostPattern, Port};
-use hamster_ball::proxy::{ProxyConfig, ProxyHandle, Resolver, Timeouts};
+use common::proxy::{
+    auth_line, config, config_on, connect_request, connect_to, echo_upstream, header, proxy,
+    proxy_on, read_head, read_to_end, start, status, tunnel,
+};
+use hamster_ball::policy::{HostName, Port};
+use hamster_ball::proxy::{ProxyHandle, Resolver, Timeouts};
 use pretty_assertions::assert_eq;
-
-const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-
-/// Resolves the names in its table to loopback and fails every other name.
-struct Table(HashMap<String, IpAddr>);
-
-impl Table {
-    fn of(names: &[&str]) -> Arc<Self> {
-        Arc::new(Self(
-            names.iter().map(|n| ((*n).to_owned(), LOCAL)).collect(),
-        ))
-    }
-}
-
-impl Resolver for Table {
-    fn resolve(&self, host: &HostName, port: Port) -> std::io::Result<Vec<SocketAddr>> {
-        self.0
-            .get(host.as_str())
-            .map(|ip| vec![SocketAddr::new(*ip, port.get())])
-            .ok_or_else(|| std::io::Error::other("no such host"))
-    }
-}
-
-fn patterns(entries: &[&str]) -> Vec<HostPattern> {
-    entries
-        .iter()
-        .map(|e| assert_ok!(HostPattern::parse(e)))
-        .collect()
-}
-
-/// A proxy that allows `allow` and resolves `names` to loopback.
-fn proxy(allow: &[&str], names: &[&str]) -> ProxyHandle {
-    start(ProxyConfig::new(patterns(allow)).with_resolver(Table::of(names)))
-}
-
-fn start(config: ProxyConfig) -> ProxyHandle {
-    assert_ok!(ProxyHandle::start(config))
-}
-
-/// An echo server: every byte read is written back; at end of input it writes `bye` and closes.
-fn echo_upstream() -> u16 {
-    let listener = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
-    let port = assert_ok!(listener.local_addr()).port();
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            thread::spawn(move || echo(stream));
-        }
-    });
-    port
-}
-
-fn echo(mut stream: TcpStream) {
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    let _ = stream.write_all(b"bye");
-}
-
-fn connect_to(proxy: &ProxyHandle) -> TcpStream {
-    let stream = assert_ok!(TcpStream::connect(proxy.addr()));
-    assert_ok!(stream.set_read_timeout(Some(Duration::from_secs(20))));
-    stream
-}
-
-/// Reads a reply head; returns it as text and the bytes read past the blank line.
-fn read_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let rest = buf.split_off(at + 4);
-            return (String::from_utf8_lossy(&buf).into_owned(), rest);
-        }
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return (String::from_utf8_lossy(&buf).into_owned(), Vec::new()),
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
-    }
-}
-
-fn read_to_end(stream: &mut TcpStream) -> Vec<u8> {
-    let mut out = Vec::new();
-    let _ = stream.read_to_end(&mut out);
-    out
-}
-
-/// Sends a CONNECT and returns the stream and the reply head.
-fn tunnel(proxy: &ProxyHandle, target: &str) -> (TcpStream, String) {
-    let mut stream = connect_to(proxy);
-    assert_ok!(
-        stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
-    );
-    let (head, _) = read_head(&mut stream);
-    (stream, head)
-}
-
-fn status(head: &str) -> &str {
-    head.lines().next().unwrap_or_default()
-}
-
-fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.lines().find_map(|l| {
-        let (n, v) = l.split_once(':')?;
-        n.eq_ignore_ascii_case(name).then(|| v.trim())
-    })
-}
 
 // ====================================================================================
 // CONNECT and the allowlist
@@ -141,7 +32,7 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 #[test]
 fn a_connect_to_an_allowed_host_becomes_a_tunnel_that_carries_bytes_both_ways() {
     let upstream = echo_upstream();
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let (mut stream, head) = tunnel(&proxy, &format!("allowed.test:{upstream}"));
     assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
     assert_ok!(stream.write_all(b"hello"));
@@ -157,7 +48,7 @@ fn a_host_that_is_not_allowed_gets_a_403_that_says_which_host_and_why() {
     assert!(status(&head).starts_with("HTTP/1.1 403"), "{head}");
     assert_eq!(header(&head, "X-Hb-Refusal"), Some("not_allowed"));
     let mut stream = connect_to(&proxy);
-    assert_ok!(stream.write_all(b"CONNECT other.test:443 HTTP/1.1\r\n\r\n"));
+    assert_ok!(stream.write_all(connect_request(&proxy, "other.test:443").as_bytes()));
     let reply = String::from_utf8_lossy(&read_to_end(&mut stream)).into_owned();
     assert!(
         reply.contains("other.test is not on the allowlist"),
@@ -176,7 +67,7 @@ fn the_allowlist_is_exact_or_wildcard_case_blind_and_label_safe() {
         "kiro.test.evil.test",
         "exact.test",
     ];
-    let proxy = proxy(&["*.kiro.test", "exact.test"], &names);
+    let proxy = proxy_on(upstream, &["*.kiro.test", "exact.test"], &names);
     let reaches = |target: &str| {
         let (_, head) = tunnel(&proxy, &format!("{target}:{upstream}"));
         status(&head).starts_with("HTTP/1.1 200")
@@ -228,7 +119,8 @@ fn a_name_that_does_not_resolve_is_a_502_and_one_that_refuses_connections_is_a_5
         let l = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
         assert_ok!(l.local_addr()).port()
     };
-    let proxy = proxy(&["gone.test", "closed.test"], &["closed.test"]);
+    let closed_rule = format!("closed.test:{closed}");
+    let proxy = proxy(&["gone.test", &closed_rule], &["closed.test"]);
     let (_, head) = tunnel(&proxy, "gone.test:443");
     assert!(status(&head).starts_with("HTTP/1.1 502"), "{head}");
     assert_eq!(header(&head, "X-Hb-Refusal"), Some("unresolved"));
@@ -245,7 +137,7 @@ fn an_empty_answer_from_the_resolver_is_unresolved_and_the_port_is_the_one_liste
             Ok(Vec::new())
         }
     }
-    let proxy = start(ProxyConfig::new(patterns(&["allowed.test"])).with_resolver(Arc::new(Empty)));
+    let proxy = start(config(&["allowed.test"], &[]).with_resolver(Arc::new(Empty)));
     assert_eq!(proxy.port(), proxy.addr().port());
     assert_ne!(proxy.port(), 0);
     let (_, head) = tunnel(&proxy, "allowed.test:443");
@@ -256,10 +148,10 @@ fn an_empty_answer_from_the_resolver_is_unresolved_and_the_port_is_the_one_liste
 #[test]
 fn bytes_sent_right_after_the_connect_head_reach_the_upstream() {
     let upstream = echo_upstream();
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let mut stream = connect_to(&proxy);
     let target = format!("allowed.test:{upstream}");
-    assert_ok!(stream.write_all(format!("CONNECT {target} HTTP/1.1\r\n\r\nearly").as_bytes()));
+    assert_ok!(stream.write_all(format!("{}early", connect_request(&proxy, &target)).as_bytes()));
     let (head, mut rest) = read_head(&mut stream);
     assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
     while rest.len() < 5 {
@@ -273,7 +165,7 @@ fn bytes_sent_right_after_the_connect_head_reach_the_upstream() {
 #[test]
 fn a_half_close_from_the_client_still_lets_the_upstream_finish_its_answer() {
     let upstream = echo_upstream();
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let (mut stream, head) = tunnel(&proxy, &format!("allowed.test:{upstream}"));
     assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
     assert_ok!(stream.write_all(b"ping"));
@@ -295,7 +187,7 @@ fn a_client_that_hangs_up_ends_the_upstream_connection_too() {
             seen.store(true, Ordering::SeqCst);
         }
     });
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(port, &["allowed.test"], &["allowed.test"]);
     let (stream, head) = tunnel(&proxy, &format!("allowed.test:{port}"));
     assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
     drop(stream);
@@ -347,10 +239,11 @@ fn http_upstream(body_len: usize, body: &'static str) -> (u16, thread::JoinHandl
 #[test]
 fn a_plain_get_is_forwarded_in_origin_form_without_the_proxys_own_headers() {
     let (port, upstream) = http_upstream(0, "page");
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(port, &["allowed.test"], &["allowed.test"]);
     let mut stream = connect_to(&proxy);
     let request = format!(
-        "GET http://allowed.test:{port}/a/b?q=1 HTTP/1.1\r\nHost: evil.test\r\nProxy-Authorization: Basic eDp5\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n"
+        "GET http://allowed.test:{port}/a/b?q=1 HTTP/1.1\r\nHost: evil.test\r\n{}Proxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n",
+        auth_line(&proxy)
     );
     assert_ok!(stream.write_all(request.as_bytes()));
     let reply = String::from_utf8_lossy(&read_to_end(&mut stream)).into_owned();
@@ -369,10 +262,12 @@ fn a_plain_get_is_forwarded_in_origin_form_without_the_proxys_own_headers() {
 fn a_post_body_sent_with_or_after_the_head_reaches_the_upstream_whole() {
     for split in [false, true] {
         let (port, upstream) = http_upstream(5, "ok");
-        let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+        let proxy = proxy_on(port, &["allowed.test"], &["allowed.test"]);
         let mut stream = connect_to(&proxy);
-        let head =
-            format!("POST http://allowed.test:{port}/submit HTTP/1.1\r\nContent-Length: 5\r\n\r\n");
+        let head = format!(
+            "POST http://allowed.test:{port}/submit HTTP/1.1\r\nContent-Length: 5\r\n{}\r\n",
+            auth_line(&proxy)
+        );
         if split {
             assert_ok!(stream.write_all(head.as_bytes()));
             thread::sleep(Duration::from_millis(100));
@@ -390,10 +285,16 @@ fn a_post_body_sent_with_or_after_the_head_reaches_the_upstream_whole() {
 #[test]
 fn a_plain_request_to_a_host_that_is_not_allowed_is_refused_before_any_connection() {
     let (port, upstream) = http_upstream(0, "secret");
-    let proxy = proxy(&["allowed.test"], &["allowed.test", "other.test"]);
+    let proxy = proxy_on(port, &["allowed.test"], &["allowed.test", "other.test"]);
     let mut stream = connect_to(&proxy);
     assert_ok!(
-        stream.write_all(format!("GET http://other.test:{port}/ HTTP/1.1\r\n\r\n").as_bytes())
+        stream.write_all(
+            format!(
+                "GET http://other.test:{port}/ HTTP/1.1\r\n{}\r\n",
+                auth_line(&proxy)
+            )
+            .as_bytes()
+        )
     );
     let reply = String::from_utf8_lossy(&read_to_end(&mut stream)).into_owned();
     assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
@@ -447,12 +348,10 @@ fn requests_that_are_not_proxy_requests_get_a_400_with_a_code() {
 
 #[test]
 fn an_oversized_head_is_a_431_and_a_slow_one_is_a_408() {
-    let config = ProxyConfig::new(patterns(&["allowed.test"]))
-        .with_resolver(Table::of(&["allowed.test"]))
-        .with_timeouts(Timeouts {
-            head: Duration::from_millis(300),
-            ..Timeouts::default()
-        });
+    let config = config(&["allowed.test"], &["allowed.test"]).with_timeouts(Timeouts {
+        head: Duration::from_millis(300),
+        ..Timeouts::default()
+    });
     let proxy = start(config);
     let mut big = b"GET http://allowed.test/ HTTP/1.1\r\nX: ".to_vec();
     big.resize(20_000, b'a');
@@ -472,15 +371,19 @@ fn an_oversized_head_is_a_431_and_a_slow_one_is_a_408() {
 #[test]
 fn two_hundred_tunnels_at_once_all_carry_their_own_bytes() {
     let upstream = echo_upstream();
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let addr = proxy.addr();
+    let auth = auth_line(&proxy);
     let workers: Vec<_> = (0..200u32)
         .map(|i| {
+            let auth = auth.clone();
             thread::spawn(move || {
                 let mut s = assert_ok!(TcpStream::connect(addr));
                 assert_ok!(s.set_read_timeout(Some(Duration::from_secs(30))));
                 let target = format!("allowed.test:{upstream}");
-                assert_ok!(s.write_all(format!("CONNECT {target} HTTP/1.1\r\n\r\n").as_bytes()));
+                assert_ok!(
+                    s.write_all(format!("CONNECT {target} HTTP/1.1\r\n{auth}\r\n").as_bytes())
+                );
                 let (head, _) = read_head(&mut s);
                 assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
                 let payload: Vec<u8> = (0..1024u32).map(|n| (n + i) as u8).collect();
@@ -504,9 +407,7 @@ fn two_hundred_tunnels_at_once_all_carry_their_own_bytes() {
 #[test]
 fn connections_beyond_the_limit_get_a_503_and_a_closed_slot_is_reused() {
     let upstream = echo_upstream();
-    let config = ProxyConfig::new(patterns(&["allowed.test"]))
-        .with_resolver(Table::of(&["allowed.test"]))
-        .with_max_connections(2);
+    let config = config_on(upstream, &["allowed.test"], &["allowed.test"]).with_max_connections(2);
     let proxy = start(config);
     let target = format!("allowed.test:{upstream}");
     let (a, ha) = tunnel(&proxy, &target);
@@ -524,7 +425,7 @@ fn connections_beyond_the_limit_get_a_503_and_a_closed_slot_is_reused() {
 #[test]
 fn stopping_ends_every_open_tunnel_leaves_no_task_behind_and_closes_the_port() {
     let upstream = echo_upstream();
-    let mut proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let mut proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let addr = proxy.addr();
     let target = format!("allowed.test:{upstream}");
     let mut open: Vec<TcpStream> = (0..50)
@@ -622,7 +523,7 @@ fn watch_memory() -> (Arc<AtomicBool>, thread::JoinHandle<u64>) {
 fn a_gibibyte_streams_through_a_tunnel_in_bounded_memory() {
     const TOTAL: u64 = 1 << 30;
     let upstream = counting_upstream();
-    let proxy = proxy(&["allowed.test"], &["allowed.test"]);
+    let proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let (mut stream, head) = tunnel(&proxy, &format!("allowed.test:{upstream}"));
     assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
     let before = rss_bytes();

@@ -45,6 +45,12 @@ system_trust = true
 # your presets can say true; any file can say false.
 # launchctl = true
 
+[net]
+# Hosts allowed to resolve to private, tunnel or other internal addresses, for example a corporate
+# network where github.com or an internal registry answers with a 100.64.x.x address. Only this
+# file and your presets can list them; hb says which entry to add when it refuses one.
+# internal_hosts = [\"github.com\", \"*.in.example.com\"]
+
 [env]
 # Variables copied from your shell into every hamster ball. HOME, PATH, TMPDIR, TERM and the proxy
 # and TLS variables are set by hb itself and cannot be listed here.
@@ -403,6 +409,8 @@ mod tests {
         assert_eq!(resolved.config.tls.system_trust, Some(true));
         assert_eq!(resolved.config.env.pass.len(), 2);
         assert!(BASE_TEMPLATE.contains("# launchctl = true"));
+        assert!(BASE_TEMPLATE.contains("# internal_hosts ="));
+        assert!(resolved.config.net.internal_hosts.is_empty());
         assert_eq!(
             resolved.config.system.launchctl, None,
             "the template must not turn launchctl on"

@@ -11,8 +11,8 @@ use crate::config::{
 use crate::explain::ExplainError;
 use crate::policy::{
     ArgWordError, ArgvError, ContainerLabelError, ContainerNameError, EnvNameError, EnvValueError,
-    ExtendTargetError, GlobTailError, HostNameError, HostPatternError, McpNameError, PathError,
-    PathPatternError, PortError, PresetNameError, RefTextError, RootError,
+    ExtendTargetError, GlobTailError, HostNameError, HostPatternError, HostRuleError, McpNameError,
+    PathError, PathPatternError, PortError, PresetNameError, RefTextError, RootError,
 };
 use crate::seatbelt::RenderError;
 use crate::session::{GuardError, HelperError, RunError};
@@ -79,6 +79,13 @@ pub enum Error {
     HostPattern {
         /// The underlying error.
         source: HostPatternError,
+    },
+
+    /// A network allowlist rule was invalid.
+    #[snafu(transparent)]
+    HostRule {
+        /// The underlying error.
+        source: HostRuleError,
     },
 
     /// A deny glob pattern was invalid.
