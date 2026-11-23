@@ -127,8 +127,9 @@ impl Interactive {
         }
     }
 
-    /// Drains the child's last output and gives the terminal back.
-    pub(super) fn finish(self) {
+    /// Drains the child's last output and gives the terminal back. Returns how many times the
+    /// agent set the clipboard.
+    pub(super) fn finish(self) -> usize {
         let Self {
             raw,
             relay,
@@ -136,10 +137,11 @@ impl Interactive {
             output,
             ..
         } = self;
-        relay.finish();
+        let clipboard_writes = relay.finish();
         hand_back(&output, &user);
         // The terminal's own settings go back, and input nobody read is discarded.
         drop(raw);
+        clipboard_writes
     }
 }
 
@@ -411,6 +413,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let mut fds = [PollFd::new(user_slave.as_fd(), PollFlags::POLLIN)];
         assert_eq!(assert_ok!(poll(&mut fds, PollTimeout::from(50u8))), 0);
+    }
+
+    #[test]
+    fn finishing_says_how_many_times_the_agent_set_the_clipboard() {
+        let outer = assert_ok!(Pty::open());
+        let inner = assert_ok!(Pty::open());
+        let user_slave = open_slave(&outer);
+        let mut child = open_slave(&inner);
+        let terminal = assert_ok!(Interactive::start_on(
+            assert_ok!(user_slave.try_clone()).into(),
+            assert_ok!(user_slave.try_clone()).into(),
+            assert_ok!(inner.clone_master()),
+        ));
+        let screen = slow_terminal(
+            assert_ok!(outer.clone_master()),
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        );
+        assert_ok!(child.write_all(b"\x1b]52;c;aGk=\x07\x1b]52;c;?\x07\x1b]52;c;aGk=\x07done"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(terminal.finish(), 2);
+        let _ = screen.join();
     }
 
     #[test]

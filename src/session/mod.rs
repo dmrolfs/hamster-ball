@@ -11,6 +11,7 @@ pub mod guardian;
 mod interactive;
 pub mod preflight;
 pub mod pty;
+pub mod pump;
 pub mod relay;
 pub mod run;
 pub mod sanitize;
@@ -28,6 +29,7 @@ pub use preflight::{
     PreflightError, ProbeOutcome, SANDBOX_EXEC, check_nesting, classify, is_nested,
 };
 pub use pty::{Pty, PtyError, Winsize};
+pub use pump::Pump;
 pub use relay::Relay;
 pub use run::{
     DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, run,

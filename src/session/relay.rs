@@ -15,12 +15,12 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use super::sanitize::Sanitizer;
 
 /// How often the thread looks at the stop flag when nothing arrives.
-const TICK_MS: u8 = 50;
+pub(super) const TICK_MS: u8 = 50;
 /// After the child has ended, how long the master may stay silent before the relay stops.
-const DRAIN_QUIET: Duration = Duration::from_millis(150);
+pub(super) const DRAIN_QUIET: Duration = Duration::from_millis(150);
 /// The most time spent draining.
-const DRAIN_MAX: Duration = Duration::from_secs(2);
-const BUFFER: usize = 8192;
+pub(super) const DRAIN_MAX: Duration = Duration::from_secs(2);
+pub(super) const BUFFER: usize = 8192;
 
 /// Where the relay thread is with respect to a pause request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,7 @@ impl Shared {
 #[derive(Debug)]
 pub struct Relay {
     shared: Arc<Shared>,
-    handle: JoinHandle<()>,
+    handle: JoinHandle<usize>,
 }
 
 impl Relay {
@@ -69,7 +69,17 @@ impl Relay {
         let theirs = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("hb-relay".to_owned())
-            .spawn(move || run(File::from(input), master, File::from(output), &theirs))?;
+            .spawn(move || {
+                let mut filter = Sanitizer::new();
+                run(
+                    File::from(input),
+                    master,
+                    File::from(output),
+                    &theirs,
+                    &mut filter,
+                );
+                filter.clipboard_writes()
+            })?;
         Ok(Self { shared, handle })
     }
 
@@ -97,11 +107,13 @@ impl Relay {
     }
 
     /// Tells the relay the child has ended, lets it drain the last output, and waits for it.
-    pub fn finish(self) {
+    ///
+    /// Returns how many clipboard writes the agent made that went through to the terminal.
+    pub fn finish(self) -> usize {
         self.shared.stop.store(true, Ordering::Relaxed);
         *self.shared.gate() = Gate::Open;
         self.shared.changed.notify_all();
-        let _ = self.handle.join();
+        self.handle.join().unwrap_or(0)
     }
 }
 
@@ -130,7 +142,7 @@ fn copy_chunk(from: &mut File, to: &mut File, filter: Option<&mut Sanitizer>) ->
 }
 
 /// Tells the terminal the agent's output is over: a sequence the agent left open is cancelled.
-fn end_of_output(filter: &mut Sanitizer, output: &mut File) {
+pub(super) fn end_of_output(filter: &mut Sanitizer, output: &mut File) {
     let mut tail = Vec::new();
     filter.finish(&mut tail);
     if !tail.is_empty() {
@@ -154,8 +166,13 @@ fn hold_while_paused(shared: &Shared) {
     }
 }
 
-fn run(mut input: File, mut master: File, mut output: File, shared: &Shared) {
-    let mut filter = Sanitizer::new();
+fn run(
+    mut input: File,
+    mut master: File,
+    mut output: File,
+    shared: &Shared,
+    filter: &mut Sanitizer,
+) {
     let mut input_open = true;
     let mut draining_since: Option<Instant> = None;
     loop {
@@ -179,9 +196,9 @@ fn run(mut input: File, mut master: File, mut output: File, shared: &Shared) {
             };
             (ready(&fds[0]), fds.get(1).is_some_and(ready))
         };
-        if master_ready && !copy_chunk(&mut master, &mut output, Some(&mut filter)) {
+        if master_ready && !copy_chunk(&mut master, &mut output, Some(filter)) {
             // End of the child's output: nothing more can come.
-            end_of_output(&mut filter, &mut output);
+            end_of_output(filter, &mut output);
             return;
         }
         if input_ready && !copy_chunk(&mut input, &mut master, None) {
@@ -189,7 +206,7 @@ fn run(mut input: File, mut master: File, mut output: File, shared: &Shared) {
         }
         if let Some(since) = draining_since {
             if !master_ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX {
-                end_of_output(&mut filter, &mut output);
+                end_of_output(filter, &mut output);
                 return;
             }
         }
@@ -303,6 +320,21 @@ mod tests {
         let got = read_some(&mut rig.user, b"cd");
         assert_eq!(got, b"abcd");
         rig.relay.finish();
+    }
+
+    #[test]
+    fn finishing_reports_how_many_clipboard_writes_went_through() {
+        let mut rig = rig();
+        assert_ok!(
+            rig.child
+                .write_all(b"\x1b]52;c;aGk=\x07mid\x1b]52;c;?\x07\x1b]52;p;aGk=\x07end")
+        );
+        assert!(!read_some(&mut rig.user, b"end").is_empty());
+        assert_eq!(
+            rig.relay.finish(),
+            2,
+            "two writes, and a read that was removed"
+        );
     }
 
     #[test]

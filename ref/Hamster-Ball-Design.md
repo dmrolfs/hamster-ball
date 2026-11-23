@@ -577,8 +577,18 @@ measures:
    answers in order, so when that answer arrives every earlier reply has, and everything read until then is discarded. A terminal
    that never answers costs 750 ms. The fence is defence in depth for a terminal bug in a query the filter lets through, and it
    also stops an ordinary late cursor-position report from showing up at the prompt.
-3. **No fallback.** There is no mode in which the agent's output reaches the terminal unfiltered with a pty. Without a pty (stdin
-   not a terminal) the agent writes to the user's streams directly and none of this applies; see 15.
+3. **No unfiltered mode.** When stdin is not a terminal there is no pty, but if stdout or stderr is a terminal the agent is given a
+   pipe for it and `hb` copies the pipe to the terminal through the same filter (`session::pump`). The agent then sees a stdout that
+   is not a terminal, as it would in `agent | tee`, which is what a batch or print-mode run expects; every interactive agent needs a
+   terminal on stdin as well, so none of them is affected. The exit fence does not apply here (`hb` is not reading the terminal's
+   input), so the filter alone keeps the replies an agent could shape from existing. Measured before the change: with
+   `hb run -- agent < /dev/null` a late title-report reply ran a command in the user's shell. The two streams are copied by separate
+   threads, so their interleaving on screen can differ from a shared terminal's. A background process of the agent that keeps a pipe
+   open cannot hold up the end of the run (the copy stops 150 ms after the last byte, 2 s at most).
+4. **Clipboard writes are counted.** An agent can only reach the clipboard through `OSC 52` (`pbcopy`, `pbpaste` and `osascript`
+   are denied the pasteboard, measured), so writes pass and reads are dropped. At the end of a run `hb` prints
+   `warning: the agent set your clipboard N times` when there were any, so a write the user did not ask for does not go unnoticed.
+   A switch to deny writes was considered and left out until someone needs it.
 
 Measured on the four agents: they emit OSC 0, 4, 8, 10 to 12 and 112 and the other sequences above, all of which pass. Two capability
 probes are dropped (pi's `OSC 7501;?` and opencode's `OSC 66`, a kitty text-sizing probe followed by a cursor-position query), and
@@ -908,4 +918,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |
 | D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
 | D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it watches each with a kernel exit notification so it never signals a reused number; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
-| D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout | owner, hb-ghd.2.4 follow-up |
+| D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard | owner, hb-ghd.2.4 follow-up |

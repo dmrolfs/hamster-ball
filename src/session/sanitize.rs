@@ -91,6 +91,8 @@ pub struct Sanitizer {
     held: Vec<u8>,
     /// Whether the terminal has been sent the start of a sequence that it has not seen the end of.
     open: bool,
+    /// How many clipboard writes (`OSC 52` with data) were let through.
+    clipboard_writes: usize,
 }
 
 impl Default for Sanitizer {
@@ -109,6 +111,7 @@ impl Sanitizer {
             mode: Mode::Ground,
             held: Vec::new(),
             open: false,
+            clipboard_writes: 0,
         }
     }
 
@@ -117,6 +120,12 @@ impl Sanitizer {
         for &byte in input {
             self.byte(byte, out);
         }
+    }
+
+    /// How many clipboard writes have been let through so far.
+    #[must_use]
+    pub fn clipboard_writes(&self) -> usize {
+        self.clipboard_writes
     }
 
     /// Whether the terminal has been left in the middle of a sequence. `hb` cancels it at the end.
@@ -377,6 +386,11 @@ impl Sanitizer {
                 self.release(out, true);
                 self.mode = Mode::StringPass;
             }
+            OscVerdict::PassClipboard => {
+                self.clipboard_writes += 1;
+                self.release(out, true);
+                self.mode = Mode::StringPass;
+            }
             // `decide_osc` drops what it cannot place within a bounded prefix, so this stays short.
             OscVerdict::Undecided => {}
         }
@@ -490,6 +504,8 @@ fn is_allowed_dcs(header: &[u8]) -> bool {
 enum OscVerdict {
     Drop,
     Pass,
+    /// Passes, and is a write to the clipboard.
+    PassClipboard,
     Undecided,
 }
 
@@ -536,7 +552,7 @@ fn decide_clipboard(rest: &[u8]) -> OscVerdict {
     match rest.get(separator + 1) {
         None => OscVerdict::Undecided,
         Some(b'?') => OscVerdict::Drop,
-        Some(_) => OscVerdict::Pass,
+        Some(_) => OscVerdict::PassClipboard,
     }
 }
 
@@ -749,6 +765,39 @@ mod tests {
         ] {
             assert_eq!(clean(query), query, "{query:?}");
         }
+    }
+
+    // ---- clipboard writes are counted ----
+
+    fn writes(input: &[u8]) -> usize {
+        let mut filter = Sanitizer::new();
+        let mut out = Vec::new();
+        filter.feed(input, &mut out);
+        filter.clipboard_writes()
+    }
+
+    #[test]
+    fn each_clipboard_write_that_passes_is_counted_once() {
+        assert_eq!(writes(b""), 0);
+        assert_eq!(writes(b"\x1b]52;c;aGk=\x07"), 1);
+        assert_eq!(writes(b"\x1b]52;c;aGk=\x07text\x1b]52;p;aGk=\x1b\\"), 2);
+        // A split sequence is still one write, wherever it is cut.
+        let whole = b"x\x1b]52;c;aGVsbG8=\x07y";
+        for cut in 0..=whole.len() {
+            let mut filter = Sanitizer::new();
+            let mut out = Vec::new();
+            filter.feed(&whole[..cut], &mut out);
+            filter.feed(&whole[cut..], &mut out);
+            assert_eq!(filter.clipboard_writes(), 1, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn what_the_filter_removes_is_not_counted_as_a_write() {
+        assert_eq!(writes(b"\x1b]52;c;?\x07"), 0, "a read");
+        assert_eq!(writes(b"\x1b]0;a title\x07\x1b]8;;http://x\x1b\\"), 0);
+        assert_eq!(writes(b"\x1b]5522;x\x07"), 0);
+        assert_eq!(writes(b"\x1b]52;c\x07"), 0, "no data");
     }
 
     // ---- ending and aborting sequences ----

@@ -5,6 +5,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -23,6 +24,7 @@ use super::guardian::{Guardian, GuardianError};
 use super::interactive::{Interactive, InteractiveError};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::pty::{Pty, PtyError};
+use super::pump::Pump;
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
@@ -301,6 +303,13 @@ pub enum RunError {
         source: GuardianError,
     },
 
+    /// The filter between the agent's output and the user's terminal could not be started.
+    #[snafu(display("the output filter could not be started"))]
+    OutputFilter {
+        /// The underlying error.
+        source: io::Error,
+    },
+
     /// The pty could not be set up.
     #[snafu(transparent)]
     Pty {
@@ -411,6 +420,15 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             }
             if spec.stdio == StdioMode::Capture {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            } else {
+                // Without a pty the agent would write to the user's terminal past the output
+                // filter, so a stream that is a terminal goes through a pipe and the filter.
+                if io::stdout().is_terminal() {
+                    command.stdout(Stdio::piped());
+                }
+                if io::stderr().is_terminal() {
+                    command.stderr(Stdio::piped());
+                }
             }
         }
     }
@@ -438,18 +456,36 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             return Err(error.into());
         }
     }
-    let running = match pty {
+    let pumps = if spec.stdio == StdioMode::Inherit && pty.is_none() {
+        match start_pumps(&mut child) {
+            Ok(pumps) => pumps,
+            Err(error) => {
+                abort_child(&mut child);
+                return Err(error);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut running = match pty {
         Some(pty) => start_on_pty(child, pty, watch, spec.signals)?,
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
+    running.pumps = pumps;
     let waited = running.wait_for_exit(spec.stdio);
     let denials = log.map(LogStream::finish).unwrap_or_default();
     // Everything hb started has ended and been reaped, so the guard has nothing left to do.
     if let Some(guard) = guard {
         guard.release();
     }
-    let (exit, stdout, stderr) = waited?;
+    let Waited {
+        exit,
+        stdout,
+        stderr,
+        clipboard_writes,
+    } = waited?;
     drop(session);
+    warnings.extend(clipboard_notice(clipboard_writes));
     Ok(Outcome {
         exit,
         stdout,
@@ -470,6 +506,47 @@ struct Running {
     child: Child,
     supervisor: Option<Supervisor>,
     terminal: Option<Interactive>,
+    /// The filters between the agent's streams and the user's terminal, when there is no pty.
+    pumps: Vec<Pump>,
+}
+
+/// How a run ended, with what was captured and what the filters saw.
+struct Waited {
+    exit: ExitKind,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// How many times the agent set the user's clipboard.
+    clipboard_writes: usize,
+}
+
+/// Starts a [`Pump`] for each of the child's streams that was given a pipe in place of the
+/// user's terminal.
+fn start_pumps(child: &mut Child) -> Result<Vec<Pump>, RunError> {
+    let mut pumps = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let sink = io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .context(OutputFilterSnafu)?;
+        pumps.push(Pump::start(OwnedFd::from(stdout), sink).context(OutputFilterSnafu)?);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let sink = io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .context(OutputFilterSnafu)?;
+        pumps.push(Pump::start(OwnedFd::from(stderr), sink).context(OutputFilterSnafu)?);
+    }
+    Ok(pumps)
+}
+
+/// The line that tells the user their clipboard was set, or nothing if it was not.
+fn clipboard_notice(writes: usize) -> Option<String> {
+    match writes {
+        0 => None,
+        1 => Some("the agent set your clipboard 1 time".to_owned()),
+        n => Some(format!("the agent set your clipboard {n} times")),
+    }
 }
 
 /// Starts forwarding signals to `child`, if `watch` was prepared. If that fails the child is
@@ -485,6 +562,7 @@ fn start_supervisor(
             child,
             supervisor: None,
             terminal: None,
+            pumps: Vec::new(),
         });
     };
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
@@ -499,6 +577,7 @@ fn start_supervisor(
             child,
             supervisor: Some(supervisor),
             terminal: None,
+            pumps: Vec::new(),
         }),
         Err(error) => {
             let _ = child.kill();
@@ -552,6 +631,7 @@ fn start_on_pty(
             child,
             supervisor: Some(supervisor),
             terminal: Some(terminal),
+            pumps: Vec::new(),
         }),
         Err(error) => {
             abort_child(&mut child);
@@ -595,11 +675,12 @@ fn open_pty(spec: &RunSpec) -> Result<Option<Pty>, RunError> {
 
 impl Running {
     /// Waits for the child, then stops the signal thread, and returns how it ended.
-    fn wait_for_exit(self, stdio: StdioMode) -> Result<(ExitKind, Vec<u8>, Vec<u8>), RunError> {
+    fn wait_for_exit(self, stdio: StdioMode) -> Result<Waited, RunError> {
         let Self {
             child,
             supervisor,
             terminal,
+            pumps,
         } = self;
         if let Some(terminal) = terminal {
             let pid = RustixPid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
@@ -610,9 +691,14 @@ impl Running {
             if let Some(supervisor) = supervisor {
                 supervisor.finish();
             }
-            terminal.finish();
+            let clipboard_writes = terminal.finish();
             return exit
-                .map(|exit| (exit, Vec::new(), Vec::new()))
+                .map(|exit| Waited {
+                    exit,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    clipboard_writes,
+                })
                 .context(SpawnSnafu);
         }
         let result = match stdio {
@@ -629,7 +715,16 @@ impl Running {
         if let Some(supervisor) = supervisor {
             supervisor.finish();
         }
-        result.context(SpawnSnafu)
+        // The agent has ended: let the filters write what is left before anything else is printed.
+        let clipboard_writes = pumps.into_iter().map(Pump::finish).sum();
+        result
+            .map(|(exit, stdout, stderr)| Waited {
+                exit,
+                stdout,
+                stderr,
+                clipboard_writes,
+            })
+            .context(SpawnSnafu)
     }
 }
 
@@ -896,6 +991,23 @@ mod tests {
             assert_err!(open_pty(&spec)),
             RunError::PtyUnavailable
         ));
+    }
+
+    #[test]
+    fn the_clipboard_notice_counts_in_the_singular_and_the_plural_and_is_silent_for_none() {
+        assert_eq!(clipboard_notice(0), None);
+        assert_eq!(
+            clipboard_notice(1).as_deref(),
+            Some("the agent set your clipboard 1 time")
+        );
+        assert_eq!(
+            clipboard_notice(2).as_deref(),
+            Some("the agent set your clipboard 2 times")
+        );
+        assert_eq!(
+            clipboard_notice(40).as_deref(),
+            Some("the agent set your clipboard 40 times")
+        );
     }
 
     #[test]

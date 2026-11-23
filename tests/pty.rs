@@ -423,6 +423,140 @@ fn the_emulator_does_type_a_late_reply_into_a_shell_that_nothing_protects() {
 }
 
 // ====================================================================================
+// No pty: stdin is a file but the output goes to a terminal
+// ====================================================================================
+
+#[test]
+fn a_late_reply_is_never_typed_into_the_shell_when_the_run_has_no_pty() {
+    // The agent's stdin is a file, so hb gives it no pty, and its output used to go straight to the
+    // user's terminal with nothing between. The same emulator as above shows the reply typed.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.base.join("typed-into-the-shell");
+    let agent = program(
+        &w,
+        "echo.pl",
+        "$|=1; print \"\\e]0;payload\\a\\e[21t\"; print \"agent-done\\n\";\n",
+    );
+    let body = format!(
+        "{emulator}\n\
+         spawn -noecho /bin/bash --norc --noprofile -i\n\
+         expect {{$ }}\nsend {{PS1='<\\#>PROMPT> '}}\nsend \"\\r\"\nexpect \"<2>PROMPT> \"\n\
+         send \"$drive run -- /usr/bin/perl {agent} < /dev/null\\r\"\n\
+         serve_terminal \"<3>PROMPT> \" 1200\n\
+         send \"\\r\"\nexpect -re {{<[0-9]+>PROMPT> }}\n\
+         send \"printf 'VERDICT=%s\\\\n' \\$(test -e {marker} && echo typed || echo clean)\\r\"\n\
+         expect -re {{VERDICT=(typed|clean)\\r}}\n\
+         puts \"RESULT:$expect_out(1,string)\"\n\
+         send \"exit\\r\"\nexpect eof\n",
+        emulator = emulator(&format!("touch {}", marker.display()), 400),
+        agent = agent,
+        marker = marker.display(),
+    );
+    let out = expect_with(&w, &[], false, &body);
+    assert!(
+        out.contains("RESULT:clean"),
+        "a reply to a query from an agent with no pty ran in the user's shell: {out}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn with_no_pty_the_agents_output_is_a_pipe_but_arrives_unchanged() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let agent = program(
+        &w,
+        "streams.pl",
+        "$|=1; print \"stdout-tty=\", (-t STDOUT ? 1 : 0), \" stdin-tty=\", (-t STDIN ? 1 : 0), \"\\n\";\n\
+         print STDERR \"to-stderr \\e[31mred\\e[0m\\n\"; print \"after \\x{4e16}\\n\";\n",
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho /bin/sh -c \"$drive run -- /usr/bin/perl {agent} < /dev/null\"\nexpect eof\n"
+        ),
+    );
+    assert!(out.contains("stdout-tty=0 stdin-tty=0"), "{out}");
+    assert!(out.contains("to-stderr \u{1b}[31mred\u{1b}[0m"), "{out}");
+    assert!(out.contains("after \u{4e16}"), "{out}");
+}
+
+// ====================================================================================
+// The clipboard notice
+// ====================================================================================
+
+fn clipboard_agent(w: &World) -> String {
+    program(
+        w,
+        "clip.pl",
+        "$|=1; print \"\\e]52;c;aGVsbG8=\\a\"; print \"\\e]52;c;?\\a\"; print \"\\e]52;p;d29ybGQ=\\a\"; print \"copied\\n\";\n",
+    )
+}
+
+#[test]
+fn a_run_on_a_pty_says_how_many_times_the_agent_set_the_clipboard() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let agent = clipboard_agent(&w);
+    let out = expect(
+        &w,
+        &[],
+        &format!("spawn -noecho $drive run -- /usr/bin/perl {agent}\nexpect eof\n"),
+    );
+    assert!(
+        out.contains("warning: the agent set your clipboard 2 times"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_run_with_no_pty_says_it_too_and_says_nothing_when_the_clipboard_was_not_touched() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let agent = clipboard_agent(&w);
+    let quiet = program(&w, "quiet.pl", "print \"nothing to see\\n\";\n");
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho /bin/sh -c \"$drive run -- /usr/bin/perl {agent} < /dev/null\"\nexpect eof\n"
+        ),
+    );
+    assert!(
+        out.contains("warning: the agent set your clipboard 2 times"),
+        "{out}"
+    );
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho /bin/sh -c \"$drive run -- /usr/bin/perl {quiet} < /dev/null\"\nexpect eof\n"
+        ),
+    );
+    assert!(out.contains("nothing to see"), "{out}");
+    assert!(!out.contains("clipboard"), "{out}");
+}
+
+#[test]
+fn a_single_clipboard_write_is_reported_in_the_singular() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let agent = program(&w, "one.pl", "print \"\\e]52;c;aGk=\\a\";\n");
+    let out = expect(
+        &w,
+        &[],
+        &format!("spawn -noecho $drive run -- /usr/bin/perl {agent}\nexpect eof\n"),
+    );
+    assert!(
+        out.contains("warning: the agent set your clipboard 1 time\n")
+            || out.contains("warning: the agent set your clipboard 1 time\r"),
+        "{out}"
+    );
+}
+
+// ====================================================================================
 // Ctrl-Z
 // ====================================================================================
 
