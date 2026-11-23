@@ -822,6 +822,22 @@ Principle: the hamster ball holds only credentials the agent itself needs to rea
 Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen by the OS, per session.
 
 - Handles `CONNECT` (HTTPS) and plain HTTP forwarding. Decisions are by hostname from the request.
+  Built in hb-ghd.3.1 (`src/proxy`): `ProxyHandle::start` binds `127.0.0.1:0` in the calling thread, so the port is known on return, and
+  serves on its own thread with a single-threaded tokio runtime; the rest of `hb` stays synchronous. Dropping the handle aborts every open
+  connection and joins the thread. At most 512 connections are served at once (more get `503`); `RLIMIT_NOFILE` is raised best-effort
+  because each tunnel holds two sockets. The request head is limited to 16 KiB and 64 headers and must arrive in 10 s; resolving and each
+  connect attempt get 10 s; an established tunnel has no time limit, so a long streaming response is never cut off. Bytes are copied with
+  `copy_bidirectional` (8 KiB buffers; a half-close is passed on), so memory does not grow with the stream: a 1 GiB tunnel test grows
+  resident memory by under 64 MiB.
+- **Plain HTTP** is one request per connection (D71): the absolute-URI request is rewritten to origin form with our own `Host`, the
+  proxy and hop-by-hop headers (and those named in `Connection`) are dropped, `Connection: close` is added, and bytes are copied until
+  either side ends. No body is ever framed, so there is no request-smuggling state to desynchronise; a pipelined second request is only
+  body bytes to the same, already allowed, upstream. A request with both `Content-Length` and `Transfer-Encoding` is refused. `https://`
+  in an absolute URI is refused (use `CONNECT`).
+- **Refusals** are HTTP replies with a one-line reason and an `X-Hb-Refusal` code: `not_allowed` 403, `ip_literal` 403, `bad_target`,
+  `malformed`, `not_a_proxy_request`, `unsupported_scheme` 400, `too_large` 431, `head_timeout` 408, `unresolved` and `unreachable` 502,
+  `timed_out` 504, `busy` 503. Address literals (`127.0.0.1`, `[::1]`, `2130706433`) are always refused in v1 (D71); an allowlist entry
+  is a host name.
 - Allowlist entries: exact host or `*.suffix`. Default is deny. Denials return `403` with a reason and are logged.
   `*.example.com` matches `a.example.com` and `a.b.example.com` but not `example.com`, and is label-boundary safe.
   Hosts are strict LDH (a `_` in a label is rejected), punycode only, and the last label must start with a letter
@@ -1050,3 +1066,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D68 | `session::env` sets `NODE_USE_SYSTEM_CA=1` with `system_trust` and `NODE_EXTRA_CA_CERTS` to a per-session `ca-bundle.pem` (only the PEM certificates of `tls.extra_ca_files`, 0600, size-capped; a file with no certificate stops the run); no other CA variable is set; `com.apple.TrustEvaluationAgent` joins the system-trust grants because curl and git fail against a TLS-inspected host without it | owner, hb-ghd.2.2 |
 | D69 | The profile allows `file-read*` on `^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$` and never a write: `/usr/bin/git` and the other developer-tool shims read that cache to find the real tool and print two error lines per call without it; the user's own unsandboxed `xcrun` trusts the same file, so a write grant would let the agent redirect `git` for the user's shells. If the cache has no entry for a tool the first call still fails to write it and prints once | owner, hb-ghd.2.2 |
 | D70 | `[system] launchctl` (default off) decides whether `/bin/launchctl` may run: `false` from any file wins and `true` is accepted only from the user's own files (the D36 rule); the profile denies exec of the program otherwise (section 4.6). Chosen over leaving it open because launchd lets a sandboxed caller start, unload and disable jobs that are not running, which no profile rule can separate, and over a hard-coded deny so a user who runs services can opt in | owner, hb-ghd.2.5 |
+| D71 | The proxy (`src/proxy`, hb-ghd.3.1) runs on tokio (`rt`, `net`, `io-util`, `time`, `sync`, `macros`) with `httparse`, on its own thread behind `ProxyHandle`; plain HTTP is one request per connection with `Connection: close`; address-literal targets are always refused; the proxy starts for every run, even with an empty allowlist, so the agent gets a `403` with a reason rather than a refused connection | owner, hb-ghd.3 |

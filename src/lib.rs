@@ -21,6 +21,7 @@ pub mod error;
 pub mod explain;
 pub mod origin;
 pub mod policy;
+pub mod proxy;
 pub mod seatbelt;
 pub mod session;
 pub(crate) mod sys;
