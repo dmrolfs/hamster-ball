@@ -9,7 +9,7 @@
 //! counted, not shown, unless [`ReportOptions::show_args`] is set; then each is bounded.
 //! Values that can carry a secret therefore cannot reach a renderer by accident.
 //!
-//! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `ctl`, `mcp`,
+//! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `terminal`, `ctl`, `mcp`,
 //! `hooks`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
 //! higher precedence). Sets are value-sorted, which is the order [`Sourced`] lists already
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
@@ -212,6 +212,13 @@ pub struct TlsReport {
     pub extra_ca_files: Vec<Row<String>>,
 }
 
+/// `[terminal]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TerminalReport {
+    /// Whether the agent may set the user's clipboard, and who said no. Allowed when no file says.
+    pub clipboard_write: Row<bool>,
+}
+
 /// `[ctl]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CtlReport {
@@ -315,6 +322,8 @@ pub struct Report {
     pub env: EnvReport,
     /// TLS.
     pub tls: TlsReport,
+    /// Terminal.
+    pub terminal: TerminalReport,
     /// `hb ctl`.
     pub ctl: CtlReport,
     /// MCP servers.
@@ -446,6 +455,18 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
             extra_ca_files: b.rows(&policy.tls.extra_ca_files, "tls.extra_ca_files", |p| {
                 p.as_str().to_owned()
             }),
+        },
+        terminal: TerminalReport {
+            clipboard_write: policy.terminal.clipboard_write.as_ref().map_or_else(
+                || Row {
+                    value: true,
+                    origins: Vec::new(),
+                },
+                |setting| Row {
+                    value: setting.value,
+                    origins: b.origins(&setting.sources, "terminal.clipboard_write"),
+                },
+            ),
         },
         ctl: CtlReport {
             label: policy.ctl.label.as_ref().map(|label| Row {

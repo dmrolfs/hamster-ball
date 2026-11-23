@@ -288,6 +288,7 @@ fn the_json_parses_and_has_a_schema_version_and_the_groups_in_order() {
             "net",
             "env",
             "tls",
+            "terminal",
             "ctl",
             "mcp",
             "hooks",
@@ -295,6 +296,24 @@ fn the_json_parses_and_has_a_schema_version_and_the_groups_in_order() {
             "warnings"
         ]
     );
+}
+
+#[test]
+fn the_terminal_group_says_clipboard_writes_are_allowed_until_a_file_denies_them() {
+    let w = World::new(PROJECT);
+    let report = w.report(false, None);
+    assert!(report.terminal.clipboard_write.value);
+    assert!(report.terminal.clipboard_write.origins.is_empty());
+    let denied = World::new("[terminal]\nclipboard_write = false\n");
+    let report = denied.report(false, None);
+    assert!(!report.terminal.clipboard_write.value);
+    assert_eq!(report.terminal.clipboard_write.origins.len(), 1);
+    let text = denied.normalise(&render_text(&report));
+    assert!(
+        text.contains("terminal\n  clipboard_write = false"),
+        "{text}"
+    );
+    assert!(text.contains("terminal.clipboard_write"), "{text}");
 }
 
 // ====================================================================================

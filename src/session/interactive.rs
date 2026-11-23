@@ -3,22 +3,21 @@
 //! Running the child on a pty (design 7.3, hb-ghd.2.4).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use rustix::process::{
     Pid as RustixPid, Signal as RustixSignal, WaitOptions, getpid, kill_process, waitpid,
 };
 use rustix::termios::tcsetwinsize;
 use snafu::{ResultExt, Snafu};
 
+use super::fence::hand_back;
 use super::pty::terminal_size;
 use super::relay::Relay;
 use super::run::ExitKind;
-use super::sanitize::MODE_RESET;
+use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::terminal::{RawMode, TerminalError};
 
 /// Why the terminal side could not be set up.
@@ -47,15 +46,6 @@ pub enum InteractiveError {
     },
 }
 
-/// How long to wait for the terminal to answer the fence query before giving up on it.
-///
-/// It is the time a reply may take to cross a slow link (ssh) and still be caught. A terminal
-/// that never answers costs this much at the end of a run.
-const FENCE_WAIT: Duration = Duration::from_millis(750);
-
-/// Primary device attributes: every terminal answers it, and answers in the order it was asked.
-const FENCE_QUERY: &[u8] = b"\x1b[c";
-
 /// The user's terminal while the child runs on the master's other side.
 pub(super) struct Interactive {
     raw: RawMode,
@@ -67,7 +57,10 @@ pub(super) struct Interactive {
 
 impl Interactive {
     /// Puts the terminal in raw mode and starts relaying between it and `master`.
-    pub(super) fn start(master: File) -> Result<Self, InteractiveError> {
+    pub(super) fn start(
+        master: File,
+        clipboard: ClipboardPolicy,
+    ) -> Result<Self, InteractiveError> {
         let stdin = io::stdin()
             .as_fd()
             .try_clone_to_owned()
@@ -76,18 +69,33 @@ impl Interactive {
             .as_fd()
             .try_clone_to_owned()
             .context(DuplicateSnafu)?;
-        Self::start_on(stdin, stdout, master)
+        Self::start_on_with(stdin, stdout, master, clipboard)
     }
 
     /// Like [`Interactive::start`] for a terminal given as descriptors (`input` and `output`
     /// both name it). Takes the descriptors so a test can use a pty of its own.
+    #[cfg(test)]
     fn start_on(input: OwnedFd, output: OwnedFd, master: File) -> Result<Self, InteractiveError> {
+        Self::start_on_with(input, output, master, ClipboardPolicy::default())
+    }
+
+    fn start_on_with(
+        input: OwnedFd,
+        output: OwnedFd,
+        master: File,
+        clipboard: ClipboardPolicy,
+    ) -> Result<Self, InteractiveError> {
         let user = Arc::new(input.try_clone().context(DuplicateSnafu)?);
         let raw = RawMode::enter(input.try_clone().context(DuplicateSnafu)?).context(RawSnafu)?;
         let master = Arc::new(master);
         let screen = output.try_clone().context(DuplicateSnafu)?;
-        let relay = Relay::start(input, master.try_clone().context(DuplicateSnafu)?, output)
-            .context(RelaySnafu)?;
+        let relay = Relay::start_with(
+            input,
+            master.try_clone().context(DuplicateSnafu)?,
+            output,
+            clipboard,
+        )
+        .context(RelaySnafu)?;
         Ok(Self {
             raw,
             relay,
@@ -129,7 +137,7 @@ impl Interactive {
 
     /// Drains the child's last output and gives the terminal back. Returns how many times the
     /// agent set the clipboard.
-    pub(super) fn finish(self) -> usize {
+    pub(super) fn finish(self) -> ClipboardUse {
         let Self {
             raw,
             relay,
@@ -137,77 +145,12 @@ impl Interactive {
             output,
             ..
         } = self;
-        let clipboard_writes = relay.finish();
+        let clipboard = relay.finish();
         hand_back(&output, &user);
         // The terminal's own settings go back, and input nobody read is discarded.
         drop(raw);
-        clipboard_writes
+        clipboard
     }
-}
-
-/// Makes the terminal safe to give back to the shell.
-///
-/// The agent may have left input modes on (mouse reports, focus events, bracketed paste) and
-/// may have asked the terminal questions whose answers are still on their way. Both would
-/// arrive as typing at the shell's prompt. The modes are switched off, and `hb` asks the
-/// terminal one question of its own: a terminal answers in order, so when that answer arrives
-/// every earlier one has, and everything read until then is thrown away.
-fn hand_back(output: &OwnedFd, user: &OwnedFd) {
-    let Ok(screen) = output.try_clone() else {
-        return;
-    };
-    let mut screen = File::from(screen);
-    let _ = screen.write_all(MODE_RESET);
-    let _ = screen.write_all(FENCE_QUERY);
-    let _ = screen.flush();
-    let Ok(input) = user.try_clone() else {
-        return;
-    };
-    let mut input = File::from(input);
-    let deadline = Instant::now() + FENCE_WAIT;
-    let mut seen: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 256];
-    while Instant::now() < deadline && !has_device_attributes_reply(&seen) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let millis = u16::try_from(left.as_millis()).unwrap_or(u16::MAX);
-        let mut fds = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
-        if poll(&mut fds, PollTimeout::from(millis)).is_ok_and(|n| n > 0) {
-            match input.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    seen.extend_from_slice(&chunk[..n]);
-                    keep_the_tail(&mut seen);
-                }
-            }
-        }
-    }
-}
-
-/// What the fence keeps of the input it has read: past this many bytes only the last
-/// [`FENCE_TAIL`] are kept, since only the end can still turn into a reply.
-const FENCE_KEEP: usize = 512;
-const FENCE_TAIL: usize = 64;
-
-fn keep_the_tail(seen: &mut Vec<u8>) {
-    if seen.len() > FENCE_KEEP {
-        let cut = seen.len() - FENCE_TAIL;
-        seen.drain(..cut);
-    }
-}
-
-/// Whether `bytes` holds a reply to a primary device attributes query: `ESC [ ? Ps ; ... c`.
-fn has_device_attributes_reply(bytes: &[u8]) -> bool {
-    bytes.windows(4).enumerate().any(|(start, window)| {
-        if window[..3] != *b"\x1b[?" {
-            return false;
-        }
-        let rest = &bytes[start + 3..];
-        let params = rest
-            .iter()
-            .take_while(|b| b.is_ascii_digit() || **b == b';')
-            .count();
-        params > 0 && rest.get(params) == Some(&b'c')
-    })
 }
 
 fn copy_size(user: &OwnedFd, master: &File) {
@@ -227,10 +170,14 @@ fn exit_kind(status: rustix::process::WaitStatus) -> ExitKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::fence::FENCE_WAIT;
     use crate::session::pty::Pty;
     use claims::assert_ok;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use pretty_assertions::assert_eq;
     use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
 
     fn open_slave(pty: &Pty) -> File {
         assert_ok!(
@@ -253,36 +200,6 @@ mod tests {
             }
         }
         seen
-    }
-
-    #[test]
-    fn the_fence_keeps_only_the_tail_of_a_flood_and_all_of_a_small_read() {
-        let mut small: Vec<u8> = (0..=255u8).cycle().take(FENCE_KEEP).collect();
-        let before = small.clone();
-        keep_the_tail(&mut small);
-        assert_eq!(small, before);
-        let mut flood: Vec<u8> = (0..=255u8).cycle().take(FENCE_KEEP + 1).collect();
-        let tail = flood[FENCE_KEEP + 1 - FENCE_TAIL..].to_vec();
-        keep_the_tail(&mut flood);
-        assert_eq!(flood, tail);
-    }
-
-    #[test]
-    fn a_primary_attributes_reply_is_recognised_wherever_it_sits_in_what_was_read() {
-        assert!(has_device_attributes_reply(b"\x1b[?62;22c"));
-        assert!(has_device_attributes_reply(b"LATEJUNK\x1b[?1;2c"));
-        assert!(has_device_attributes_reply(b"\x1b[?6c trailing"));
-        for no in [
-            &b""[..],
-            b"\x1b[?62;22",
-            b"\x1b[62;22c",
-            b"\x1b[>0;95;0c",
-            b"c",
-            b"\x1b[?c",
-            b"\x1b[?6x2c",
-        ] {
-            assert!(!has_device_attributes_reply(no), "{no:?}");
-        }
     }
 
     /// A user's terminal that answers the fence query late, and sends a stale reply before that.
@@ -433,7 +350,7 @@ mod tests {
         );
         assert_ok!(child.write_all(b"\x1b]52;c;aGk=\x07\x1b]52;c;?\x07\x1b]52;c;aGk=\x07done"));
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(terminal.finish(), 2);
+        assert_eq!(terminal.finish().allowed, 2);
         let _ = screen.join();
     }
 

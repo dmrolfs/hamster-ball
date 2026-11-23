@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ use nix::sys::signal::Signal;
 use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 use rustix::process::setsid;
+use rustix::termios::{LocalModes, Termios, tcgetattr};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use super::signals::{SignalError, Target, clear_mask};
@@ -88,12 +90,14 @@ pub enum GuardError {
 }
 
 /// One line the guard understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GuardCommand {
     /// Clean up this target if `hb` dies.
     Watch(Target),
     /// `hb` finished normally: exit and touch nothing.
     Release,
+    /// The user's terminal, which `hb` is about to put in raw mode.
+    Terminal(PathBuf),
 }
 
 /// Why a line sent to the guard was refused.
@@ -115,6 +119,7 @@ pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
         ["release"] => Ok(GuardCommand::Release),
+        ["tty", path] => terminal_device(path).map(GuardCommand::Terminal),
         ["watch", kind @ ("group" | "process"), pid] => {
             let pid: i32 = pid.parse().ok().context(BadPidSnafu)?;
             if pid < FIRST_SIGNALLABLE_PID {
@@ -131,6 +136,20 @@ pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
     }
 }
 
+/// A path the guard will write to: a terminal device and nothing else.
+fn terminal_device(path: &str) -> Result<PathBuf, LineError> {
+    let path = Path::new(path);
+    let name = path.strip_prefix("/dev/").map_err(|_| LineError::Unknown)?;
+    let plain = name.components().count() == 1
+        && name.to_string_lossy().starts_with("tty")
+        && !name.to_string_lossy().contains("..");
+    if plain {
+        Ok(path.to_path_buf())
+    } else {
+        UnknownSnafu.fail()
+    }
+}
+
 /// The text `hb` sends to register `target`.
 fn watch_line(target: Target) -> String {
     match target {
@@ -138,6 +157,61 @@ fn watch_line(target: Target) -> String {
         Target::Child(pid) => format!("watch process {pid}\n"),
     }
 }
+
+// ====================================================================================
+// The terminal
+// ====================================================================================
+
+/// What the guard says when `hb` was killed while it held the user's terminal in raw mode.
+///
+/// It cannot put the terminal back: zsh reads the settings when it reaps a job and applies them
+/// to every later command, so any repair from outside is undone (measured; the same is true of
+/// every raw-mode program). It can say what happened and what to type.
+const HINT: &[u8] =
+    b"\r\n[hb was killed while it held your terminal in raw mode. If the terminal misbehaves, type: reset]\r\n";
+
+/// Whether `settings` are what `hb`'s raw mode leaves: signal keys off. A shell that has already
+/// switched line editing back on (zsh does) still shows it.
+fn looks_raw(settings: &Termios) -> bool {
+    !settings.local_modes.contains(LocalModes::ISIG)
+}
+
+/// The user's terminal, opened so the guard can tell whether a killed `hb` left it raw.
+struct TerminalWatch {
+    terminal: File,
+}
+
+impl TerminalWatch {
+    /// Opens the terminal at `path` without making it the guard's controlling terminal.
+    fn open(path: &Path) -> Option<Self> {
+        let terminal = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        tcgetattr(&terminal).ok()?;
+        Some(Self::from_file(terminal))
+    }
+
+    fn from_file(terminal: File) -> Self {
+        Self { terminal }
+    }
+
+    /// Writes the hint if the terminal is raw. Returns whether it did.
+    fn hint_if_raw(&self) -> bool {
+        let raw = tcgetattr(&self.terminal).is_ok_and(|settings| looks_raw(&settings));
+        if raw {
+            let mut terminal = &self.terminal;
+            let _ = terminal.write_all(HINT);
+        }
+        raw
+    }
+}
+
+/// How long the guard waits after `hb` has gone before it looks at the terminal, so a shell that
+/// puts the terminal back itself (bash does) has done so and no hint is printed for nothing.
+const HINT_DELAY: Duration = Duration::from_millis(300);
 
 // ====================================================================================
 // hb's side
@@ -194,6 +268,18 @@ impl Guardian {
         self.process.id()
     }
 
+    /// Tells the guard which terminal `hb` is about to put in raw mode, so that if `hb` is killed
+    /// it can say so.
+    ///
+    /// # Errors
+    /// [`GuardianError::Tell`] if the guard cannot be written to.
+    pub fn terminal(&mut self, path: &Path) -> Result<(), GuardianError> {
+        self.commands
+            .write_all(format!("tty {}\n", path.display()).as_bytes())
+            .and_then(|()| self.commands.flush())
+            .context(TellSnafu)
+    }
+
     /// Asks the guard to end `target` if `hb` dies before [`Guardian::release`].
     ///
     /// # Errors
@@ -243,6 +329,28 @@ enum Next {
 /// [`GuardError`] if it cannot set itself up. It never returns an error after it has started
 /// ending processes.
 pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
+    let (ended, terminal) = guard_loop(grace)?;
+    if ended == Ended::HbGone {
+        if let Some(terminal) = terminal {
+            // Give a shell that puts the terminal back itself time to do it.
+            thread::sleep(HINT_DELAY);
+            terminal.hint_if_raw();
+        }
+    }
+    Ok(())
+}
+
+/// How the guard's loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// `hb` sent `release`.
+    Released,
+    /// `hb` is gone without one, and what it left running has been dealt with.
+    HbGone,
+}
+
+/// The guard's loop: reads orders, watches processes, and ends them if `hb` goes away.
+fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardError> {
     clear_mask().context(MaskSnafu)?;
     // A session of its own: no terminal signal (Ctrl-C, hangup) reaches the guard. It is
     // already a leader when started by hand, which is fine.
@@ -266,6 +374,7 @@ pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
         .context(QueueSnafu)?;
 
     let mut watched: HashMap<i32, Target> = HashMap::new();
+    let mut terminal: Option<TerminalWatch> = None;
     let mut buffered: Vec<u8> = Vec::new();
     let mut pipe_open = true;
     let mut terminating: Option<Instant> = None;
@@ -282,13 +391,13 @@ pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
         if !pipe_open && terminating.is_none() {
             // `hb` is gone and did not release: end what is left.
             if watched.is_empty() {
-                return Ok(());
+                return Ok((Ended::HbGone, terminal));
             }
             send_all(&watched, Signal::SIGTERM);
             terminating = Some(Instant::now() + grace);
         }
         if terminating.is_some() && watched.is_empty() {
-            return Ok(());
+            return Ok((Ended::HbGone, terminal));
         }
         let timeout = terminating.map(|deadline| {
             TimeSpec::from_duration(deadline.saturating_duration_since(Instant::now()))
@@ -301,15 +410,20 @@ pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
         if ready == 0 {
             if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
                 send_all(&watched, Signal::SIGKILL);
-                return Ok(());
+                return Ok((Ended::HbGone, terminal));
             }
             continue;
         }
         for event in &events[..ready] {
             match event.filter() {
                 Ok(EventFilter::EVFILT_READ) if pipe_open => {
-                    let (next, open) =
-                        read_commands(&mut commands, &mut buffered, &mut watched, &queue)?;
+                    let (next, open) = read_commands(
+                        &mut commands,
+                        &mut buffered,
+                        &mut watched,
+                        &mut terminal,
+                        &queue,
+                    )?;
                     pipe_open = open;
                     if !open {
                         // End of input stays readable; stop being told about it.
@@ -324,7 +438,7 @@ pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
                         let _ = queue.kevent(&[done], &mut [], Some(zero()));
                     }
                     if next == Next::Release {
-                        return Ok(());
+                        return Ok((Ended::Released, None));
                     }
                 }
                 Ok(EventFilter::EVFILT_PROC) => {
@@ -353,6 +467,7 @@ fn read_commands(
     commands: &mut File,
     buffered: &mut Vec<u8>,
     watched: &mut HashMap<i32, Target>,
+    terminal: &mut Option<TerminalWatch>,
     queue: &Kqueue,
 ) -> Result<(Next, bool), GuardError> {
     let mut chunk = [0u8; 256];
@@ -371,6 +486,7 @@ fn read_commands(
         match parse_line(&text) {
             Ok(GuardCommand::Release) => return Ok((Next::Release, true)),
             Ok(GuardCommand::Watch(target)) => watch(target, watched, queue),
+            Ok(GuardCommand::Terminal(path)) => *terminal = TerminalWatch::open(&path),
             // A line the guard does not understand protects nothing; the next one may.
             Err(_) => {}
         }
@@ -408,6 +524,7 @@ mod tests {
     use super::*;
     use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
+    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
 
     #[test]
     fn a_watch_line_names_a_group_or_a_single_process() {
@@ -469,6 +586,69 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    fn a_terminal() -> (crate::session::pty::Pty, File) {
+        let pty = assert_ok!(crate::session::pty::Pty::open());
+        let slave = assert_ok!(
+            File::options()
+                .read(true)
+                .write(true)
+                .open(pty.slave_path().as_str())
+        );
+        (pty, slave)
+    }
+
+    #[test]
+    fn a_tty_line_names_a_terminal_device_and_nothing_else() {
+        assert_eq!(
+            assert_ok!(parse_line("tty /dev/ttys004")),
+            GuardCommand::Terminal(std::path::PathBuf::from("/dev/ttys004"))
+        );
+        for bad in [
+            "tty",
+            "tty /etc/passwd",
+            "tty /dev/null",
+            "tty /dev/../etc/passwd",
+            "tty /dev/ttys004 /dev/ttys005",
+            "tty relative/tty",
+        ] {
+            assert!(parse_line(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_is_raw_when_signal_keys_are_off_and_cooked_when_they_are_on() {
+        let (_pty, slave) = a_terminal();
+        let cooked = assert_ok!(tcgetattr(&slave));
+        assert!(!looks_raw(&cooked));
+        let mut raw = cooked.clone();
+        raw.make_raw();
+        assert!(looks_raw(&raw));
+        // What zsh leaves after adopting hb's settings: line editing back on, signal keys still off.
+        let mut hybrid = raw.clone();
+        hybrid
+            .local_modes
+            .insert(LocalModes::ICANON | LocalModes::ECHO);
+        assert!(looks_raw(&hybrid));
+    }
+
+    #[test]
+    fn the_hint_is_written_to_a_raw_terminal_and_not_to_a_cooked_one() {
+        let (pty, slave) = a_terminal();
+        let mut screen = assert_ok!(pty.clone_master());
+        let watch = TerminalWatch::from_file(assert_ok!(slave.try_clone()));
+        assert!(!watch.hint_if_raw(), "a cooked terminal got a hint");
+        let mut raw = assert_ok!(tcgetattr(&slave));
+        raw.make_raw();
+        assert_ok!(tcsetattr(&slave, OptionalActions::Now, &raw));
+        assert!(watch.hint_if_raw());
+        let mut seen = vec![0u8; 512];
+        let n = assert_ok!(std::io::Read::read(&mut screen, &mut seen));
+        let text = String::from_utf8_lossy(&seen[..n]).into_owned();
+        assert!(text.contains("hb was killed"), "{text:?}");
+        assert!(text.contains("reset"), "{text:?}");
+        assert!(text.starts_with("\r\n"), "{text:?}");
     }
 
     #[test]

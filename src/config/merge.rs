@@ -19,7 +19,7 @@ use snafu::Snafu;
 
 use super::closure::ClosureFile;
 use super::location::FileLocation;
-use super::resolve::ResolvedMcpServer;
+use super::resolve::{ResolvedConfig, ResolvedMcpServer};
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
     Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
@@ -94,6 +94,26 @@ impl MergedTls {
     }
 }
 
+/// The merged `[terminal]` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergedTerminal {
+    /// `Some(false)` if any file says `false` (the stricter value), else `Some(true)` if any
+    /// says `true`, else `None`. The sources are the files that gave the winning value.
+    pub clipboard_write: Option<Sourced<bool>>,
+}
+
+impl MergedTerminal {
+    /// Whether the agent may set the user's clipboard: unless some file says `false`. The
+    /// default is to allow, because under `hb` the terminal's `OSC 52` is the agent's only clipboard path.
+    #[must_use]
+    pub fn effective_clipboard_write(&self) -> bool {
+        self.clipboard_write
+            .as_ref()
+            .is_none_or(|setting| setting.value)
+    }
+}
+
 /// The merged `[ctl]` rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -118,6 +138,8 @@ pub struct Policy {
     pub env: MergedEnv,
     /// `[tls]`.
     pub tls: MergedTls,
+    /// `[terminal]`.
+    pub terminal: MergedTerminal,
     /// `[ctl]`.
     pub ctl: MergedCtl,
     /// `[mcp.<name>]`, in sorted name order; every file naming a server must agree on it.
@@ -264,6 +286,9 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
             system_trust: system_trust(files),
             extra_ca_files: union(files, |c| positions(&c.tls.extra_ca_files)),
         },
+        terminal: MergedTerminal {
+            clipboard_write: stricter_flag(files, |c| c.terminal.clipboard_write),
+        },
         ctl: MergedCtl {
             label: label(files, &mut collected),
             containers: union(files, |c| positions(&c.ctl.containers)),
@@ -405,17 +430,25 @@ fn keyed<K: Ord + Clone, V: PartialEq + Clone>(
         .collect()
 }
 
-/// `false` beats `true`: any file that distrusts the system store wins.
-fn system_trust(files: &[ClosureFile]) -> Option<Sourced<bool>> {
+/// `false` beats `true`: any file that says `false` wins, so a file can only tighten a setting.
+fn stricter_flag(
+    files: &[ClosureFile],
+    get: impl Fn(&ResolvedConfig) -> Option<bool>,
+) -> Option<Sourced<bool>> {
     let sources_saying = |wanted: bool| -> Vec<Source> {
         files
             .iter()
-            .filter(|file| file.resolved.tls.system_trust == Some(wanted))
+            .filter(|file| get(&file.resolved) == Some(wanted))
             .map(|file| Source::value(file.id))
             .collect()
     };
     Sourced::from_sources(false, sources_saying(false))
         .or_else(|| Sourced::from_sources(true, sources_saying(true)))
+}
+
+/// `tls.system_trust`: any file that distrusts the system store wins.
+fn system_trust(files: &[ClosureFile]) -> Option<Sourced<bool>> {
+    stricter_flag(files, |c| c.tls.system_trust)
 }
 
 /// Every file that sets a label must set the same one.
@@ -964,6 +997,43 @@ mod tests {
             project(with_trust(None)),
         ]);
         assert_eq!(policy.tls.system_trust, None);
+    }
+
+    fn with_clipboard(value: Option<bool>) -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.terminal.clipboard_write = value;
+        config
+    }
+
+    #[test]
+    fn clipboard_write_false_beats_true_from_any_file_and_a_project_can_only_tighten_it() {
+        let policy = merged(vec![
+            user("base", with_clipboard(Some(true))),
+            project(with_clipboard(Some(false))),
+        ]);
+        let setting = assert_some!(policy.terminal.clipboard_write.clone());
+        assert!(!setting.value);
+        assert_eq!(setting.sources, vec![Source::value(FileId::new(1))]);
+        assert!(!policy.terminal.effective_clipboard_write());
+        // A project cannot turn back on what the user turned off.
+        let policy = merged(vec![
+            user("base", with_clipboard(Some(false))),
+            project(with_clipboard(Some(true))),
+        ]);
+        assert!(!policy.terminal.effective_clipboard_write());
+    }
+
+    #[test]
+    fn clipboard_write_is_allowed_unless_some_file_says_false() {
+        let unset = merged(vec![user("base", with_clipboard(None))]);
+        assert_eq!(unset.terminal.clipboard_write, None);
+        assert!(unset.terminal.effective_clipboard_write());
+        let on = merged(vec![
+            user("base", with_clipboard(Some(true))),
+            project(with_clipboard(None)),
+        ]);
+        assert!(assert_some!(on.terminal.clipboard_write.clone()).value);
+        assert!(on.terminal.effective_clipboard_write());
     }
 
     fn with_label(label: Option<&str>) -> ResolvedConfig {

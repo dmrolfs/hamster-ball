@@ -18,13 +18,13 @@ use std::time::Instant;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use super::relay::{BUFFER, DRAIN_MAX, DRAIN_QUIET, TICK_MS, end_of_output};
-use super::sanitize::Sanitizer;
+use super::sanitize::{ClipboardPolicy, ClipboardUse, Sanitizer};
 
 /// A running copy of one stream to the terminal. Call [`Pump::finish`] after the agent has ended.
 #[derive(Debug)]
 pub struct Pump {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<usize>,
+    handle: JoinHandle<ClipboardUse>,
 }
 
 impl Pump {
@@ -33,25 +33,42 @@ impl Pump {
     /// # Errors
     /// [`io::Error`] if the thread cannot be started.
     pub fn start(source: OwnedFd, sink: OwnedFd) -> io::Result<Self> {
+        Self::start_with(source, sink, ClipboardPolicy::default())
+    }
+
+    /// Like [`Pump::start`], with a policy for the agent's clipboard writes.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the thread cannot be started.
+    pub fn start_with(
+        source: OwnedFd,
+        sink: OwnedFd,
+        clipboard: ClipboardPolicy,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("hb-pump".to_owned())
-            .spawn(move || run(File::from(source), File::from(sink), &flag))?;
+            .spawn(move || run(File::from(source), File::from(sink), &flag, clipboard))?;
         Ok(Self { stop, handle })
     }
 
     /// Tells the pump the agent has ended, lets it drain what is left, and waits for it.
     ///
-    /// Returns how many clipboard writes went through.
-    pub fn finish(self) -> usize {
+    /// Returns what the agent did with the clipboard: writes let through, and writes removed.
+    pub fn finish(self) -> ClipboardUse {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().unwrap_or(0)
+        self.handle.join().unwrap_or_default()
     }
 }
 
-fn run(mut source: File, mut sink: File, stop: &AtomicBool) -> usize {
-    let mut filter = Sanitizer::new();
+fn run(
+    mut source: File,
+    mut sink: File,
+    stop: &AtomicBool,
+    clipboard: ClipboardPolicy,
+) -> ClipboardUse {
+    let mut filter = Sanitizer::with_clipboard(clipboard);
     let mut draining_since: Option<Instant> = None;
     let mut buffer = [0u8; BUFFER];
     loop {
@@ -84,7 +101,7 @@ fn run(mut source: File, mut sink: File, stop: &AtomicBool) -> usize {
         }
     }
     end_of_output(&mut filter, &mut sink);
-    filter.clipboard_writes()
+    filter.clipboard_use()
 }
 
 #[cfg(test)]
@@ -133,7 +150,7 @@ mod tests {
         assert_ok!(rig.agent.write_all(text));
         drop(rig.agent);
         assert_eq!(read_all(&mut rig.screen), text);
-        assert_eq!(rig.pump.finish(), 0);
+        assert_eq!(rig.pump.finish(), ClipboardUse::default());
     }
 
     #[test]
@@ -166,7 +183,7 @@ mod tests {
         drop(rig.agent);
         let seen = read_all(&mut rig.screen);
         assert!(seen.ends_with(b"\x18"), "{seen:?}");
-        assert_eq!(rig.pump.finish(), 1);
+        assert_eq!(rig.pump.finish().allowed, 1);
     }
 
     #[test]
@@ -185,6 +202,28 @@ mod tests {
         rig.pump.finish();
         assert_ok!(writer.join().map_err(|_| "writer panicked"));
         assert_eq!(read_all(&mut rig.screen), b"just in time");
+    }
+
+    #[test]
+    fn with_clipboard_writes_denied_none_reaches_the_terminal_and_finish_counts_the_blocked() {
+        let (mut agent, theirs) = assert_ok!(UnixStream::pair());
+        let (mut screen, sink) = assert_ok!(UnixStream::pair());
+        assert_ok!(screen.set_read_timeout(Some(Duration::from_millis(300))));
+        let pump = assert_ok!(Pump::start_with(
+            OwnedFd::from(theirs),
+            OwnedFd::from(sink),
+            ClipboardPolicy::Deny
+        ));
+        assert_ok!(agent.write_all(b"a\x1b]52;c;aGk=\x07b"));
+        drop(agent);
+        assert_eq!(read_all(&mut screen), b"ab");
+        assert_eq!(
+            pump.finish(),
+            ClipboardUse {
+                allowed: 0,
+                blocked: 1
+            }
+        );
     }
 
     #[test]

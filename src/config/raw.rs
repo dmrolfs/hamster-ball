@@ -23,6 +23,7 @@ pub(crate) struct RawConfig {
     pub(crate) net: RawNet,
     pub(crate) env: RawEnv,
     pub(crate) tls: RawTls,
+    pub(crate) terminal: RawTerminal,
     pub(crate) ctl: RawCtl,
     pub(crate) mcp: BTreeMap<String, RawMcpServer>,
     pub(crate) hooks: Vec<Vec<String>>,
@@ -62,6 +63,13 @@ pub(crate) struct RawEnv {
 pub(crate) struct RawTls {
     pub(crate) system_trust: Option<bool>,
     pub(crate) extra_ca_files: Vec<String>,
+}
+
+/// `[terminal]`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct RawTerminal {
+    pub(crate) clipboard_write: Option<bool>,
 }
 
 /// `[ctl]`.

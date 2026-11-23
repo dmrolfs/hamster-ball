@@ -462,6 +462,44 @@ fn a_late_reply_is_never_typed_into_the_shell_when_the_run_has_no_pty() {
 }
 
 #[test]
+fn with_no_pty_a_late_reply_to_an_ordinary_query_and_a_mode_left_on_do_not_reach_the_shell() {
+    // The filter lets cursor-position queries and mouse-mode requests through. A buggy terminal's
+    // reply to one, or a mouse mode left on, would be typed into the shell once hb is gone.
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.base.join("typed-into-the-shell");
+    let agent = program(
+        &w,
+        "position.pl",
+        "$|=1; print \"\\e[6n\\e[?1000h\\e[?1004h\"; print \"agent-done\\n\";\n",
+    );
+    let body = format!(
+        "{emulator}\n\
+         spawn -noecho /bin/bash --norc --noprofile -i\n\
+         expect {{$ }}\nsend {{PS1='<\\#>PROMPT> '}}\nsend \"\\r\"\nexpect \"<2>PROMPT> \"\n\
+         send \"$drive run -- /usr/bin/perl {agent} < /dev/null\\r\"\n\
+         serve_terminal \"<3>PROMPT> \" 1200\n\
+         send \"\\r\"\nexpect -re {{<[0-9]+>PROMPT> }}\n\
+         send \"printf 'VERDICT=%s\\\\n' \\$(test -e {marker} && echo typed || echo clean)\\r\"\n\
+         expect -re {{VERDICT=(typed|clean)\\r}}\n\
+         puts \"RESULT:$expect_out(1,string)\"\n\
+         send \"exit\\r\"\nexpect eof\n",
+        emulator = emulator(&format!("touch {}", marker.display()), 400),
+        agent = agent,
+        marker = marker.display(),
+    );
+    let out = expect_with(&w, &[], false, &body);
+    assert!(
+        out.contains("RESULT:clean"),
+        "a late reply with no pty ran in the user's shell: {out}"
+    );
+    assert!(!marker.exists());
+    for mode in ["\u{1b}[?1000l", "\u{1b}[?1004l"] {
+        assert!(out.contains(mode), "{mode:?} was not switched off: {out}");
+    }
+}
+
+#[test]
 fn with_no_pty_the_agents_output_is_a_pipe_but_arrives_unchanged() {
     sandboxed!();
     let w = World::new(PROJECT);
@@ -539,6 +577,64 @@ fn a_run_with_no_pty_says_it_too_and_says_nothing_when_the_clipboard_was_not_tou
     assert!(!out.contains("clipboard"), "{out}");
 }
 
+const REFUSED: &str = "warning: the agent tried to set your clipboard 2 times; terminal.clipboard_write = false stopped it";
+
+#[test]
+fn with_clipboard_writes_denied_a_run_on_a_pty_removes_them_and_says_so() {
+    sandboxed!();
+    let w = World::new(&format!("{PROJECT}[terminal]\nclipboard_write = false\n"));
+    let agent = clipboard_agent(&w);
+    let out = expect(
+        &w,
+        &[],
+        &format!("spawn -noecho $drive run -- /usr/bin/perl {agent}\nexpect eof\n"),
+    );
+    assert!(out.contains("copied"), "{out}");
+    assert!(
+        !out.contains("\u{1b}]52;"),
+        "an OSC 52 reached the terminal: {out:?}"
+    );
+    assert!(out.contains(REFUSED), "{out}");
+    assert!(!out.contains("the agent set your clipboard"), "{out}");
+}
+
+#[test]
+fn with_clipboard_writes_denied_a_run_with_no_pty_does_the_same() {
+    sandboxed!();
+    let w = World::new(&format!("{PROJECT}[terminal]\nclipboard_write = false\n"));
+    let agent = clipboard_agent(&w);
+    let out = expect(
+        &w,
+        &[],
+        &format!(
+            "spawn -noecho /bin/sh -c \"$drive run -- /usr/bin/perl {agent} < /dev/null\"\nexpect eof\n"
+        ),
+    );
+    assert!(out.contains("copied"), "{out}");
+    assert!(
+        !out.contains("\u{1b}]52;"),
+        "an OSC 52 reached the terminal: {out:?}"
+    );
+    assert!(out.contains(REFUSED), "{out}");
+}
+
+#[test]
+fn a_project_cannot_turn_clipboard_writes_back_on_after_the_users_base_denied_them() {
+    sandboxed!();
+    let w = World::with_base(
+        "[terminal]\nclipboard_write = false\n",
+        &format!("{PROJECT}[terminal]\nclipboard_write = true\n"),
+    );
+    let agent = clipboard_agent(&w);
+    let out = expect(
+        &w,
+        &[],
+        &format!("spawn -noecho $drive run -- /usr/bin/perl {agent}\nexpect eof\n"),
+    );
+    assert!(!out.contains("\u{1b}]52;"), "{out:?}");
+    assert!(out.contains(REFUSED), "{out}");
+}
+
 #[test]
 fn a_single_clipboard_write_is_reported_in_the_singular() {
     sandboxed!();
@@ -553,6 +649,61 @@ fn a_single_clipboard_write_is_reported_in_the_singular() {
         out.contains("warning: the agent set your clipboard 1 time\n")
             || out.contains("warning: the agent set your clipboard 1 time\r"),
         "{out}"
+    );
+}
+
+/// The Tcl that starts `hb` under `shell`, kills it with SIGKILL, and waits a moment.
+fn kill_hb_in_a_shell(w: &World, shell_command: &str, prompt_pattern: &str, tail: &str) -> String {
+    let waits = program(
+        w,
+        "wait.pl",
+        "$|=1; print \"hbpid=\", getppid(), \"\\nready\\n\"; sleep 1 for 1..60;\n",
+    );
+    let body = format!(
+        "spawn -noecho {shell_command}\nexpect -re {{{prompt_pattern}}}\nsend \"PS1='PROMPT> '\\r\"\nexpect \"PROMPT> \"\n\
+         send \"$drive run -- /usr/bin/perl {waits}\\r\"\nexpect -re {{hbpid=([0-9]+)}}\nset hbpid $expect_out(1,string)\nexpect \"ready\"\n\
+         exec /bin/kill -9 $hbpid\nexpect \"PROMPT> \"\n{tail}\nsend \"exit\\r\"\nexpect eof\n"
+    );
+    expect(w, &[], &body)
+}
+
+#[test]
+fn a_sigkilled_hb_that_left_a_zsh_terminal_raw_says_so_and_names_reset() {
+    // zsh adopts the raw settings of a job that was killed, and no repair from outside survives
+    // that, so the guard cannot fix the terminal. It can say what happened.
+    sandboxed!();
+    if !std::path::Path::new("/bin/zsh").exists() {
+        eprintln!("SKIP: no zsh");
+        return;
+    }
+    let w = World::new(PROJECT);
+    let out = kill_hb_in_a_shell(
+        &w,
+        "/bin/zsh -f -i",
+        "[%#] ",
+        "expect -re {type: reset\\]}\nputs \"\\nHINT-SEEN\"",
+    );
+    assert!(out.contains("HINT-SEEN"), "{out}");
+    assert!(
+        out.contains("hb was killed while it held your terminal in raw mode"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_sigkilled_hb_under_bash_prints_no_hint_because_bash_puts_the_terminal_back() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let out = kill_hb_in_a_shell(
+        &w,
+        "/bin/bash --norc --noprofile -i",
+        "[$] ",
+        "sleep 1.5\nsend \"echo AFTER-THE-WAIT\\r\"\nexpect -re {AFTER-THE-WAIT\\r}",
+    );
+    assert!(out.contains("AFTER-THE-WAIT"), "{out}");
+    assert!(
+        !out.contains("hb was killed"),
+        "a hint was printed for a cooked terminal: {out}"
     );
 }
 

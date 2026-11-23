@@ -2415,6 +2415,12 @@
     },
     "extra_ca_files": []
   },
+  "terminal": {
+    "clipboard_write": {
+      "value": true,
+      "origins": []
+    }
+  },
   "ctl": {
     "label": {
       "value": "com.docker.compose.project=demo",

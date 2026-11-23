@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-use super::sanitize::Sanitizer;
+use super::sanitize::{ClipboardPolicy, ClipboardUse, Sanitizer};
 
 /// How often the thread looks at the stop flag when nothing arrives.
 pub(super) const TICK_MS: u8 = 50;
@@ -52,7 +52,7 @@ impl Shared {
 #[derive(Debug)]
 pub struct Relay {
     shared: Arc<Shared>,
-    handle: JoinHandle<usize>,
+    handle: JoinHandle<ClipboardUse>,
 }
 
 impl Relay {
@@ -61,6 +61,19 @@ impl Relay {
     /// # Errors
     /// [`io::Error`] if the thread cannot be started.
     pub fn start(input: OwnedFd, master: File, output: OwnedFd) -> io::Result<Self> {
+        Self::start_with(input, master, output, ClipboardPolicy::default())
+    }
+
+    /// Like [`Relay::start`], with a policy for the agent's clipboard writes.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the thread cannot be started.
+    pub fn start_with(
+        input: OwnedFd,
+        master: File,
+        output: OwnedFd,
+        clipboard: ClipboardPolicy,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             gate: Mutex::new(Gate::Open),
@@ -70,7 +83,7 @@ impl Relay {
         let handle = thread::Builder::new()
             .name("hb-relay".to_owned())
             .spawn(move || {
-                let mut filter = Sanitizer::new();
+                let mut filter = Sanitizer::with_clipboard(clipboard);
                 run(
                     File::from(input),
                     master,
@@ -78,7 +91,7 @@ impl Relay {
                     &theirs,
                     &mut filter,
                 );
-                filter.clipboard_writes()
+                filter.clipboard_use()
             })?;
         Ok(Self { shared, handle })
     }
@@ -108,12 +121,12 @@ impl Relay {
 
     /// Tells the relay the child has ended, lets it drain the last output, and waits for it.
     ///
-    /// Returns how many clipboard writes the agent made that went through to the terminal.
-    pub fn finish(self) -> usize {
+    /// Returns what the agent did with the clipboard: writes let through, and writes removed.
+    pub fn finish(self) -> ClipboardUse {
         self.shared.stop.store(true, Ordering::Relaxed);
         *self.shared.gate() = Gate::Open;
         self.shared.changed.notify_all();
-        self.handle.join().unwrap_or(0)
+        self.handle.join().unwrap_or_default()
     }
 }
 
@@ -331,9 +344,39 @@ mod tests {
         );
         assert!(!read_some(&mut rig.user, b"end").is_empty());
         assert_eq!(
-            rig.relay.finish(),
+            rig.relay.finish().allowed,
             2,
             "two writes, and a read that was removed"
+        );
+    }
+
+    #[test]
+    fn with_clipboard_writes_denied_none_reaches_the_screen_and_finish_counts_them_as_blocked() {
+        let outer = assert_ok!(Pty::open());
+        let inner = assert_ok!(Pty::open());
+        let outer_slave = open_slave(&outer);
+        let mut child = open_slave(&inner);
+        std::mem::forget(assert_ok!(RawMode::enter(
+            assert_ok!(outer_slave.try_clone()).into()
+        )));
+        std::mem::forget(assert_ok!(RawMode::enter(
+            assert_ok!(child.try_clone()).into()
+        )));
+        let relay = assert_ok!(Relay::start_with(
+            assert_ok!(outer_slave.try_clone()).into(),
+            assert_ok!(inner.clone_master()),
+            outer_slave.into(),
+            ClipboardPolicy::Deny,
+        ));
+        let mut user = assert_ok!(outer.clone_master());
+        assert_ok!(child.write_all(b"a\x1b]52;c;aGk=\x07b\x1b]52;p;aGk=\x07end"));
+        assert_eq!(read_some(&mut user, b"end"), b"abend");
+        assert_eq!(
+            relay.finish(),
+            ClipboardUse {
+                allowed: 0,
+                blocked: 2
+            }
         );
     }
 

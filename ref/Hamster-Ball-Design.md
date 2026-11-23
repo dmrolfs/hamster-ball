@@ -121,7 +121,7 @@ config never applies silently.
 - `deny` rules from every layer apply, and **deny wins** over any allow. A read-deny (`fs.deny_read`) also denies
   write, delete and rename; a write-deny denies only those (D34).
 - There is no syntax to remove or narrow an entry that a lower layer added. A project can only add.
-- Scalars (few exist) never loosen: `tls.system_trust` takes `false` if any file says `false` (D35), and
+- Scalars (few exist) never loosen: `tls.system_trust` and `terminal.clipboard_write` take `false` if any file says `false` (D35, D67), and
   `ctl.label` must be the same in every file that sets it, because a project label would otherwise replace the base's
   scope (D33). The earlier "otherwise the highest layer" fallback is removed.
 - Sections that run code on the host or switch protections off (`hooks`, `guard.exceptions`) are accepted **only**
@@ -177,6 +177,9 @@ tools = ["node", "git"]                         # programs found on your PATH wh
 [tls]
 system_trust = true                             # base default; see 4.5
 extra_ca_files = []
+
+[terminal]
+clipboard_write = true                          # false: remove the agent's OSC 52 clipboard writes; see 7.3
 
 [ctl]                                           # section 9
 label      = "com.docker.compose.project=icehouse"
@@ -550,9 +553,13 @@ pipe to it. A normal end sends `release` and the guard exits. If the pipe closes
 running SIGTERM and, after 2 s, SIGKILL. It watches each registered process with a kernel exit notification, so a process that
 has ended is forgotten and its number, which the system may give to an unrelated program, is never signalled. Measured before the
 guard: with no terminal, a killed `hb` left both the agent and the `log stream` running (with a pty the kernel hangs up the agent,
-and `log stream` dies with the session). **The raw terminal is not repaired**: bash puts the terminal back itself, but zsh (the
-macOS login shell) reads the terminal's settings when it reaps the job and applies them to later commands, so a guard that restores
-the settings loses that race every time (0 of 8 in a trace that showed the guard restoring them first) and `reset` stays the cure.
+and `log stream` dies with the session). **The raw terminal cannot be repaired, so the guard says so.** Bash puts the terminal back itself. zsh (the macOS login shell)
+adopts the settings of a job that was killed and applies them to every later command: measured, with a guard that restored the
+settings first (0 of 8), and with `stty sane` from outside at 0 and 300 ms after the shell reaped the job (undone at the next
+command both times). That holds for every raw-mode program, not only `hb`. So the guard is told the user's terminal when `hb` is
+about to put it in raw mode, and if `hb` dies without a release it waits 300 ms and, if the signal keys are still off, writes
+`[hb was killed while it held your terminal in raw mode. If the terminal misbehaves, type: reset]`. Under bash, which has
+repaired it, nothing is printed.
 
 **What the agent can ask the user's terminal** (D67). The agent's output reaches the user's real terminal, and some terminals
 answer some queries with text the asker chose, typing the answer into the terminal's input: the title report (CVE-2003-0063
@@ -580,15 +587,20 @@ measures:
 3. **No unfiltered mode.** When stdin is not a terminal there is no pty, but if stdout or stderr is a terminal the agent is given a
    pipe for it and `hb` copies the pipe to the terminal through the same filter (`session::pump`). The agent then sees a stdout that
    is not a terminal, as it would in `agent | tee`, which is what a batch or print-mode run expects; every interactive agent needs a
-   terminal on stdin as well, so none of them is affected. The exit fence does not apply here (`hb` is not reading the terminal's
-   input), so the filter alone keeps the replies an agent could shape from existing. Measured before the change: with
-   `hb run -- agent < /dev/null` a late title-report reply ran a command in the user's shell. The two streams are copied by separate
-   threads, so their interleaving on screen can differ from a shared terminal's. A background process of the agent that keeps a pipe
-   open cannot hold up the end of the run (the copy stops 150 ms after the last byte, 2 s at most).
-4. **Clipboard writes are counted.** An agent can only reach the clipboard through `OSC 52` (`pbcopy`, `pbpaste` and `osascript`
-   are denied the pasteboard, measured), so writes pass and reads are dropped. At the end of a run `hb` prints
-   `warning: the agent set your clipboard N times` when there were any, so a write the user did not ask for does not go unnoticed.
-   A switch to deny writes was considered and left out until someone needs it.
+   terminal on stdin as well, so none of them is affected. `hb` is not relaying the terminal here, so at the end it does what it does
+   for a pty run on its own copy of the terminal: it puts the terminal in raw mode (so the answers are not echoed), switches off
+   mouse, focus and paste reporting, asks for the device attributes, discards input until the answer, and restores the settings.
+   It does this only if its own process group is the terminal's foreground group, because from the background it would be
+   stopped. Measured before the change: with `hb run -- agent < /dev/null` a late title-report reply ran a command in the user's
+   shell. The two streams are copied by separate threads, so their interleaving on screen can differ from a shared terminal's. A
+   background process of the agent that keeps a pipe open cannot hold up the end of the run (the copy stops 150 ms after the last
+   byte, 2 s at most).
+4. **Clipboard writes are counted, and can be refused.** An agent can only reach the clipboard through `OSC 52` (`pbcopy`,
+   `pbpaste` and `osascript` are denied the pasteboard, measured), so writes pass by default and reads are dropped. At the end of
+   a run `hb` prints `warning: the agent set your clipboard N times` when there were any. `[terminal] clipboard_write = false`
+   removes the writes instead, and the end of the run says `the agent tried to set your clipboard N times;
+   terminal.clipboard_write = false stopped it`. Like `tls.system_trust`, `false` from any file wins, so a project can refuse but
+   cannot turn back on what the user's base refused. `hb init` writes the setting commented out.
 
 Measured on the four agents: they emit OSC 0, 4, 8, 10 to 12 and 112 and the other sequences above, all of which pass. Two capability
 probes are dropped (pi's `OSC 7501;?` and opencode's `OSC 66`, a kitty text-sizing probe followed by a cursor-position query), and
@@ -918,4 +930,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |
 | D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
 | D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it watches each with a kernel exit notification so it never signals a reused number; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
-| D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard | owner, hb-ghd.2.4 follow-up |
+| D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard, and `[terminal] clipboard_write = false` (any file wins) removes the writes and says it did; after a no-pty run `hb` runs the same mode reset and device-attributes fence on the terminal; the guard prints a one-line hint when a killed `hb` left the terminal raw | owner, hb-ghd.2.4 follow-up |

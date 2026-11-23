@@ -20,11 +20,13 @@ use snafu::{ResultExt, Snafu, ensure};
 use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
 use super::interactive::{Interactive, InteractiveError};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::pty::{Pty, PtyError};
 use super::pump::Pump;
+use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::policy::{CanonicalPath, PathError, ToolName};
@@ -435,6 +437,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     // If hb is killed (SIGKILL cannot be handled) nothing in hb can end the agent or the log
     // stream, so a guard process does. It exists whenever hb supervises the run.
     let mut guard = helper.map(Guardian::start).transpose()?;
+    if let (Some(guard), Some(_), Some(terminal)) = (guard.as_mut(), &pty, user_terminal()) {
+        // So that if hb is killed while it holds the terminal raw, the guard can say what happened.
+        guard.terminal(&terminal)?;
+    }
     // The log is listening before the child starts, so its first denials are not missed.
     let log = match (&tag, &spec.denials) {
         (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
@@ -456,8 +462,13 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             return Err(error.into());
         }
     }
+    let clipboard = if loaded.policy.terminal.effective_clipboard_write() {
+        ClipboardPolicy::Allow
+    } else {
+        ClipboardPolicy::Deny
+    };
     let pumps = if spec.stdio == StdioMode::Inherit && pty.is_none() {
-        match start_pumps(&mut child) {
+        match start_pumps(&mut child, clipboard) {
             Ok(pumps) => pumps,
             Err(error) => {
                 abort_child(&mut child);
@@ -468,7 +479,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         Vec::new()
     };
     let mut running = match pty {
-        Some(pty) => start_on_pty(child, pty, watch, spec.signals)?,
+        Some(pty) => start_on_pty(child, pty, watch, spec.signals, clipboard)?,
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
     running.pumps = pumps;
@@ -482,10 +493,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         exit,
         stdout,
         stderr,
-        clipboard_writes,
+        clipboard,
     } = waited?;
     drop(session);
-    warnings.extend(clipboard_notice(clipboard_writes));
+    warnings.extend(clipboard_notices(clipboard));
     Ok(Outcome {
         exit,
         stdout,
@@ -515,38 +526,81 @@ struct Waited {
     exit: ExitKind,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    /// How many times the agent set the user's clipboard.
-    clipboard_writes: usize,
+    /// What the agent did with the user's clipboard.
+    clipboard: ClipboardUse,
 }
 
 /// Starts a [`Pump`] for each of the child's streams that was given a pipe in place of the
 /// user's terminal.
-fn start_pumps(child: &mut Child) -> Result<Vec<Pump>, RunError> {
+fn start_pumps(child: &mut Child, clipboard: ClipboardPolicy) -> Result<Vec<Pump>, RunError> {
     let mut pumps = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let sink = io::stdout()
             .as_fd()
             .try_clone_to_owned()
             .context(OutputFilterSnafu)?;
-        pumps.push(Pump::start(OwnedFd::from(stdout), sink).context(OutputFilterSnafu)?);
+        pumps.push(
+            Pump::start_with(OwnedFd::from(stdout), sink, clipboard).context(OutputFilterSnafu)?,
+        );
     }
     if let Some(stderr) = child.stderr.take() {
         let sink = io::stderr()
             .as_fd()
             .try_clone_to_owned()
             .context(OutputFilterSnafu)?;
-        pumps.push(Pump::start(OwnedFd::from(stderr), sink).context(OutputFilterSnafu)?);
+        pumps.push(
+            Pump::start_with(OwnedFd::from(stderr), sink, clipboard).context(OutputFilterSnafu)?,
+        );
     }
     Ok(pumps)
 }
 
-/// The line that tells the user their clipboard was set, or nothing if it was not.
-fn clipboard_notice(writes: usize) -> Option<String> {
-    match writes {
-        0 => None,
-        1 => Some("the agent set your clipboard 1 time".to_owned()),
-        n => Some(format!("the agent set your clipboard {n} times")),
+/// The path of the user's terminal (hb's stdin), if it has one.
+fn user_terminal() -> Option<std::path::PathBuf> {
+    let name = rustix::termios::ttyname(io::stdin(), Vec::new()).ok()?;
+    Some(std::path::PathBuf::from(
+        name.to_string_lossy().into_owned(),
+    ))
+}
+
+/// The terminal the agent's output went to, as a descriptor `hb` can also read from: its stdout, or
+/// failing that its stderr, whichever is a terminal.
+fn output_terminal() -> Option<OwnedFd> {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let fd = if stdout.is_terminal() {
+        stdout.as_fd().try_clone_to_owned()
+    } else if stderr.is_terminal() {
+        stderr.as_fd().try_clone_to_owned()
+    } else {
+        return None;
+    };
+    fd.ok()
+}
+
+/// The lines that tell the user what the agent did with their clipboard: nothing, if nothing.
+fn clipboard_notices(used: ClipboardUse) -> Vec<String> {
+    let times = |n: usize| {
+        if n == 1 {
+            "1 time".to_owned()
+        } else {
+            format!("{n} times")
+        }
+    };
+    let mut lines = Vec::new();
+    if used.allowed > 0 {
+        lines.push(format!(
+            "the agent set your clipboard {}",
+            times(used.allowed)
+        ));
     }
+    if used.blocked > 0 {
+        lines.push(format!(
+            "the agent tried to set your clipboard {}; terminal.clipboard_write = false stopped it",
+            times(used.blocked)
+        ));
+    }
+    lines
 }
 
 /// Starts forwarding signals to `child`, if `watch` was prepared. If that fails the child is
@@ -606,13 +660,14 @@ fn start_on_pty(
     pty: Pty,
     watch: Option<Watch>,
     mode: SignalMode,
+    clipboard: ClipboardPolicy,
 ) -> Result<Running, RunError> {
     let (Some(watch), SignalMode::Forward { grace }) = (watch, mode) else {
         abort_child(&mut child);
         return Err(RunError::PtyUnavailable);
     };
     // Dropping hb's own copy of the slave lets the master see the end of the child's output.
-    let terminal = match Interactive::start(pty.release_slave()) {
+    let terminal = match Interactive::start(pty.release_slave(), clipboard) {
         Ok(terminal) => terminal,
         Err(error) => {
             abort_child(&mut child);
@@ -691,13 +746,13 @@ impl Running {
             if let Some(supervisor) = supervisor {
                 supervisor.finish();
             }
-            let clipboard_writes = terminal.finish();
+            let clipboard = terminal.finish();
             return exit
                 .map(|exit| Waited {
                     exit,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
-                    clipboard_writes,
+                    clipboard,
                 })
                 .context(SpawnSnafu);
         }
@@ -716,13 +771,22 @@ impl Running {
             supervisor.finish();
         }
         // The agent has ended: let the filters write what is left before anything else is printed.
-        let clipboard_writes = pumps.into_iter().map(Pump::finish).sum();
+        let filtered = !pumps.is_empty();
+        let clipboard = pumps
+            .into_iter()
+            .map(Pump::finish)
+            .fold(ClipboardUse::default(), |sum, used| sum + used);
+        if filtered {
+            if let Some(terminal) = output_terminal() {
+                settle(&terminal);
+            }
+        }
         result
             .map(|(exit, stdout, stderr)| Waited {
                 exit,
                 stdout,
                 stderr,
-                clipboard_writes,
+                clipboard,
             })
             .context(SpawnSnafu)
     }
@@ -995,19 +1059,39 @@ mod tests {
 
     #[test]
     fn the_clipboard_notice_counts_in_the_singular_and_the_plural_and_is_silent_for_none() {
-        assert_eq!(clipboard_notice(0), None);
+        let used = |allowed, blocked| ClipboardUse { allowed, blocked };
+        assert!(clipboard_notices(used(0, 0)).is_empty());
         assert_eq!(
-            clipboard_notice(1).as_deref(),
-            Some("the agent set your clipboard 1 time")
+            clipboard_notices(used(1, 0)),
+            ["the agent set your clipboard 1 time"]
         );
         assert_eq!(
-            clipboard_notice(2).as_deref(),
-            Some("the agent set your clipboard 2 times")
+            clipboard_notices(used(2, 0)),
+            ["the agent set your clipboard 2 times"]
         );
         assert_eq!(
-            clipboard_notice(40).as_deref(),
-            Some("the agent set your clipboard 40 times")
+            clipboard_notices(used(40, 0)),
+            ["the agent set your clipboard 40 times"]
         );
+    }
+
+    #[test]
+    fn writes_that_were_blocked_are_reported_as_attempts_and_name_the_setting() {
+        let used = |allowed, blocked| ClipboardUse { allowed, blocked };
+        assert_eq!(
+            clipboard_notices(used(0, 1)),
+            [
+                "the agent tried to set your clipboard 1 time; terminal.clipboard_write = false stopped it"
+            ]
+        );
+        assert_eq!(
+            clipboard_notices(used(0, 3)),
+            [
+                "the agent tried to set your clipboard 3 times; terminal.clipboard_write = false stopped it"
+            ]
+        );
+        // Both can happen only if the policy changed mid-run, which it cannot; both are reported anyway.
+        assert_eq!(clipboard_notices(used(1, 1)).len(), 2);
     }
 
     #[test]

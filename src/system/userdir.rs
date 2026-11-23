@@ -34,6 +34,11 @@ pub const BASE_TEMPLATE: &str = "\
 # Trust the system certificate store (needed behind a TLS-inspecting proxy such as Zscaler).
 system_trust = true
 
+[terminal]
+# An agent can set your clipboard through your terminal (OSC 52); hb says so when it does.
+# Uncomment to refuse: the write is removed and hb says it tried.
+# clipboard_write = false
+
 [env]
 # Variables copied from your shell into every hamster ball. HOME, PATH, TMPDIR, TERM and the proxy
 # and TLS variables are set by hb itself and cannot be listed here.

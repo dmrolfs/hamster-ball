@@ -80,6 +80,36 @@ enum Mode {
     StringEscape,
 }
 
+/// Whether the agent may set the user's clipboard (`OSC 52` with data).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClipboardPolicy {
+    /// Writes pass. Most terminals apply their own policy to them.
+    #[default]
+    Allow,
+    /// Writes are removed.
+    Deny,
+}
+
+/// What the agent did with the clipboard, as the filter saw it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClipboardUse {
+    /// Writes that were let through.
+    pub allowed: usize,
+    /// Writes that were removed because the policy denies them.
+    pub blocked: usize,
+}
+
+impl std::ops::Add for ClipboardUse {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            allowed: self.allowed + other.allowed,
+            blocked: self.blocked + other.blocked,
+        }
+    }
+}
+
 /// A streaming filter. Feed it the agent's output in any chunking; the result does not depend on it.
 #[derive(Debug, Clone)]
 pub struct Sanitizer {
@@ -91,8 +121,8 @@ pub struct Sanitizer {
     held: Vec<u8>,
     /// Whether the terminal has been sent the start of a sequence that it has not seen the end of.
     open: bool,
-    /// How many clipboard writes (`OSC 52` with data) were let through.
-    clipboard_writes: usize,
+    clipboard: ClipboardPolicy,
+    used: ClipboardUse,
 }
 
 impl Default for Sanitizer {
@@ -111,7 +141,8 @@ impl Sanitizer {
             mode: Mode::Ground,
             held: Vec::new(),
             open: false,
-            clipboard_writes: 0,
+            clipboard: ClipboardPolicy::Allow,
+            used: ClipboardUse::default(),
         }
     }
 
@@ -122,10 +153,25 @@ impl Sanitizer {
         }
     }
 
+    /// A filter with the given clipboard policy.
+    #[must_use]
+    pub fn with_clipboard(clipboard: ClipboardPolicy) -> Self {
+        Self {
+            clipboard,
+            ..Self::new()
+        }
+    }
+
+    /// What the agent has done with the clipboard so far.
+    #[must_use]
+    pub fn clipboard_use(&self) -> ClipboardUse {
+        self.used
+    }
+
     /// How many clipboard writes have been let through so far.
     #[must_use]
     pub fn clipboard_writes(&self) -> usize {
-        self.clipboard_writes
+        self.used.allowed
     }
 
     /// Whether the terminal has been left in the middle of a sequence. `hb` cancels it at the end.
@@ -200,6 +246,11 @@ impl Sanitizer {
                 return;
             }
             ESC => {
+                if self.mode == Mode::StringEscape {
+                    // The ESC before this one already ended the string; give the terminal its ST.
+                    out.extend_from_slice(&[ESC, b'\\']);
+                    self.open = false;
+                }
                 self.escape();
                 return;
             }
@@ -386,11 +437,18 @@ impl Sanitizer {
                 self.release(out, true);
                 self.mode = Mode::StringPass;
             }
-            OscVerdict::PassClipboard => {
-                self.clipboard_writes += 1;
-                self.release(out, true);
-                self.mode = Mode::StringPass;
-            }
+            OscVerdict::PassClipboard => match self.clipboard {
+                ClipboardPolicy::Allow => {
+                    self.used.allowed += 1;
+                    self.release(out, true);
+                    self.mode = Mode::StringPass;
+                }
+                ClipboardPolicy::Deny => {
+                    self.used.blocked += 1;
+                    self.held.clear();
+                    self.mode = Mode::StringDrop;
+                }
+            },
             // `decide_osc` drops what it cannot place within a bounded prefix, so this stays short.
             OscVerdict::Undecided => {}
         }
@@ -800,6 +858,57 @@ mod tests {
         assert_eq!(writes(b"\x1b]52;c\x07"), 0, "no data");
     }
 
+    // ---- the clipboard policy ----
+
+    fn denying(input: &[u8]) -> (Vec<u8>, ClipboardUse) {
+        let mut filter = Sanitizer::with_clipboard(ClipboardPolicy::Deny);
+        let mut out = Vec::new();
+        filter.feed(input, &mut out);
+        (out, filter.clipboard_use())
+    }
+
+    #[test]
+    fn with_writes_denied_the_osc_never_reaches_the_terminal_and_the_attempt_is_counted() {
+        let (out, used) = denying(b"a\x1b]52;c;aGk=\x07b\x1b]52;p;aGk=\x1b\\c");
+        assert_eq!(out, b"abc");
+        assert_eq!(
+            used,
+            ClipboardUse {
+                allowed: 0,
+                blocked: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_clipboard_read_is_removed_in_either_policy_and_is_not_counted_as_a_write() {
+        let (out, used) = denying(b"x\x1b]52;c;?\x07y");
+        assert_eq!(out, b"xy");
+        assert_eq!(used, ClipboardUse::default());
+    }
+
+    #[test]
+    fn denying_writes_changes_nothing_else() {
+        let (out, used) = denying(b"\x1b]0;title\x07\x1b[31mred\x1b[0m\x1b]8;;u\x1b\\");
+        assert_eq!(out, b"\x1b]0;title\x07\x1b[31mred\x1b[0m\x1b]8;;u\x1b\\");
+        assert_eq!(used, ClipboardUse::default());
+    }
+
+    #[test]
+    fn the_default_policy_allows_and_counts_allowed_writes() {
+        let mut filter = Sanitizer::new();
+        let mut out = Vec::new();
+        filter.feed(b"\x1b]52;c;aGk=\x07", &mut out);
+        assert_eq!(out, b"\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            filter.clipboard_use(),
+            ClipboardUse {
+                allowed: 1,
+                blocked: 0
+            }
+        );
+    }
+
     // ---- ending and aborting sequences ----
 
     #[test]
@@ -811,6 +920,13 @@ mod tests {
             clean(b"\x1b]0;title\x1b[21tafter"),
             b"\x1b]0;title\x1b\\after"
         );
+    }
+
+    #[test]
+    fn two_escapes_in_a_row_inside_a_string_still_end_it_with_a_terminator() {
+        assert_eq!(clean(b"\x1bPq\x1b\x1b0"), b"\x1bPq\x1b\\\x1b0");
+        assert_eq!(clean(b"\x1b]0;t\x1b\x1b[21tz"), b"\x1b]0;t\x1b\\z");
+        assert_eq!(clean(b"\x1bPq\x1b\x1b\\"), b"\x1bPq\x1b\\");
     }
 
     #[test]

@@ -43,13 +43,13 @@ pub use extends::ExtendsError;
 pub use location::{FileLocation, classify};
 pub use merge::{
     MAX_MERGE_ERRORS, MergeError, MergeErrors, MergedCtl, MergedEnv, MergedFs, MergedNet,
-    MergedTls, Policy, merge,
+    MergedTerminal, MergedTls, Policy, merge,
 };
 pub use project::{ProjectError, load_project};
 pub use resolve::{
     Diagnostics, EntryError, Indexed, ResolveContext, ResolveErrors, Resolved, ResolvedConfig,
     ResolvedCtl, ResolvedEnv, ResolvedFs, ResolvedGuard, ResolvedMcpServer, ResolvedNet,
-    ResolvedTls, resolve_file,
+    ResolvedTerminal, ResolvedTls, resolve_file,
 };
 #[cfg(test)]
 pub(crate) use text::SymlinkPolicy;

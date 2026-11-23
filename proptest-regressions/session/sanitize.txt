@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 027a38448b5f98616cb1059596417138fb7cfdb104da6b04c9b1c94d72413c09 # shrinks to input = [160]
 cc 53a0f77daf8e07400ba915f9445a6d1bbb224ebbb48e01449b60760ddd2c999d # shrinks to input = [27, 95, 24]
+cc 1966533a0df2b7163a157d3d9d9214d553f75a4dba6d828322c45d64a3e66fef # shrinks to input = [27, 80, 113, 27, 27, 48]

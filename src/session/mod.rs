@@ -7,6 +7,7 @@ pub mod denials;
 pub mod dir;
 pub mod env;
 pub mod fds;
+mod fence;
 pub mod guardian;
 mod interactive;
 pub mod preflight;

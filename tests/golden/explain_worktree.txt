@@ -154,6 +154,9 @@ env.set (values are never shown)
 tls
   system_trust = true  <- [0] tls.system_trust
 
+terminal
+  clipboard_write = true  
+
 ctl
   (none)
 

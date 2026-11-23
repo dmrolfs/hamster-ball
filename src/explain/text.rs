@@ -143,6 +143,14 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
         rows(out, &report.tls.extra_ca_files, t, |v| t.show(v))?;
     }
 
+    writeln!(out, "\nterminal")?;
+    writeln!(
+        out,
+        "  clipboard_write = {}  {}",
+        report.terminal.clipboard_write.value,
+        origins(&report.terminal.clipboard_write.origins, t)
+    )?;
+
     section(
         out,
         "ctl",

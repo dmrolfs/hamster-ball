@@ -247,6 +247,8 @@ pub struct ResolvedConfig {
     pub env: ResolvedEnv,
     /// `[tls]`.
     pub tls: ResolvedTls,
+    /// `[terminal]`.
+    pub terminal: ResolvedTerminal,
     /// `[ctl]`.
     pub ctl: ResolvedCtl,
     /// `[mcp.<name>]`, keyed by name, in sorted order.
@@ -306,6 +308,14 @@ pub struct ResolvedEnv {
     pub set: BTreeMap<EnvName, EnvValue>,
     /// Programs to make findable on the child's `PATH`, in file order (design 7.2, D59).
     pub tools: Vec<ToolName>,
+}
+
+/// `[terminal]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedTerminal {
+    /// Whether the agent may set the clipboard; `None` means this file did not say.
+    pub clipboard_write: Option<bool>,
 }
 
 /// `[tls]`.
@@ -428,6 +438,9 @@ impl<'a> Resolution<'a> {
             tls: ResolvedTls {
                 system_trust: parsed.tls.system_trust,
                 extra_ca_files: self.extra_ca_files(&parsed.tls.extra_ca_files),
+            },
+            terminal: ResolvedTerminal {
+                clipboard_write: parsed.terminal.clipboard_write,
             },
             ctl: ResolvedCtl {
                 label: self.label(parsed.ctl.label.as_deref()),
@@ -849,6 +862,29 @@ mod tests {
         assert_eq!(fx.resolved("[tls]\n").config.tls.system_trust, None);
         let off = fx.resolved("[tls]\nsystem_trust = false\n");
         assert_eq!(off.config.tls.system_trust, Some(false));
+    }
+
+    #[test]
+    fn terminal_clipboard_write_is_read_as_given_and_stays_unset_when_absent() {
+        let fx = Fixture::new();
+        assert_eq!(fx.resolved("").config.terminal.clipboard_write, None);
+        assert_eq!(
+            fx.resolved("[terminal]\n").config.terminal.clipboard_write,
+            None
+        );
+        let off = fx.resolved("[terminal]\nclipboard_write = false\n");
+        assert_eq!(off.config.terminal.clipboard_write, Some(false));
+        let on = fx.resolved("[terminal]\nclipboard_write = true\n");
+        assert_eq!(on.config.terminal.clipboard_write, Some(true));
+    }
+
+    #[test]
+    fn an_unknown_terminal_key_or_a_wrong_type_is_a_parse_error_naming_the_key() {
+        let fx = Fixture::new();
+        let unknown = fx.errors("[terminal]\nclipboard_read = true\n");
+        assert_eq!(key_of(&unknown, 0), "terminal.clipboard_read");
+        let wrong = fx.errors("[terminal]\nclipboard_write = \"no\"\n");
+        assert_eq!(key_of(&wrong, 0), "terminal.clipboard_write");
     }
 
     #[test]
