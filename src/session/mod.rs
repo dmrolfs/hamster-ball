@@ -2,6 +2,7 @@
 // ABOUTME: `run` is the library entry point that `hb run` and the probe-matrix harness both call.
 //! A run: everything between "the policy is loaded" and "the child has exited".
 
+pub mod ca_bundle;
 pub mod child_helper;
 pub mod denials;
 pub mod dir;
@@ -19,10 +20,11 @@ pub mod sanitize;
 pub mod signals;
 pub mod terminal;
 
+pub use ca_bundle::{CaBundleError, write_bundle};
 pub use child_helper::{HelperError, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
-pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 pub use fds::close_inherited_fds;
 pub use guardian::{GuardError, Guardian, GuardianError, run_guard};
 pub use interactive::InteractiveError;

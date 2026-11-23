@@ -13,6 +13,7 @@
 ; system_read
 (allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/private/etc") (subpath "/private/var/select") (subpath "/Library/Developer/CommandLineTools"))
 (allow file-read* file-write* (regex #"^/dev/fd/[0-9]+$") (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr"))
+(allow file-read* (regex #"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$"))
 ; grants
 (allow file-read* file-write* (subpath (param "W0")) (subpath (param "W1")))
 ; template_allow

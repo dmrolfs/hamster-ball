@@ -221,12 +221,17 @@ bind_ports = []                                 # ports it may listen on, 1024-6
 
 ### 4.5 TLS
 
-- `tls.system_trust` (base default `true`): allows the Mach lookups `com.apple.SecurityServer` and
-  `com.apple.SystemConfiguration.configd`, read access to the files `/Library/Keychains/System.keychain` and
-  `System.keychain-db` (never the directory), and sets `NODE_USE_SYSTEM_CA=1` (D62). `trustd` and `trustd.agent` come
-  from `system.sb`.
-- `tls.extra_ca_files`: read access to each file and `NODE_EXTRA_CA_CERTS` set to it
-  (several files are concatenated into a per-session bundle).
+- `tls.system_trust` (base default `true`): allows the Mach lookups `com.apple.SecurityServer`,
+  `com.apple.SystemConfiguration.configd` and `com.apple.TrustEvaluationAgent`, read access to the files
+  `/Library/Keychains/System.keychain` and `System.keychain-db` (never the directory), and sets `NODE_USE_SYSTEM_CA=1`
+  (D62, D68). `trustd` and `trustd.agent` come from `system.sb`.
+- `tls.extra_ca_files`: read access to each file, and `NODE_EXTRA_CA_CERTS` set to a per-session bundle. `hb` reads the files
+  outside the sandbox, copies only their PEM `CERTIFICATE` blocks (a key or notes in the same file are not copied), joins them in
+  the order of the config, and writes `ca-bundle.pem` (mode 0600) in the session directory. A file with no certificate, a file over
+  1 MiB or a bundle over 4 MiB stops the run before the agent starts, because Node would only print `Ignoring extra certs` and the
+  run would look like "system trust only".
+- Only Node's two variables are set. `SSL_CERT_FILE` and its kin are not: in Python and `uv` they replace the public roots (measured,
+  below), and curl and git ignore them. A tool that needs a private CA can be given its own variable with `[env] set`.
 - The proxy never decrypts traffic. It tunnels bytes.
 
 Measured (Node 24 inside the hamster ball, through the proxy):
@@ -238,6 +243,10 @@ Measured (Node 24 inside the hamster ball, through the proxy):
 | `NODE_EXTRA_CA_CERTS` only | fail | OK | OK |
 | both | OK | OK | OK |
 
+Reproduced under `hb` with a throwaway CA and a local server (`tests/tls_handshake.rs`, Node 24.11.1 and 26.3.0): no setting and
+system trust alone fail with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (a throwaway CA is not in the system store); the extra CA alone
+verifies, and so do both together. The "both" row stands. The first analysis's contrary report is not reproduced a third time.
+
 The measured minimum (D62; `history/hb-ghd.2.1_oracle-tls-ports-keychain.md`, then re-checked by hand for Node 24 and `uv`), macOS 15.7.7 only:
 
 | Element | Needed by | Without it |
@@ -246,12 +255,13 @@ The measured minimum (D62; `history/hb-ghd.2.1_oracle-tls-ports-keychain.md`, th
 | read of `System.keychain` | the same | Node 24 fails (`-25300`) |
 | `com.apple.SystemConfiguration.configd` | `uv` and `uvx` (Rust `system-configuration`) | `uv` panics, even with an explicit proxy env |
 | `com.apple.trustd`, `trustd.agent` | curl, git, Node, Go, Rust | in `system.sb` already |
+| `com.apple.TrustEvaluationAgent` | curl and git (SecureTransport), verifying a host signed by a root in the system store | `(60) unable to get local issuer certificate` (D68) |
 
 Dropped, because no tested client regressed without them: `securityd`, `securityd.xpc` (also the route to the data-protection
 keychain), the `/private/var/db/mds` read, the whole `/Library/Keychains` directory (it held `apsd.keychain`, 0644, which no client opens)
 and `user-preference-read` for `kCFPreferencesAnyApplication`. Tested clients: curl, git, Node 24/26, Bun, Go, Rust (rustls),
 Python, `uv`, claude, pi and opencode (the last three against a local TLS server only; kiro-cli ignores the CA env vars).
-Not tested: native-tls, Deno, Electron CLIs, a real TLS-inspecting proxy, a system proxy or PAC (`configd` may matter there) and
+Not tested: native-tls, Deno, Electron CLIs, a system proxy or PAC being followed (see below) and
 macOS versions other than 15.7. A client that needs a dropped item shows up as a denial under `--log-denials` (hb-ghd.2.3b); the fix
 is one more entry in `TLS_SERVICES`. `configd` is kept although it exposes the network configuration store (interface names, SSID text,
 DNS addresses, console user): `uv` needs it.
@@ -260,6 +270,30 @@ DNS addresses, console user): `uv` needs it.
 be reproduced: both settings worked on Node 24.11, 26.0 and 26.3 under the minimum, in a clean environment. The earlier run most likely did not load
 the extra bundle (an unreadable path prints `Ignoring extra certs` and looks like "system only"). The four-combination handshake test
 (hb-ghd.2.2) still decides. The user keychain domain is not visible inside the ball (the floor denies `~/Library/Keychains`), so a corporate root installed only there is missing. The floor, not `securityd`, is what keeps the user keychain out: see section 6 and `tests/seatbelt_tls.rs`.
+
+**A real TLS-inspecting proxy (D68, `tests/tls_inspection.rs`, opt-in).** On a machine where Zscaler re-signs `kiro.dev`, `opencode.ai` and
+`context7.com` (and not `example.com`), under the generated profile plus a network allow: Node with `NODE_USE_SYSTEM_CA=1`, Bun and
+`uv --native-tls` verify the re-signed hosts; Node without system trust fails them with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` and still
+verifies `example.com`, which is the inspector-off case. curl failed on the re-signed hosts until `TrustEvaluationAgent` was granted
+(denials logged: `TrustEvaluationAgent`, `kCFPreferencesAnyApplication`, `networkd.plist`; adding each alone: only the first fixed it).
+`kCFPreferencesAnyApplication` and `networkd.plist` stay out. The test decides "re-signed" by whether Node's own roots verify the host, so
+it names no vendor. claude, driven through `hb` against a local server, fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` without an extra CA and
+completes the handshake and sends `POST /v1/messages` with one. pi and opencode could not be driven without credentials and a provider
+config; they run on Node and Bun, whose rows are measured. kiro-cli ignores the CA variables and needs a login before any TLS call: not exercised.
+
+**Extra CAs reach Node-based clients only (D68).** `NODE_EXTRA_CA_CERTS` adds to Node's roots. The variables other clients read do not
+behave alike under the profile, so `hb` sets none of them. Measured: Python's `SSL_CERT_FILE` and `uv`'s (also with `--native-tls`)
+replace the roots, so a public host then fails; Node ignores it; the system curl (SecureTransport) ignores `SSL_CERT_FILE`,
+`CURL_CA_BUNDLE` and `--cacert`; git's `GIT_SSL_CAINFO` did not break a public host. A tool outside Node that must trust a private CA is
+configured by the user with its own variable through `[env] set`, pointing at a file the tool can read. Where the tool's variable replaces
+the roots (Python, `uv`), that file must hold the public roots as well. A bundle of
+the system roots plus the extra CAs for non-Node clients was considered and not built: it needs a second trust store.
+
+**System proxy and PAC.** Not exercised: `networksetup` needs admin rights and rewrites live network settings, so no test changes them.
+What is measured, read-only (`tests/seatbelt_tls.rs`): `scutil --proxy` inside the ball prints the host's proxy settings with
+`configd` granted and an empty dictionary without it, so `configd` is what carries system proxy and PAC settings in, and without it
+they disappear without an error. `uv` panics without `configd` (`tests/tls_handshake.rs`). The same visibility means the agent can read
+the host's proxy configuration while `system_trust` is on; M3 should show that to the user.
 
 These settings add trusted roots only. They work with Zscaler off, because hosts then present
 public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
@@ -416,7 +450,7 @@ reopened the file; placed before, it did not). Generated order:
 3. Allow reads and writes from the merged config, with wildcard operations only. System read-only directories: `/usr`,
    `/bin`, `/sbin`, `/private/etc`, `/private/var/select` (`/bin/sh` is a select symlink), `/Library/Developer/CommandLineTools`
    (git, clang). Not `/Library` whole: it contains `/Library/Keychains`, which section 4.5 gates. Device nodes: `/dev/fd/N`,
-   `/dev/stdin`, `/dev/stdout`, `/dev/stderr`.
+   `/dev/stdin`, `/dev/stdout`, `/dev/stderr`. The `xcrun` tool-path cache `<user temp dir>/xcrun_db`, read only (D69).
 4. TLS Mach services and keychain reads (section 4.5), as typed rules in the first renderer cut.
 5. Network: outbound only to `(remote ip (param "PROXY"))`, plus each `loopback_ports` entry. Never `localhost:*`
    (a wildcard allowed other loopback ports). The port is a parameter, so the text does not depend on it.
@@ -815,7 +849,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 9. Presets for codex and omp once installed.
 10. **Unverified under the final profile**: AppleEvents (`osascript` driving Terminal) and `launchctl submit` (hb-ghd.2.5).
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
-    open: the data-protection keychain, a real corporate TLS-inspecting proxy, and a system proxy or PAC that might need `configd`.
+    open: the data-protection keychain and a system proxy or PAC actually being followed (`configd` gates the settings; see 4.5).
 11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
 12. **Output with no pty** (7.3, D67): when stdin is not a terminal but stdout or stderr is, the agent writes to the user's terminal directly. The output filter and the exit fence do not apply, and a terminal's reply to a query goes to the user's shell. Decide whether `hb` should pass such output through a filtering pipe (the agent then sees a stdout that is not a terminal) or leave it and document it.
 
@@ -931,3 +965,5 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
 | D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it watches each with a kernel exit notification so it never signals a reused number; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
 | D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard, and `[terminal] clipboard_write = false` (any file wins) removes the writes and says it did; after a no-pty run `hb` runs the same mode reset and device-attributes fence on the terminal; the guard prints a one-line hint when a killed `hb` left the terminal raw | owner, hb-ghd.2.4 follow-up |
+| D68 | `session::env` sets `NODE_USE_SYSTEM_CA=1` with `system_trust` and `NODE_EXTRA_CA_CERTS` to a per-session `ca-bundle.pem` (only the PEM certificates of `tls.extra_ca_files`, 0600, size-capped; a file with no certificate stops the run); no other CA variable is set; `com.apple.TrustEvaluationAgent` joins the system-trust grants because curl and git fail against a TLS-inspected host without it | owner, hb-ghd.2.2 |
+| D69 | The profile allows `file-read*` on `^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$` and never a write: `/usr/bin/git` and the other developer-tool shims read that cache to find the real tool and print two error lines per call without it; the user's own unsandboxed `xcrun` trusts the same file, so a write grant would let the agent redirect `git` for the user's shells. If the cache has no entry for a tool the first call still fails to write it and prints once | owner, hb-ghd.2.2 |

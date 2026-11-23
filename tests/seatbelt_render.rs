@@ -537,6 +537,54 @@ fn git_hooks_and_config_cannot_be_written_but_the_rest_of_the_project_can() {
     assert!(!proj.join(".git/commondir").exists());
 }
 
+/// The user temp directory (`/private/var/folders/xx/yyyy/T/`), where `xcrun` keeps its cache.
+fn user_temp_dir() -> Option<std::path::PathBuf> {
+    let out = Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .ok()?;
+    let dir = String::from_utf8(out.stdout).ok()?;
+    fs::canonicalize(dir.trim()).ok()
+}
+
+#[test]
+fn the_git_shim_reads_the_xcrun_cache_quietly_and_the_cache_stays_unwritable() {
+    sandboxed!();
+    let Some(cache) = user_temp_dir()
+        .map(|t| t.join("xcrun_db"))
+        .filter(|c| c.is_file())
+    else {
+        eprintln!("SKIP: no xcrun cache on this machine");
+        return;
+    };
+    let w = World::new(PROJECT);
+    let home = w.home_dir();
+    let p = w.render(&RenderInputs::new());
+    let quiet = run(&p, &home, &w.project, "/usr/bin/git --version");
+    assert!(succeeds(&quiet), "{}", stderr(&quiet));
+    assert_eq!(stderr(&quiet), "", "the shim should find its cache");
+    // The control: without the grant the same call still works but complains, so the grant is why.
+    let without = without_lines(&p, "xcrun_db");
+    let noisy = run(&without, &home, &w.project, "/usr/bin/git --version");
+    assert!(
+        stderr(&noisy).contains("xcrun_db"),
+        "control did not show the noise: {}",
+        stderr(&noisy)
+    );
+    // Read-only: the user's unsandboxed xcrun trusts this file. `touch -c` only changes its
+    // timestamp and creates nothing, so a regression here cannot plant anything.
+    let touch = format!("/usr/bin/touch -c {}", quote(&cache));
+    assert!(!succeeds(&run(&p, &home, &w.project, &touch)));
+    let temp = quote(&cache.with_file_name("xcrun_db-hbtest"));
+    assert!(!succeeds(&run(
+        &p,
+        &home,
+        &w.project,
+        &format!("echo x > {temp}")
+    )));
+    assert!(!cache.with_file_name("xcrun_db-hbtest").exists());
+}
+
 #[test]
 fn renaming_git_aside_and_planting_a_pointer_is_blocked_and_the_control_shows_the_pin_is_why() {
     sandboxed!();

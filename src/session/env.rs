@@ -43,6 +43,15 @@ pub enum EnvBuildError {
     },
 }
 
+/// What the child needs to know about TLS trust (design 4.5).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TlsEnv<'a> {
+    /// `tls.system_trust`: Node is told to use the system certificate store.
+    pub system_trust: bool,
+    /// The per-session bundle of `tls.extra_ca_files`, if there are any: Node adds its certificates.
+    pub ca_bundle: Option<&'a CanonicalPath>,
+}
+
 /// What the child's environment is built from.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvInputs<'a> {
@@ -58,6 +67,8 @@ pub struct EnvInputs<'a> {
     pub stdin_is_tty: bool,
     /// The merged `[env]` section.
     pub env: &'a MergedEnv,
+    /// TLS trust settings.
+    pub tls: TlsEnv<'a>,
 }
 
 /// The environment the child starts with, and nothing else.
@@ -95,6 +106,14 @@ impl ChildEnv {
         vars.insert("TMPDIR".into(), inputs.session_dir.as_str().into());
         vars.insert("PATH".into(), path_value(inputs.tool_dirs)?);
         vars.insert("TERM".into(), term_value(inputs));
+        // Only Node's variables: `SSL_CERT_FILE` and its kin would replace the public roots in the
+        // clients that read them (measured: Python, uv) and mean nothing to curl and git.
+        if inputs.tls.system_trust {
+            vars.insert("NODE_USE_SYSTEM_CA".into(), "1".into());
+        }
+        if let Some(bundle) = inputs.tls.ca_bundle {
+            vars.insert("NODE_EXTRA_CA_CERTS".into(), bundle.as_str().into());
+        }
         Ok(Self(vars))
     }
 
@@ -206,6 +225,8 @@ mod tests {
         tools: Vec<CanonicalPath>,
         tty: bool,
         env: MergedEnv,
+        trust: bool,
+        bundle: Option<CanonicalPath>,
     }
 
     impl Case {
@@ -217,6 +238,8 @@ mod tests {
                 tools: Vec::new(),
                 tty: false,
                 env: MergedEnv::default(),
+                trust: false,
+                bundle: None,
             }
         }
 
@@ -228,6 +251,10 @@ mod tests {
                 tool_dirs: &self.tools,
                 stdin_is_tty: self.tty,
                 env: &self.env,
+                tls: TlsEnv {
+                    system_trust: self.trust,
+                    ca_bundle: self.bundle.as_ref(),
+                },
             })
         }
 
@@ -323,6 +350,64 @@ mod tests {
             assert_err!(case.build()),
             EnvBuildError::ColonInToolDir { .. }
         ));
+    }
+
+    #[test]
+    fn node_is_told_to_use_the_system_store_only_when_system_trust_is_on() {
+        let mut case = Case::new();
+        assert_eq!(case.ok().get("NODE_USE_SYSTEM_CA"), None);
+        case.trust = true;
+        assert_eq!(case.ok().get("NODE_USE_SYSTEM_CA"), Some(OsStr::new("1")));
+    }
+
+    #[test]
+    fn node_gets_the_session_bundle_as_its_extra_ca_file_only_when_there_is_one() {
+        let mut case = Case::new();
+        assert_eq!(case.ok().get("NODE_EXTRA_CA_CERTS"), None);
+        case.bundle = Some(cp("/private/var/folders/x/T/hb-1-2-3/ca-bundle.pem"));
+        assert_eq!(
+            case.ok().get("NODE_EXTRA_CA_CERTS"),
+            Some(OsStr::new(
+                "/private/var/folders/x/T/hb-1-2-3/ca-bundle.pem"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_two_settings_are_independent_and_nothing_else_about_tls_is_set() {
+        let mut case = Case::new();
+        case.trust = true;
+        case.bundle = Some(cp("/private/var/folders/x/T/hb-1-2-3/ca-bundle.pem"));
+        let env = case.ok();
+        for name in ["NODE_USE_SYSTEM_CA", "NODE_EXTRA_CA_CERTS"] {
+            assert!(env.get(name).is_some(), "{name}");
+        }
+        for name in [
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+            "REQUESTS_CA_BUNDLE",
+        ] {
+            assert_eq!(
+                env.get(name),
+                None,
+                "{name} replaces the public roots in some clients, so hb does not set it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_cannot_override_what_hb_sets_for_tls() {
+        for name in ["NODE_USE_SYSTEM_CA", "NODE_EXTRA_CA_CERTS"] {
+            let mut case = Case::new();
+            case.trust = true;
+            case.env = merged(&[], &[(name, "0")]);
+            assert!(
+                matches!(assert_err!(case.build()), EnvBuildError::Reserved { .. }),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -30,16 +30,29 @@ const SYSTEM_READ: &[&str] = &[
 const DEV_NODES: &[&str] = &["/dev/stdin", "/dev/stdout", "/dev/stderr"];
 const DEV_FD_REGEX: &str = "^/dev/fd/[0-9]+$";
 
+/// The `xcrun` tool-path cache in the user temp directory (`<T>/xcrun_db`).
+///
+/// `/usr/bin/git` and the other developer-tool shims read it to find the real binary. Without
+/// the read they print two `couldn't create cache file` lines on every call. Read only: the
+/// user's own unsandboxed `xcrun` trusts this file, so a write grant would let the agent point
+/// `git` at its own binary. The regex matches the per-user `/private/var/folders/xx/yyyy/T`
+/// layout without asking the OS for the directory (another user's copy is unreadable anyway).
+const XCRUN_DB_REGEX: &str = "^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$";
+
 /// The trust services (design 4.5, D62).
 ///
 /// Only what a measured client needed. `trustd` and `trustd.agent` are already in `system.sb`.
 /// `SecurityServer` and the `System.keychain` read are what Node's `NODE_USE_SYSTEM_CA` needs;
-/// `configd` is what `uv` needs (it panics without it). `securityd.xpc` is left out because it
-/// is also the route to the data-protection keychain. `System.keychain-db` is the name a newer
-/// macOS may use; the Security framework already probes it.
+/// `configd` is what `uv` needs (it panics without it). `TrustEvaluationAgent` is what curl and
+/// git (SecureTransport) need to verify a host whose certificate is signed by a root in the
+/// system store: against a real TLS-inspected host curl fails with it missing and works with it
+/// (D68). `securityd.xpc` is left out because it is also the route to the data-protection
+/// keychain. `System.keychain-db` is the name a newer macOS may use; the Security framework
+/// already probes it.
 const TLS_SERVICES: &[&str] = &[
     "com.apple.SecurityServer",
     "com.apple.SystemConfiguration.configd",
+    "com.apple.TrustEvaluationAgent",
 ];
 const TLS_READ: &[&str] = &[
     "/Library/Keychains/System.keychain",
@@ -147,6 +160,11 @@ fn system_read(rules: &mut Vec<Rule>) {
         Section::SystemRead,
         &[Op::FileReadAll, Op::FileWriteAll],
         nodes,
+    ));
+    rules.push(Rule::allow(
+        Section::SystemRead,
+        &[Op::FileReadAll],
+        vec![Filter::StaticRegex(XCRUN_DB_REGEX)],
     ));
 }
 
@@ -568,6 +586,23 @@ mod tests {
     }
 
     #[test]
+    fn xcrun_cache_is_readable_and_never_writable() {
+        let rules = rendered(&policy_with(vec![]), &RenderInputs::new());
+        let cache = |op| {
+            find(&rules, Section::SystemRead, op)
+                .into_iter()
+                .filter(|r| {
+                    r.filters
+                        .iter()
+                        .any(|f| f.static_text().is_some_and(|t| t.ends_with("/xcrun_db$")))
+                })
+                .count()
+        };
+        assert_eq!(cache(Op::FileReadAll), 1);
+        assert_eq!(cache(Op::FileWriteAll), 0);
+    }
+
+    #[test]
     fn device_nodes_cover_fd_and_the_standard_streams() {
         let rules = rendered(&policy_with(vec![]), &RenderInputs::new());
         let nodes = find(&rules, Section::SystemRead, Op::FileWriteAll);
@@ -669,10 +704,11 @@ mod tests {
             .collect()
     }
 
-    /// Design 4.5, D62: the measured minimum (history/hb-ghd.2.1_oracle-tls-ports-keychain.md).
-    /// `trustd` is already in `system.sb`; `securityd.xpc` would also reach the data-protection
-    /// keychain; no tested client needed `securityd`, `/private/var/db/mds` or the global
-    /// preference domain.
+    /// Design 4.5, D62 and D68: the measured minimum (history/hb-ghd.2.1_oracle-tls-ports-keychain.md,
+    /// history/hb-ghd.2.2_analysis-and-plan.md). `trustd` is already in `system.sb`;
+    /// `TrustEvaluationAgent` is what curl and git need to verify a TLS-inspected host;
+    /// `securityd.xpc` would also reach the data-protection keychain; no tested client needed
+    /// `securityd`, `/private/var/db/mds`, the global preference domain or `networkd.plist`.
     #[test]
     fn system_trust_grants_exactly_the_measured_minimum() {
         let mut policy = policy_with(vec![]);
@@ -685,7 +721,8 @@ mod tests {
             static_texts(mach[0]),
             [
                 "com.apple.SecurityServer",
-                "com.apple.SystemConfiguration.configd"
+                "com.apple.SystemConfiguration.configd",
+                "com.apple.TrustEvaluationAgent"
             ]
         );
         let reads = find(&rules, Section::Tls, Op::FileReadAll);

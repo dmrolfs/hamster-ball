@@ -98,6 +98,33 @@ fn system_trust_lets_security_list_system_certificates_through_securityserver() 
 }
 
 #[test]
+fn system_trust_is_what_lets_the_agent_see_the_hosts_proxy_settings() {
+    sandboxed!();
+    // Read only: `scutil --proxy` prints the system proxy and PAC settings and changes nothing.
+    // Nothing here sets a proxy, so the test does not show a PAC being followed (design 4.5).
+    let settings = |on: bool| {
+        let w = World::new(&trusting(on));
+        let out = run(
+            &w.render(&RenderInputs::new()),
+            &w.home_dir(),
+            &w.project,
+            "/usr/sbin/scutil --proxy",
+        );
+        stdout(&out)
+    };
+    let (on, off) = (settings(true), settings(false));
+    assert!(
+        on.contains("ExceptionsList") || on.contains("Proxy") || on.contains("PAC"),
+        "with configd granted scutil should print the host's settings: {on:?}"
+    );
+    assert_eq!(
+        off.trim(),
+        "<dictionary> {\n}",
+        "control: without configd the settings are empty, not an error"
+    );
+}
+
+#[test]
 fn system_trust_does_not_reach_services_no_tested_client_needed() {
     sandboxed!();
     let w = World::new(&trusting(true));

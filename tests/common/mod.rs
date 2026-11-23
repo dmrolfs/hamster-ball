@@ -15,6 +15,8 @@ use hamster_ball::seatbelt::{Profile, RenderInputs, render, render_filtered};
 use hamster_ball::system::{Environment, FloorEnvironment, UserConfigDir};
 use tempfile::TempDir;
 
+pub mod tls;
+
 /// A canonical, throwaway tree: `home/`, a project at `home/work/proj`, and a PATH.
 pub struct World {
     _dir: TempDir,

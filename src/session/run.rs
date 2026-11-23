@@ -17,9 +17,10 @@ use nix::unistd::Pid;
 use rustix::process::Pid as RustixPid;
 use snafu::{ResultExt, Snafu, ensure};
 
+use super::ca_bundle::{CaBundleError, write_bundle};
 use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
-use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER};
+use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
 use super::interactive::{Interactive, InteractiveError};
@@ -305,6 +306,13 @@ pub enum RunError {
         source: GuardianError,
     },
 
+    /// The CA bundle for `tls.extra_ca_files` could not be built.
+    #[snafu(transparent)]
+    CaBundle {
+        /// The underlying error.
+        source: CaBundleError,
+    },
+
     /// The filter between the agent's output and the user's terminal could not be started.
     #[snafu(display("the output filter could not be started"))]
     OutputFilter {
@@ -384,6 +392,15 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let profile = render(&loaded.policy, &inputs)?;
     warnings.extend(profile.warnings.iter().map(ToString::to_string));
 
+    let ca_files: Vec<CanonicalPath> = loaded
+        .policy
+        .tls
+        .extra_ca_files
+        .iter()
+        .map(|file| file.value.clone())
+        .collect();
+    let ca_bundle = write_bundle(session.path(), &ca_files)?;
+
     let stdin_is_tty = stdin_is_tty(spec.stdio, io::stdin().is_terminal());
     let child_env = ChildEnv::build(&EnvInputs {
         parent: &env.vars,
@@ -392,6 +409,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         tool_dirs: &tool_dirs,
         stdin_is_tty,
         env: &loaded.policy.env,
+        tls: TlsEnv {
+            system_trust: loaded.policy.tls.effective_system_trust(),
+            ca_bundle: ca_bundle.as_ref(),
+        },
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let helper = match (spec.signals, &pty) {
@@ -947,6 +968,7 @@ mod tests {
             tool_dirs: path_dirs,
             stdin_is_tty: false,
             env: &policy_env,
+            tls: TlsEnv::default(),
         }))
     }
 

@@ -120,6 +120,111 @@ fn the_child_environment_is_exactly_the_allowed_set_and_no_parent_token_reaches_
     assert!(text.contains(&format!("HOME={}", w.home_dir().display())));
 }
 
+// ====================================================================================
+// TLS trust (design 4.5)
+// ====================================================================================
+
+const CERT: &str = "-----BEGIN CERTIFICATE-----\nQUFBQQ==\n-----END CERTIFICATE-----\n";
+
+#[test]
+fn system_trust_sets_node_use_system_ca_and_turning_it_off_removes_it() {
+    sandboxed!();
+    let on = World::with_base("[tls]\nsystem_trust = true\n", PROJECT);
+    let out = sh(&on, "echo \"[$NODE_USE_SYSTEM_CA][$NODE_EXTRA_CA_CERTS]\"");
+    assert_eq!(stdout(&out).trim(), "[1][]");
+    let off = World::with_base(
+        "[tls]\nsystem_trust = true\n",
+        &format!("{PROJECT}[tls]\nsystem_trust = false\n"),
+    );
+    let out = sh(&off, "echo \"[$NODE_USE_SYSTEM_CA]\"");
+    assert_eq!(stdout(&out).trim(), "[]", "false from any file wins");
+    let unset = World::new(PROJECT);
+    assert_eq!(
+        stdout(&sh(&unset, "echo \"[$NODE_USE_SYSTEM_CA]\"")).trim(),
+        "[]"
+    );
+}
+
+#[test]
+fn extra_ca_files_become_one_bundle_in_the_session_directory_that_the_child_can_read() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let first = w.project.join("one.pem");
+    let second = w.project.join("two.pem");
+    common::write(&first, &format!("junk\n{CERT}"));
+    common::write(&second, &CERT.replace("QUFBQQ==", "QkJCQg=="));
+    w.set_project(&format!(
+        "{PROJECT}[tls]\nextra_ca_files = [{}, {}]\n",
+        common::toml_string(&first.to_string_lossy()),
+        common::toml_string(&second.to_string_lossy())
+    ));
+    let out = sh(
+        &w,
+        "echo \"$NODE_EXTRA_CA_CERTS\"; stat -f %Lp \"$NODE_EXTRA_CA_CERTS\"; cat \"$NODE_EXTRA_CA_CERTS\"",
+    );
+    assert_eq!(
+        out.exit,
+        ExitKind::Exited(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    let mut lines = text.lines();
+    let bundle = std::path::Path::new(lines.next().unwrap_or_default());
+    assert_eq!(lines.next(), Some("600"), "{text}");
+    assert_eq!(
+        bundle.file_name().and_then(|n| n.to_str()),
+        Some("ca-bundle.pem")
+    );
+    assert_eq!(
+        bundle.parent().and_then(|p| p.parent()),
+        Some(temp_dir(&w).as_path())
+    );
+    let body: Vec<&str> = lines.collect();
+    assert_eq!(
+        body,
+        [
+            "-----BEGIN CERTIFICATE-----",
+            "QUFBQQ==",
+            "-----END CERTIFICATE-----",
+            "-----BEGIN CERTIFICATE-----",
+            "QkJCQg==",
+            "-----END CERTIFICATE-----"
+        ],
+        "only the certificates, in the order of the config"
+    );
+    assert!(
+        !bundle.exists(),
+        "the bundle went with the session directory"
+    );
+}
+
+#[test]
+fn a_ca_file_with_no_certificate_stops_the_run_before_the_child_starts() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let bad = w.project.join("not-a-cert.pem");
+    common::write(&bad, "this is not a certificate\n");
+    w.set_project(&format!(
+        "{PROJECT}[tls]\nextra_ca_files = [{}]\n",
+        common::toml_string(&bad.to_string_lossy())
+    ));
+    let marker = w.project.join("child-ran");
+    let spec = RunSpec::new(["/usr/bin/touch", &marker.to_string_lossy()]);
+    let error = assert_err!(run(&w.env, &w.loaded(), &spec));
+    assert!(matches!(error, RunError::CaBundle { .. }), "{error}");
+    assert!(error.to_string().contains("not-a-cert.pem"), "{error}");
+    assert!(
+        !marker.exists(),
+        "the child ran although the CA file was bad"
+    );
+    assert_eq!(
+        assert_ok!(fs::read_dir(temp_dir(&w))).count(),
+        0,
+        "no session directory is left behind"
+    );
+}
+
 #[test]
 fn the_child_starts_in_the_project_directory() {
     sandboxed!();
