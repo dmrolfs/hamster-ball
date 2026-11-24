@@ -90,6 +90,9 @@ impl GrantSummary {
             if !mcp.net.is_empty() {
                 value.push_str(&format!("; net: {}", mcp.net.join(", ")));
             }
+            if !mcp.warm_net.is_empty() {
+                value.push_str(&format!("; warm_net: {}", mcp.warm_net.join(", ")));
+            }
             if !mcp.bind_ports.is_empty() {
                 let ports: Vec<String> = mcp.bind_ports.iter().map(u16::to_string).collect();
                 value.push_str(&format!("; listens on: {}", ports.join(", ")));

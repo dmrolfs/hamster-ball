@@ -2451,6 +2451,7 @@
       "arg_count": 3,
       "args": null,
       "net": [],
+      "warm_net": [],
       "bind_ports": [
         24282
       ],

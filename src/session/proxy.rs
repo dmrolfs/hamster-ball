@@ -226,17 +226,16 @@ impl ProxyRun {
         trail: Arc<ProxyTrail>,
         tuning: Option<&ProxyTuning>,
     ) -> Result<Self, ProxyError> {
-        let mut config =
-            ProxyConfig::new(policy.net.allow.iter().map(|r| r.value.clone()).collect())
-                .with_internal_hosts(
-                    policy
-                        .net
-                        .internal_hosts
-                        .iter()
-                        .map(|h| h.value.clone())
-                        .collect(),
-                )
-                .with_audit(Arc::clone(&trail) as Arc<dyn AuditSink>);
+        let mut config = ProxyConfig::new(policy.run_allowlist())
+            .with_internal_hosts(
+                policy
+                    .net
+                    .internal_hosts
+                    .iter()
+                    .map(|h| h.value.clone())
+                    .collect(),
+            )
+            .with_audit(Arc::clone(&trail) as Arc<dyn AuditSink>);
         if let Some(tune) = tuning {
             config = tune.apply(config);
         }

@@ -330,6 +330,19 @@ fn mcp_line(server: &McpRow, t: &Tilde<'_>) -> String {
                 .join(", ")
         )
     };
+    let warm = if server.warm_net.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  warm: {}",
+            server
+                .warm_net
+                .iter()
+                .map(|h| Escaped(h).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let bind = if server.bind_ports.is_empty() {
         String::new()
     } else {
@@ -340,7 +353,7 @@ fn mcp_line(server: &McpRow, t: &Tilde<'_>) -> String {
         )
     };
     format!(
-        "{}: {} {args}{net}{bind}  {}",
+        "{}: {} {args}{net}{warm}{bind}  {}",
         Escaped(&server.name),
         Escaped(command),
         origins(&server.origins, t)

@@ -42,7 +42,7 @@ Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design li
 
 | Built and tested | Not built yet |
 |---|---|
-| layered config, `hb explain`, `hb profile` | `hb warm` and MCP server handling (milestone 7); `[mcp.*]` is parsed and its `bind_ports` are enforced, but `hb` does not start or cache servers |
+| layered config, `hb explain`, `hb profile` | `hb warm` and MCP server handling (milestone 7); `[mcp.*]` `net` and `bind_ports` are enforced, but `hb` does not yet start, warm or cache servers |
 | `hb run`: Seatbelt profile, empty environment, pty, signals | `hb ctl` for project containers (milestone 8); `[ctl]` is parsed only |
 | HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
 | approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
@@ -211,6 +211,11 @@ launchctl = false                        # true (your own files only) lets the a
 
 [guard]
 exceptions = ["~/work/myproj/.env.local"]   # base and your presets only; absolute or ~/ patterns
+
+[mcp.context7]                           # a remote MCP server: no command, only the host it needs at run time
+net = ["mcp.context7.com"]               # host or host:port; joins net.allow
+# warm_net = ["pypi.org"]                # hosts only `hb warm` may reach for this server (not built yet)
+# bind_ports = [24282, 24283]            # loopback ports the server may listen on (profile-wide)
 
 [hooks.pre_run.bedrock]                  # base and your presets only; see Credentials
 command      = ["~/bin/credential-process", "--profile", "my-profile"]
@@ -427,7 +432,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | A hook fails or times out and nothing starts | The run stops before the agent. Run the hook command by hand to see its error; raise `timeout_secs` (at most 300). |
 | claude is about 20 s slower inside the ball | Expected: its OTEL and `awsAuthRefresh` helpers cannot run and it waits for them. |
 | claude fails with `AWS authentication failed ... check AWS permissions and model access` | The credentials reached Bedrock but your role cannot invoke the model. The same failure happens outside the ball. |
-| opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Remote ones are refused and `npx`/`uvx` ones are not on the ball's `PATH`. Allow their hosts yourself. Support for them is milestone 7. |
+| opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Declare each remote one with `[mcp.<name>] net = ["mcp.example.com"]` in your base. `npx` and `uvx` ones are not on the ball's `PATH` unless you list them in `[env] tools`; offline start from a warm cache is milestone 7 (`hb warm` is not built yet). |
 | `hb explain` warns that the approval store location is ignored | `XDG_STATE_HOME` is set; `hb` ignores it on purpose. |
 | Grants differ from what you wrote | `hb explain` lists skipped grants (missing path) and floor overrides. |
 

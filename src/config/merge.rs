@@ -186,6 +186,22 @@ impl Policy {
         &self.floor
     }
 
+    /// The hosts a run may reach: `net.allow` plus each `[mcp.<name>] net`, without duplicates, in order.
+    ///
+    /// `warm_net` is not part of it: those hosts are for `hb warm` alone.
+    #[must_use]
+    pub fn run_allowlist(&self) -> Vec<HostRule> {
+        self.net
+            .allow
+            .iter()
+            .map(|rule| &rule.value)
+            .chain(self.mcp.values().flat_map(|server| &server.value.net))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// [`PROJECT_NOT_GRANTED`] when no read or write grant is the project `root` or a directory
     /// above it, and `None` otherwise.
     ///
@@ -898,7 +914,11 @@ mod tests {
                 ..server("uvx", &["a"])
             },
             ResolvedMcpServer {
-                net: vec![assert_ok!(HostPattern::parse("x.example.com"))],
+                net: vec![assert_ok!(HostRule::parse("x.example.com"))],
+                ..server("uvx", &["a"])
+            },
+            ResolvedMcpServer {
+                warm_net: vec![assert_ok!(HostRule::parse("x.example.com"))],
                 ..server("uvx", &["a"])
             },
         ] {
@@ -922,6 +942,29 @@ mod tests {
             project(with_mcp("other", server("npx", &[]))),
         ]);
         assert_eq!(policy.mcp.len(), 2);
+    }
+
+    #[test]
+    fn the_run_allowlist_is_net_allow_plus_each_servers_net_and_never_warm_net() {
+        let mut base = ResolvedConfig::default();
+        base.net.allow = vec![assert_ok!(HostRule::parse("crates.io"))];
+        let remote = ResolvedMcpServer {
+            net: vec![
+                assert_ok!(HostRule::parse("mcp.example.com")),
+                assert_ok!(HostRule::parse("crates.io")),
+            ],
+            warm_net: vec![assert_ok!(HostRule::parse("pypi.org"))],
+            ..ResolvedMcpServer::default()
+        };
+        base.mcp
+            .insert(assert_ok!(McpName::parse("remote")), remote);
+        let policy = merged(vec![user("base", base)]);
+        let hosts: Vec<String> = policy
+            .run_allowlist()
+            .iter()
+            .map(|r| format!("{}:{}", r.pattern, r.port))
+            .collect();
+        assert_eq!(hosts, ["crates.io:443", "mcp.example.com:443"]);
     }
 
     fn binding(first: i64, count: i64) -> ResolvedMcpServer {

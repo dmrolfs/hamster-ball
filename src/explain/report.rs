@@ -25,7 +25,7 @@ use crate::guard::patterns;
 use crate::origin::{KeyPath, Layer, Located, Origin, Source, Sourced};
 use crate::policy::{
     CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, Hook, HookName,
-    PathPattern,
+    HostRule, PathPattern,
 };
 use crate::system::find_tools;
 
@@ -90,6 +90,11 @@ pub struct OriginRow {
     pub key: Option<String>,
     /// The floor rule's name, for a floor origin.
     pub floor_rule: Option<String>,
+}
+
+/// A host rule as `host:port`.
+fn host_text(rule: &HostRule) -> String {
+    format!("{}:{}", rule.pattern, rule.port)
 }
 
 /// A value and where it came from.
@@ -250,8 +255,10 @@ pub struct McpRow {
     pub arg_count: usize,
     /// The arguments, only with `--show-args`.
     pub args: Option<Vec<String>>,
-    /// Hosts it needs.
+    /// Hosts it needs at run time, as `host:port`; they are in the allowlist.
     pub net: Vec<String>,
+    /// Hosts it needs only while `hb warm` starts it, as `host:port`; never in the allowlist.
+    pub warm_net: Vec<String>,
     /// Loopback ports it may listen on. The rule is profile-wide and does not confine the listener to loopback.
     pub bind_ports: Vec<u16>,
     /// Where it is declared.
@@ -454,6 +461,17 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         });
     }
 
+    let mut mcp_hosts = Vec::new();
+    for (name, server) in &policy.mcp {
+        let key = format!("mcp.{}.net", name.as_str());
+        for rule in &server.value.net {
+            mcp_hosts.push(Row {
+                value: host_text(rule),
+                origins: b.origins(&server.sources, &key),
+            });
+        }
+    }
+
     Report {
         schema_version: SCHEMA_VERSION,
         project: ProjectRow {
@@ -468,9 +486,11 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         },
         deny,
         net: NetReport {
-            hosts: b.rows(&policy.net.allow, "net.allow", |rule| {
-                format!("{}:{}", rule.pattern, rule.port)
-            }),
+            hosts: b
+                .rows(&policy.net.allow, "net.allow", host_text)
+                .into_iter()
+                .chain(mcp_hosts)
+                .collect(),
             internal_hosts: b.rows(
                 &policy.net.internal_hosts,
                 "net.internal_hosts",
@@ -561,7 +581,8 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
                         .map(|a| bounded(a.as_str(), MAX_ARG_CHARS))
                         .collect()
                 }),
-                net: server.value.net.iter().map(ToString::to_string).collect(),
+                net: server.value.net.iter().map(host_text).collect(),
+                warm_net: server.value.warm_net.iter().map(host_text).collect(),
                 bind_ports: server.value.bind_ports.iter().map(|p| p.get()).collect(),
                 origins: b.origins(&server.sources, &format!("mcp.{}", name.as_str())),
             })

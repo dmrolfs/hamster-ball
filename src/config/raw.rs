@@ -96,6 +96,7 @@ pub(crate) struct RawMcpServer {
     pub(crate) command: Option<String>,
     pub(crate) args: Vec<String>,
     pub(crate) net: Vec<String>,
+    pub(crate) warm_net: Vec<String>,
     pub(crate) bind_ports: Vec<i64>,
 }
 

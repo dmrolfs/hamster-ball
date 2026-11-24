@@ -376,8 +376,11 @@ pub struct ResolvedMcpServer {
     pub command: Option<ArgWord>,
     /// Its arguments.
     pub args: Vec<ArgWord>,
-    /// Hosts this server needs at run time.
-    pub net: Vec<HostPattern>,
+    /// Hosts this server needs at run time (`host` or `host:port`); they join the run allowlist.
+    pub net: Vec<HostRule>,
+    /// Hosts allowed only while `hb warm` starts this server (`host` or `host:port`): the
+    /// registries it installs from. Never part of the run allowlist.
+    pub warm_net: Vec<HostRule>,
     /// Loopback ports this server may listen on. The rule is profile-wide, and Seatbelt cannot
     /// confine the listener to the loopback interface (design 7.1, D58).
     pub bind_ports: Vec<BindPort>,
@@ -710,10 +713,11 @@ impl<'a> Resolution<'a> {
                 &server.args,
                 ArgWord::parse,
             );
-            let net = self.list(
-                entry_key.clone().field("net"),
-                &server.net,
-                HostPattern::parse,
+            let net = self.list(entry_key.clone().field("net"), &server.net, HostRule::parse);
+            let warm_net = self.list(
+                entry_key.clone().field("warm_net"),
+                &server.warm_net,
+                HostRule::parse,
             );
             let bind_ports = self.bind_ports(entry_key.field("bind_ports"), &server.bind_ports);
             if let Some(valid_name) = valid_name {
@@ -723,6 +727,7 @@ impl<'a> Resolution<'a> {
                         command,
                         args,
                         net,
+                        warm_net,
                         bind_ports,
                     },
                 );
@@ -1433,6 +1438,38 @@ mod tests {
         let resolved = fx.resolved("[mcp.sequential-thinking]\ncommand = \"npx\"\n");
         let name = assert_ok!(McpName::parse("sequential-thinking"));
         assert!(resolved.config.mcp.contains_key(&name));
+    }
+
+    #[test]
+    fn mcp_net_and_warm_net_take_host_and_port_entries() {
+        let fx = Fixture::new();
+        let resolved = fx.resolved(
+            "[mcp.a]\nnet = [\"mcp.example.com\", \"api.example.com:8443\"]\nwarm_net = [\"pypi.org\"]\n",
+        );
+        let server = assert_some!(resolved.config.mcp.get("a"));
+        let net: Vec<String> = server
+            .net
+            .iter()
+            .map(|r| format!("{}:{}", r.pattern, r.port))
+            .collect();
+        assert_eq!(net, ["mcp.example.com:443", "api.example.com:8443"]);
+        let warm: Vec<String> = server
+            .warm_net
+            .iter()
+            .map(|r| format!("{}:{}", r.pattern, r.port))
+            .collect();
+        assert_eq!(warm, ["pypi.org:443"]);
+    }
+
+    #[test]
+    fn warm_net_entries_are_validated_and_a_wildcard_over_a_public_suffix_is_refused() {
+        let fx = Fixture::new();
+        let errors = fx.errors("[mcp.a]\nwarm_net = [\"fine.example.com\", \"bad host\"]\n");
+        assert_eq!(key_of(&errors, 0), "mcp.a.warm_net[1]");
+        let errors =
+            fx.errors("[mcp.a]\nnet = [\"*.amazonaws.com\"]\nwarm_net = [\"*.github.io\"]\n");
+        assert_eq!(key_of(&errors, 0), "mcp.a.net[0]");
+        assert_eq!(key_of(&errors, 1), "mcp.a.warm_net[0]");
     }
 
     #[test]

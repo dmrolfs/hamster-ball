@@ -18,7 +18,7 @@
 #
 # MCP servers in `~/.config/opencode/opencode.json` are not part of the agent. Local ones started with
 # `npx` or `uvx` fail here ("Executable not found"); remote ones are refused by the proxy. Give each its
-# own `[mcp.*]`. A local MCP server of your own may ask for more hosts (lean-ctx asked for github.com).
+# own `[mcp.*]` with `net = ["host"]`. A local MCP server of your own may ask for more hosts (lean-ctx asked for github.com).
 #
 # Denied and harmless: `com.apple.securityd.xpc` and the `com.apple.security` preference (TLS verifies
 # without them), ~/Library/Keychains probes, FSEvents, and reads of `~/.claude` and `~/.agents`.

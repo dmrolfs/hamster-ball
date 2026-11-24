@@ -204,7 +204,8 @@ containers = []
 [mcp.serena]                                    # section 10
 command = "uvx"
 args    = ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server"]
-net     = []                                    # hosts needed at run time (none: cache is warm)
+net     = []                                    # hosts needed at run time (host or host:port); they join net.allow. A remote server has no command: [mcp.context7] net = ["mcp.context7.com"]
+warm_net = []                                   # hosts `hb warm` may reach for this server (registries are built in); never allowed at run time
 bind_ports = []                                 # ports it may listen on, 1024-65535, at most 16 (profile-wide, at most 64 distinct in all; see 7.1 step 5)
 ```
 
