@@ -450,6 +450,7 @@ fn stopping_ends_every_open_tunnel_leaves_no_task_behind_and_closes_the_port() {
     let upstream = echo_upstream();
     let mut proxy = proxy_on(upstream, &["allowed.test"], &["allowed.test"]);
     let addr = proxy.addr();
+    let auth = auth_line(&proxy);
     let target = format!("allowed.test:{upstream}");
     let mut open: Vec<TcpStream> = (0..50)
         .map(|_| {
@@ -474,17 +475,46 @@ fn stopping_ends_every_open_tunnel_leaves_no_task_behind_and_closes_the_port() {
             "a tunnel survived stop"
         );
     }
-    assert!(TcpStream::connect(addr).is_err(), "the port is still open");
-    proxy.stop();
+    assert!(!still_serves(addr, &auth), "the proxy still answers");
+}
+
+/// Whether the proxy that was at `addr` is still answering, judged by its own credential.
+///
+/// A port that was freed can be taken by another test's proxy before the check runs, so a
+/// successful connect alone does not mean this proxy survived. Another proxy has another token
+/// and answers `407`; the proxy under test accepts its own credential and answers anything else.
+fn still_serves(addr: SocketAddr, auth_line: &str) -> bool {
+    let Ok(mut stream) = TcpStream::connect(addr) else {
+        return false;
+    };
+    assert_ok!(stream.set_read_timeout(Some(Duration::from_secs(3))));
+    let request =
+        format!("CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n{auth_line}\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let (head, _) = read_head(&mut stream);
+    !head.is_empty() && !status(&head).starts_with("HTTP/1.1 407")
+}
+
+#[test]
+fn only_the_proxy_whose_credential_it_is_counts_as_still_serving() {
+    let a = proxy(&["allowed.test"], &["allowed.test"]);
+    let b = proxy(&["allowed.test"], &["allowed.test"]);
+    assert!(still_serves(a.addr(), &auth_line(&a)));
+    assert!(
+        !still_serves(a.addr(), &auth_line(&b)),
+        "another proxy's credential gets a 407"
+    );
 }
 
 #[test]
 fn dropping_the_handle_stops_the_proxy() {
-    let addr = {
+    let (addr, auth) = {
         let proxy = proxy(&["allowed.test"], &["allowed.test"]);
-        proxy.addr()
+        (proxy.addr(), auth_line(&proxy))
     };
-    assert!(TcpStream::connect(addr).is_err());
+    assert!(!still_serves(addr, &auth));
 }
 
 // ====================================================================================
