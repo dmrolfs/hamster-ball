@@ -175,6 +175,29 @@ fn a_half_close_from_the_client_still_lets_the_upstream_finish_its_answer() {
 }
 
 #[test]
+fn an_upstream_that_finishes_ends_the_clients_stream_while_the_client_is_still_open() {
+    let listener = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
+    let port = assert_ok!(listener.local_addr()).port();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let _ = s.write_all(b"done");
+        }
+    });
+    let proxy = proxy_on(port, &["allowed.test"], &["allowed.test"]);
+    let mut stream = connect_to(&proxy);
+    assert_ok!(
+        stream.write_all(connect_request(&proxy, &format!("allowed.test:{port}")).as_bytes())
+    );
+    // The answer may arrive in the same read as the reply head.
+    let (head, mut answer) = read_head(&mut stream);
+    assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_ok!(stream.set_read_timeout(Some(Duration::from_secs(3))));
+    // The client never half-closes: the end of the answer must come from the proxy.
+    assert_ok!(stream.read_to_end(&mut answer));
+    assert_eq!(answer, b"done");
+}
+
+#[test]
 fn a_client_that_hangs_up_ends_the_upstream_connection_too() {
     let listener = assert_ok!(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)));
     let port = assert_ok!(listener.local_addr()).port();

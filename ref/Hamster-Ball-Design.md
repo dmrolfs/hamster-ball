@@ -883,8 +883,9 @@ Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen b
 - Loopback connections to the hamster ball's own listeners are denied by default (measured). Only
   `net.loopback_ports` are reachable.
 - **Audit.** One event per connection (`AuditEvent`: host and port when the request named a valid one, served or refused with the code and
-  reason, bytes each way). No headers, no bodies, no token: nothing from the request but the validated host and port is recorded. Events
-  go to an optional sink; hb-ghd.3.3 connects it to `--log-denials` (refusals), `--log-proxy` (everything) and a one-line end-of-run
+  reason, bytes each way). No headers, no bodies, no token: nothing from the request but the validated host and port is recorded. A served
+  connection is recorded when it ends, and also when the run ends first, with the bytes that had crossed (hb-ghd.3.5: an agent's
+  keep-alive tunnels are usually still open then, and were lost before). Events go to an optional sink; hb-ghd.3.3 connects it to `--log-denials` (refusals), `--log-proxy` (everything) and a one-line end-of-run
   summary of refusals that `--no-proxy-summary` hides.
 
 ### 12.1 Corporate networks
@@ -920,7 +921,7 @@ All measured under the deny-default profile with proxy-only network. Home-relati
 
 | Agent | Read-only | Read-write | Hosts (own) | Notes |
 |---|---|---|---|---|
-| kiro-cli 3.3.0 | `~/.local/bin/kiro-cli` | `~/.kiro`, `~/Library/Application Support/kiro-cli` | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com`, `desktop-release.q.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (Zscaler re-signs `kiro.dev`). |
+| kiro-cli 3.5.0 | none (its binary needs no read grant) | `~/.kiro`, `~/Library/Application Support/kiro-cli` | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (Zscaler re-signs `kiro.dev`). Measured in hb-ghd.3.5: the 3.3.0 spike also listed `desktop-release.q.us-east-1.amazonaws.com` (update check) and a read of `~/.local/bin/kiro-cli`; 3.5.0 needs neither. Its MCP servers, `~/.gitconfig` and FSEvents are denied harmlessly. |
 | pi 1.5.2 | `~/.pi/agent/bin`, `~/.pi/agent/install`, `~/.nvm/versions/node` | `~/.pi/agent` (whole directory; it creates lock files) | provider gateway (user-specific) | Needs `NODE_EXTRA_CA_CERTS` for the private gateway CA. Default provider is `localhost:18089`. |
 | claude 2.1.296 | `~/.local/share/claude`, `~/.local/bin/claude`, `/private/tmp` | `~/.claude`, `~/.claude.json`, `~/.cache/claude`, `~/.local/state/claude` | Bedrock: `bedrock-runtime`, `bedrock`, `sts` in `us-east-1` | Credentials via host hook (section 11). Uses fixed `/tmp/claude-<uid>`; narrowing `/private/tmp` is open (section 15). Optional hosts seen: `api.anthropic.com`, `downloads.claude.ai` (updater); denied by default. |
 | opencode 1.2.0 | `~/.config/opencode`, `~/.bun/install`, `/opt/homebrew` | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode` | `models.dev`, `opencode.ai` (Zscaler-signed) | Earlier notes said it needs `com.apple.securityd.xpc` and the `kCFPreferencesAnyApplication` read. The D62 run showed a TLS fetch to a local server works without both (a denial is logged, the call succeeds); an end-to-end run is still missing (no provider is configured on this machine). Loopback bind for its in-process server needs `bind_ports`. |

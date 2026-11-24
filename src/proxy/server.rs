@@ -4,13 +4,15 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdListener};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use snafu::{ResultExt, Snafu};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -363,13 +365,7 @@ async fn connection(
 ) {
     let _ = client.set_nodelay(true);
     match serve_connection(&mut client, &shared).await {
-        Ok(served) => record(
-            &shared,
-            Some(&served.authority),
-            Decision::Allowed,
-            served.bytes_up,
-            served.bytes_down,
-        ),
+        Ok(()) => {}
         Err(failure) => {
             record(
                 &shared,
@@ -410,11 +406,86 @@ async fn reply(client: &mut TcpStream, refusal: &Refusal) {
     .await;
 }
 
-/// A connection that was served.
-struct Served {
-    authority: Authority,
-    bytes_up: u64,
-    bytes_down: u64,
+/// A connection that was served, from the moment it reached its upstream.
+///
+/// Records its [`Decision::Allowed`] event when dropped, so a tunnel that is cut off, because the
+/// run ended or the task was aborted, is audited with the bytes that crossed so far.
+struct Served<'a> {
+    shared: &'a Shared,
+    authority: &'a Authority,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+}
+
+impl<'a> Served<'a> {
+    fn new(shared: &'a Shared, authority: &'a Authority) -> Self {
+        Self {
+            shared,
+            authority,
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for Served<'_> {
+    fn drop(&mut self) {
+        record(
+            self.shared,
+            Some(self.authority),
+            Decision::Allowed,
+            self.bytes_up.load(Ordering::Relaxed),
+            self.bytes_down.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// The client's stream, counting what is read from it (sent upstream) and written to it.
+struct Counted<'a> {
+    inner: &'a mut TcpStream,
+    served: &'a Served<'a>,
+}
+
+impl AsyncRead for Counted<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if poll.is_ready() {
+            let read = buf.filled().len().saturating_sub(before);
+            self.served
+                .bytes_up
+                .fetch_add(read as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for Counted<'_> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &poll {
+            self.served
+                .bytes_down
+                .fetch_add(*written as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
 }
 
 /// A connection that was refused, and what its request named, if anything valid.
@@ -440,8 +511,8 @@ impl Failure {
 }
 
 /// Serves one connection: read the head, authenticate, decide, connect, then copy both ways
-/// until either ends.
-async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<Served, Failure> {
+/// until either ends. A served connection is audited by [`Served`], not here.
+async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<(), Failure> {
     let (head, leftover) = read_head(client, shared.timeouts.head)
         .await
         .map_err(Failure::before_target)?;
@@ -459,11 +530,7 @@ async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<Ser
     }
     check_rules(&shared.rules, &authority).map_err(fail)?;
     let mut upstream = connect(shared, &authority).await.map_err(fail)?;
-    let served = |bytes_up, bytes_down| Served {
-        authority: authority.clone(),
-        bytes_up,
-        bytes_down,
-    };
+    let served = Served::new(shared, &authority);
     match opening {
         None => {
             if client
@@ -471,22 +538,29 @@ async fn serve_connection(client: &mut TcpStream, shared: &Shared) -> Result<Ser
                 .await
                 .is_err()
             {
-                return Ok(served(0, 0));
+                return Ok(());
             }
         }
         Some(head) => {
             if upstream.write_all(head).await.is_err() {
-                return Ok(served(0, 0));
+                return Ok(());
             }
         }
     }
-    if !leftover.is_empty() && upstream.write_all(&leftover).await.is_err() {
-        return Ok(served(0, 0));
+    if !leftover.is_empty() {
+        if upstream.write_all(&leftover).await.is_err() {
+            return Ok(());
+        }
+        served
+            .bytes_up
+            .fetch_add(leftover.len() as u64, Ordering::Relaxed);
     }
-    let (up, down) = copy_bidirectional(client, &mut upstream)
-        .await
-        .unwrap_or((0, 0));
-    Ok(served(up + leftover.len() as u64, down))
+    let mut counted = Counted {
+        inner: client,
+        served: &served,
+    };
+    let _ = copy_bidirectional(&mut counted, &mut upstream).await;
+    Ok(())
 }
 
 /// Whether some rule allows the host on the port, and if not, which refusal says why.

@@ -385,6 +385,26 @@ fn a_served_connection_is_one_event_with_the_bytes_that_crossed_in_each_directio
 }
 
 #[test]
+fn a_tunnel_still_open_when_the_proxy_stops_is_audited_with_the_bytes_so_far() {
+    let upstream = echo_upstream();
+    let (mut proxy, sink) = audited(&["allowed.test"], &["allowed.test"], upstream);
+    let (mut stream, head) = tunnel(&proxy, &format!("allowed.test:{upstream}"));
+    assert!(status(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_ok!(stream.write_all(&[7u8; 100]));
+    let mut back = vec![0u8; 100];
+    assert_ok!(stream.read_exact(&mut back));
+    proxy.stop();
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].decision, Decision::Allowed);
+    assert_eq!(
+        events[0].host.as_ref().map(HostName::as_str),
+        Some("allowed.test")
+    );
+    assert_eq!((events[0].bytes_up, events[0].bytes_down), (100, 100));
+}
+
+#[test]
 fn bytes_sent_with_the_connect_head_are_counted_as_sent_upstream() {
     let upstream = echo_upstream();
     let (proxy, sink) = audited(&["allowed.test"], &["allowed.test"], upstream);
