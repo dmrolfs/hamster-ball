@@ -536,10 +536,15 @@ mod tests {
         let mut child = assert_ok!(rig.child.try_clone());
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
+        // The child writes whenever the pty has room, one byte at a time, so the relay always
+        // finds output waiting. A timed writer (a write every 20 ms) fails under load: a pause of
+        // DRAIN_QUIET in the writer's own scheduling is a quiet gap, and the relay rightly ends.
         let writer = thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                let _ = child.write_all(b"noise");
-                thread::sleep(Duration::from_millis(20));
+                let mut fds = [PollFd::new(child.as_fd(), PollFlags::POLLOUT)];
+                if poll(&mut fds, PollTimeout::from(5u8)).is_ok_and(|n| n > 0) {
+                    let _ = child.write(b"n");
+                }
             }
         });
         // Keep the screen side drained so the writer is not what ends the relay.
