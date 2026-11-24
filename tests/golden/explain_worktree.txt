@@ -169,6 +169,9 @@ ctl
 mcp
   (none)
 
+offline launchers (uvx and npx start from hb's own cache, with --offline)
+  (none)
+
 hooks (run on the host, in order)
   notify: /usr/bin/notify 2 args hidden (30s)  <- [0] hooks.pre_run.notify
 

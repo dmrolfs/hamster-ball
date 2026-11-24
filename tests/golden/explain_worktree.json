@@ -2698,6 +2698,11 @@
     "containers": []
   },
   "mcp": [],
+  "offline": {
+    "enabled": false,
+    "launchers": [],
+    "cache_root": null
+  },
   "hooks": [
     {
       "name": "notify",

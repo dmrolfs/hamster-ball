@@ -2467,6 +2467,11 @@
       ]
     }
   ],
+  "offline": {
+    "enabled": true,
+    "launchers": [],
+    "cache_root": "<FIX>/home/.cache/hamster-ball"
+  },
   "hooks": [
     {
       "name": "notify",
@@ -2515,6 +2520,11 @@
   },
   "guard_exceptions": [],
   "warnings": [
+    {
+      "kind": "offline_launcher_unavailable",
+      "message": "[mcp.serena] starts `uvx`, which is not in [env] tools, so hb cannot start it from its offline cache; add \"uvx\" to [env] tools",
+      "origins": []
+    },
     {
       "kind": "skipped_allow",
       "message": "`~/.cargo/registry` was not granted: missing",

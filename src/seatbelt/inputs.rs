@@ -41,6 +41,8 @@ pub struct RenderInputs {
     pub proxy: Option<ProxyEndpoint>,
     /// The per-session directory (read and write).
     pub session_dir: Option<CanonicalPath>,
+    /// hb's own cache for the offline MCP launchers (read and write); `None` when the run has none.
+    pub cache_dir: Option<CanonicalPath>,
     /// The pty slave the child owns (`file-ioctl` on this one node).
     pub tty: Option<CanonicalPath>,
     /// Tags every denial so `--log-denials` can find it.
@@ -73,6 +75,13 @@ impl RenderInputs {
     #[must_use]
     pub fn with_session_dir(mut self, dir: CanonicalPath) -> Self {
         self.session_dir = Some(dir);
+        self
+    }
+
+    /// Sets hb's cache directory.
+    #[must_use]
+    pub fn with_cache_dir(mut self, dir: CanonicalPath) -> Self {
+        self.cache_dir = Some(dir);
         self
     }
 

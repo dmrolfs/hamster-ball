@@ -194,6 +194,22 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
 
     section(
         out,
+        "offline launchers (uvx and npx start from hb's own cache, with --offline)",
+        !report.offline.enabled,
+    )?;
+    for launcher in &report.offline.launchers {
+        writeln!(out, "  {}  runs {}", launcher.tool, t.show(&launcher.runs))?;
+    }
+    if let Some(root) = &report.offline.cache_root {
+        writeln!(
+            out,
+            "  cache  {} (read and write, not your own caches)",
+            t.show(root)
+        )?;
+    }
+
+    section(
+        out,
         "hooks (run on the host, in order)",
         report.hooks.is_empty(),
     )?;

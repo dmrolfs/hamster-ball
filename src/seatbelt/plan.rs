@@ -149,7 +149,8 @@ fn grant_roots<'a>(policy: &'a Policy, inputs: &'a RenderInputs) -> Vec<&'a Cano
             .chain(policy.fs.write.iter().map(|g| &g.value))
             .chain(policy.tls.extra_ca_files.iter().map(|g| &g.value))
             .chain(inputs.exec_dirs.iter())
-            .chain(inputs.session_dir.iter()),
+            .chain(inputs.session_dir.iter())
+            .chain(inputs.cache_dir.iter()),
     )
 }
 
@@ -230,6 +231,13 @@ fn grants(rules: &mut Vec<Rule>, policy: &Policy, inputs: &RenderInputs) {
             Section::Grants,
             &[Op::FileReadAll, Op::FileWriteAll],
             vec![Filter::Subpath(pv(ParamKind::Session, session))],
+        ));
+    }
+    if let Some(cache) = &inputs.cache_dir {
+        rules.push(Rule::allow(
+            Section::Grants,
+            &[Op::FileReadAll, Op::FileWriteAll],
+            vec![Filter::Subpath(pv(ParamKind::Cache, cache))],
         ));
     }
     if let Some(tty) = &inputs.tty {
@@ -798,6 +806,36 @@ mod tests {
         let all: Vec<String> = rules.iter().flat_map(filter_texts).collect();
         assert!(all.contains(&"/private/var/folders/x/T/hb-1".to_owned()));
         assert!(all.contains(&"/Users/me/.nvm/versions/node/v24/bin".to_owned()));
+    }
+
+    #[test]
+    fn the_cache_dir_is_granted_read_and_write_and_is_not_a_write_grant_of_the_policy() {
+        let none = rendered(&policy_with(vec![]), &RenderInputs::new());
+        let all = |rules: &[Rule]| -> Vec<String> { rules.iter().flat_map(filter_texts).collect() };
+        assert!(!all(&none).iter().any(|t| t.contains("hamster-ball")));
+        let inputs = RenderInputs::new().with_cache_dir(cp("/Users/me/.cache/hamster-ball"));
+        let rules = rendered(&policy_with(vec![]), &inputs);
+        assert_ok!(check(&rules));
+        let grant = rules
+            .iter()
+            .find(|r| {
+                r.section == Section::Grants
+                    && r.filters
+                        .iter()
+                        .any(|f| matches!(f, Filter::Subpath(p) if p.kind == ParamKind::Cache))
+            })
+            .map(|r| (r.ops.clone(), filter_texts(r)));
+        let (ops, texts) = assert_some!(grant);
+        assert_eq!(texts, ["/Users/me/.cache/hamster-ball"]);
+        assert!(
+            ops.contains(&Op::FileReadAll) && ops.contains(&Op::FileWriteAll),
+            "{ops:?}"
+        );
+        let ancestors = find(&rules, Section::Metadata, Op::FileReadData);
+        assert!(
+            filter_texts(ancestors[0]).contains(&"/Users/me/.cache/hamster-ball".to_owned()),
+            "the cache's ancestors are listable"
+        );
     }
 
     #[test]

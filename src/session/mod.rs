@@ -12,6 +12,7 @@ mod fence;
 pub mod guardian;
 pub mod hooks;
 mod interactive;
+pub mod offline;
 pub mod ports;
 pub mod preflight;
 pub mod proxy;

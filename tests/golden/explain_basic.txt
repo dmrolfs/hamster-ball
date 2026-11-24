@@ -156,6 +156,9 @@ ctl
 mcp
   serena: uvx 3 args hidden  may listen on 24282 (profile-wide, not loopback-only)  <- [2] mcp.serena
 
+offline launchers (uvx and npx start from hb's own cache, with --offline)
+  cache  ~/.cache/hamster-ball (read and write, not your own caches)
+
 hooks (run on the host, in order)
   notify: /usr/bin/notify 2 args hidden (30s)  <- [0] hooks.pre_run.notify
 
@@ -169,5 +172,6 @@ guard.exceptions
   (none)
 
 warnings
+  offline_launcher_unavailable: [mcp.serena] starts `uvx`, which is not in [env] tools, so hb cannot start it from its offline cache; add "uvx" to [env] tools
   skipped_allow: `~/.cargo/registry` was not granted: missing  <- [1] fs.read[0]
   skipped_allow: `~/missing` was not granted: missing  <- [2] fs.read[1]

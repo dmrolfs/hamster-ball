@@ -26,6 +26,7 @@ use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
+use super::offline::{OfflineError, OfflinePlan};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::proxy::{ProxyRun, ProxyTrail, ProxyTuning};
@@ -234,6 +235,13 @@ pub enum RunError {
         source: HookRunError,
     },
 
+    /// The offline MCP launchers or their cache could not be set up.
+    #[snafu(transparent)]
+    Offline {
+        /// The underlying error.
+        source: OfflineError,
+    },
+
     /// The proxy could not start.
     #[snafu(transparent)]
     Proxy {
@@ -427,6 +435,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         .collect();
 
     warnings.extend(skipped_allow_warnings(loaded));
+    let offline = OfflinePlan::plan(&loaded.policy, &tools, &env.home);
+    if let Some(plan) = &offline {
+        warnings.extend(plan.warnings().iter().cloned());
+    }
 
     let temp = temp_parent(env)?;
     sweep_stale(temp.as_path());
@@ -434,6 +446,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
     // the session directory (with whatever they wrote) goes with it.
     let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
+    let launchers = offline
+        .as_ref()
+        .map(|plan| plan.install(session.path()))
+        .transpose()?;
 
     let loopback: Vec<_> = loaded
         .policy
@@ -458,6 +474,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let mut inputs = RenderInputs::new()
         .with_session_dir(session.path().clone())
         .with_exec_dirs(tool_dirs.clone());
+    if let Some(installed) = &launchers {
+        inputs = inputs.with_cache_dir(installed.cache_root().clone());
+    }
     let roots: Vec<CanonicalPath> = loaded
         .policy
         .fs
@@ -497,6 +516,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         home: &env.home,
         session_dir: session.path(),
         tool_dirs: &tool_dirs,
+        shim_dir: launchers.as_ref().map(|installed| installed.bin_dir()),
         stdin_is_tty,
         env: &loaded.policy.env,
         tls: TlsEnv {
@@ -1066,6 +1086,7 @@ mod tests {
             home: &home,
             session_dir: &session,
             tool_dirs: path_dirs,
+            shim_dir: None,
             stdin_is_tty: false,
             env: &policy_env,
             tls: TlsEnv::default(),

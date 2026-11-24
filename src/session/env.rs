@@ -77,6 +77,8 @@ pub struct EnvInputs<'a> {
     pub session_dir: &'a CanonicalPath,
     /// Directories of `[env] tools`, appended to `PATH` in this order.
     pub tool_dirs: &'a [CanonicalPath],
+    /// The directory of the offline `uvx` and `npx` launchers, put first on `PATH`.
+    pub shim_dir: Option<&'a CanonicalPath>,
     /// Whether stdin is a terminal, which decides `TERM`.
     pub stdin_is_tty: bool,
     /// The merged `[env]` section.
@@ -134,7 +136,10 @@ impl ChildEnv {
         vars.insert(SESSION_MARKER.into(), "1".into());
         vars.insert("HOME".into(), inputs.home.path().as_str().into());
         vars.insert("TMPDIR".into(), inputs.session_dir.as_str().into());
-        vars.insert("PATH".into(), path_value(inputs.tool_dirs)?);
+        vars.insert(
+            "PATH".into(),
+            path_value(inputs.shim_dir, inputs.tool_dirs)?,
+        );
         vars.insert("TERM".into(), term_value(inputs));
         // Only Node's variables: `SSL_CERT_FILE` and its kin would replace the public roots in the
         // clients that read them (measured: Python, uv) and mean nothing to curl and git.
@@ -191,8 +196,22 @@ impl fmt::Debug for ChildEnv {
     }
 }
 
-fn path_value(tool_dirs: &[CanonicalPath]) -> Result<OsString, EnvBuildError> {
-    let mut path = String::from(SYSTEM_PATH);
+fn path_value(
+    shim_dir: Option<&CanonicalPath>,
+    tool_dirs: &[CanonicalPath],
+) -> Result<OsString, EnvBuildError> {
+    let mut path = String::new();
+    if let Some(dir) = shim_dir {
+        ensure!(
+            !dir.as_str().contains(':'),
+            ColonInToolDirSnafu {
+                dir: dir.as_str().to_owned()
+            }
+        );
+        path.push_str(dir.as_str());
+        path.push(':');
+    }
+    path.push_str(SYSTEM_PATH);
     for dir in tool_dirs {
         ensure!(
             !dir.as_str().contains(':'),
@@ -260,6 +279,7 @@ mod tests {
         home: HomeDir,
         session: CanonicalPath,
         tools: Vec<CanonicalPath>,
+        shim: Option<CanonicalPath>,
         tty: bool,
         env: MergedEnv,
         trust: bool,
@@ -275,6 +295,7 @@ mod tests {
                 home: HomeDir::new(cp("/Users/me")),
                 session: cp("/private/var/folders/x/T/hb-1-2-3"),
                 tools: Vec::new(),
+                shim: None,
                 tty: false,
                 env: MergedEnv::default(),
                 trust: false,
@@ -290,6 +311,7 @@ mod tests {
                 home: &self.home,
                 session_dir: &self.session,
                 tool_dirs: &self.tools,
+                shim_dir: self.shim.as_ref(),
                 stdin_is_tty: self.tty,
                 env: &self.env,
                 tls: TlsEnv {
@@ -475,6 +497,34 @@ mod tests {
         case.tty = true;
         case.parent = ParentVars::default();
         assert_eq!(get(&case.ok(), "TERM"), Some(OsStr::new("dumb")));
+    }
+
+    #[test]
+    fn the_launcher_directory_comes_before_the_system_path_and_only_when_there_is_one() {
+        let mut case = Case::new();
+        case.tools = vec![cp("/Users/me/.nvm/bin")];
+        case.shim = Some(cp("/private/var/folders/x/T/hb-1-2-3/bin"));
+        assert_eq!(
+            get(&case.ok(), "PATH"),
+            Some(OsStr::new(&format!(
+                "/private/var/folders/x/T/hb-1-2-3/bin:{SYSTEM_PATH}:/Users/me/.nvm/bin"
+            )))
+        );
+        case.shim = None;
+        assert_eq!(
+            get(&case.ok(), "PATH"),
+            Some(OsStr::new(&format!("{SYSTEM_PATH}:/Users/me/.nvm/bin")))
+        );
+    }
+
+    #[test]
+    fn a_launcher_directory_with_a_colon_cannot_go_on_path() {
+        let mut case = Case::new();
+        case.shim = Some(cp("/private/tmp/a:b/bin"));
+        assert!(matches!(
+            case.build(),
+            Err(EnvBuildError::ColonInToolDir { .. })
+        ));
     }
 
     #[test]

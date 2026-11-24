@@ -174,6 +174,8 @@ pub enum ParamKind {
     Tty,
     /// The session directory (`S<n>`).
     Session,
+    /// hb's own cache directory, read and write (`C<n>`).
+    Cache,
     /// A unix socket (`K<n>`).
     Socket,
     /// The proxy endpoint (`PROXY`).
@@ -194,6 +196,7 @@ impl ParamKind {
             Self::Bind => "B",
             Self::Tty => "T",
             Self::Session => "S",
+            Self::Cache => "C",
             Self::Socket => "K",
             Self::Proxy => "PROXY",
         }
@@ -426,6 +429,7 @@ mod tests {
             ParamKind::Bind,
             ParamKind::Tty,
             ParamKind::Session,
+            ParamKind::Cache,
             ParamKind::Socket,
             ParamKind::Proxy,
         ];

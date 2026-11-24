@@ -856,8 +856,18 @@ Measured: each of your MCP servers started inside the hamster ball and answered 
 
 - Agent presets list only the agent's own hosts. MCP servers are declared in `[mcp.<name>]` and each
   contributes its own run-time hosts (normally none).
-- `hb` rewrites `uvx` and `npx` invocations to their offline forms, so no registry is reachable at run time
-  and `@latest` cannot drift.
+- **Offline launchers (hb-ghd.7.2, D83).** When a declared server has a `command`, `hb` writes `uvx` and `npx` scripts into
+  `<session>/bin`, first on the child's `PATH`. Each is `exec <real tool> --offline "$@"` with the tool's cache variables
+  (`UV_CACHE_DIR`, `UV_TOOL_DIR`, or `npm_config_cache`) set for that call only. The real tool comes from `[env] tools`; a declared server that
+  starts a bare `uvx` or `npx` that `[env] tools` does not list is a warning (`hb explain` kind `offline_launcher_unavailable`). So no registry is
+  reachable from these two commands and `@latest` cannot drift. `uv sync`, `npm install` and a call by absolute path are untouched. The script
+  `exec`s, so stdin, stdout, signals and the process are the tool's own: a wrapper that kept the tool as a child lost stdin (a background job
+  in a non-interactive `sh`) or left the tool running after a TERM (measured). Before the `exec` it prints a hint naming `hb warm` to stderr when
+  `<cache>/warmed` is missing; a package missing from a warmed cache keeps uv's or npm's own failure text.
+- **hb's own cache** is `~/.cache/hamster-ball/{uv,uv-tools,npm}`, made 0700 on the host and granted read-write through the profile's cache
+  parameter, not through `fs.write`, so it is not a secrets-guard root (uv unpacks `certifi/cacert.pem` into its cache). It is never the
+  user's `~/.cache/uv` or `~/.npm`: uv writes to its cache even offline (a read-only cache fails), so a shared one would be agent-writable
+  and a planted package would run in the user's own `npx` later. `hb explain` shows the launchers and the cache (group `offline`).
 - `hb warm` is the only command that may reach registries. It runs outside agent sessions.
 - `uv` and other Rust tools need `com.apple.SystemConfiguration.configd`, which is in the base (section 4.5).
 - `beads-mcp` is broken on the host (its Python interpreter is gone); unrelated to `hb`.
@@ -1242,3 +1252,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D80 | claude preset (hb-ghd.6.2): no `/private/tmp` grant; `CLAUDE_CODE_TMPDIR={session_dir}` replaces the planned `claude-<uid>`/`cc-socks` narrowing (a uid-named path cannot be spelled by a preset and must exist beforehand); the credential command is a hook in the user's base, not in the preset; `DISABLE_AUTOUPDATER=1` with a read-only install; the harness passes claude on a served `bedrock-runtime` connection and requires `OK` only on exit 0, because the measuring account's Bedrock role explicitly denies `InvokeModel` | agreed |
 | D81 | opencode preset (hb-ghd.6.3): narrow Homebrew reads instead of `/opt/homebrew` (it holds database data under `var`); config directory read-only; `deny_write` on the plugin cache and downloaded tools so the agent cannot plant code that a plain `opencode` runs; conformance by a made-up API key and `opencode.ai`'s 401, because a provider-less `run` depends on free-tier quota and retried for over 100 s (one run in 34 s); `Agent` has an `env` field that the harness sets in its own project preset; `Expect::Word` matches a phrase of consecutive whole words | agreed |
 | D82 | The project directory is granted by a file, not implicitly: `hb init` writes `[fs] write = ["."]` into the base, and `hb explain` and `hb run` warn when no read or write grant covers the project (`Policy::project_grant_warning`). `hb <command>` without `run` is not built: the usage line and `--help` show `hb run -- <program>` instead | agreed |
+| D83 | Offline MCP launchers (hb-ghd.7.2): `uvx` and `npx` scripts first on `PATH` that `exec` the real tool with `--offline` and hb's own cache, only when a declared `[mcp.*]` has a command; the hint naming `hb warm` is printed before the `exec` (a wrapper that keeps the tool as a child loses stdin or orphans the tool); the cache is hb's, outside the user's caches and the guard's roots | agreed |

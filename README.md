@@ -148,9 +148,10 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 3. It scans for secret files, lists tracked ones, and runs your pre-run hooks on the host.
 4. It starts a proxy on `127.0.0.1` with a random port and a per-run credential, and creates a private session directory
    (this run's `TMPDIR`).
-5. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
+5. With a declared `[mcp.*]` that has a `command`, it also writes offline `uvx` and `npx` launchers first on `PATH` (see `hb explain`).
+6. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
    it sets itself and the ones you list, on a pty of its own when stdin is a terminal.
-6. When the command ends it stops the proxy, removes the session directory (hook files included) and exits with the command's status.
+7. When the command ends it stops the proxy, removes the session directory (hook files included) and exits with the command's status.
 
 Paths are canonicalized with `realpath` before they reach the profile, because Seatbelt matches resolved paths. A grant whose
 path does not exist is skipped, and `hb explain` and `hb run` say so: create the directory first.
@@ -432,6 +433,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | A hook fails or times out and nothing starts | The run stops before the agent. Run the hook command by hand to see its error; raise `timeout_secs` (at most 300). |
 | claude is about 20 s slower inside the ball | Expected: its OTEL and `awsAuthRefresh` helpers cannot run and it waits for them. |
 | claude fails with `AWS authentication failed ... check AWS permissions and model access` | The credentials reached Bedrock but your role cannot invoke the model. The same failure happens outside the ball. |
+| An MCP server started with `npx` or `uvx` says the package is not available offline | With a declared `[mcp.*]` that has a `command`, `hb` makes `uvx` and `npx` start from its own cache (`~/.cache/hamster-ball`) with `--offline`; no registry is reachable. The cache is filled by `hb warm` (milestone 7, not built yet). `hb explain` shows the launchers. |
 | opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Declare each remote one with `[mcp.<name>] net = ["mcp.example.com"]` in your base. `npx` and `uvx` ones are not on the ball's `PATH` unless you list them in `[env] tools`; offline start from a warm cache is milestone 7 (`hb warm` is not built yet). |
 | `hb explain` warns that the approval store location is ignored | `XDG_STATE_HOME` is set; `hb` ignores it on purpose. |
 | Grants differ from what you wrote | `hb explain` lists skipped grants (missing path) and floor overrides. |

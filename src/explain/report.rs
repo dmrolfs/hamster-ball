@@ -10,7 +10,7 @@
 //! Values that can carry a secret therefore cannot reach a renderer by accident.
 //!
 //! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `terminal`, `system`, `ctl`, `mcp`,
-//! `hooks`, `guard`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
+//! `offline`, `hooks`, `guard`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
 //! higher precedence). Sets are value-sorted, which is the order [`Sourced`] lists already
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
 //! `hooks` are in name order, which is the order they run in. A value's origins are in closure order.
@@ -27,6 +27,7 @@ use crate::policy::{
     CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, Hook, HookName,
     HostRule, PathPattern,
 };
+use crate::session::offline::OfflinePlan;
 use crate::system::find_tools;
 
 /// The version of the JSON shape. Additive fields keep it; a rename or removal bumps it.
@@ -90,6 +91,26 @@ pub struct OriginRow {
     pub key: Option<String>,
     /// The floor rule's name, for a floor origin.
     pub floor_rule: Option<String>,
+}
+
+/// The offline launchers a run would put first on `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OfflineReport {
+    /// Whether a declared server has a command, which turns the launchers on.
+    pub enabled: bool,
+    /// One per launcher `[env] tools` found.
+    pub launchers: Vec<LauncherRow>,
+    /// Where hb's own cache lives, read and write for the ball; `None` when off.
+    pub cache_root: Option<String>,
+}
+
+/// One offline launcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LauncherRow {
+    /// `uvx` or `npx`.
+    pub tool: String,
+    /// The real tool it runs with `--offline`.
+    pub runs: String,
 }
 
 /// A host rule as `host:port`.
@@ -370,6 +391,8 @@ pub struct Report {
     pub ctl: CtlReport,
     /// MCP servers.
     pub mcp: Vec<McpRow>,
+    /// The offline `uvx` and `npx` launchers.
+    pub offline: OfflineReport,
     /// Host-side hooks.
     pub hooks: Vec<HookRow>,
     /// The secrets guard.
@@ -450,6 +473,30 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
                 origins: Vec::new(),
             }),
     );
+    let names: Vec<_> = policy.env.tools.iter().map(|t| t.value.clone()).collect();
+    let lookup = find_tools(&names, options.path_var).unwrap_or_default();
+    let plan = OfflinePlan::plan(policy, &lookup, options.home);
+    warnings.extend(plan.iter().flat_map(|plan| {
+        plan.warnings().iter().map(|message| WarningRow {
+            kind: "offline_launcher_unavailable".to_owned(),
+            message: message.clone(),
+            origins: Vec::new(),
+        })
+    }));
+    let offline = OfflineReport {
+        enabled: plan.is_some(),
+        launchers: plan
+            .iter()
+            .flat_map(|plan| plan.launchers())
+            .map(|launcher| LauncherRow {
+                tool: launcher.kind().to_string(),
+                runs: launcher.real().to_string_lossy().into_owned(),
+            })
+            .collect(),
+        cache_root: plan
+            .as_ref()
+            .map(|plan| plan.cache_root().to_string_lossy().into_owned()),
+    };
     warnings.extend(b.skipped_allows());
     warnings.extend(b.shadowed_grants(policy, options.root));
     if options.xdg_state_home_set {
@@ -587,6 +634,7 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
                 origins: b.origins(&server.sources, &format!("mcp.{}", name.as_str())),
             })
             .collect(),
+        offline,
         hooks: policy
             .hooks
             .iter()
