@@ -262,6 +262,63 @@ fn the_aws_format_gives_the_agent_a_credentials_pair_and_the_real_aws_directory_
 }
 
 #[test]
+fn under_the_claude_preset_the_agent_gets_session_credentials_and_a_private_tmp_but_not_the_real_ones()
+ {
+    sandboxed!();
+    let w = World::new("extends = [\"agent/claude\"]\n[fs]\nwrite = [\".\"]\n");
+    write(
+        &w.home_dir().join(".aws/credentials"),
+        "[real]\naws_secret_access_key = REAL-SECRET\n",
+    );
+    let hook = tool(&w, "cred", &format!("cat <<'EOF'\n{CREDENTIALS}\nEOF"));
+    with_base(
+        &w,
+        &format!(
+            "[tls]\nsystem_trust = true\n[hooks.pre_run.bedrock]\ncommand = [\"{}\", \"--profile\", \"p\"]\nformat = \"aws_credential_process\"\nprofile = \"p\"\n",
+            hook.display()
+        ),
+    );
+    let script = format!(
+        "grep -c AKIAEXAMPLE \"$AWS_SHARED_CREDENTIALS_FILE\"; \
+         cat \"$HOME/.aws/credentials\" 2>/dev/null && echo REAL-READ-OK; \
+         '{tool}' 2>/dev/null && echo TOOL-RAN; \
+         echo \"tmpdir=$CLAUDE_CODE_TMPDIR session=$TMPDIR updater=$DISABLE_AUTOUPDATER\"; \
+         mkdir \"$CLAUDE_CODE_TMPDIR/claude-502\" && echo OWN-TMP-OK; \
+         mkdir /private/tmp/claude-502 2>/dev/null && echo SHARED-TMP-OK; \
+         mkdir /private/tmp/cc-socks 2>/dev/null && echo SHARED-SOCKS-OK; true",
+        tool = hook.display()
+    );
+    let out = run(&w, &["/bin/sh", "-c", &script]);
+    let text = stdout(&out);
+    assert!(text.starts_with("1\n"), "{text}{}", stderr(&out));
+    assert!(text.contains("OWN-TMP-OK"), "{text}{}", stderr(&out));
+    assert!(text.contains("updater=1"), "{text}");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("tmpdir="))
+        .unwrap_or("");
+    let session = line
+        .split("session=")
+        .nth(1)
+        .and_then(|r| r.split(' ').next());
+    assert_eq!(
+        line.strip_prefix("tmpdir=")
+            .and_then(|r| r.split(' ').next()),
+        session,
+        "{text}"
+    );
+    for leak in [
+        "REAL-READ-OK",
+        "REAL-SECRET",
+        "TOOL-RAN",
+        "SHARED-TMP-OK",
+        "SHARED-SOCKS-OK",
+    ] {
+        assert!(!text.contains(leak), "{leak}: {text}");
+    }
+}
+
+#[test]
 fn a_placeholder_in_set_names_the_sessions_private_directory() {
     sandboxed!();
     let w = World::new(&format!(

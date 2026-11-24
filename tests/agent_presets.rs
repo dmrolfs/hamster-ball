@@ -15,14 +15,20 @@ use hamster_ball::system::UserConfigDir;
 use pretty_assertions::assert_eq;
 
 /// Merges `extends = ["agent/<name>"]` with a base that turns system trust on, after creating `dirs`
-/// under the world's home (an allow rule for a path that does not exist is skipped).
+/// under the world's home (an allow rule for a path that does not exist is skipped). An entry that
+/// ends in `.json` is made a file.
 fn merged(name: &str, dirs: &[&str]) -> (World, Loaded) {
     let world = World::with_base(
         "[tls]\nsystem_trust = true\n",
         &format!("extends = [\"agent/{name}\"]\n"),
     );
     for dir in dirs {
-        assert_ok!(fs::create_dir_all(world.home_dir().join(dir)));
+        let path = world.home_dir().join(dir);
+        if dir.ends_with(".json") {
+            assert_ok!(fs::write(path, "{}"));
+        } else {
+            assert_ok!(fs::create_dir_all(path));
+        }
     }
     let discovery = assert_ok!(discover(&world.project, &world.home));
     let user = UserConfigDir::locate(&world.home);
@@ -113,4 +119,67 @@ fn the_pi_preset_writes_its_state_but_not_the_launcher_and_names_no_provider() {
         .map(|t| t.value.as_str())
         .collect();
     assert_eq!(tools, ["node"]);
+}
+
+#[test]
+fn the_claude_preset_writes_its_state_reaches_three_bedrock_hosts_and_has_no_hook() {
+    let (world, loaded) = merged(
+        "claude",
+        &[
+            ".claude",
+            ".claude.json",
+            ".cache/claude",
+            ".local/state/claude",
+        ],
+    );
+    let mut writes = write_grants(&world, &loaded);
+    writes.sort();
+    assert_eq!(
+        writes,
+        [
+            "~/.cache/claude",
+            "~/.claude",
+            "~/.claude.json",
+            "~/.local/state/claude"
+        ]
+    );
+    let hosts: Vec<String> = loaded
+        .policy
+        .net
+        .allow
+        .iter()
+        .map(|rule| format!("{}:{}", rule.value.pattern, rule.value.port.get()))
+        .collect();
+    assert_eq!(
+        hosts,
+        [
+            "bedrock-runtime.us-east-1.amazonaws.com:443",
+            "bedrock.us-east-1.amazonaws.com:443",
+            "sts.us-east-1.amazonaws.com:443"
+        ]
+    );
+    let set: Vec<(&str, &str)> = loaded
+        .policy
+        .env
+        .set
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.value.as_str()))
+        .collect();
+    assert!(
+        set.contains(&("CLAUDE_CODE_TMPDIR", "{session_dir}")),
+        "{set:?}"
+    );
+    assert!(set.contains(&("DISABLE_AUTOUPDATER", "1")), "{set:?}");
+    assert!(
+        loaded.policy.hooks.is_empty(),
+        "the credential command is the user's, not the preset's"
+    );
+    let tmp_grants = loaded
+        .policy
+        .fs
+        .write
+        .iter()
+        .filter(|w| w.value.as_str().starts_with("/private/tmp") || w.value.as_str() == "/tmp")
+        .count();
+    assert_eq!(tmp_grants, 0);
 }

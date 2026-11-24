@@ -25,6 +25,10 @@ pub struct EmbeddedPresets;
 
 /// `(name, text)` pairs. Keep sorted by name.
 const EMBEDDED: &[(&str, &str)] = &[
+    (
+        "agent/claude",
+        include_str!("../../presets/agent/claude.toml"),
+    ),
     ("agent/kiro", include_str!("../../presets/agent/kiro.toml")),
     ("agent/pi", include_str!("../../presets/agent/pi.toml")),
 ];

@@ -1,0 +1,52 @@
+# agent/claude: claude 2.1.328 on Bedrock, measured 2026-11-24 with `claude -p` behind the proxy.
+#
+# `~/.claude`, `~/.claude.json`, `~/.cache/claude` and `~/.local/state/claude` hold claude's settings,
+# sessions and logs and are written. The install (`~/.local/share/claude`, `~/.local/bin/claude`) is read
+# only, so the agent cannot replace what a plain `claude` runs outside the sandbox; that is also why the
+# updater cannot work here. `DISABLE_AUTOUPDATER=1` is set so it does not try (it is the variable the
+# updater checks in this build; a headless Bedrock run made no update request with or without it).
+#
+# `CLAUDE_CODE_TMPDIR={session_dir}` moves claude's `claude-<uid>` and `cc-socks` directories into the run's
+# private directory. Without it claude needs `/private/tmp/claude-<uid>` and fails with EPERM. The shared
+# `/private/tmp` stays closed.
+#
+# Credentials are yours and are not in this preset. Your credential command and `~/.aws` are not
+# reachable from inside, so run the command on the host with a hook in your base config
+# (`~/.config/hamster-ball/base.toml`; a project file cannot define hooks):
+#
+#   [hooks.pre_run.bedrock]
+#   command = ["~/path/to/credential-process", "--profile", "my-profile"]
+#   format = "aws_credential_process"
+#   profile = "my-profile"
+#
+# hb writes the AWS config and credentials files into the run's private directory and sets
+# `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`. `profile` must be the profile claude selects
+# (`AWS_PROFILE` in `~/.claude/settings.json` if it forces one). The credentials last as long as your
+# tool says (about 11 hours for the one measured); start a new run after that.
+#
+# Hosts: Bedrock runtime, Bedrock and STS in us-east-1. Another region needs its own hosts in your config.
+#
+# Denied and harmless: `otelHeadersHelper` and `awsAuthRefresh` from `~/.claude/settings.json` cannot run
+# (they are programs in your home). claude prints a warning for each and waits about 20 s before it goes
+# on, so a sandboxed run is about 20 s slower. No telemetry is sent (its headers come from that helper).
+# Also denied and harmless: the unix socket listener (`[uds-messaging] Failed to listen`),
+# `~/Library/Caches/claude-cli-nodejs` log writes, `ps`, and `/dev/tty`.
+#
+# Not proven: that a prompt returns `OK`. The account used for the measurement denies `bedrock:InvokeModel`
+# (explicit deny), so the check is that the request reaches `bedrock-runtime` through the proxy.
+[env]
+set = { CLAUDE_CODE_TMPDIR = "{session_dir}", DISABLE_AUTOUPDATER = "1" }
+
+[fs]
+read = ["~/.local/share/claude", "~/.local/bin/claude"]
+write = ["~/.claude", "~/.claude.json", "~/.cache/claude", "~/.local/state/claude"]
+
+[net]
+allow = [
+  "bedrock-runtime.us-east-1.amazonaws.com",
+  "bedrock.us-east-1.amazonaws.com",
+  "sts.us-east-1.amazonaws.com",
+]
+
+[tls]
+system_trust = true

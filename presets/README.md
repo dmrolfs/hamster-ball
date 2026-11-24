@@ -54,7 +54,7 @@ An agent that is not installed, or has no preset yet, is skipped. On a failure t
 |---|---|
 | kiro-cli | exits 0 and prints `OK` |
 | pi | exits 0 and prints `OK` |
-| claude | exits 0 and a connection to `bedrock-runtime.*` is served |
+| claude | a connection to `bedrock-runtime.*` is served, and `OK` is printed if it exits 0 (a failed exit is not judged: the account may deny the model) |
 | opencode | exits as the same command does without the sandbox |
 
 The run uses the real home directory (the agent's login is there) but not your `~/.config/hamster-ball`: a private user

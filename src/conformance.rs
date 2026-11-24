@@ -85,7 +85,9 @@ const WRAPPER: &str = "my ($limit, @cmd) = @ARGV;\
 pub enum Expect {
     /// Exit 0 and this word in what it printed.
     Word(&'static str),
-    /// Exit 0 and a connection served to a host starting with this prefix.
+    /// A connection served to a host starting with this prefix, and the word `OK` if the agent
+    /// exits 0. A failed exit is not judged: the account may deny the model after the request has
+    /// reached the provider through the sandbox, and that is not the preset's fault.
     AllowedConnectionTo(&'static str),
     /// Exit with the same status as the same command run without the sandbox.
     SameExitAsBaseline,
@@ -622,8 +624,10 @@ fn judge(
             }
         }
         Expect::AllowedConnectionTo(prefix) => {
-            if !timed_out && exit != ExitKind::Exited(0) {
-                failures.push(Failure::Exit(exit));
+            if exit == ExitKind::Exited(0)
+                && !has_word(&strip_ansi(&String::from_utf8_lossy(stdout)), "OK")
+            {
+                failures.push(Failure::MissingWord("OK"));
             }
             let served = events.iter().any(|e| {
                 e.decision == Decision::Allowed
@@ -891,7 +895,7 @@ mod tests {
             judge(
                 &agent,
                 DEFAULT_TIMEOUT,
-                ExitKind::Exited(0),
+                ExitKind::Exited(1),
                 b"",
                 &served,
                 None
@@ -903,13 +907,35 @@ mod tests {
             judge(
                 &agent,
                 DEFAULT_TIMEOUT,
-                ExitKind::Exited(0),
+                ExitKind::Exited(1),
                 b"",
                 &other,
                 None
             ),
             [Failure::NoConnectionTo("bedrock-runtime.")]
         );
+    }
+
+    #[test]
+    fn a_connection_agent_that_exits_cleanly_must_also_say_the_word_but_a_failed_exit_is_not_judged()
+     {
+        let agent = Agent {
+            expect: Expect::AllowedConnectionTo("bedrock-runtime."),
+            ..WORD
+        };
+        let served = [event(
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            Decision::Allowed,
+        )];
+        let judged = |exit, out: &[u8]| judge(&agent, DEFAULT_TIMEOUT, exit, out, &served, None);
+        assert_eq!(judged(ExitKind::Exited(0), b"OK\n"), []);
+        assert_eq!(
+            judged(ExitKind::Exited(0), b"I cannot say"),
+            [Failure::MissingWord("OK")]
+        );
+        // The account may deny the model: the request still reached Bedrock through the sandbox.
+        assert_eq!(judged(ExitKind::Exited(1), b"access denied"), []);
+        assert_eq!(judged(ExitKind::Signalled(9), b""), []);
     }
 
     #[test]
@@ -946,7 +972,7 @@ mod tests {
                 &served,
                 None
             ),
-            [Failure::Exit(ExitKind::Exited(3))]
+            []
         );
         let baseline = Agent {
             expect: Expect::SameExitAsBaseline,
