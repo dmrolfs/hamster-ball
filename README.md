@@ -1,12 +1,454 @@
-<!-- ABOUTME: Entry point for hamster-ball: a macOS command (`hb`) that runs AI coding agents in a policy-defined hamster ball. -->
-<!-- ABOUTME: Status: design phase. The design lives in ref/Hamster-Ball-Design.md. -->
+<!-- ABOUTME: Entry point for hamster-ball: what `hb` does, how to install and use it, the config reference and troubleshooting. -->
+<!-- ABOUTME: Describes what is built today (milestones 1 to 6); the design and its decision log are in ref/Hamster-Ball-Design.md. -->
 
 # hamster-ball
 
 The agent runs freely inside a clear ball it can't leave, and you can watch.
 
-`hb` runs an AI coding agent (kiro-cli, pi, claude, opencode, and others) inside a
-macOS Seatbelt hamster ball. Each project describes its hamster ball in a `hamster-ball.toml`.
-A user-level base config applies to every project and cannot be loosened by one.
+`hb` runs an AI coding agent (kiro-cli, pi, claude, opencode, or any command) inside a macOS Seatbelt sandbox.
+Each project describes its ball in a small `hamster-ball.toml`. A base config of your own applies to every project, and no
+project can loosen it. The agent reaches the network only through a proxy that checks every host against an allowlist, and
+it cannot read your credentials, your browser profiles or the secret files in the project.
 
-Status: design phase. Read [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md).
+- [What it protects, and what it does not](#what-it-protects-and-what-it-does-not)
+- [Status](#status)
+- [Getting started](#getting-started)
+- [User guide](#user-guide)
+- [Reference](#reference)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+
+## What it protects, and what it does not
+
+`hb` limits what an agent can do when it is wrong, confused or tricked by text it reads. Inside the ball:
+
+| The agent can | The agent cannot |
+|---|---|
+| read and write the directories you grant (normally the project) | read `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, keychains, browser profiles, shell history, other credential stores |
+| reach the hosts you list, over HTTPS or HTTP, through the proxy | open any other connection, resolve names itself, or reach another local port |
+| read `.env.example` and other templates | read `.env`, `*.pem`, `*.key`, `*secret*.yaml` and the like, in any directory it may write |
+| run the programs on a fixed, short `PATH` | change your shell startup files, `~/.gitconfig`, programs on your `PATH`, git hooks, or `hamster-ball.toml` itself |
+| see only the environment variables you pass | run `podman` or `docker`, `launchctl`, `open`, `sudo`, or type into your terminal |
+
+The floor (what is always denied) is compiled into `hb`. No config file can remove an item from it.
+
+Not covered: a hostile agent with a kernel exploit (use a VM), other operating systems, and anything you grant yourself.
+The proxy tunnels bytes and never decrypts them, so an allowed host can still receive anything the agent can read.
+The full threat model is section 2 of [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md).
+
+## Status
+
+Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design lists eight milestones; six are built.
+
+| Built and tested | Not built yet |
+|---|---|
+| layered config, `hb explain`, `hb profile` | `hb warm` and MCP server handling (milestone 7); `[mcp.*]` is parsed and its `bind_ports` are enforced, but `hb` does not start or cache servers |
+| `hb run`: Seatbelt profile, empty environment, pty, signals | `hb ctl` for project containers (milestone 8); `[ctl]` is parsed only |
+| HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
+| approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
+| secrets guard, `hb doctor` | |
+| host-side hooks, Bedrock credentials | |
+| presets for kiro-cli, pi, claude and opencode | |
+
+## Getting started
+
+### Requirements
+
+- macOS (15 tested) on Apple silicon. `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
+- Rust 1.85 or newer to build it.
+- An agent you already use and can run outside the ball (log in to it there first).
+
+### Install
+
+```sh
+git clone https://github.com/dmrolfs/hamster-ball && cd hamster-ball
+cargo install --path .
+hb --version
+```
+
+`hb` must live in a directory the agent cannot write. The floor write-denies every directory on your `PATH`, and
+`hb` itself, so `~/.cargo/bin` is fine. `hb` refuses to run as root and refuses to start inside another sandbox
+(macOS does not nest them).
+
+### First run
+
+1. **Create your base config.** It applies to every project and only you can edit it (the floor denies it to the agent).
+
+   ```sh
+   hb init        # writes ~/.config/hamster-ball/base.toml, never overwrites
+   ```
+
+   The file is commented. It makes every project writable (`[fs] write = ["."]`: a project is not granted on its own, so a
+   base without that line leaves the agent unable to read the project). On a network that inspects TLS (Zscaler and similar)
+   leave `tls.system_trust = true`.
+
+2. **Describe the project.** In the project's root directory:
+
+   ```toml
+   # hamster-ball.toml
+   extends = ["agent/kiro"]     # kiro-cli's own state and hosts; see Presets for the others
+   ```
+
+   Add hosts, paths and variables here as the project needs them (see the config reference).
+
+   `hb` finds the project by walking up from the current directory to the first `hamster-ball.toml`. It stops with an
+   error if there is none; it never falls back to the current directory.
+
+3. **Look at what you are granting.**
+
+   ```sh
+   hb explain                       # every effective rule and the file it came from
+   hb explain --path ~/.ssh/id_rsa  # why one path can or cannot be reached
+   ```
+
+4. **Approve it.** The agent can write the project directory, so `hb` runs a project config only after you have
+   reviewed its exact bytes.
+
+   ```sh
+   hb approve                       # shows what the project adds beyond your base; type y
+   ```
+
+5. **Run the agent.**
+
+   ```sh
+   hb run -- "$(command -v kiro-cli)" chat
+   ```
+
+   The command is looked up on a short `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin` plus the programs named in `[env] tools`).
+   An agent installed elsewhere needs its full path, as above, or an entry in `[env] tools`.
+
+6. **Watch what it asks for.** If something fails, see what was refused:
+
+   ```sh
+   hb run --log-denials --log-proxy -- "$(command -v kiro-cli)" chat
+   ```
+
+   Denials print as `hb: denied: ...` and connections as `hb: proxy: allowed|refused host:port ...`. They are hints for a
+   person: the macOS log is incomplete, so do not turn them into rules without testing.
+
+Run `hb doctor` once per project to see secret-looking files the guard does not cover.
+
+## User guide
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `hb init` | Creates `~/.config/hamster-ball/base.toml` from a commented template. Never overwrites. |
+| `hb run [--log-denials] [--log-proxy] [--no-proxy-summary] [--] <command>...` | Runs the command in the ball and exits with its status (`128 + n` for a signal). Needs an approved config. |
+| `hb explain [--format text\|json] [--show-args] [--path <path>]` | Prints every effective rule with the file it came from, what the floor overrides, skipped grants and warnings (including a project that no grant covers). Runs nothing, needs no approval. `--path` answers one question about one path (merged config and floor only). |
+| `hb approve [--revoke]` | Shows what the project adds beyond your base and asks `Approve this config? [y/N]`. Needs a terminal. `--revoke` takes the approval back and needs none. |
+| `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, and secret-looking launchd variable names. Prints names, never contents. |
+| `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
+
+### How a run is built
+
+1. `hb` finds the project, loads your base, the presets in `extends`, and the project file, and merges them under the floor.
+2. It checks the project config is approved (exit 78 if not).
+3. It scans for secret files, lists tracked ones, and runs your pre-run hooks on the host.
+4. It starts a proxy on `127.0.0.1` with a random port and a per-run credential, and creates a private session directory
+   (this run's `TMPDIR`).
+5. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
+   it sets itself and the ones you list, on a pty of its own when stdin is a terminal.
+6. When the command ends it stops the proxy, removes the session directory (hook files included) and exits with the command's status.
+
+Paths are canonicalized with `realpath` before they reach the profile, because Seatbelt matches resolved paths. A grant whose
+path does not exist is skipped, and `hb explain` and `hb run` say so: create the directory first.
+
+### Config files and layers
+
+From weakest to strongest:
+
+| Layer | File | Who can change it |
+|---|---|---|
+| Floor | compiled into `hb` | nobody |
+| Base | `~/.config/hamster-ball/base.toml` | you; always applied; a project cannot skip it |
+| Presets | built in (`agent/...`), or yours in `~/.config/hamster-ball/presets/<name>.toml`, or a path | named by `extends`; presets may extend presets |
+| Project | `hamster-ball.toml` in the project root | you and the agent's changes, which is why it needs approval |
+
+Merge rules:
+
+- Lists are unioned. A project can add and never remove. `deny` from any layer beats any allow.
+- Maps (`env.set`) merge by key. The same key with two different values is an error that names both files.
+- Switches never loosen: `tls.system_trust`, `terminal.clipboard_write` and `system.launchctl` are `false` if any file says so.
+- Settings that run code on your machine or switch protections off are accepted only from files that are physically yours (the
+  base, your presets): `hooks`, `guard.exceptions`, `net.internal_hosts`, and `system.launchctl = true`. A project file that has
+  one is an error naming the file.
+- Relative paths mean the project root in every layer, so `write = ["."]` in a preset means the project. `~` and `~/...` are
+  the only home forms; there is no `$VAR` expansion. Patterns in `deny_read` and `deny_write` may use `*`, `?` and `**`.
+- `hb` refuses a grant that is too broad: `/`, your home, an ancestor of it, or a path with fewer than two components.
+
+### Config reference
+
+```toml
+extends = ["agent/pi", "my-team"]       # built-in presets, ~/.config/hamster-ball/presets/<name>.toml, or a path
+
+[fs]
+read       = ["~/work/shared-fixtures"]  # read-only
+write      = ["."]                       # read and write; "." is the project
+deny_read  = ["config/*.secrets.yaml"]   # also denies write, delete and rename
+deny_write = ["~/.pi/agent/bin"]         # reads stay as granted
+
+[net]
+allow          = ["crates.io", "*.example.com", "git.example.com:8443"]   # host, *.suffix, optional :port (default 443)
+internal_hosts = ["github.com"]          # your own files only: may resolve to private addresses
+loopback_ports = [5432, 9001]            # services you started yourself; reached directly, not through the proxy
+
+[env]
+pass  = ["LANG", "COLORTERM"]            # copied from your shell
+set   = { RUST_BACKTRACE = "1", MY_TMP = "{session_dir}/work" }   # {session_dir} is this run's private directory
+tools = ["node", "git"]                  # programs found on your PATH when hb starts; their directories are added and readable
+
+[tls]
+system_trust   = true                    # verify against the system roots (TLS-inspecting networks); sets NODE_USE_SYSTEM_CA=1
+extra_ca_files = ["~/ca/corp.pem"]       # private CAs for Node clients; hb sets NODE_EXTRA_CA_CERTS to a per-run bundle
+
+[terminal]
+clipboard_write = true                   # false removes the agent's OSC 52 clipboard writes
+
+[system]
+launchctl = false                        # true (your own files only) lets the agent run launchctl; see the warning in the design, 4.6
+
+[guard]
+exceptions = ["~/work/myproj/.env.local"]   # base and your presets only; absolute or ~/ patterns
+
+[hooks.pre_run.bedrock]                  # base and your presets only; see Credentials
+command      = ["~/bin/credential-process", "--profile", "my-profile"]
+format       = "aws_credential_process"
+profile      = "my-profile"
+timeout_secs = 30                        # 1 to 300
+```
+
+Limits: a config file is read as UTF-8, up to 256 KiB and 4096 entries per list, from a regular file you own that is not
+world-writable. Wildcards over a public suffix or a whole cloud domain (`*.github.io`, `*.amazonaws.com`) are refused at load time:
+list the exact hosts. A host entry is a name, never an IP address.
+
+### Presets
+
+Built into `hb` today: `agent/kiro`, `agent/pi`, `agent/claude`, `agent/opencode`. Each lists only the agent's own state and hosts.
+No preset names a model provider or an MCP server.
+
+| Preset | Measured with | Reads | Writes | Hosts | You still add |
+|---|---|---|---|---|---|
+| `agent/kiro` | kiro-cli 3.5.0 | none | `~/.kiro`, `~/Library/Application Support/kiro-cli` (not its `node`, `bun`, `tui.js`, `bunfig.toml`, `kas`) | `app.kiro.dev` and five more | nothing |
+| `agent/pi` | pi 1.6.0 | via `env.tools = ["node"]` | `~/.pi/agent` (not `bin`, `install`) | none | your provider's host or gateway port, and its CA if private |
+| `agent/claude` | claude 2.1.328 | `~/.local/share/claude`, `~/.local/bin/claude` | `~/.claude`, `~/.claude.json`, `~/.cache/claude`, `~/.local/state/claude` | `bedrock-runtime`, `bedrock`, `sts` in us-east-1 | a credential hook in your base (below) |
+| `agent/opencode` | opencode 1.2.0 (Homebrew) | `~/.config/opencode`, Homebrew `Cellar`, `opt`, `lib`, `etc/openssl@3` | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode` (not its plugin cache or `bin`) | `models.dev`, `opencode.ai` | hosts for your MCP servers, if any |
+
+Each preset file in [`presets/agent/`](presets/agent) starts with a header that says what was measured, what is denied and
+harmless, and what is not proven. [`presets/README.md`](presets/README.md) explains how to write one and how to check it against the
+real agent (`HB_CONFORMANCE=1 cargo test --features test-support --test conformance`).
+
+Write your own the same way: a TOML file in `~/.config/hamster-ball/presets/<name>.toml`, used as `extends = ["<name>"]`. A team
+preset with `[fs] write = ["."]` and the hosts your toolchain needs saves repeating them. Agents installed some other way (a
+different Node, a non-Homebrew opencode) need their own `fs.read` grant for the install.
+
+Preset grants for programs the agent could replace are write-denied on purpose: a plain `claude` or `pi` that you run outside
+the ball must never run something the agent planted. Keep that in mind when you widen a write grant over an install directory.
+
+### Network access
+
+The agent has no direct network and no DNS. It gets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lowercase forms) pointing at
+the per-run proxy, with a random credential so other local processes cannot use it. The proxy:
+
+- allows a host only if an `allow` entry matches it and its port, and answers anything else with a `403` and an `X-Hb-Refusal` code;
+- resolves names itself and connects to the address it checked, so a name that later points at `127.0.0.1` or `169.254.169.254` is refused;
+- refuses private, tunnel and other internal addresses unless the host is in `net.internal_hosts`;
+- never decrypts traffic, and logs no headers or bodies.
+
+Refusal codes you will see: `not_allowed` (add the host), `port_not_allowed` (add `host:port`), `internal_address` (add the host to
+`net.internal_hosts` in your base), `ip_literal` (use a name), `unresolved` and `unreachable` (the name or route is wrong), `timed_out`.
+
+**Corporate networks.** Measured on a Zscaler client tunnel; nothing in `hb` is specific to it.
+
+| Need | How |
+|---|---|
+| TLS inspection re-signs hosts | `tls.system_trust = true` (base default). A private CA for Node clients: `tls.extra_ca_files` |
+| Internal names, or public names such as `github.com`, that resolve to `100.64.0.0/10` or RFC 1918 addresses | list them in `net.internal_hosts` in your base |
+| Split DNS | works: the proxy uses the system resolver |
+| An upstream HTTP proxy, PAC, NTLM or Kerberos | not supported: the proxy connects directly |
+
+`tls.extra_ca_files` and `NODE_USE_SYSTEM_CA` reach Node-based clients (pi, opencode's Node launcher, claude). kiro-cli ignores
+both. Python and `uv` read their own variables: give them one with `[env] set` if you need it.
+
+### Environment
+
+The agent starts with an empty environment. `hb` sets `HOME`, `PATH`, `TMPDIR` (the private session directory), `TERM`,
+`HB_SESSION=1`, the proxy variables and the TLS variables. Everything else you must ask for with `[env] pass` (copied) or
+`[env] set` (fixed). `HOME`, `PATH`, `TMPDIR`, `TERM`, `HB_*`, `DYLD_*`, `LD_*` and the proxy and TLS names cannot be set or passed.
+`set` wins over `pass`, and a hook's variable wins over `set`. `hb explain` never shows a `set` value. Static cloud keys are never
+passed on purpose; use a hook (below).
+
+### Secrets guard
+
+Always on. Below every directory the agent may write (normally the project), at any depth, these names cannot be read, written,
+renamed, deleted or hard-linked: `.env`, `.env.*`, `*secret*.yaml|yml|json|toml`, `*.pem`, `*.key`, `*.p12`. Names stay visible, so
+`ls` works; contents do not.
+
+- Templates (`*.example`, `*.sample`, `*.template`) stay editable.
+- Files git tracks are skipped, since the agent can already read them with `git show`. `hb doctor` lists them.
+- Key and certificate files below `node_modules` and `site-packages` (not `.env*`) are usable, so `pip install` and
+  `rm -rf node_modules` work. `hb` pins the directories that hold them against rename. A directory that gets its first key after
+  `hb` starts is not pinned.
+- Add project patterns with `fs.deny_read`. To switch the guard off for a file, list its absolute or `~/` pattern in
+  `[guard] exceptions` in your base. A project cannot.
+- A secret with an unusual name is not caught. `hb doctor` lists look-alikes (`.netrc`, `id_rsa`, `*.tfvars`, `*.tfstate`, files with
+  `token`, `password` or `api key` in the name) by name only.
+
+### Approval
+
+A project's `hamster-ball.toml`, and any file it extends from inside the project, can be changed by the agent or by a `git pull`.
+So `hb run` runs them only when their exact bytes were approved, and the ball makes those files read-only for the agent.
+
+- `hb approve` prints the project root, each file with a short digest and everything the project adds beyond your base,
+  including what the presets it names grant. It accepts only a typed `y` or `yes`, at a terminal. There is no `--yes`.
+- Any change to a byte, or a renamed, added or removed file, asks again. Moving the project asks again.
+- Records live in `~/.local/state/hamster-ball/approvals/` (the floor hides the directory from the agent). `XDG_STATE_HOME` is ignored.
+- Without a terminal an unapproved config exits **78** and runs nothing. `hb approve --revoke` works without one.
+- Your base and user presets are not hashed: they are outside the ball's reach. Built-in presets are part of the `hb` you installed.
+
+### Credentials and hooks
+
+A hook runs a program of yours on the host, before the agent starts, and gives the agent a file instead of the credential tool.
+Hooks are defined only in your base or user presets. A project that extends such a preset runs its hooks, and `hb approve` lists them.
+
+```toml
+# ~/.config/hamster-ball/base.toml
+[hooks.pre_run.bedrock]
+command = ["~/ai-coding/credential-process", "--profile", "my-profile"]
+format  = "aws_credential_process"
+profile = "my-profile"           # the profile the agent selects (claude's settings pick AWS_PROFILE)
+```
+
+- `command` is an argument list (no shell), and its program is an absolute path or starts with `~/`. It runs with a scrubbed
+  environment and a time limit (`timeout_secs`, default 30, at most 300) that kills its process group. A failing hook stops the run
+  before the agent starts. Signals wait while a hook runs, so the limit is what bounds it.
+- With `format = "aws_credential_process"`, `hb` itself reads the tool's JSON (Version 1) and writes an AWS `config` and `credentials`
+  pair, mode 0600, into the session directory, then sets `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`. No converter program
+  runs on the host. The agent never sees `~/.aws` or your credential tool.
+- Without a format, list `outputs = { VAR = "file" }`: `hb` makes each file mode 0600, sets `VAR` to its path, and removes it at the end.
+- Credentials last as long as your tool says (about 11 hours for the one measured): start a new run after that.
+- A hook's output files and the whole session directory are removed when the run ends, including after a signal.
+
+**claude on Bedrock.** Add the hook above, put `extends = ["agent/claude"]` in the project, and run
+`hb run -- ~/.local/bin/claude`. Expect about 20 s of extra start time: claude's `otelHeadersHelper` and `awsAuthRefresh` from
+`~/.claude/settings.json` cannot run inside the ball, so no telemetry is sent, and claude waits for them before it goes on.
+claude's temp files go to the run's private directory (`CLAUDE_CODE_TMPDIR`), so `/private/tmp` stays closed.
+
+### Debugging a run
+
+| Want | Use |
+|---|---|
+| The rules and where each came from | `hb explain` (`--format json` for scripts) |
+| Why one path is or is not reachable | `hb explain --path <path>` |
+| What the sandbox denied | `hb run --log-denials ...` |
+| Every proxy connection with its byte counts | `hb run --log-proxy ...` |
+| The generated profile | `hb profile` |
+| Whether secrets are exposed | `hb doctor` |
+
+Both log flags print live when stderr is redirected and after the run on a terminal, so an interactive screen is not corrupted
+(1000 lines at most). A run that had proxy refusals and no `--log-denials` ends with a one-line warning, which `--no-proxy-summary` hides.
+
+## Reference
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success (`hb explain` with warnings is still 0) |
+| 1 | config, load, floor, hook or run-start error (including `hb` started inside another sandbox), printed with its cause chain |
+| 2 | usage error |
+| 78 | the project's config is not approved; nothing was run. The message tells this apart from a command that exited 78 itself |
+| other | `hb run`: the command's own code, or `128 + signal` |
+
+When the command dies of INT, TERM, HUP or KILL, `hb` cleans up and raises the same signal on itself, so a calling shell sees a
+signalled child.
+
+### Files and directories
+
+| Path | What |
+|---|---|
+| `~/.config/hamster-ball/base.toml` | your base config |
+| `~/.config/hamster-ball/presets/<name>.toml` | your presets |
+| `~/.local/state/hamster-ball/approvals/` | approval records (0700; the agent cannot read or write it) |
+| `<project>/hamster-ball.toml` | the project config; read-only inside the ball |
+| a private directory under your temp dir | this run's `TMPDIR`, with the hook files and the TLS bundle; removed at exit |
+
+`hb` takes your home from the password database, not `$HOME`, and refuses a mismatch. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are ignored.
+
+### What the floor always denies
+
+| Effect | Paths (home-relative unless absolute) |
+|---|---|
+| no read, no write | `.ssh`, `.aws`, `.gnupg`, `.netrc`, `.config/gh`, `.docker`, `.kube`, `Library/Keychains`, `.git-credentials`, `.cargo/credentials*`, `.npmrc`, `.pypirc`, `.pgpass`, `.vault-token`, cloud CLIs (`gcloud`, `azure`, `oci`, `doctl`, ...), 1Password, shell and atuin history, every major browser's profile, container data (`.local/share/containers`, `/var/run/docker.sock`, `/var/run/podman`), and `~/.config/hamster-ball` with `~/.local/state/hamster-ball` |
+| no connect | the Docker, Podman, Colima, Lima, Rancher and OrbStack sockets |
+| no write | shell startup files, `.gitconfig`, `.config/git`, `.cargo/config*`, `.terraformrc`, `.yarnrc*`, `.m2/settings.xml`, `.config/pip`, `.config/uv`, LaunchAgents, program directories (`~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, every directory on your `PATH`), `hb` itself, and in the project `hamster-ball.toml` plus git's `hooks` and `config` |
+
+Deny wins over every allow. The list is section 6 of the design. `hb explain` prints the 140-odd rules that apply to your
+machine and reports a grant the floor overrides (`grant_shadowed_by_floor`).
+
+### Host services
+
+| Service | Default | Who can change it |
+|---|---|---|
+| network | none; the proxy and listed loopback ports | any file adds hosts and ports |
+| system trust store | on in the generated base | any file may turn it off |
+| clipboard writes | on | any file may turn it off |
+| internal addresses (`net.internal_hosts`) | none | your own files only |
+| `launchctl` | off | your own files may turn it on |
+
+Never available, with no switch: LaunchServices (`open`), Apple Events, setuid programs (`sudo`, `ps`, `top`), the pasteboard tools
+(`pbcopy`, `pbpaste`), keystroke injection, `log show`, and signalling a process outside the ball. The agent can still read machine
+facts such as `ifconfig`, `hostname` and `sw_vers`; with the proxy as the only way out they cannot leave the machine.
+
+## Troubleshooting
+
+Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy` (what was refused).
+
+| Symptom | Cause and fix |
+|---|---|
+| `hb: this project's config has not been approved` (exit 78) | Run `hb approve` in a terminal. Any edit to the project file, or a `git pull` that changes it, asks again. |
+| `no hamster-ball.toml found in ... or any parent directory` | Create one in the project root. `hb` never uses the current directory by default. |
+| `` `claude` was not found on the PATH the program will have `` | The ball's `PATH` is short. Use the full path (`hb run -- ~/.local/bin/claude`) or add the program to `[env] tools`. |
+| `warning: the project directory is not granted`, or `Can't read the current directory (EPERM)` | No grant covers the project. Add `[fs] write = ["."]` to your base (a base made by an older `hb init` lacks it) or to the project file. A grant of a directory inside the project does not count. |
+| `` `~/.cache/claude` was not granted: missing `` | An allow rule for a path that does not exist is skipped. Create the directory, or start the agent once outside the ball. |
+| `hb: proxy: refused host:443 not_allowed` | The agent asked for a host you have not listed. Add it to `[net] allow` if you trust it. |
+| `refused ... (internal_address)` | The name resolves to a private or tunnel address (common for `github.com` behind Zscaler). Add the host to `net.internal_hosts` in your **base**; a project file cannot. |
+| `port_not_allowed` | The host is listed on another port. Add `host:port`. |
+| TLS errors such as `UNABLE_TO_VERIFY_LEAF_SIGNATURE` or `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | The network re-signs the host. Keep `tls.system_trust = true`, or give the CA with `tls.extra_ca_files`. kiro-cli and Python ignore Node's variables. |
+| A connection shows `allowed ... down=0` and nothing comes back | `hb` connected and the far side sent nothing. Seen once on a Zscaler network for about an hour, including for a plain Rust program with no `hb`; the cause was not found. Check the same host with `curl` outside the ball. |
+| `hb cannot run inside another sandbox, because sandbox-exec cannot nest` (exit 1) | macOS cannot nest sandboxes. Run `hb` from a shell that is not inside another agent's sandbox (including another `hb`). |
+| A file is unreadable inside the ball: `.env`, `*.pem`, `*secret*.yaml` | The secrets guard, by design. Use a template (`.env.example`), pass the value with `[env] pass`, or list an exception in your base. |
+| `git push -u`, `git remote add` or `git commit` hooks fail | `.git/config` and `.git/hooks` are write-denied so the agent cannot plant code that git runs outside the ball. Do these outside, and push from your own shell. `git` over HTTPS needs an `allow` entry and has no credentials inside. |
+| `podman` or `docker` does nothing, or `launchctl`, `open`, `pbcopy` fail | By design. Container control is planned (`hb ctl`); `launchctl` is a base-only switch. |
+| An environment variable is missing in the agent | The environment starts empty. Add the name to `[env] pass`, or set a value with `[env] set`. |
+| `[env] pass` or `set` rejected | The name is reserved (`HOME`, `PATH`, `TMPDIR`, `TERM`, `HB_*`, `DYLD_*`, `LD_*`, proxy and TLS names). |
+| `hooks` or `guard`, `net.internal_hosts` rejected in a project | Those sections are accepted only from your base and your presets. Move them there. |
+| A hook fails or times out and nothing starts | The run stops before the agent. Run the hook command by hand to see its error; raise `timeout_secs` (at most 300). |
+| claude is about 20 s slower inside the ball | Expected: its OTEL and `awsAuthRefresh` helpers cannot run and it waits for them. |
+| claude fails with `AWS authentication failed ... check AWS permissions and model access` | The credentials reached Bedrock but your role cannot invoke the model. The same failure happens outside the ball. |
+| opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Remote ones are refused and `npx`/`uvx` ones are not on the ball's `PATH`. Allow their hosts yourself. Support for them is milestone 7. |
+| `hb explain` warns that the approval store location is ignored | `XDG_STATE_HOME` is set; `hb` ignores it on purpose. |
+| Grants differ from what you wrote | `hb explain` lists skipped grants (missing path) and floor overrides. |
+
+Still stuck: `hb profile` prints the exact profile, and `hb explain --format json` gives every rule with its origin for a bug report.
+Do not paste `[env] set` values or hook arguments into one; `hb explain` hides them unless you pass `--show-args`.
+
+## Development
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features                       # about 1600 tests; the sandbox ones skip when sandbox-exec is nested
+HB_REQUIRE_SANDBOX=1 cargo test --all-features  # fail instead of skipping when the sandbox is not usable
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
+```
+
+- The code is a library (`hamster_ball`) and a thin binary (`hb`). `hb-testdrive` is a test-only copy of `hb` that takes its
+  environment from variables (feature `test-support`).
+- Linting is strict: no `unsafe`, no `unwrap` or `expect` outside tests. Errors use `snafu`. Every file starts with two `ABOUTME:` lines.
+- Agent presets are proved against the real agent by an opt-in harness that spends real requests:
+  `HB_CONFORMANCE=1 cargo test --features test-support --test conformance -- --nocapture <agent>`. See [presets/README.md](presets/README.md).
+- [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md) is the design: threat model, config schema, the floor, enforcement,
+  proxy, presets, test plan and the numbered decision log (D1 to D81). Each "Measured" statement in it comes from a run on a real machine.
+- Work is tracked with beads (`bd`), epic `hb-ghd`; working notes live in `history/` and are not committed.
