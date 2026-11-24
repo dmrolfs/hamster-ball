@@ -103,6 +103,7 @@ impl Fake {
             name: "fake",
             binary: path,
             args: &[],
+            env: &[],
             expect,
         }
     }
@@ -266,6 +267,40 @@ fn a_connection_agent_passes_only_with_a_served_connection_to_its_host_prefix() 
             &fake.settings()
         )),
         [Failure::NoConnectionTo("bedrock-runtime.")]
+    );
+}
+
+#[test]
+fn an_agents_own_variables_reach_the_sandboxed_run_beside_the_users_project_env() {
+    sandboxed!();
+    let fake = Fake::new("echo \"key=$FAKE_KEY other=$OTHER\"");
+    let agent = Agent {
+        env: &[("FAKE_KEY", "bogus")],
+        ..fake.agent(Expect::Word("key"))
+    };
+    let mut settings = fake.settings();
+    settings.project_extra = "[env]\nset = { OTHER = \"user\" }\n".to_owned();
+    let presets = [("agent/fake", fake.preset.as_str())];
+    let builtins = StaticPresets(&presets);
+    let verdict = run_agent(
+        &Agent {
+            expect: Expect::Word("bogus"),
+            ..agent
+        },
+        &Context {
+            env: &fake.world.env,
+            builtins: &builtins,
+            settings: &settings,
+        },
+    );
+    let Verdict::Passed(report) = &verdict else {
+        assert_ok!(Err::<(), _>(format!("{verdict}")));
+        return;
+    };
+    assert!(
+        report.output.iter().any(|l| l == "key=bogus other=user"),
+        "{:?}",
+        report.output
     );
 }
 

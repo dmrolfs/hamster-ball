@@ -61,8 +61,8 @@ Attack paths the design must close, each backed by a measurement or a decision:
 
 ```sh
 cd ~/work/myproj
-hb kiro-cli chat          # run any command in the hamster ball (default action is `run`)
-hb run -- cargo test      # explicit form
+hb run -- kiro-cli chat   # run any command in the hamster ball (`--` is optional)
+hb run -- cargo test
 hb explain                # effective policy, with the source file of every rule
 hb approve                # review and approve this project's hamster-ball.toml (needs a terminal)
 hb approve --revoke       # take the approval back (no terminal needed)
@@ -77,6 +77,16 @@ Install: `cargo install --path .`. `hb` must live in a directory the hamster bal
 
 A project contains only TOML. No Rust or scripts are added to projects.
 
+`hb <command>` is not a shorthand for `hb run -- <command>` (D82): a typo of a subcommand would run a program of that name, and
+each new subcommand would change what `hb <word>` means. An alias (`alias hbr='hb run --'`) gives the short form.
+
+**The project is not granted by itself (D82).** `write = ["."]` gives the project, and it comes from a file: normally the base, so
+`hb init` writes it, but a preset or the project file can say it. With no read or write grant over the project directory the agent
+cannot read it, and `hb explain` (warning `project_not_granted`) and `hb run` (before the command starts) say what to add. A grant
+inside the project does not count. An implicit grant was rejected: it could not be removed (a read-only review of a project would
+be impossible, since nothing narrows a grant), and the approval summary, `explain`, the guard roots and the pins would each need to
+know a rule that no file states.
+
 ## 4. Config model
 
 ### 4.1 Layers and files
@@ -85,8 +95,8 @@ From lowest to highest precedence:
 
 1. **Floor**: compiled into `hb`. Cannot be changed by any file (section 6).
 2. **User base**: `~/.config/hamster-ball/base.toml`. Always applied. Not opt-in, so a project cannot skip it.
-3. **Presets**: named in `extends`. Built-in (`rust`, `node`, `python`, `git`, `agent/kiro`,
-   `agent/pi`, `agent/claude`, `agent/opencode`), user presets in `~/.config/hamster-ball/presets/<name>.toml`,
+3. **Presets**: named in `extends`. Built-in (`agent/kiro`, `agent/pi`, `agent/claude`, `agent/opencode`;
+   the language presets `rust`, `node`, `python` and `git` are planned and not built), user presets in `~/.config/hamster-ball/presets/<name>.toml`,
    or a path to a TOML file. Presets may extend other presets.
 4. **Project**: `hamster-ball.toml` in the project root.
 
@@ -160,11 +170,11 @@ config never applies silently.
 
 ```toml
 # ~/work/icehouse/hamster-ball.toml
-extends = ["rust", "git", "agent/kiro", "agent/pi"]
+extends = ["agent/kiro", "agent/pi"]                 # plus your own presets; "rust", "node", "python" and "git" are planned
 
 [fs]
 read       = ["~/work/shared-fixtures"]        # extra read-only paths
-write      = ["."]                              # relative to the project root ("." is implicit)
+write      = ["."]                              # relative to the project root; "." is the project (see below)
 deny_read  = ["config/*.secrets.yaml"]          # project-specific secrets (section 8)
 
 [net]
@@ -993,7 +1003,7 @@ All measured under the deny-default profile with proxy-only network. Home-relati
 | kiro-cli 3.5.0 | none (its binary needs no read grant) | `~/.kiro`, `~/Library/Application Support/kiro-cli` except `node`, `bun`, `tui.js`, `bunfig.toml` and `kas` (`deny_write`: a plain `kiro-cli` runs them outside the sandbox; kiro cannot self-update its agent server inside hb) | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (Zscaler re-signs `kiro.dev`). Measured in hb-ghd.3.5: the 3.3.0 spike also listed `desktop-release.q.us-east-1.amazonaws.com` (update check) and a read of `~/.local/bin/kiro-cli`; 3.5.0 needs neither. Its MCP servers, `~/.gitconfig` and FSEvents are denied harmlessly. |
 | pi 1.6.0 | none (`env.tools = ["node"]` makes the Node install readable) | `~/.pi/agent`, except `bin` and `install` (`deny_write`: they hold the launcher a plain `pi` runs outside the sandbox) | none: the provider is user config (`net.allow` for a remote gateway, `loopback_ports` for a local one such as `localhost:18089`, `tls.extra_ca_files` for a private CA) | Measured in hb-ghd.3.6 with provider `here` (a remote gateway behind a self-signed CA). Without the CA file pi fails with `DEPTH_ZERO_SELF_SIGNED_CERT`. Its update check (`install/update.lock`) and `~/.agents/skills` reads are denied harmlessly. A loopback gateway was reached directly with `loopback_ports` (a stub on 18089 saw pi's requests). |
 | claude 2.1.328 | `~/.local/share/claude`, `~/.local/bin/claude` | `~/.claude`, `~/.claude.json`, `~/.cache/claude`, `~/.local/state/claude` | Bedrock: `bedrock-runtime`, `bedrock`, `sts` in `us-east-1` | Credentials via a host hook in the user base (section 11), not in the preset. `CLAUDE_CODE_TMPDIR={session_dir}` keeps claude out of the shared `/private/tmp`; `DISABLE_AUTOUPDATER=1` and the read-only install keep the updater idle (`api.anthropic.com` and `downloads.claude.ai` are not requested in a headless Bedrock run). Sandboxed runs wait about 20 s on the OTEL and `awsAuthRefresh` helpers. |
-| opencode 1.2.0 | `~/.config/opencode`, `~/.bun/install`, `/opt/homebrew` | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode` | `models.dev`, `opencode.ai` (Zscaler-signed) | Earlier notes said it needs `com.apple.securityd.xpc` and the `kCFPreferencesAnyApplication` read. The D62 run showed a TLS fetch to a local server works without both (a denial is logged, the call succeeds); an end-to-end run is still missing (no provider is configured on this machine). Loopback bind for its in-process server needs `bind_ports`. |
+| opencode 1.2.0 (Homebrew) | `~/.config/opencode`, and from Homebrew `Cellar`, `opt`, `lib`, `etc/openssl@3` (not all of `/opt/homebrew`, which holds `var`; `~/.bun/install` is not needed) | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode`; `deny_write` on what a plain opencode runs: `~/.cache/opencode/{node_modules,package.json,bun.lock}` and `~/.local/share/opencode/bin` | `models.dev`, `opencode.ai` (Zscaler-signed; system trust) | The config directory can be read-only (opencode skips its dependency install). The `securityd` and preference denials do not stop TLS. MCP servers in the user's opencode config are not part of the preset: `npx`/`uvx` ones fail, remote ones are refused (M7). Run opencode once outside hb after an install or update (default plugin install needs npm). Loopback bind for its in-process server needs `bind_ports`. |
 | codex, omp | | | | **Not installed here; no preset until tested.** |
 
 Presets are hand-written. Measured: Seatbelt denial logs are incomplete (40 of 40 reported for `sh` and
@@ -1018,7 +1028,7 @@ question under the real profile and proxy, and returns a verdict:
 | kiro-cli | `chat --no-interactive "Reply with the single word OK"` | exit 0 and `OK` in the output |
 | pi | `--provider here --model claude-haiku-4-5 -p "..."` | exit 0 and `OK` in the output |
 | claude | `-p "..." --max-turns 1` | a served connection to `bedrock-runtime.*`, and `OK` in the output if it exits 0 (a failed exit is not judged: the account may deny the model) |
-| opencode | `run "..."` | the same exit status as the same command without the sandbox |
+| opencode | `run --format json -m opencode/big-pickle "..."` with a made-up `OPENCODE_API_KEY` (set by the harness) | exit 0 and `Invalid credential` in the output: a model request goes through the proxy and `opencode.ai` refuses the key (HTTP 401). No provider is needed, no free-tier request is spent, and it takes about 7 s |
 
 Every connection the proxy refuses (other than the credentials challenge) fails the check and names the host: the agent asked for
 something outside the allow set in force, which is the preset plus what the runner put in `HB_CONFORMANCE_PROJECT`. On a failure the
@@ -1229,3 +1239,5 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D78 | Secrets guard (`src/guard`, hb-ghd.5): covers every writable grant; exceptions are absolute or `~/` path patterns (a relative one is refused); templates are re-allowed by name inside each root; tracked files come from a hardened host-side `git ls-files`; key and secret-named files (not `.env*`) below `node_modules` and `site-packages` are re-allowed together with unlink pins on every directory that holds a guarded file (a directory rename is otherwise a bypass, measured); an incomplete scan switches the exemption off; `hb doctor` reports look-alike names, tracked secrets and launchd variable names, never contents | owner, hb-ghd.5 |
 | D79 | Hooks (`[hooks.pre_run.<name>]`, hb-ghd.6.1) replace the flat argv list: argv only, an absolute or `~/` program, a scrubbed environment, a 1 to 300 s timeout that kills the process group, per-hook 0700 directories under the session directory, file outputs by variable, and an `aws_credential_process` format parsed by `hb` itself so no converter runs on the host; keyed merge (two files defining one name differently conflict); run in name order; `[env] set` values may use `{session_dir}` | owner, hb-ghd.6 |
 | D80 | claude preset (hb-ghd.6.2): no `/private/tmp` grant; `CLAUDE_CODE_TMPDIR={session_dir}` replaces the planned `claude-<uid>`/`cc-socks` narrowing (a uid-named path cannot be spelled by a preset and must exist beforehand); the credential command is a hook in the user's base, not in the preset; `DISABLE_AUTOUPDATER=1` with a read-only install; the harness passes claude on a served `bedrock-runtime` connection and requires `OK` only on exit 0, because the measuring account's Bedrock role explicitly denies `InvokeModel` | agreed |
+| D81 | opencode preset (hb-ghd.6.3): narrow Homebrew reads instead of `/opt/homebrew` (it holds database data under `var`); config directory read-only; `deny_write` on the plugin cache and downloaded tools so the agent cannot plant code that a plain `opencode` runs; conformance by a made-up API key and `opencode.ai`'s 401, because a provider-less `run` depends on free-tier quota and retried for over 100 s (one run in 34 s); `Agent` has an `env` field that the harness sets in its own project preset; `Expect::Word` matches a phrase of consecutive whole words | agreed |
+| D82 | The project directory is granted by a file, not implicitly: `hb init` writes `[fs] write = ["."]` into the base, and `hb explain` and `hb run` warn when no read or write grant covers the project (`Policy::project_grant_warning`). `hb <command>` without `run` is not built: the usage line and `--help` show `hb run -- <program>` instead | agreed |

@@ -55,7 +55,7 @@ An agent that is not installed, or has no preset yet, is skipped. On a failure t
 | kiro-cli | exits 0 and prints `OK` |
 | pi | exits 0 and prints `OK` |
 | claude | a connection to `bedrock-runtime.*` is served, and `OK` is printed if it exits 0 (a failed exit is not judged: the account may deny the model) |
-| opencode | exits as the same command does without the sandbox |
+| opencode | exits 0 and prints `Invalid credential`: the harness sets a made-up `OPENCODE_API_KEY`, so a model request goes through the proxy and `opencode.ai` answers 401 (no provider needed, no free-tier request spent) |
 
 The run uses the real home directory (the agent's login is there) but not your `~/.config/hamster-ball`: a private user
 config holds only what the variables give it, so a result depends on the preset.
@@ -79,3 +79,21 @@ Example for pi against a remote gateway with a private CA (`provider.toml` is th
 HB_CONFORMANCE=1 HB_CONFORMANCE_PROJECT=provider.toml HB_CONFORMANCE_BASE=base.toml \
   cargo test --features test-support --test conformance -- --nocapture pi
 ```
+
+An agent that starts MCP servers from your own config (opencode reads `~/.config/opencode/opencode.json`) asks for their hosts too,
+and the check fails on each one the preset does not allow. For a check on such a machine, list them in the project file, and put a
+host that resolves to a private address (a corporate proxy's range) in `net.internal_hosts` of the base file:
+
+```sh
+# project.toml:  [net]
+#                allow = ["mcp.example.com", "github.com"]
+# base.toml:     [tls]
+#                system_trust = true
+#                [net]
+#                internal_hosts = ["github.com"]
+HB_CONFORMANCE=1 HB_CONFORMANCE_PROJECT=project.toml HB_CONFORMANCE_BASE=base.toml \
+  cargo test --features test-support --test conformance -- --nocapture opencode
+```
+
+Some criteria need a variable the agent cannot get without a provider (opencode's made-up key). The harness sets those itself in
+`Agent::env`; they reach only the sandboxed run.

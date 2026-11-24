@@ -43,7 +43,7 @@ pub use extends::ExtendsError;
 pub use location::{FileLocation, classify};
 pub use merge::{
     MAX_MERGE_ERRORS, MergeError, MergeErrors, MergedCtl, MergedEnv, MergedFs, MergedNet,
-    MergedSystem, MergedTerminal, MergedTls, Policy, merge,
+    MergedSystem, MergedTerminal, MergedTls, PROJECT_NOT_GRANTED, Policy, merge,
 };
 pub use project::{ProjectError, load_project};
 pub use resolve::{

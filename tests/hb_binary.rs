@@ -23,6 +23,10 @@ fn an_unknown_command_prints_usage_and_exits_2() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Usage: hb"), "{stderr}");
     assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+    assert!(
+        stderr.contains("hb run"),
+        "the usage line shows how to run a program: {stderr}"
+    );
 }
 
 #[test]
@@ -36,6 +40,10 @@ fn help_lists_the_commands_on_stdout() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("init"), "{stdout}");
     assert!(stdout.contains("explain"), "{stdout}");
+    assert!(
+        stdout.contains("hb run -- <program>"),
+        "the help shows how to run a program: {stdout}"
+    );
 }
 
 #[test]

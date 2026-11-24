@@ -38,7 +38,13 @@ use crate::text::Escaped;
 
 /// Run AI coding agents inside a hamster ball.
 #[derive(Debug, Parser)]
-#[command(name = "hb", version, about)]
+#[command(
+    name = "hb",
+    version,
+    about,
+    override_usage = "hb <COMMAND>\n       hb run [OPTIONS] [--] <COMMAND>...",
+    after_help = "To run a program in the hamster ball: hb run -- <program> [args]\nFor example: hb run -- ~/.local/bin/claude"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -503,6 +509,10 @@ fn run_command_with(
         if let Err(error) = block_supervised() {
             return fail(err, crate::Error::from(RunError::from(error)));
         }
+    }
+    // Said before the command starts: the agent's own error for it is only "Operation not permitted".
+    if let Some(warning) = loaded.policy.project_grant_warning(discovery.root.path()) {
+        let _ = writeln!(err, "warning: {warning}");
     }
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let mut spec = RunSpec::new(command)

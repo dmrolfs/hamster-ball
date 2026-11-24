@@ -175,11 +175,31 @@ pub struct Policy {
     floor: Floor,
 }
 
+/// Said when no `fs.read` or `fs.write` grant covers the project directory.
+pub const PROJECT_NOT_GRANTED: &str = "the project directory is not granted, so the agent cannot read or write it; \
+add `write = [\".\"]` under `[fs]`, usually in your base config (`hb init` writes it)";
+
 impl Policy {
     /// The floor this policy was built on.
     #[must_use]
     pub fn floor(&self) -> &Floor {
         &self.floor
+    }
+
+    /// [`PROJECT_NOT_GRANTED`] when no read or write grant is the project `root` or a directory
+    /// above it, and `None` otherwise.
+    ///
+    /// The project is not granted by itself: a grant comes from the base, a preset or the project
+    /// file, as `write = ["."]` (design 4.4). A grant inside the project does not cover it.
+    #[must_use]
+    pub fn project_grant_warning(&self, root: &CanonicalPath) -> Option<&'static str> {
+        let covered = self
+            .fs
+            .read
+            .iter()
+            .chain(&self.fs.write)
+            .any(|grant| grant.value.is_same_or_ancestor_of(root));
+        (!covered).then_some(PROJECT_NOT_GRANTED)
     }
 }
 

@@ -102,6 +102,9 @@ pub struct Agent {
     pub binary: &'static str,
     /// Its arguments for one non-interactive question.
     pub args: &'static [&'static str],
+    /// Variables the sandboxed run sets (name, value): what the agent needs for its check and a
+    /// provider-less setup cannot give it.
+    pub env: &'static [(&'static str, &'static str)],
     /// What counts as success.
     pub expect: Expect,
 }
@@ -112,19 +115,31 @@ pub const AGENTS: [Agent; 4] = [
         name: "claude",
         binary: "claude",
         args: &["-p", QUESTION, "--max-turns", "1"],
+        env: &[],
         expect: Expect::AllowedConnectionTo("bedrock-runtime."),
     },
     Agent {
         name: "kiro",
         binary: "kiro-cli",
         args: &["chat", "--no-interactive", QUESTION],
+        env: &[],
         expect: Expect::Word("OK"),
     },
     Agent {
         name: "opencode",
         binary: "opencode",
-        args: &["run", QUESTION],
-        expect: Expect::SameExitAsBaseline,
+        // No provider is needed: a made-up key makes opencode.ai answer 401 "Invalid credential" within
+        // seconds, which is a full round trip through the proxy that costs no free-tier request.
+        args: &[
+            "run",
+            "--format",
+            "json",
+            "-m",
+            "opencode/big-pickle",
+            QUESTION,
+        ],
+        env: &[("OPENCODE_API_KEY", "hb-conformance-not-a-real-key")],
+        expect: Expect::Word("Invalid credential"),
     },
     Agent {
         name: "pi",
@@ -137,6 +152,7 @@ pub const AGENTS: [Agent; 4] = [
             "-p",
             QUESTION,
         ],
+        env: &[],
         expect: Expect::Word("OK"),
     },
 ];
@@ -473,7 +489,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn create(preset: &str, settings: &Settings) -> Result<Self, String> {
+    fn create(preset: &str, env: &[(&str, &str)], settings: &Settings) -> Result<Self, String> {
         let parent = CanonicalPath::from_canonical(
             &fs::canonicalize(std::env::temp_dir()).map_err(|e| format!("temp dir: {e}"))?,
         )
@@ -487,13 +503,14 @@ impl Rig {
                 .map_err(|e| format!("{}: {e}", sub.display()))?;
         }
         write_private(&user_config.join("base.toml"), &settings.base_config)?;
-        // The project is writable, as in any project of the user's; a preset of its own keeps that
-        // out of `project_extra`, which may have an `[fs]` table of its own.
+        // The project is writable, as in any project of the user's, and gets the agent's own
+        // variables; a preset of its own keeps both out of `project_extra`, which may have an
+        // `[fs]` or `[env]` table of its own.
         let presets = user_config.join("presets");
         fs::create_dir(&presets).map_err(|e| format!("{}: {e}", presets.display()))?;
         write_private(
             &presets.join(format!("{PROJECT_PRESET}.toml")),
-            "[fs]\nwrite = [\".\"]\n",
+            &project_preset(env),
         )?;
         write_private(
             &project.join("hamster-ball.toml"),
@@ -508,6 +525,19 @@ impl Rig {
             user_config,
         })
     }
+}
+
+/// The private preset every check extends: a writable project and the agent's variables.
+fn project_preset(env: &[(&str, &str)]) -> String {
+    let mut text = String::from("[fs]\nwrite = [\".\"]\n");
+    if !env.is_empty() {
+        let set: toml::Table = env
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), toml::Value::String((*value).to_owned())))
+            .collect();
+        text.push_str(&format!("[env]\nset = {}\n", toml::Value::Table(set)));
+    }
+    text
 }
 
 fn write_private(path: &Path, text: &str) -> Result<(), String> {
@@ -525,7 +555,7 @@ fn attempt(
     preset: &str,
     report: &mut Report,
 ) -> Result<Vec<Failure>, String> {
-    let rig = Rig::create(preset, ctx.settings)?;
+    let rig = Rig::create(preset, agent.env, ctx.settings)?;
     let mut env = ctx.env.clone();
     env.cwd = fs::canonicalize(&rig.project).map_err(|e| format!("project: {e}"))?;
     let discovery = discover(&env.cwd, &env.home).map_err(|e| e.to_string())?;
@@ -682,10 +712,20 @@ fn find_binary(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Whether `word` is a whole word of `text`.
-fn has_word(text: &str, word: &str) -> bool {
+/// The alphanumeric runs of `text`.
+fn words(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric())
-        .any(|token| token == word)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Whether `phrase` (one word or several) occurs in `text` as consecutive whole words.
+fn has_word(text: &str, phrase: &str) -> bool {
+    let wanted = words(phrase);
+    !wanted.is_empty()
+        && words(text)
+            .windows(wanted.len())
+            .any(|window| window == wanted.as_slice())
 }
 
 /// `text` without terminal escape sequences (colours, cursor movement).
@@ -769,6 +809,7 @@ mod tests {
         name: "fake",
         binary: "fake",
         args: &[],
+        env: &[],
         expect: Expect::Word("OK"),
     };
 
@@ -787,6 +828,45 @@ mod tests {
         for text in ["", "okay", "BOOK", "OKAY", "O K"] {
             assert!(!has_word(&strip_ansi(text), "OK"), "{text:?}");
         }
+    }
+
+    #[test]
+    fn the_project_preset_is_writable_and_carries_the_agents_variables_as_valid_toml() {
+        let plain: toml::Table = assert_ok!(project_preset(&[]).parse());
+        assert_eq!(plain.keys().collect::<Vec<_>>(), ["fs"]);
+        let text = project_preset(&[("A_KEY", "va\"lue\\x"), ("B", "2")]);
+        let parsed: toml::Table = assert_ok!(text.parse());
+        let set = &parsed["env"]["set"];
+        assert_eq!(set["A_KEY"].as_str(), Some("va\"lue\\x"));
+        assert_eq!(set["B"].as_str(), Some("2"));
+        assert_eq!(parsed["fs"]["write"][0].as_str(), Some("."));
+    }
+
+    #[test]
+    fn a_phrase_is_found_only_as_consecutive_whole_words() {
+        for text in [
+            "Invalid credential",
+            "Error: Invalid credential\n",
+            "\u{1b}[91mError: \u{1b}[0mInvalid   credential.",
+        ] {
+            assert!(
+                has_word(&strip_ansi(text), "Invalid credential"),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "",
+            "Invalid credentials",
+            "credential Invalid",
+            "Invalid the credential",
+            "Invalid",
+        ] {
+            assert!(
+                !has_word(&strip_ansi(text), "Invalid credential"),
+                "{text:?}"
+            );
+        }
+        assert!(!has_word("anything", ""));
     }
 
     #[test]
@@ -1140,7 +1220,10 @@ mod tests {
             by_name("claude"),
             Some(Expect::AllowedConnectionTo("bedrock-runtime."))
         );
-        assert_eq!(by_name("opencode"), Some(Expect::SameExitAsBaseline));
+        assert_eq!(
+            by_name("opencode"),
+            Some(Expect::Word("Invalid credential"))
+        );
         let names: Vec<&str> = AGENTS.iter().map(|a| a.name).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();

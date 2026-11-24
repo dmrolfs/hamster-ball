@@ -183,3 +183,68 @@ fn the_claude_preset_writes_its_state_reaches_three_bedrock_hosts_and_has_no_hoo
         .count();
     assert_eq!(tmp_grants, 0);
 }
+
+#[test]
+fn the_opencode_preset_reads_its_config_and_program_writes_its_state_and_not_what_it_executes() {
+    let (world, loaded) = merged(
+        "opencode",
+        &[
+            ".config/opencode",
+            ".local/share/opencode",
+            ".cache/opencode",
+            ".local/state/opencode",
+        ],
+    );
+    let mut writes = write_grants(&world, &loaded);
+    writes.sort();
+    assert_eq!(
+        writes,
+        [
+            "~/.cache/opencode",
+            "~/.local/share/opencode",
+            "~/.local/state/opencode"
+        ]
+    );
+    let home = world.home.path().as_str().to_owned();
+    let reads: Vec<String> = loaded
+        .policy
+        .fs
+        .read
+        .iter()
+        .map(|r| r.value.as_str().replace(&home, "~"))
+        .collect();
+    assert!(reads.iter().any(|r| r == "~/.config/opencode"), "{reads:?}");
+    assert!(
+        !reads
+            .iter()
+            .any(|r| r == "/opt/homebrew" || r.contains(".bun")),
+        "{reads:?}"
+    );
+    let denied: Vec<String> = loaded
+        .policy
+        .fs
+        .deny_write
+        .iter()
+        .map(|d| format!("{:?}", d.value))
+        .collect();
+    for path in [
+        "/.cache/opencode/node_modules",
+        "/.cache/opencode/package.json",
+        "/.cache/opencode/bun.lock",
+        "/.local/share/opencode/bin",
+    ] {
+        assert!(
+            denied.iter().any(|d| d.contains(path)),
+            "{path}: {denied:?}"
+        );
+    }
+    let hosts: Vec<String> = loaded
+        .policy
+        .net
+        .allow
+        .iter()
+        .map(|rule| format!("{}:{}", rule.value.pattern, rule.value.port.get()))
+        .collect();
+    assert_eq!(hosts, ["models.dev:443", "opencode.ai:443"]);
+    assert!(loaded.policy.hooks.is_empty());
+}

@@ -1,0 +1,49 @@
+# agent/opencode: opencode 1.2.0 (Homebrew), measured 2026-11-24 with `opencode run` behind the proxy.
+#
+# opencode is a Node launcher that starts a native binary under /opt/homebrew/Cellar. Reads: its config
+# directory `~/.config/opencode` (config, plugins; read-only, opencode logs "config dir is not writable,
+# skipping dependency install" and goes on) and the parts of Homebrew that node and the binary need:
+# `Cellar`, `opt`, `lib` and `etc/openssl@3` (node aborts without its `openssl.cnf`). All of
+# `/opt/homebrew` is not granted: it also holds `var`, where Homebrew keeps database data. A Node or install
+# that is not in Homebrew needs its own read grant in your config. `~/.bun/install` is not needed.
+#
+# Writes: `~/.local/share/opencode` (session database, logs), `~/.cache/opencode` (model list, plugin
+# cache) and `~/.local/state/opencode`. The login (`auth.json`) is in the first, so the agent can read it.
+# Not written: what a plain `opencode` runs outside the sandbox, so the agent cannot plant code there:
+# the plugin cache (`~/.cache/opencode/node_modules`, `package.json`, `bun.lock`) and downloaded tools
+# (`~/.local/share/opencode/bin`). Run opencode once outside hb after installing or updating it: it
+# installs its default plugin then, and could not do it here (npm is not an allowed host).
+#
+# Hosts: models.dev (the model list, fetched at every start) and opencode.ai (its hosted models).
+#
+# MCP servers in `~/.config/opencode/opencode.json` are not part of the agent. Local ones started with
+# `npx` or `uvx` fail here ("Executable not found"); remote ones are refused by the proxy. Give each its
+# own `[mcp.*]`. A local MCP server of your own may ask for more hosts (lean-ctx asked for github.com).
+#
+# Denied and harmless: `com.apple.securityd.xpc` and the `com.apple.security` preference (TLS verifies
+# without them), ~/Library/Keychains probes, FSEvents, and reads of `~/.claude` and `~/.agents`.
+#
+# Proven: it starts, loads config and plugins, fetches the model list and sends a model request through
+# the proxy. No provider is configured on the measuring machine, so a real answer is not proven; the
+# conformance check sends a made-up key and expects opencode.ai's "Invalid credential".
+[fs]
+read = [
+  "~/.config/opencode",
+  "/opt/homebrew/Cellar",
+  "/opt/homebrew/etc/openssl@3",
+  "/opt/homebrew/lib",
+  "/opt/homebrew/opt",
+]
+write = ["~/.cache/opencode", "~/.local/share/opencode", "~/.local/state/opencode"]
+deny_write = [
+  "~/.cache/opencode/bun.lock",
+  "~/.cache/opencode/node_modules",
+  "~/.cache/opencode/package.json",
+  "~/.local/share/opencode/bin",
+]
+
+[net]
+allow = ["models.dev", "opencode.ai"]
+
+[tls]
+system_trust = true

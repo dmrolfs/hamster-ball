@@ -434,6 +434,15 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
             origins: Vec::new(),
         })
         .collect();
+    warnings.extend(
+        policy
+            .project_grant_warning(options.root)
+            .map(|message| WarningRow {
+                kind: "project_not_granted".to_owned(),
+                message: message.to_owned(),
+                origins: Vec::new(),
+            }),
+    );
     warnings.extend(b.skipped_allows());
     warnings.extend(b.shadowed_grants(policy, options.root));
     if options.xdg_state_home_set {

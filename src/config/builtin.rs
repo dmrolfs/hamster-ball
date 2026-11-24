@@ -30,6 +30,10 @@ const EMBEDDED: &[(&str, &str)] = &[
         include_str!("../../presets/agent/claude.toml"),
     ),
     ("agent/kiro", include_str!("../../presets/agent/kiro.toml")),
+    (
+        "agent/opencode",
+        include_str!("../../presets/agent/opencode.toml"),
+    ),
     ("agent/pi", include_str!("../../presets/agent/pi.toml")),
 ];
 

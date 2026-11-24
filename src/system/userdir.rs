@@ -30,6 +30,11 @@ pub const BASE_TEMPLATE: &str = "\
 # what is allowed here but can never remove or weaken anything this file or the floor forbids.
 # Add the hosts, paths and environment variables you want every hamster ball to have.
 
+[fs]
+# Every project is writable. A project is not granted on its own: remove this line to grant each
+# project in its own hamster-ball.toml instead. Other paths: read = [\"~/dir\"], write = [\"~/dir\"].
+write = [\".\"]
+
 [tls]
 # Trust the system certificate store (needed behind a TLS-inspecting proxy such as Zscaler).
 system_trust = true
@@ -442,6 +447,12 @@ mod tests {
         ));
         assert_eq!(resolved.config.tls.system_trust, Some(true));
         assert_eq!(resolved.config.env.pass.len(), 2);
+        assert_eq!(
+            resolved.config.fs.write.len(),
+            1,
+            "the template makes each project writable"
+        );
+        assert!(BASE_TEMPLATE.contains("\nwrite = [\".\"]\n"));
         assert!(BASE_TEMPLATE.contains("# launchctl = true"));
         assert!(BASE_TEMPLATE.contains("# exceptions = ["));
         assert!(BASE_TEMPLATE.contains("# [hooks.pre_run.bedrock]"));
