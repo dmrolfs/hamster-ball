@@ -52,6 +52,14 @@ system_trust = true
 # with / or ~/ so it names one project, and may end in a glob such as *.secrets.yaml.
 # exceptions = [\"~/work/myproj/.env.local\"]
 
+# Host-side steps that run before every hamster ball, outside it. Only this file and your presets can
+# define one. A claude on Bedrock needs fresh credentials that the sandbox must never fetch itself: hb
+# runs your credential tool here and gives the agent only a short-lived file.
+# [hooks.pre_run.bedrock]
+# command = [\"~/path/to/credential-process\", \"--profile\", \"my-profile\"]
+# format = \"aws_credential_process\"
+# profile = \"my-profile\"      # the name the agent selects (claude's own settings pick AWS_PROFILE)
+
 [net]
 # Hosts allowed to resolve to private, tunnel or other internal addresses, for example a corporate
 # network where github.com or an internal registry answers with a 100.64.x.x address. Only this
@@ -436,6 +444,7 @@ mod tests {
         assert_eq!(resolved.config.env.pass.len(), 2);
         assert!(BASE_TEMPLATE.contains("# launchctl = true"));
         assert!(BASE_TEMPLATE.contains("# exceptions = ["));
+        assert!(BASE_TEMPLATE.contains("# [hooks.pre_run.bedrock]"));
         assert!(BASE_TEMPLATE.contains("# internal_hosts ="));
         assert!(resolved.config.net.internal_hosts.is_empty());
         assert_eq!(

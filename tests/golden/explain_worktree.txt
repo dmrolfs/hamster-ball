@@ -170,7 +170,7 @@ mcp
   (none)
 
 hooks (run on the host, in order)
-  notify 2 args hidden  <- [0] hooks[0]
+  notify: /usr/bin/notify 2 args hidden (30s)  <- [0] hooks.pre_run.notify
 
 guard (secrets: content and writes denied, names visible)
   covers    ~/work/proj

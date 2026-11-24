@@ -900,8 +900,15 @@ mod tests {
         ) {
             let location = [FileLocation::InProject, FileLocation::Other][location_index];
             let mut c = ResolvedConfig::default();
-            let words = vec!["echo".to_owned()];
-            c.hooks = vec![assert_ok!(crate::policy::Argv::parse(&words))];
+            let words = vec!["/bin/echo".to_owned()];
+            let hook = assert_ok!(crate::policy::Hook::new(
+                assert_ok!(crate::policy::Argv::parse(&words)),
+                crate::policy::HookTimeout::default(),
+                None,
+                None,
+                std::collections::BTreeMap::new(),
+            ));
+            c.hooks = std::iter::once((assert_ok!(crate::policy::HookName::parse("h")), hook)).collect();
             let layer = if hooked_in_project { Layer::Project } else { Layer::Preset };
             let files = numbered(vec![file("evil", layer, location, c)]);
             // Either the merge refuses, or the hook is absent; it is never merged in.

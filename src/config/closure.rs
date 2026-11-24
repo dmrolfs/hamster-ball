@@ -743,7 +743,10 @@ mod tests {
     const BUILTINS: StaticPresets<'static> = StaticPresets(&[
         ("rust", "[net]\nallow = [\"crates.io\"]\n"),
         ("git", "[net]\nallow = [\"github.com\"]\n"),
-        ("hooked", "hooks = [[\"echo\", \"built-in\"]]\n"),
+        (
+            "hooked",
+            "[hooks.pre_run.h]\ncommand = [\"/echo\", \"built-in\"]\n",
+        ),
         ("loops", "extends = [\"loops\"]\n"),
     ]);
 
@@ -1027,7 +1030,7 @@ mod tests {
     fn an_absolute_path_to_a_user_preset_behaves_exactly_like_the_name() {
         let w = World::new();
         w.base("");
-        let file = w.user_preset("mine", "hooks = [[\"echo\"]]\n");
+        let file = w.user_preset("mine", "[hooks.pre_run.h]\ncommand = [\"/echo\"]\n");
         w.project(&format!("extends = [\"{}\"]\n", file.display()));
         // Location is physical, so the alias is as trusted as the name: hooks are allowed.
         let closure = w.closure();
@@ -1448,7 +1451,7 @@ mod tests {
     fn hooks_in_the_project_file_are_an_error_naming_that_file() {
         let w = World::new();
         w.base("");
-        let project = w.project("hooks = [[\"curl\", \"evil\"]]\n");
+        let project = w.project("[hooks.pre_run.h]\ncommand = [\"/curl\", \"evil\"]\n");
         let err = assert_err!(w.load());
         let (path, section, location) = user_only_error(&err);
         assert_eq!(path, assert_ok!(fs::canonicalize(&project)));
@@ -1533,7 +1536,10 @@ mod tests {
     fn hooks_in_an_in_project_preset_are_an_error_naming_the_preset() {
         let w = World::new();
         w.base("");
-        w.write(&w.project_dir().join("p.toml"), "hooks = [[\"x\"]]\n");
+        w.write(
+            &w.project_dir().join("p.toml"),
+            "[hooks.pre_run.h]\ncommand = [\"/x\"]\n",
+        );
         w.project("extends = [\"./p.toml\"]\n");
         let err = assert_err!(w.load());
         let (path, _, location) = user_only_error(&err);
@@ -1547,7 +1553,7 @@ mod tests {
         w.base("");
         let elsewhere = w.write(
             &w.tree.outside("shared").join("h.toml"),
-            "hooks = [[\"x\"]]\n",
+            "[hooks.pre_run.h]\ncommand = [\"/x\"]\n",
         );
         w.project(&format!("extends = [\"{}\"]\n", elsewhere.display()));
         let err = assert_err!(w.load());
@@ -1558,8 +1564,11 @@ mod tests {
     #[test]
     fn hooks_in_the_base_a_user_preset_and_a_builtin_are_accepted() {
         let w = World::new();
-        w.base("hooks = [[\"echo\", \"base\"]]\n");
-        w.user_preset("mine", "hooks = [[\"echo\", \"preset\"]]\n");
+        w.base("[hooks.pre_run.h]\ncommand = [\"/echo\", \"base\"]\n");
+        w.user_preset(
+            "mine",
+            "[hooks.pre_run.h]\ncommand = [\"/echo\", \"preset\"]\n",
+        );
         w.project("extends = [\"mine\", \"hooked\"]\n");
         assert_eq!(w.closure().files().len(), 4);
     }
@@ -1568,7 +1577,10 @@ mod tests {
     fn a_user_preset_that_extends_an_in_project_file_with_hooks_names_the_in_project_file() {
         let w = World::new();
         w.base("");
-        let inner = w.write(&w.project_dir().join("inner.toml"), "hooks = [[\"x\"]]\n");
+        let inner = w.write(
+            &w.project_dir().join("inner.toml"),
+            "[hooks.pre_run.h]\ncommand = [\"/x\"]\n",
+        );
         w.user_preset("trusted", &format!("extends = [\"{}\"]\n", inner.display()));
         w.project("extends = [\"trusted\"]\n");
         let err = assert_err!(w.load());
@@ -1582,7 +1594,7 @@ mod tests {
     #[test]
     fn a_base_that_extends_a_project_file_with_hooks_is_refused() {
         let w = World::new();
-        w.project("hooks = [[\"x\"]]\n");
+        w.project("[hooks.pre_run.h]\ncommand = [\"/x\"]\n");
         w.base(&format!(
             "extends = [\"{}\"]\n",
             w.discovery.config.display()
@@ -1597,7 +1609,7 @@ mod tests {
     fn a_user_preset_that_is_also_hard_linked_elsewhere_cannot_carry_hooks() {
         let w = World::new();
         w.base("");
-        let preset = w.user_preset("linked", "hooks = [[\"x\"]]\n");
+        let preset = w.user_preset("linked", "[hooks.pre_run.h]\ncommand = [\"/x\"]\n");
         assert_ok!(fs::hard_link(
             &preset,
             w.project_dir().join("writable-alias.toml")
@@ -1614,7 +1626,7 @@ mod tests {
         w.base("");
         let target = w.write(
             &w.tree.outside("dotfiles").join("p.toml"),
-            "hooks = [[\"x\"]]\n",
+            "[hooks.pre_run.h]\ncommand = [\"/x\"]\n",
         );
         let name = assert_ok!(crate::policy::PresetName::parse("dot"));
         let path = w.user.preset_file(&name);
@@ -1644,7 +1656,7 @@ mod tests {
     fn user_only_sections_are_reported_before_other_resolve_errors_in_the_same_file() {
         let w = World::new();
         w.base("");
-        w.project("hooks = [[\"x\"]]\n[net]\nallow = [\"bad host\"]\n");
+        w.project("[hooks.pre_run.h]\ncommand = [\"/x\"]\n[net]\nallow = [\"bad host\"]\n");
         assert!(matches!(
             assert_err!(w.load()),
             LoadError::UserOnlySection { .. }
@@ -1664,7 +1676,10 @@ mod tests {
             tree.home()
         ));
         let config = project_dir.join("hamster-ball.toml");
-        assert_ok!(fs::write(&config, "hooks = [[\"x\"]]\n"));
+        assert_ok!(fs::write(
+            &config,
+            "[hooks.pre_run.h]\ncommand = [\"/x\"]\n"
+        ));
         assert_ok!(fs::write(user.base_file(), ""));
         let discovery = Discovery { root, config };
         let floor_env = FloorEnvironment::new();
@@ -1890,7 +1905,7 @@ mod tests {
         assert!(!err.to_string().contains('\u{202e}'), "{err}");
         crate::error::conventions::assert_display_excludes_sources(&err);
 
-        w.project("hooks = [[\"x\"]]\n");
+        w.project("[hooks.pre_run.h]\ncommand = [\"/x\"]\n");
         let err = assert_err!(w.load());
         crate::error::conventions::assert_display_excludes_sources(&err);
     }

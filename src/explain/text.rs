@@ -357,8 +357,21 @@ fn hook_line(hook: &HookRow, t: &Tilde<'_>) -> String {
                 .join(" ")
         },
     );
+    let mut extra = format!("{}s", hook.timeout_secs);
+    if let Some(format) = &hook.format {
+        extra.push_str(&format!(", {}", Escaped(format)));
+    }
+    if !hook.outputs.is_empty() {
+        let names: Vec<String> = hook
+            .outputs
+            .iter()
+            .map(|o| Escaped(o).to_string())
+            .collect();
+        extra.push_str(&format!(", sets {}", names.join(" ")));
+    }
     format!(
-        "{} {args}  {}",
+        "{}: {} {args} ({extra})  {}",
+        Escaped(&hook.name),
         Escaped(&hook.program),
         origins(&hook.origins, t)
     )

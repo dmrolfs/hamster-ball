@@ -97,7 +97,7 @@ impl GrantSummary {
             out.add("mcp", value, &mcp.origins);
         }
         for hook in &report.hooks {
-            let mut value = hook.program.clone();
+            let mut value = format!("{}: {}", hook.name, hook.program);
             for arg in hook.args.iter().flatten() {
                 value.push(' ');
                 value.push_str(arg);

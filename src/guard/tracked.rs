@@ -3,15 +3,14 @@
 //! Git-tracked files (design section 8).
 
 use std::ffi::OsStr;
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use super::patterns::{is_guarded, is_template};
 use crate::policy::CanonicalPath;
+use crate::sys::{BoundedError, run_bounded};
 
 /// Where git is looked for: the system one, never something found through `PATH`.
 pub const SYSTEM_GIT: &str = "/usr/bin/git";
@@ -102,16 +101,6 @@ fn tracked_guarded_within(
     }
 }
 
-/// Kills the child's whole process group.
-fn end_group(child: &std::process::Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-}
-
 /// `git ls-files -z`, run so that nothing in the repository can make it run a program.
 fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, Listing> {
     let mut command = Command::new(git);
@@ -133,48 +122,18 @@ fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, 
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Its own process group, so a timeout ends whatever git started as well.
-        .process_group(0);
+        .env("GIT_TERMINAL_PROMPT", "0");
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         command.env("TMPDIR", tmp);
     }
-    let mut child = command.spawn().map_err(|_| Listing::Unavailable)?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        return Err(Listing::Unavailable);
-    };
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) | Err(_) => {
-                end_group(&child);
-                let _ = child.wait();
-                // Not joined: a program that escaped the group could still hold the pipe, and
-                // the reader ends by itself when the pipe closes.
-                drop(reader);
-                return Err(Listing::TimedOut);
-            }
-        }
-    };
-    let bytes = reader.join().map_err(|_| Listing::Unavailable)?;
-    if status.success() {
-        Ok(bytes)
-    } else {
-        Err(Listing::NotARepository)
+    match run_bounded(&mut command, timeout, MAX_OUTPUT_BYTES) {
+        Ok(done) if done.status.success() => Ok(done.stdout),
+        Ok(_) => Err(Listing::NotARepository),
+        Err(BoundedError::TimedOut) => Err(Listing::TimedOut),
+        Err(BoundedError::Spawn(_)) => Err(Listing::Unavailable),
     }
 }
 
@@ -183,6 +142,8 @@ mod tests {
     use super::*;
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
+    use std::process::Stdio;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn git_available() -> bool {

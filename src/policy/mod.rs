@@ -12,6 +12,7 @@ pub mod env;
 pub mod extends;
 pub mod floor;
 pub mod home;
+pub mod hook;
 pub mod host;
 pub mod names;
 pub mod path;
@@ -33,6 +34,7 @@ pub use floor::{
     parse_commondir, parse_gitdir_pointer, parse_path_var,
 };
 pub use home::{HomeDir, ProjectRoot, RootError, broadness};
+pub use hook::{AwsProfile, Hook, HookError, HookFormat, HookName, HookTimeout, OutputFile};
 pub use host::{
     HostName, HostNameError, HostPattern, HostPatternError, HostRule, HostRuleError,
     protected_suffix_list_version,

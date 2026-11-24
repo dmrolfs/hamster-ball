@@ -2700,16 +2700,20 @@
   "mcp": [],
   "hooks": [
     {
-      "program": "notify",
+      "name": "notify",
+      "program": "/usr/bin/notify",
       "arg_count": 2,
       "args": null,
+      "timeout_secs": 30,
+      "format": null,
+      "outputs": [],
       "origins": [
         {
           "layer": "user_base",
           "file_index": 0,
           "name": null,
           "file": "<FIX>/home/.config/hamster-ball/base.toml",
-          "key": "hooks[0]",
+          "key": "hooks.pre_run.notify",
           "floor_rule": null
         }
       ]

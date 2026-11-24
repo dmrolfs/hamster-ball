@@ -85,7 +85,13 @@ pub struct EnvInputs<'a> {
     pub tls: TlsEnv<'a>,
     /// The proxy the child must use. `None` only for a child that has no network at all.
     pub proxy: Option<&'a ProxyUrl>,
+    /// The variables the pre-run hooks set, each naming a file in the session directory. They
+    /// win over `[env] set`: a hook is the later and more specific word.
+    pub hook_vars: &'a BTreeMap<EnvName, CanonicalPath>,
 }
+
+/// What `[env] set` values may contain to name this run's private directory.
+pub const SESSION_DIR_PLACEHOLDER: &str = "{session_dir}";
 
 /// The environment the child starts with, and nothing else.
 #[derive(Clone, PartialEq, Eq)]
@@ -114,8 +120,16 @@ impl ChildEnv {
             ensure!(!name.is_reserved(), ReservedSnafu { name: name.clone() });
             vars.insert(
                 OsString::from(name.as_str()),
-                OsString::from(value.value.as_str()),
+                OsString::from(
+                    value
+                        .value
+                        .as_str()
+                        .replace(SESSION_DIR_PLACEHOLDER, inputs.session_dir.as_str()),
+                ),
             );
+        }
+        for (name, path) in inputs.hook_vars {
+            vars.insert(OsString::from(name.as_str()), OsString::from(path.as_str()));
         }
         vars.insert(SESSION_MARKER.into(), "1".into());
         vars.insert("HOME".into(), inputs.home.path().as_str().into());
@@ -251,6 +265,7 @@ mod tests {
         trust: bool,
         bundle: Option<CanonicalPath>,
         proxy: Option<ProxyUrl>,
+        hook_vars: BTreeMap<EnvName, CanonicalPath>,
     }
 
     impl Case {
@@ -265,6 +280,7 @@ mod tests {
                 trust: false,
                 bundle: None,
                 proxy: None,
+                hook_vars: BTreeMap::new(),
             }
         }
 
@@ -281,6 +297,7 @@ mod tests {
                     ca_bundle: self.bundle.as_ref(),
                 },
                 proxy: self.proxy.as_ref(),
+                hook_vars: &self.hook_vars,
             })
         }
 
@@ -296,6 +313,54 @@ mod tests {
     fn proxy_url() -> ProxyUrl {
         let token = assert_ok!(crate::proxy::Token::generate());
         ProxyUrl::new(51234, &token)
+    }
+
+    #[test]
+    fn the_session_dir_placeholder_in_a_set_value_names_this_runs_directory() {
+        let mut case = Case::new();
+        case.env = merged(
+            &[],
+            &[
+                ("CLAUDE_CODE_TMPDIR", "{session_dir}"),
+                ("TWICE", "{session_dir}/a:{session_dir}/b"),
+                ("OTHER", "{not_a_placeholder}"),
+            ],
+        );
+        let env = assert_ok!(case.build());
+        let session = "/private/var/folders/x/T/hb-1-2-3";
+        assert_eq!(env.get("CLAUDE_CODE_TMPDIR"), Some(OsStr::new(session)));
+        assert_eq!(
+            env.get("TWICE"),
+            Some(OsStr::new(&format!("{session}/a:{session}/b")))
+        );
+        assert_eq!(env.get("OTHER"), Some(OsStr::new("{not_a_placeholder}")));
+    }
+
+    #[test]
+    fn a_variable_a_hook_set_wins_over_the_config_and_is_a_path_in_the_session() {
+        let mut case = Case::new();
+        case.env = merged(&[], &[("AWS_CONFIG_FILE", "/elsewhere/config")]);
+        case.hook_vars.insert(
+            name("AWS_CONFIG_FILE"),
+            cp("/private/var/folders/x/T/hb-1-2-3/hooks/b/config"),
+        );
+        case.hook_vars.insert(
+            name("OTHER_FILE"),
+            cp("/private/var/folders/x/T/hb-1-2-3/hooks/b/other"),
+        );
+        let env = assert_ok!(case.build());
+        assert_eq!(
+            env.get("AWS_CONFIG_FILE"),
+            Some(OsStr::new(
+                "/private/var/folders/x/T/hb-1-2-3/hooks/b/config"
+            ))
+        );
+        assert_eq!(
+            env.get("OTHER_FILE"),
+            Some(OsStr::new(
+                "/private/var/folders/x/T/hb-1-2-3/hooks/b/other"
+            ))
+        );
     }
 
     #[test]

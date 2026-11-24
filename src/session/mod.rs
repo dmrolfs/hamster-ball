@@ -10,6 +10,7 @@ pub mod env;
 pub mod fds;
 mod fence;
 pub mod guardian;
+pub mod hooks;
 mod interactive;
 pub mod ports;
 pub mod preflight;

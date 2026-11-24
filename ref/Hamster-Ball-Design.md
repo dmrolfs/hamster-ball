@@ -174,7 +174,7 @@ loopback_ports = [3030, 3031, 3032, 5432, 9001, 9002]                           
 
 [env]
 pass  = ["LANG", "COLORTERM"]                   # names copied from your shell (not HOME, PATH, TMPDIR, TERM, proxy or TLS names, HB_*, DYLD_*, LD_*)
-set   = { RUST_BACKTRACE = "1" }
+set   = { RUST_BACKTRACE = "1" }                # a value may say {session_dir}: this run's private directory (also TMPDIR)
 tools = ["node", "git"]                         # programs found on your PATH when hb starts; see 7.2
 
 [tls]
@@ -858,8 +858,27 @@ Principle: the hamster ball holds only credentials the agent itself needs to rea
 - **Agent logins** live in each agent's state directory, which its preset allows (kiro-cli's token is in
   `~/Library/Application Support/kiro-cli`, pi's in `~/.pi/agent/auth.json`). Domain allowlisting limits where
   they can be sent. Accepted by the owner.
-- **Host-side hooks** run before the hamster ball starts, outside it, with argv only (no shell). They are
-  accepted only from the user base and presets (section 4.2).
+- **Host-side hooks (hb-ghd.6.1, D79)** run before the hamster ball starts, outside it, in your own base or presets only (4.2):
+
+  ```toml
+  [hooks.pre_run.bedrock]                       # name: lower case, digits, _ and -; hooks run in name order
+  command      = ["~/tools/credential-process", "--profile", "p"]   # argv only, no shell; the program is absolute or ~/
+  timeout_secs = 30                             # 1 to 300, default 30; a hook past it is killed with what it started
+  format       = "aws_credential_process"       # optional; needs profile
+  profile      = "p"                            # the AWS profile the agent selects
+  outputs      = { MY_FILE = "out.txt" }        # optional: variable for the agent -> a file the hook wrote
+  ```
+
+  The hook runs with `HOME`, a system `PATH`, and `TMPDIR` and `HB_HOOK_DIR` set to its own 0700 directory
+  `<session>/hooks/<name>`; no other variable, no input, and its output is never shown (nor any error that holds it).
+  A non-zero exit, a timeout or output that does not fit its `format` ends the run before the agent starts, and names the
+  hook. Files named in `outputs` must be regular files; `hb` sets them to 0600 and gives the agent their paths (a hook's
+  variable wins over `[env] set`; two hooks cannot set the same one). With `format = "aws_credential_process"` `hb` itself reads
+  the tool's JSON (Version 1, `AccessKeyId`, `SecretAccessKey`, optional `SessionToken`; characters a key never has are
+  refused) and writes `config` (`[profile p]`, or `[default]`) and `credentials` there, and sets `AWS_CONFIG_FILE` and
+  `AWS_SHARED_CREDENTIALS_FILE`. No converter program runs outside the sandbox. The whole session directory, hook files
+  included, is removed at the end of the run and after a signal. Signals are held while a hook runs, so the time limit is
+  what bounds it. A project that extends a user preset runs that preset's hooks, so the approval summary lists them.
 - **claude on Bedrock**: a hook runs your `credential-process` on the host and writes a 0600
   `credentials`/`config` pair into a per-session directory. `hb` sets `AWS_CONFIG_FILE` and
   `AWS_SHARED_CREDENTIALS_FILE` to it, and removes the directory on exit.
@@ -1209,3 +1228,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
 | D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |
 | D78 | Secrets guard (`src/guard`, hb-ghd.5): covers every writable grant; exceptions are absolute or `~/` path patterns (a relative one is refused); templates are re-allowed by name inside each root; tracked files come from a hardened host-side `git ls-files`; key and secret-named files (not `.env*`) below `node_modules` and `site-packages` are re-allowed together with unlink pins on every directory that holds a guarded file (a directory rename is otherwise a bypass, measured); an incomplete scan switches the exemption off; `hb doctor` reports look-alike names, tracked secrets and launchd variable names, never contents | owner, hb-ghd.5 |
+| D79 | Hooks (`[hooks.pre_run.<name>]`, hb-ghd.6.1) replace the flat argv list: argv only, an absolute or `~/` program, a scrubbed environment, a 1 to 300 s timeout that kills the process group, per-hook 0700 directories under the session directory, file outputs by variable, and an `aws_credential_process` format parsed by `hb` itself so no converter runs on the host; keyed merge (two files defining one name differently conflict); run in name order; `[env] set` values may use `{session_dir}` | owner, hb-ghd.6 |

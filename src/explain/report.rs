@@ -13,7 +13,7 @@
 //! `hooks`, `guard`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
 //! higher precedence). Sets are value-sorted, which is the order [`Sourced`] lists already
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
-//! `hooks` keep first-seen order, which is meaningful. A value's origins are in closure order.
+//! `hooks` are in name order, which is the order they run in. A value's origins are in closure order.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -24,7 +24,8 @@ use crate::config::{Closure, FileSource, FsAccess, FsDecision, Loaded, Policy};
 use crate::guard::patterns;
 use crate::origin::{KeyPath, Layer, Located, Origin, Source, Sourced};
 use crate::policy::{
-    Argv, CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, PathPattern,
+    CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, Hook, HookName,
+    PathPattern,
 };
 use crate::system::find_tools;
 
@@ -260,12 +261,20 @@ pub struct McpRow {
 /// One host-side hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HookRow {
+    /// The hook's name; hooks run in name order.
+    pub name: String,
     /// The program, shortened.
     pub program: String,
     /// How many arguments it has.
     pub arg_count: usize,
     /// The arguments, only with `--show-args`.
     pub args: Option<Vec<String>>,
+    /// Seconds it may run.
+    pub timeout_secs: u64,
+    /// What `hb` does with its output, if anything.
+    pub format: Option<String>,
+    /// The environment variables its files are given to the agent as (names only).
+    pub outputs: Vec<String>,
     /// Where it is declared.
     pub origins: Vec<OriginRow>,
 }
@@ -551,7 +560,7 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         hooks: policy
             .hooks
             .iter()
-            .map(|hook| b.hook_row(hook, options.show_args))
+            .map(|(name, hook)| b.hook_row(name, hook, options.show_args))
             .collect(),
         guard: GuardReport {
             roots: policy
@@ -722,10 +731,11 @@ impl Builder<'_> {
         }
     }
 
-    fn hook_row(&self, hook: &Sourced<Argv>, show_args: bool) -> HookRow {
-        let words = hook.value.words();
+    fn hook_row(&self, name: &HookName, hook: &Sourced<Hook>, show_args: bool) -> HookRow {
+        let words = hook.value.command.words();
         HookRow {
-            program: bounded(hook.value.program().as_str(), MAX_PROGRAM_CHARS),
+            name: name.as_str().to_owned(),
+            program: bounded(hook.value.command.program().as_str(), MAX_PROGRAM_CHARS),
             arg_count: words.len().saturating_sub(1),
             args: show_args.then(|| {
                 words
@@ -734,7 +744,15 @@ impl Builder<'_> {
                     .map(|w| bounded(w.as_str(), MAX_ARG_CHARS))
                     .collect()
             }),
-            origins: self.origins(&hook.sources, "hooks"),
+            timeout_secs: hook.value.timeout.get().as_secs(),
+            format: hook.value.format.map(|f| f.to_string()),
+            outputs: hook
+                .value
+                .outputs
+                .keys()
+                .map(|v| v.as_str().to_owned())
+                .collect(),
+            origins: self.origins(&hook.sources, &format!("hooks.pre_run.{}", name.as_str())),
         }
     }
 

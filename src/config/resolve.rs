@@ -13,16 +13,17 @@ use snafu::Snafu;
 
 use crate::origin::{KeyPath, Located, Origin};
 use crate::policy::{
-    ArgWord, ArgWordError, Argv, ArgvError, BindPort, CanonicalPath, ContainerLabel,
+    ArgWord, ArgWordError, Argv, ArgvError, AwsProfile, BindPort, CanonicalPath, ContainerLabel,
     ContainerLabelError, ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue,
-    EnvValueError, ExtendRef, GuardException, HomeDir, HostPattern, HostPatternError, HostRule,
-    HostRuleError, McpName, McpNameError, PathError, PathPattern, PathPatternError, Port,
-    PortError, ProjectRoot, RefTextError, ToolName, ToolNameError,
+    EnvValueError, ExtendRef, GuardException, HomeDir, Hook, HookError, HookFormat, HookName,
+    HookTimeout, HostPattern, HostPatternError, HostRule, HostRuleError, McpName, McpNameError,
+    OutputFile, PathError, PathPattern, PathPatternError, Port, PortError, ProjectRoot,
+    RefTextError, ToolName, ToolNameError,
 };
 use crate::system::{AllowOutcome, PathResolver, SkippedPath};
 use crate::text::EscapedBounded;
 
-use super::raw::{self, ParseError, RawConfig, RawMcpServer};
+use super::raw::{self, ParseError, RawConfig, RawHooks, RawMcpServer};
 use super::text::ConfigText;
 
 /// Longest text echoed from a TOML parse error's message before it is cut off.
@@ -198,6 +199,12 @@ pub enum EntryError {
         /// The underlying error.
         source: ArgvError,
     },
+    /// A `[hooks.pre_run.<name>]` field was invalid.
+    #[snafu(transparent)]
+    Hook {
+        /// The underlying error.
+        source: HookError,
+    },
     /// An `[mcp.<name>]` server name was invalid.
     #[snafu(transparent)]
     McpName {
@@ -261,9 +268,9 @@ pub struct ResolvedConfig {
     pub system: ResolvedSystem,
     /// `[mcp.<name>]`, keyed by name, in sorted order.
     pub mcp: BTreeMap<McpName, ResolvedMcpServer>,
-    /// Each `hooks` entry, as an argv array. Shape-only: whether a project file may declare
-    /// `hooks` at all is a merge-time rule (section 4.2), not this module's concern.
-    pub hooks: Vec<Argv>,
+    /// Each `[hooks.pre_run.<name>]`. Shape-only: whether a project file may declare `hooks` at
+    /// all is a merge-time rule (section 4.2), not this module's concern.
+    pub hooks: BTreeMap<HookName, Hook>,
     /// `[guard]`.
     pub guard: ResolvedGuard,
 }
@@ -734,19 +741,100 @@ impl<'a> Resolution<'a> {
         }
     }
 
-    fn hooks(&mut self, items: &[Vec<String>]) -> Vec<Argv> {
-        let key = KeyPath::root().field("hooks");
-        if self.over_cap(&key, items.len()) {
-            return Vec::new();
+    fn hooks(&mut self, raw: &RawHooks) -> BTreeMap<HookName, Hook> {
+        let key = KeyPath::root().field("hooks").field("pre_run");
+        if self.over_cap(&key, raw.pre_run.len()) {
+            return BTreeMap::new();
         }
-        let mut hooks = Vec::with_capacity(items.len());
-        for (index, words) in items.iter().enumerate() {
-            match Argv::parse(words) {
-                Ok(argv) => hooks.push(argv),
-                Err(error) => self.push(key.clone().index(index), error),
+        let mut hooks = BTreeMap::new();
+        for (name, hook) in &raw.pre_run {
+            let entry_key = key.clone().key(name.clone());
+            let valid_name = match HookName::parse(name) {
+                Ok(valid) => Some(valid),
+                Err(error) => {
+                    self.push(entry_key.clone(), error);
+                    None
+                }
+            };
+            let resolved = self.hook(&entry_key, hook);
+            if let (Some(name), Some(resolved)) = (valid_name, resolved) {
+                hooks.insert(name, resolved);
             }
         }
         hooks
+    }
+
+    /// One hook: every field is checked, so a mistake in each shows in one pass.
+    fn hook(&mut self, key: &KeyPath, raw: &raw::RawHook) -> Option<Hook> {
+        let command = match Argv::parse(&raw.command) {
+            Ok(command) => Some(command),
+            Err(error) => {
+                self.push(key.clone().field("command"), error);
+                None
+            }
+        };
+        let timeout = match raw.timeout_secs.map(HookTimeout::from_secs) {
+            None => Some(HookTimeout::default()),
+            Some(Ok(timeout)) => Some(timeout),
+            Some(Err(error)) => {
+                self.push(key.clone().field("timeout_secs"), error);
+                None
+            }
+        };
+        let format = match raw.format.as_deref().map(HookFormat::parse) {
+            None => Some(None),
+            Some(Ok(format)) => Some(Some(format)),
+            Some(Err(error)) => {
+                self.push(key.clone().field("format"), error);
+                None
+            }
+        };
+        let profile = match raw.profile.as_deref().map(AwsProfile::parse) {
+            None => Some(None),
+            Some(Ok(profile)) => Some(Some(profile)),
+            Some(Err(error)) => {
+                self.push(key.clone().field("profile"), error);
+                None
+            }
+        };
+        let outputs = self.outputs(&key.clone().field("outputs"), &raw.outputs);
+        let (Some(command), Some(timeout), Some(format), Some(profile)) =
+            (command, timeout, format, profile)
+        else {
+            return None;
+        };
+        match Hook::new(command, timeout, format, profile, outputs) {
+            Ok(hook) => Some(hook),
+            Err(error) => {
+                self.push(key.clone(), error);
+                None
+            }
+        }
+    }
+
+    fn outputs(
+        &mut self,
+        key: &KeyPath,
+        raw: &BTreeMap<String, String>,
+    ) -> BTreeMap<EnvName, OutputFile> {
+        let mut outputs = BTreeMap::new();
+        for (variable, file) in raw {
+            let entry_key = key.clone().key(variable.clone());
+            match (EnvName::parse_user(variable), OutputFile::parse(file)) {
+                (Ok(variable), Ok(file)) => {
+                    outputs.insert(variable, file);
+                }
+                (variable, file) => {
+                    if let Err(error) = variable {
+                        self.push(entry_key.clone(), error);
+                    }
+                    if let Err(error) = file {
+                        self.push(entry_key, error);
+                    }
+                }
+            }
+        }
+        outputs
     }
 }
 
@@ -832,7 +920,8 @@ mod tests {
         assert_ok!(fs::create_dir_all(fx.project_path().join("src")));
         let resolved = fx.resolved(
             "extends = [\"rust\", \"agent/kiro\"]\n\
-             hooks = [[\"echo\", \"hi there\"], [\"true\"]]\n\
+             [hooks.pre_run.h]\n\
+             command = [\"/echo\", \"hi there\"]\n\
              [fs]\n\
              write = [\"src\"]\n\
              [net]\n\
@@ -881,9 +970,10 @@ mod tests {
         assert_eq!(serena.net.len(), 1);
         let ports: Vec<u16> = serena.bind_ports.iter().map(|p| p.get()).collect();
         assert_eq!(ports, vec![24282, 24283]);
-        assert_eq!(config.hooks.len(), 2);
-        assert_eq!(config.hooks[0].program().as_str(), "echo");
-        assert_eq!(config.hooks[0].words()[1].as_str(), "hi there");
+        assert_eq!(config.hooks.len(), 1);
+        let hook = assert_some!(config.hooks.get(&assert_ok!(HookName::parse("h"))));
+        assert_eq!(hook.command.program().as_str(), "/echo");
+        assert_eq!(hook.command.words()[1].as_str(), "hi there");
         assert!(resolved.diagnostics.skipped.is_empty());
     }
 
@@ -1221,11 +1311,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_hook_command_is_an_error_with_its_index() {
+    fn an_empty_hook_command_is_an_error_naming_the_hook() {
         let fx = Fixture::new();
-        let errors = fx.errors("hooks = [[\"ok\"], []]\n");
+        let errors = fx.errors("[hooks.pre_run.a]\ncommand = []\n");
         assert_eq!(errors.errors.len(), 1);
-        assert_eq!(key_of(&errors, 0), "hooks[1]");
+        assert_eq!(key_of(&errors, 0), "hooks.pre_run.a.command");
         assert!(matches!(
             errors.errors[0].value,
             EntryError::Argv {
@@ -1237,14 +1327,71 @@ mod tests {
     #[test]
     fn a_nul_in_a_hook_word_is_an_error() {
         let fx = Fixture::new();
-        let errors = fx.errors("hooks = [[\"echo\", \"a\\u0000b\"]]\n");
-        assert_eq!(key_of(&errors, 0), "hooks[0]");
+        let errors = fx.errors("[hooks.pre_run.a]\ncommand = [\"/echo\", \"a\\u0000b\"]\n");
+        assert_eq!(key_of(&errors, 0), "hooks.pre_run.a.command");
         assert!(matches!(
             errors.errors[0].value,
             EntryError::Argv {
                 source: ArgvError::Word { index: 1, .. }
             }
         ));
+    }
+
+    #[test]
+    fn a_hook_resolves_with_its_defaults_and_options() {
+        let fx = Fixture::new();
+        let resolved = fx.resolved(
+            "[hooks.pre_run.plain]\ncommand = [\"/usr/bin/true\"]\n\
+             [hooks.pre_run.bedrock]\ncommand = [\"~/bin/cred\", \"--profile\", \"p\"]\n\
+             timeout_secs = 60\nformat = \"aws_credential_process\"\nprofile = \"p\"\n\
+             [hooks.pre_run.bedrock.outputs]\nMY_FILE = \"out.txt\"\n",
+        );
+        let plain = assert_some!(
+            resolved
+                .config
+                .hooks
+                .get(&assert_ok!(HookName::parse("plain")))
+        );
+        assert_eq!(plain.timeout, HookTimeout::default());
+        assert_eq!((plain.format, plain.profile.is_none()), (None, true));
+        let bedrock = assert_some!(
+            resolved
+                .config
+                .hooks
+                .get(&assert_ok!(HookName::parse("bedrock")))
+        );
+        assert_eq!(bedrock.timeout.get(), std::time::Duration::from_secs(60));
+        assert_eq!(bedrock.format, Some(HookFormat::AwsCredentialProcess));
+        assert_eq!(assert_some!(bedrock.profile.as_ref()).as_str(), "p");
+        let names: Vec<&str> = bedrock.outputs.keys().map(EnvName::as_str).collect();
+        assert_eq!(names, ["MY_FILE"]);
+    }
+
+    #[test]
+    fn every_hook_field_that_is_wrong_is_reported_in_one_pass() {
+        let fx = Fixture::new();
+        let errors = fx.errors(
+            "[hooks.pre_run.Bad]\ncommand = [\"relative\"]\n\
+             [hooks.pre_run.b]\ncommand = [\"/x\"]\ntimeout_secs = 301\nformat = \"json\"\nprofile = \"a b\"\n\
+             [hooks.pre_run.b.outputs]\nHOME = \"x\"\nOK = \"../x\"\n\
+             [hooks.pre_run.c]\ncommand = [\"/x\"]\nformat = \"aws_credential_process\"\n",
+        );
+        let keys: Vec<String> = (0..errors.errors.len())
+            .map(|i| key_of(&errors, i))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "hooks.pre_run.Bad",
+                "hooks.pre_run.Bad",
+                "hooks.pre_run.b.timeout_secs",
+                "hooks.pre_run.b.format",
+                "hooks.pre_run.b.profile",
+                "hooks.pre_run.b.outputs.HOME",
+                "hooks.pre_run.b.outputs.OK",
+                "hooks.pre_run.c",
+            ]
+        );
     }
 
     #[test]
@@ -1565,7 +1712,12 @@ mod tests {
                 format!("[ctl]\ncontainers = {}\n", many("a")),
                 "ctl.containers",
             ),
-            (format!("hooks = {:?}\n", vec![vec!["x"]; 4097]), "hooks"),
+            (
+                (0..4097)
+                    .map(|i| format!("[hooks.pre_run.h{i}]\ncommand = [\"/x\"]\n"))
+                    .collect::<String>(),
+                "hooks.pre_run",
+            ),
             (
                 format!("[guard]\nexceptions = {}\n", many("a")),
                 "guard.exceptions",

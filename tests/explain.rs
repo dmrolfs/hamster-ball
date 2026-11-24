@@ -17,8 +17,6 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 const BASE: &str = r#"
-hooks = [["notify", "--token", "s3cret-hook-arg"]]
-
 [tls]
 system_trust = true
 
@@ -31,6 +29,9 @@ read = ["~/ref"]
 
 [net]
 allow = ["api.example.com"]
+
+[hooks.pre_run.notify]
+command = ["/usr/bin/notify", "--token", "s3cret-hook-arg"]
 "#;
 
 const RUST: &str = r#"
@@ -763,17 +764,21 @@ fn repeated_runs_produce_identical_output() {
 }
 
 #[test]
-fn hooks_keep_their_closure_order_and_everything_else_is_sorted() {
-    let base =
-        "hooks = [[\"zzz\"], [\"aaa\"]]\n[net]\nallow = [\"z.example.com\", \"a.example.com\"]\n";
+fn hooks_and_everything_else_are_sorted_by_name() {
+    let base = "[net]\nallow = [\"z.example.com\", \"a.example.com\"]\n\
+                [hooks.pre_run.zzz]\ncommand = [\"/zzz\"]\n[hooks.pre_run.aaa]\ncommand = [\"/aaa\"]\n";
     let w = World::new(PROJECT);
     assert_ok!(fs::write(
         w.home_dir().join(".config/hamster-ball/base.toml"),
         base
     ));
     let report = w.report(false, None);
-    let hooks: Vec<&str> = report.hooks.iter().map(|h| h.program.as_str()).collect();
-    assert_eq!(hooks, ["zzz", "aaa"]);
+    let hooks: Vec<(&str, &str)> = report
+        .hooks
+        .iter()
+        .map(|h| (h.name.as_str(), h.program.as_str()))
+        .collect();
+    assert_eq!(hooks, [("aaa", "/aaa"), ("zzz", "/zzz")]);
     let hosts: Vec<&str> = report.net.hosts.iter().map(|h| h.value.as_str()).collect();
     let mut sorted = hosts.clone();
     sorted.sort_unstable();

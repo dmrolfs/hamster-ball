@@ -12,7 +12,7 @@
 //! Whether a path is finally denied is decided by Seatbelt rule order (M2.1); the advisory
 //! query for tests and `explain` is [`Policy::decide`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use snafu::Snafu;
@@ -22,8 +22,8 @@ use super::location::FileLocation;
 use super::resolve::{ResolvedConfig, ResolvedMcpServer};
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
-    Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
-    HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
+    BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor, Hook,
+    HookName, HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
 };
 use crate::sys::path_preview;
 
@@ -167,8 +167,8 @@ pub struct Policy {
     pub system: MergedSystem,
     /// `[mcp.<name>]`, in sorted name order; every file naming a server must agree on it.
     pub mcp: BTreeMap<McpName, Sourced<ResolvedMcpServer>>,
-    /// Host-side commands, in closure order, equal commands collapsed.
-    pub hooks: Vec<Sourced<Argv>>,
+    /// `[hooks.pre_run.<name>]`, in name order; every file naming a hook must agree on it.
+    pub hooks: BTreeMap<HookName, Sourced<Hook>>,
     /// Secrets-guard exceptions.
     pub guard_exceptions: Vec<Sourced<PathPattern>>,
     /// The floor: no layer can narrow it, and it is the same one `merge` was given.
@@ -327,7 +327,22 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
             |c| c.mcp.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             |name| KeyPath::root().field("mcp").key(name.as_str()),
         ),
-        hooks: ordered_union(files, |c| positions(&c.hooks)),
+        hooks: keyed(
+            files,
+            &mut collected,
+            |c| {
+                c.hooks
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            },
+            |name| {
+                KeyPath::root()
+                    .field("hooks")
+                    .field("pre_run")
+                    .key(name.as_str())
+            },
+        ),
         guard_exceptions: union(files, |c| positions(&c.guard.exceptions)),
         floor,
     };
@@ -397,30 +412,6 @@ fn union<T: Ord>(
         .into_iter()
         .filter_map(|(value, sources)| Sourced::from_sources(value, sources))
         .collect()
-}
-
-/// Like [`union`], but keeps first-seen order, for fields where order is meaningful.
-fn ordered_union<T: std::hash::Hash + Eq + Clone>(
-    files: &[ClosureFile],
-    pick: impl Fn(&super::resolve::ResolvedConfig) -> Vec<(T, u32)>,
-) -> Vec<Sourced<T>> {
-    let mut positions: HashMap<T, usize> = HashMap::new();
-    let mut out: Vec<Sourced<T>> = Vec::new();
-    for file in files {
-        for (value, index) in pick(&file.resolved) {
-            let source = Source::entry(file.id, index);
-            match positions.get(&value) {
-                Some(&at) => {
-                    out[at].sources.push(source);
-                }
-                None => {
-                    positions.insert(value.clone(), out.len());
-                    out.push(Sourced::new(value, source));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Merges a keyed map: equal values from several files combine; a different value for a key
@@ -1203,27 +1194,64 @@ mod tests {
     }
 
     // ====================================================================================
-    // Hooks keep order
+    // Hooks are named
     // ====================================================================================
 
+    fn hook(words: &[&str]) -> Hook {
+        assert_ok!(Hook::new(
+            argv(words),
+            crate::policy::HookTimeout::default(),
+            None,
+            None,
+            BTreeMap::new()
+        ))
+    }
+
+    fn hooks_of(entries: &[(&str, &[&str])]) -> BTreeMap<HookName, Hook> {
+        entries
+            .iter()
+            .map(|(name, words)| (assert_ok!(HookName::parse(name)), hook(words)))
+            .collect()
+    }
+
     #[test]
-    fn hooks_keep_closure_order_and_collapse_equal_commands_keeping_both_sources() {
+    fn hooks_are_in_name_order_and_equal_ones_from_two_files_keep_both_sources() {
         let a = ResolvedConfig {
-            hooks: vec![argv(&["zeta"]), argv(&["alpha"])],
+            hooks: hooks_of(&[("20-zeta", &["/z"]), ("10-alpha", &["/a"])]),
             ..ResolvedConfig::default()
         };
         let b = ResolvedConfig {
-            hooks: vec![argv(&["alpha"]), argv(&["mid"])],
+            hooks: hooks_of(&[("10-alpha", &["/a"]), ("15-mid", &["/m"])]),
             ..ResolvedConfig::default()
         };
         let policy = merged(vec![user("base", a), user("preset", b)]);
-        let order: Vec<Vec<&str>> = policy
-            .hooks
-            .iter()
-            .map(|h| h.value.words().iter().map(ArgWord::as_str).collect())
-            .collect();
-        assert_eq!(order, vec![vec!["zeta"], vec!["alpha"], vec!["mid"]]);
-        assert_eq!(policy.hooks[1].sources.len(), 2);
+        let order: Vec<&str> = policy.hooks.keys().map(HookName::as_str).collect();
+        assert_eq!(order, vec!["10-alpha", "15-mid", "20-zeta"]);
+        let alpha = assert_some!(policy.hooks.get(&assert_ok!(HookName::parse("10-alpha"))));
+        assert_eq!(alpha.sources.len(), 2);
+    }
+
+    #[test]
+    fn two_files_that_define_the_same_hook_differently_conflict() {
+        let a = ResolvedConfig {
+            hooks: hooks_of(&[("bedrock", &["/one"])]),
+            ..ResolvedConfig::default()
+        };
+        let b = ResolvedConfig {
+            hooks: hooks_of(&[("bedrock", &["/two"])]),
+            ..ResolvedConfig::default()
+        };
+        let errors = assert_err!(merge(
+            &closure(vec![user("base", a), user("preset", b)]),
+            Floor::empty()
+        ));
+        assert!(
+            errors.errors[0]
+                .to_string()
+                .contains("hooks.pre_run.bedrock"),
+            "{}",
+            errors.errors[0]
+        );
     }
 
     // ====================================================================================
@@ -1232,7 +1260,7 @@ mod tests {
 
     fn with_hooks() -> ResolvedConfig {
         ResolvedConfig {
-            hooks: vec![argv(&["echo"])],
+            hooks: hooks_of(&[("h", &["/echo"])]),
             ..ResolvedConfig::default()
         }
     }

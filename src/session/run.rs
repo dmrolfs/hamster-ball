@@ -24,6 +24,7 @@ use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
+use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
@@ -226,6 +227,13 @@ pub enum RunError {
     #[snafu(display("there is no command to run"))]
     EmptyCommand,
 
+    /// A pre-run hook failed.
+    #[snafu(transparent)]
+    Hook {
+        /// The underlying error.
+        source: HookRunError,
+    },
+
     /// The proxy could not start.
     #[snafu(transparent)]
     Proxy {
@@ -423,6 +431,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let temp = temp_parent(env)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
+    // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
+    // the session directory (with whatever they wrote) goes with it.
+    let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
 
     let loopback: Vec<_> = loaded
         .policy
@@ -493,6 +504,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             ca_bundle: ca_bundle.as_ref(),
         },
         proxy: Some(&proxy_url),
+        hook_vars: hook_outputs.vars(),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let helper = match (spec.signals, &pty) {
@@ -1058,6 +1070,7 @@ mod tests {
             env: &policy_env,
             tls: TlsEnv::default(),
             proxy: None,
+            hook_vars: &std::collections::BTreeMap::new(),
         }))
     }
 

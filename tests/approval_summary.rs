@@ -161,3 +161,25 @@ fn a_very_long_value_is_cut_in_what_is_printed() {
     assert!(line.len() < 700, "{}", line.len());
     assert!(line.contains("..."), "{line}");
 }
+
+#[test]
+fn a_hook_the_project_selects_by_extending_a_user_preset_is_listed_for_approval() {
+    let world = World::new("extends = [\"tool\"]\n");
+    common::write(
+        &world
+            .home_dir()
+            .join(".config/hamster-ball/presets/tool.toml"),
+        "[hooks.pre_run.fetch]\ncommand = [\"/usr/local/bin/fetch\", \"--fast\"]\n",
+    );
+    let discovery = assert_ok!(discover(&world.project, &world.home));
+    let user = UserConfigDir::locate(&world.home);
+    let loaded = assert_ok!(load(
+        &LoadRequest::new(&world.home, &discovery, &user, &world.env.floor)
+            .with_builtins(&EmbeddedPresets)
+    ));
+    let summary = GrantSummary::for_project(&world.env, &discovery, &loaded);
+    assert_eq!(
+        shown(&summary),
+        ["hooks fetch: /usr/local/bin/fetch --fast (tool)"]
+    );
+}

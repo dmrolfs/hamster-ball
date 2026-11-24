@@ -112,3 +112,147 @@ mod tests {
         assert!(shown.chars().count() < 300, "{}", shown.len());
     }
 }
+
+/// Why [`run_bounded`] gave no output.
+#[derive(Debug)]
+pub(crate) enum BoundedError {
+    /// The program could not be started.
+    Spawn(io::Error),
+    /// It ran past the time allowed and its process group was killed.
+    TimedOut,
+}
+
+/// What a program that ended on its own left behind.
+#[derive(Debug)]
+pub(crate) struct Finished {
+    /// How it ended.
+    pub(crate) status: std::process::ExitStatus,
+    /// What it wrote to standard output, up to the limit.
+    pub(crate) stdout: Vec<u8>,
+}
+
+/// Runs `command` with no input, its standard output captured (up to `max_bytes`) and its
+/// standard error dropped, in a process group of its own that is killed at `timeout`.
+///
+/// The reader of the output is not waited for after a timeout: a program that escaped the group
+/// could still hold the pipe, and the reader ends by itself when the pipe closes.
+pub(crate) fn run_bounded(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    max_bytes: u64,
+) -> Result<Finished, BoundedError> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().map_err(BoundedError::Spawn)?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err(BoundedError::Spawn(io::Error::other(
+            "no pipe for standard output",
+        )));
+    };
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(max_bytes).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                let _ = child.wait();
+                drop(reader);
+                return Err(BoundedError::TimedOut);
+            }
+        }
+    };
+    let stdout = reader
+        .join()
+        .map_err(|_| BoundedError::Spawn(io::Error::other("the output reader failed")))?;
+    Ok(Finished { status, stdout })
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use claims::assert_ok;
+    use pretty_assertions::assert_eq;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn a_program_that_ends_gives_its_status_and_its_output() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("echo out; echo err >&2; exit 3"),
+            Duration::from_secs(10),
+            1024
+        ));
+        assert_eq!(done.status.code(), Some(3));
+        assert_eq!(done.stdout, b"out\n");
+    }
+
+    #[test]
+    fn output_beyond_the_limit_is_cut_and_the_program_is_not_blocked() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("yes | head -c 100000"),
+            Duration::from_secs(10),
+            100
+        ));
+        assert_eq!(done.stdout.len(), 100);
+    }
+
+    #[test]
+    fn a_program_that_runs_too_long_is_killed_with_what_it_started() {
+        let started = Instant::now();
+        let result = run_bounded(&mut sh("sleep 20 & wait"), Duration::from_millis(300), 1024);
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_a_spawn_error() {
+        let result = run_bounded(
+            &mut Command::new("/nonexistent/program"),
+            Duration::from_secs(1),
+            1,
+        );
+        assert!(matches!(result, Err(BoundedError::Spawn(_))), "{result:?}");
+    }
+
+    #[test]
+    fn standard_input_is_closed() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("cat; echo done"),
+            Duration::from_secs(5),
+            64
+        ));
+        assert_eq!(done.stdout, b"done\n");
+    }
+}

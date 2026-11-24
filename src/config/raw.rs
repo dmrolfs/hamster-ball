@@ -27,7 +27,7 @@ pub(crate) struct RawConfig {
     pub(crate) ctl: RawCtl,
     pub(crate) system: RawSystem,
     pub(crate) mcp: BTreeMap<String, RawMcpServer>,
-    pub(crate) hooks: Vec<Vec<String>>,
+    pub(crate) hooks: RawHooks,
     pub(crate) guard: RawGuard,
 }
 
@@ -97,6 +97,24 @@ pub(crate) struct RawMcpServer {
     pub(crate) args: Vec<String>,
     pub(crate) net: Vec<String>,
     pub(crate) bind_ports: Vec<i64>,
+}
+
+/// `[hooks]`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct RawHooks {
+    pub(crate) pre_run: BTreeMap<String, RawHook>,
+}
+
+/// One `[hooks.pre_run.<name>]`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct RawHook {
+    pub(crate) command: Vec<String>,
+    pub(crate) timeout_secs: Option<i64>,
+    pub(crate) format: Option<String>,
+    pub(crate) profile: Option<String>,
+    pub(crate) outputs: BTreeMap<String, String>,
 }
 
 /// `[guard]`.
@@ -319,10 +337,22 @@ mod tests {
     #[test]
     fn hooks_and_guard_parse_with_deny_unknown_fields() {
         let config = assert_ok!(parsed(
-            "hooks = [[\"echo\", \"hi\"]]\n[guard]\nexceptions = [\".env\"]\n"
+            "[hooks.pre_run.a]\ncommand = [\"/bin/echo\", \"hi\"]\ntimeout_secs = 5\nformat = \"aws_credential_process\"\nprofile = \"p\"\n[hooks.pre_run.a.outputs]\nX = \"f\"\n[guard]\nexceptions = [\".env\"]\n"
         ));
-        assert_eq!(config.hooks, vec![vec!["echo".to_owned(), "hi".to_owned()]]);
+        let hook = &config.hooks.pre_run["a"];
+        assert_eq!(hook.command, vec!["/bin/echo".to_owned(), "hi".to_owned()]);
+        assert_eq!(hook.timeout_secs, Some(5));
+        assert_eq!(hook.format.as_deref(), Some("aws_credential_process"));
+        assert_eq!(hook.profile.as_deref(), Some("p"));
+        assert_eq!(hook.outputs["X"], "f");
         assert_eq!(config.guard.exceptions, vec![".env"]);
+    }
+
+    #[test]
+    fn an_unknown_hook_field_or_phase_is_a_schema_error() {
+        assert!(parsed("[hooks.pre_run.a]\ncommand = [\"/x\"]\nshell = \"sh\"\n").is_err());
+        assert!(parsed("[hooks.post_run.a]\ncommand = [\"/x\"]\n").is_err());
+        assert!(parsed("hooks = [ [\"echo\"] ]\n").is_err());
     }
 
     #[test]
@@ -445,7 +475,7 @@ mod tests {
             "'hooks' = []\n",
             "\"h\\u006foks\" = []\n",
             "  hooks   =   []\n",
-            "hooks = [[\"echo\"]]\n",
+            "[hooks.pre_run.h]\ncommand = [\"/echo\"]\n",
             "a = 1\n[hooks.pre_run.x]\ncommand = [\"echo\"]\n",
         ] {
             assert!(probe(spelling).hooks, "{spelling:?} was not flagged");
