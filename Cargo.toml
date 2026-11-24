@@ -50,6 +50,7 @@ claims = "0.8.0"
 idna = "1.1.0"
 pretty_assertions = "1.4.1"
 proptest = "1.11.0"
+regex = "1"
 tempfile = "3.27.0"
 
 [lints.rust]

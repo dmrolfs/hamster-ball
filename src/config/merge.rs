@@ -23,7 +23,7 @@ use super::resolve::{ResolvedConfig, ResolvedMcpServer};
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
     Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor,
-    GuardException, HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
+    HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
 };
 use crate::sys::path_preview;
 
@@ -170,7 +170,7 @@ pub struct Policy {
     /// Host-side commands, in closure order, equal commands collapsed.
     pub hooks: Vec<Sourced<Argv>>,
     /// Secrets-guard exceptions.
-    pub guard_exceptions: Vec<Sourced<GuardException>>,
+    pub guard_exceptions: Vec<Sourced<PathPattern>>,
     /// The floor: no layer can narrow it, and it is the same one `merge` was given.
     floor: Floor,
 }
@@ -553,7 +553,7 @@ mod tests {
     use crate::origin::{FileId, Layer, Source};
     use crate::policy::{
         ArgWord, Argv, BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue,
-        GlobTail, GuardException, HostPattern, McpName, PathPattern, Port, PresetName,
+        GlobTail, HostPattern, McpName, PathPattern, Port, PresetName,
     };
     use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
@@ -725,7 +725,7 @@ mod tests {
         a.env.tools = vec![assert_ok!(ToolName::parse("node"))];
         a.tls.extra_ca_files = vec![cpath("/p/ca.pem")];
         a.ctl.containers = vec![assert_ok!(ContainerName::parse("pg"))];
-        a.guard.exceptions = vec![assert_ok!(GuardException::parse(".env.example"))];
+        a.guard.exceptions = vec![deny("/p/.env.example")];
         let policy = merged(vec![user("base", a)]);
         assert_eq!(policy.fs.write.len(), 1);
         assert_eq!(policy.fs.deny_read.len(), 1);
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn guard_exceptions_from_an_ineligible_file_are_refused() {
         let mut config = ResolvedConfig::default();
-        config.guard.exceptions = vec![assert_ok!(GuardException::parse(".env"))];
+        config.guard.exceptions = vec![deny("/p/.env")];
         let files = closure(vec![project(config)]);
         let errors = assert_err!(merge(&files, Floor::empty()));
         assert!(

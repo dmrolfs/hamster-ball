@@ -16,16 +16,18 @@
 (allow file-read* (regex #"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$"))
 ; grants
 (allow file-read* file-write* (subpath (param "W0")) (subpath (param "W1")))
+; guard
+(deny file-read-data file-read-xattr file-write* (regex (param "G0")) (regex (param "G1")))
 ; template_allow
-(allow file-read-data file-read-xattr file-write* (literal (param "W2")))
+(allow file-read-data file-read-xattr file-write* (regex (param "G2")) (regex (param "G3")) (literal (param "W2")))
 ; host_services
 (deny process-exec (literal "/bin/launchctl"))
 ; policy_deny
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F1")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G0")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G4")))
 (deny file-write* (subpath (param "F2")))
-(deny file-write* (regex (param "G1")))
+(deny file-write* (regex (param "G5")))
 ; floor
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F3")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F4")))
@@ -87,8 +89,8 @@
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F59")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F60")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F61")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G2")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G3")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G6")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G7")))
 (deny file-write* (subpath (param "F62")))
 (deny file-write* (subpath (param "F63")))
 (deny file-write* (subpath (param "F64")))
@@ -128,16 +130,16 @@
 (deny file-write* (subpath (param "F99")))
 (deny file-write* (subpath (param "F100")))
 (deny file-write* (subpath (param "F101")))
-(deny file-write* (regex (param "G4")))
-(deny file-write* (regex (param "G5")))
-(deny file-write* (regex (param "G6")))
-(deny file-write* (regex (param "G7")))
 (deny file-write* (regex (param "G8")))
 (deny file-write* (regex (param "G9")))
 (deny file-write* (regex (param "G10")))
 (deny file-write* (regex (param "G11")))
 (deny file-write* (regex (param "G12")))
 (deny file-write* (regex (param "G13")))
+(deny file-write* (regex (param "G14")))
+(deny file-write* (regex (param "G15")))
+(deny file-write* (regex (param "G16")))
+(deny file-write* (regex (param "G17")))
 (deny network-outbound (remote unix-socket (subpath (param "K0"))))
 (deny network-outbound (remote unix-socket (subpath (param "K1"))))
 (deny network-outbound (remote unix-socket (subpath (param "K2"))))
@@ -160,12 +162,16 @@
 ;; A1=<FIX>/home/work/proj
 ;; W0=<FIX>/home/Library
 ;; W1=<FIX>/home/work/proj
+;; G0=^<FIX>/home/Library(/.*)?/(\.[eE][nN][vV](\.[^/]*)?|[^/]*[sS][eE][cC][rR][eE][tT][^/]*\.([yY][aA][mM][lL]|[yY][mM][lL]|[jJ][sS][oO][nN]|[tT][oO][mM][lL])|[^/]*\.([pP][eE][mM]|[kK][eE][yY]|[pP]12))$
+;; G1=^<FIX>/home/work/proj(/.*)?/(\.[eE][nN][vV](\.[^/]*)?|[^/]*[sS][eE][cC][rR][eE][tT][^/]*\.([yY][aA][mM][lL]|[yY][mM][lL]|[jJ][sS][oO][nN]|[tT][oO][mM][lL])|[^/]*\.([pP][eE][mM]|[kK][eE][yY]|[pP]12))$
+;; G2=^<FIX>/home/Library(/.*)?\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$
+;; G3=^<FIX>/home/work/proj(/.*)?\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$
 ;; W2=<FIX>/home/work/proj/.env.example
 ;; F0=<FIX>/home/.config/gh
 ;; F1=<FIX>/home/work/proj/.env
-;; G0=^<FIX>/home/work/proj/secrets/[^/]*\.yaml(/.*)?$
+;; G4=^<FIX>/home/work/proj/secrets/[^/]*\.yaml(/.*)?$
 ;; F2=<FIX>/home/work/proj/vendor
-;; G1=^<FIX>/home/work/proj(/[^/]+)*/[^/]*\.lock(/.*)?$
+;; G5=^<FIX>/home/work/proj(/[^/]+)*/[^/]*\.lock(/.*)?$
 ;; F3=<FIX>/home/.aws
 ;; F4=<FIX>/home/.azure
 ;; F5=<FIX>/home/.config/atuin
@@ -225,8 +231,8 @@
 ;; F59=<FIX>/home/Library/Keychains
 ;; F60=<FIX>/home/Library/Safari
 ;; F61=<FIX>/home/Library/WebKit
-;; G2=^<FIX>/home/\.[^/]*_history(/.*)?$
-;; G3=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
+;; G6=^<FIX>/home/\.[^/]*_history(/.*)?$
+;; G7=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
 ;; F62=<FIX>/bin
 ;; F63=<FIX>/home/.bash_login
 ;; F64=<FIX>/home/.bash_logout
@@ -267,16 +273,16 @@
 ;; F99=<FIX>/main/.git/worktrees/wt/config
 ;; F100=<FIX>/main/.git/worktrees/wt/config.worktree
 ;; F101=<FIX>/main/.git/worktrees/wt/hooks
-;; G4=^<FIX>/main/\.git/modules(/[^/]+)*/commondir(/.*)?$
-;; G5=^<FIX>/main/\.git/modules(/[^/]+)*/config(/.*)?$
-;; G6=^<FIX>/main/\.git/modules(/[^/]+)*/config\.worktree(/.*)?$
-;; G7=^<FIX>/main/\.git/modules(/[^/]+)*/hooks(/.*)?$
-;; G8=^<FIX>/main/\.git/worktrees/[^/]*/config\.worktree(/.*)?$
-;; G9=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/commondir(/.*)?$
-;; G10=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config(/.*)?$
-;; G11=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config\.worktree(/.*)?$
-;; G12=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/hooks(/.*)?$
-;; G13=^<FIX>/main/\.git/worktrees/wt/worktrees/[^/]*/config\.worktree(/.*)?$
+;; G8=^<FIX>/main/\.git/modules(/[^/]+)*/commondir(/.*)?$
+;; G9=^<FIX>/main/\.git/modules(/[^/]+)*/config(/.*)?$
+;; G10=^<FIX>/main/\.git/modules(/[^/]+)*/config\.worktree(/.*)?$
+;; G11=^<FIX>/main/\.git/modules(/[^/]+)*/hooks(/.*)?$
+;; G12=^<FIX>/main/\.git/worktrees/[^/]*/config\.worktree(/.*)?$
+;; G13=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/commondir(/.*)?$
+;; G14=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config(/.*)?$
+;; G15=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/config\.worktree(/.*)?$
+;; G16=^<FIX>/main/\.git/worktrees/wt/modules(/[^/]+)*/hooks(/.*)?$
+;; G17=^<FIX>/main/\.git/worktrees/wt/worktrees/[^/]*/config\.worktree(/.*)?$
 ;; K0=<FIX>/home/.colima
 ;; K1=<FIX>/home/.docker/run
 ;; K2=<FIX>/home/.lima

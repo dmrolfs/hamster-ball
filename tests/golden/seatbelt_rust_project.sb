@@ -23,6 +23,10 @@
 ; network
 (allow network-outbound (remote ip (param "PROXY")))
 (allow network-outbound (remote ip (param "L0")) (remote ip (param "L1")))
+; guard
+(deny file-read-data file-read-xattr file-write* (regex (param "G0")))
+; template_allow
+(allow file-read-data file-read-xattr file-write* (regex (param "G1")))
 ; host_services
 (deny process-exec (literal "/bin/launchctl"))
 ; floor
@@ -86,8 +90,8 @@
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F57")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F58")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F59")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G0")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G1")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G2")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G3")))
 (deny file-write* (subpath (param "F60")))
 (deny file-write* (subpath (param "F61")))
 (deny file-write* (subpath (param "F62")))
@@ -138,6 +142,8 @@
 ;; PROXY=localhost:1
 ;; L0=localhost:3030
 ;; L1=localhost:5432
+;; G0=^<FIX>/home/work/proj(/.*)?/(\.[eE][nN][vV](\.[^/]*)?|[^/]*[sS][eE][cC][rR][eE][tT][^/]*\.([yY][aA][mM][lL]|[yY][mM][lL]|[jJ][sS][oO][nN]|[tT][oO][mM][lL])|[^/]*\.([pP][eE][mM]|[kK][eE][yY]|[pP]12))$
+;; G1=^<FIX>/home/work/proj(/.*)?\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$
 ;; F0=<FIX>/home/.aws
 ;; F1=<FIX>/home/.azure
 ;; F2=<FIX>/home/.config/atuin
@@ -198,8 +204,8 @@
 ;; F57=<FIX>/home/Library/Keychains
 ;; F58=<FIX>/home/Library/Safari
 ;; F59=<FIX>/home/Library/WebKit
-;; G0=^<FIX>/home/\.[^/]*_history(/.*)?$
-;; G1=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
+;; G2=^<FIX>/home/\.[^/]*_history(/.*)?$
+;; G3=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
 ;; F60=<FIX>/bin
 ;; F61=<FIX>/home/.bash_login
 ;; F62=<FIX>/home/.bash_logout

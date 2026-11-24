@@ -2483,6 +2483,31 @@
       ]
     }
   ],
+  "guard": {
+    "roots": [
+      "<FIX>/home/work/proj"
+    ],
+    "patterns": [
+      ".env",
+      ".env.*",
+      "*secret*.yaml",
+      "*secret*.yml",
+      "*secret*.json",
+      "*secret*.toml",
+      "*.pem",
+      "*.key",
+      "*.p12"
+    ],
+    "templates": [
+      "*.example",
+      "*.sample",
+      "*.template"
+    ],
+    "dependency_dirs": [
+      "node_modules",
+      "site-packages"
+    ]
+  },
   "guard_exceptions": [],
   "warnings": [
     {

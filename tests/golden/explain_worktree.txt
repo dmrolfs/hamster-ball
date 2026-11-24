@@ -172,6 +172,12 @@ mcp
 hooks (run on the host, in order)
   notify 2 args hidden  <- [0] hooks[0]
 
+guard (secrets: content and writes denied, names visible)
+  covers    ~/work/proj
+  denies    .env .env.* *secret*.yaml *secret*.yml *secret*.json *secret*.toml *.pem *.key *.p12
+  allows    *.example *.sample *.template (templates)
+  exempts   key and secret-named files (not .env*) below node_modules or site-packages
+
 guard.exceptions
   (none)
 

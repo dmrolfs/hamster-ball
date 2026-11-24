@@ -380,9 +380,8 @@ pub struct ResolvedMcpServer {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedGuard {
-    /// Secrets-guard patterns to re-allow; only their form is checked here, what they match is
-    /// defined with the guard itself.
-    pub exceptions: Vec<GuardException>,
+    /// Where the secrets guard is switched off: absolute patterns, resolved like `fs.deny_read`.
+    pub exceptions: Vec<PathPattern>,
 }
 
 /// Parses and resolves `text` into a [`Resolved`] config.
@@ -481,11 +480,7 @@ impl<'a> Resolution<'a> {
             mcp: self.mcp(&parsed.mcp),
             hooks: self.hooks(&parsed.hooks),
             guard: ResolvedGuard {
-                exceptions: self.list(
-                    KeyPath::root().field("guard").field("exceptions"),
-                    &parsed.guard.exceptions,
-                    GuardException::parse,
-                ),
+                exceptions: self.guard_exceptions(&parsed.guard.exceptions),
             },
         };
         if self.errors.is_empty() {
@@ -593,6 +588,19 @@ impl<'a> Resolution<'a> {
             deny_read: self.list(fs_key("deny_read"), &raw.deny_read, parse_pattern),
             deny_write: self.list(fs_key("deny_write"), &raw.deny_write, parse_pattern),
         }
+    }
+
+    /// `guard.exceptions`: a checked absolute form, then a path pattern like `fs.deny_read`.
+    fn guard_exceptions(&mut self, items: &[String]) -> Vec<PathPattern> {
+        let resolver = self.resolver;
+        self.list(
+            KeyPath::root().field("guard").field("exceptions"),
+            items,
+            |spelling| -> Result<PathPattern, EntryError> {
+                GuardException::parse(spelling)?;
+                Ok(PathPattern::parse(&resolver, spelling)?)
+            },
+        )
     }
 
     /// Resolves `fs.read`/`fs.write` allow rules: granted paths are returned, skipped ones go
@@ -840,7 +848,7 @@ mod tests {
              label = \"com.docker.compose.project=icehouse\"\n\
              containers = [\"pg-1\"]\n\
              [guard]\n\
-             exceptions = [\".env.example\"]\n\
+             exceptions = [\"~/p/.env.example\"]\n\
              [mcp.serena]\n\
              command = \"uvx\"\n\
              args = [\"--from\", \"git+https://x\", \"serena\"]\n\
@@ -860,7 +868,12 @@ mod tests {
         let label = assert_some!(config.ctl.label.as_ref());
         assert_eq!(label.to_string(), "com.docker.compose.project=icehouse");
         assert_eq!(config.ctl.containers[0].as_str(), "pg-1");
-        assert_eq!(config.guard.exceptions[0].as_str(), ".env.example");
+        assert!(
+            config.guard.exceptions[0]
+                .base
+                .as_str()
+                .ends_with("/p/.env.example")
+        );
         let serena = assert_some!(config.mcp.get("serena"));
         assert_eq!(assert_some!(serena.command.as_ref()).as_str(), "uvx");
         let args: Vec<&str> = serena.args.iter().map(ArgWord::as_str).collect();
@@ -938,8 +951,9 @@ mod tests {
     #[test]
     fn extends_and_guard_exceptions_keep_their_order() {
         let fx = Fixture::new();
-        let resolved =
-            fx.resolved("extends = [\"z\", \"a\", \"m\"]\n[guard]\nexceptions = [\"y\", \"b\"]\n");
+        let resolved = fx.resolved(
+            "extends = [\"z\", \"a\", \"m\"]\n[guard]\nexceptions = [\"~/y\", \"~/b\"]\n",
+        );
         let extends: Vec<&str> = resolved
             .config
             .extends
@@ -952,7 +966,7 @@ mod tests {
             .guard
             .exceptions
             .iter()
-            .map(GuardException::as_str)
+            .map(|e| e.base.as_str().rsplit('/').next().unwrap_or_default())
             .collect();
         assert_eq!(exceptions, vec!["y", "b"]);
     }
@@ -1282,6 +1296,22 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_guard_exception_is_an_error_that_names_the_entry_and_the_reason() {
+        let fx = Fixture::new();
+        let errors =
+            fx.errors("[guard]\nexceptions = [\".env\", \"~/ok/.env\", \"config/*.yaml\"]\n");
+        let keys: Vec<String> = (0..errors.errors.len())
+            .map(|i| key_of(&errors, i))
+            .collect();
+        assert_eq!(keys, vec!["guard.exceptions[0]", "guard.exceptions[2]"]);
+        assert!(
+            errors.errors[0].value.to_string().contains("`/` or `~/`"),
+            "{}",
+            errors.errors[0].value
+        );
+    }
+
+    #[test]
     fn empty_or_control_extends_and_guard_exceptions_are_errors() {
         let fx = Fixture::new();
         let errors =
@@ -1367,7 +1397,7 @@ mod tests {
             "[net]\nloopback_ports = [80, 0]\n",
             "[env]\npass = [\"OK\", \"1bad\"]\n",
             "[ctl]\ncontainers = [\"ok\", \"-bad\"]\n",
-            "[guard]\nexceptions = [\"ok\", \"\"]\n",
+            "[guard]\nexceptions = [\"~/ok\", \"\"]\n",
             "hooks = [[\"ok\"], []]\n",
             "[fs]\ndeny_read = [\"ok\", \"a\\u0000b\"]\n",
             "[fs]\ndeny_write = [\"ok\", \"a\\u0000b\"]\n",

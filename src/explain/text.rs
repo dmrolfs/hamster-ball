@@ -201,6 +201,27 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
         writeln!(out, "  {}", hook_line(hook, t))?;
     }
 
+    section(
+        out,
+        "guard (secrets: content and writes denied, names visible)",
+        report.guard.roots.is_empty(),
+    )?;
+    if !report.guard.roots.is_empty() {
+        let t_roots: Vec<String> = report.guard.roots.iter().map(|r| t.show(r)).collect();
+        writeln!(out, "  covers    {}", t_roots.join(", "))?;
+        writeln!(out, "  denies    {}", report.guard.patterns.join(" "))?;
+        writeln!(
+            out,
+            "  allows    {} (templates)",
+            report.guard.templates.join(" ")
+        )?;
+        writeln!(
+            out,
+            "  exempts   key and secret-named files (not .env*) below {}",
+            report.guard.dependency_dirs.join(" or ")
+        )?;
+    }
+
     section(out, "guard.exceptions", report.guard_exceptions.is_empty())?;
     rows(out, &report.guard_exceptions, t, |v| cell(v))?;
 

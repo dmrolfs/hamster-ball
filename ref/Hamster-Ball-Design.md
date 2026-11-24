@@ -728,20 +728,48 @@ On by default; no setup. Denies read, write, delete, rename and hard-link for fi
 
 `.env`, `.env.*`, `*secret*.{yaml,yml,json,toml}`, `*.pem`, `*.key`, `*.p12`
 
-- **Templates stay editable**: `*.example`, `*.sample`, `*.template` are re-allowed after the deny.
-- **Git-tracked files are skipped**: the agent can already read them with `git show`.
-  `hb doctor` warns when a tracked file looks like a secret. icehouse tracks a `.env`;
-  its contents have not been inspected.
-- **Exceptions live only in the user base** (`[guard.exceptions]` keyed by project path), never in a project file.
+- **Where.** Below every `fs.write` grant (the project, and any other directory you made writable), at any depth. Not below
+  read-only grants: toolchains carry CA bundles named `*.pem` that TLS needs. Names are compared without regard to case, and each
+  letter is written as a two-letter class in the regex so a case-sensitive volume is covered too.
+- **Templates stay editable**: `*.example`, `*.sample`, `*.template` below a guard root are re-allowed after the deny, naming
+  the same operations the deny names. Anchored to the roots, so the re-allow opens nothing outside them. The floor and
+  `deny_*` come after, so a template name cannot reopen them (`.git/hooks/pre-commit.sample` stays denied).
+- **Git-tracked files are skipped**: the agent can already read them with `git show`. `hb` runs `git ls-files -z` on the host
+  with the system `/usr/bin/git`, an empty environment and config, `core.fsmonitor=false`, hooks off and a 5 s limit, and
+  re-allows each tracked file with a guarded name (at most 128; symbolic links are left out). No git, or a failure, means nothing
+  is skipped, and the run says so. `hb doctor` lists tracked files the guard would deny. icehouse tracks a `.env`; its contents have
+  not been inspected.
+- **Exceptions live only in the user base.** `[guard] exceptions` is a list of patterns that must start with `/` or `~/` and use the
+  grammar of `fs.deny_read` (a base directory plus a glob tail); a relative entry is refused, because the base applies to every
+  project and a relative one would switch the guard off everywhere. A matched file is re-allowed for read and write. A project
+  file with the section is refused (D36).
 - File names stay visible (`ls`, `stat` work); contents do not.
 - Projects add their own patterns with `fs.deny_read`.
-- Limit: a secret with an unusual name is not caught. `hb doctor` lists unmatched secret-looking files.
+- **Dependency directories (D78).** Packages ship files with these names: `certifi/cacert.pem` (also inside `pip`), `botocore/cacert.pem`,
+  grpc's `roots.pem`, `tornado/test/test.key`, twisted's test certificates, aws-sdk's `secretsmanager-*.json`. Denied, they stop
+  `pip install` of tornado or twisted, `rm -rf node_modules`, and every Python TLS client that reads certifi. So below a directory
+  named `node_modules` or `site-packages` (a venv is `.venv/lib/pythonX/site-packages`), the key and secret-named names (not
+  `.env*`) are re-allowed for read, write and delete.
+- **The pins that make that sound.** A deny on the files inside a directory does not stop renaming the directory, so
+  `mv certs node_modules/x/certs` would put a key where the exemption reads it, and `mv` of the key out under a harmless name
+  would follow. Measured both (`history/hb-ghd.5_dependency-dir-spike.md`). So at start `hb` walks the guard roots on the host
+  (skipping `.git`, `node_modules`, `site-packages`, `.venv`, `venv` and `target`; at most 100,000 entries) and pins against rename and
+  delete every directory that holds a guarded file and every directory above it up to the root (at most 256). A walk over a
+  limit switches the exemption off, which fails closed and is reported. Symbolic links, hard links, `cp` and `tar` into a dependency
+  directory were measured blocked.
+- **Residual, stated.** A directory that gets its first key or certificate after `hb` has started is not pinned; an agent that
+  blindly moves directories into `node_modules` could read it. `.env*` files are never exempt, so the commonest secret is not affected.
+  `hb doctor` and `hb explain` say the exemption is on.
+- Limit: a secret with an unusual name is not caught. `hb doctor` lists unmatched secret-looking files by name (never their
+  contents): `.netrc`, `.npmrc`, `id_rsa`, keystores, `*.tfvars`, `*.tfstate`, and data files whose name contains secret, token,
+  credential, password or api key. It also names secret-looking variables in the launchd environment, which the agent can read when
+  `system.launchctl` is on (4.6). Values are never printed.
 
 Measured: all four pattern types blocked on read; blocked all of rename-then-read, copy, hard link,
 symlink, parent-directory rename, delete, overwrite, new `.env.local`, and `git add -f`; blocked
 renaming, hard-linking, copying and symlinking a secret under a template name; `.ENV` blocked
 on the case-insensitive filesystem (Seatbelt evaluates the canonical path); templates and source
-files stay readable and writable.
+files stay readable and writable. `tests/secrets_guard.rs` repeats these under the real profile.
 
 ## 9. Containers
 
@@ -1180,3 +1208,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
 | D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |
+| D78 | Secrets guard (`src/guard`, hb-ghd.5): covers every writable grant; exceptions are absolute or `~/` path patterns (a relative one is refused); templates are re-allowed by name inside each root; tracked files come from a hardened host-side `git ls-files`; key and secret-named files (not `.env*`) below `node_modules` and `site-packages` are re-allowed together with unlink pins on every directory that holds a guarded file (a directory rename is otherwise a bypass, measured); an incomplete scan switches the exemption off; `hb doctor` reports look-alike names, tracked secrets and launchd variable names, never contents | owner, hb-ghd.5 |

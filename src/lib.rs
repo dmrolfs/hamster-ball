@@ -22,6 +22,7 @@ pub mod config;
 pub mod conformance;
 pub mod error;
 pub mod explain;
+pub mod guard;
 pub mod origin;
 pub mod policy;
 pub mod proxy;

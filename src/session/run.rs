@@ -33,6 +33,7 @@ use super::pump::Pump;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
+use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
 use crate::policy::{CanonicalPath, PathError, ToolName};
 use crate::proxy::ProxyError;
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
@@ -446,6 +447,18 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let mut inputs = RenderInputs::new()
         .with_session_dir(session.path().clone())
         .with_exec_dirs(tool_dirs.clone());
+    let roots: Vec<CanonicalPath> = loaded
+        .policy
+        .fs
+        .write
+        .iter()
+        .map(|grant| grant.value.clone())
+        .collect();
+    let guard = prepare_guard(&roots, Path::new(SYSTEM_GIT));
+    warnings.extend(guard.notes.iter().map(ToString::to_string));
+    inputs = inputs
+        .with_guard(guard.inputs)
+        .with_guard_allow(guard.tracked);
     if let Some(endpoint) = proxy.endpoint() {
         inputs = inputs.with_proxy(endpoint);
     }

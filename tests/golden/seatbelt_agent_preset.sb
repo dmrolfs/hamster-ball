@@ -27,6 +27,10 @@
 (allow network-outbound (remote ip (param "PROXY")))
 (allow network-bind (local ip (param "B0")) (local ip (param "B1")))
 (allow network-inbound (local ip (param "B0")) (local ip (param "B1")))
+; guard
+(deny file-read-data file-read-xattr file-write* (with message "hb-0123abcd guard") (regex (param "G0")) (regex (param "G1")))
+; template_allow
+(allow file-read-data file-read-xattr file-write* (regex (param "G2")) (regex (param "G3")))
 ; host_services
 (deny process-exec (with message "hb-0123abcd launchctl") (literal "/bin/launchctl"))
 ; floor
@@ -90,8 +94,8 @@
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F57")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F58")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (subpath (param "F59")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G0")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G1")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G4")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (with message "hb-0123abcd floor") (regex (param "G5")))
 (deny file-write* (with message "hb-0123abcd floor") (subpath (param "F60")))
 (deny file-write* (with message "hb-0123abcd floor") (subpath (param "F61")))
 (deny file-write* (with message "hb-0123abcd floor") (subpath (param "F62")))
@@ -151,6 +155,10 @@
 ;; PROXY=localhost:41234
 ;; B0=localhost:24282
 ;; B1=localhost:24283
+;; G0=^<FIX>/home/\.pi/agent(/.*)?/(\.[eE][nN][vV](\.[^/]*)?|[^/]*[sS][eE][cC][rR][eE][tT][^/]*\.([yY][aA][mM][lL]|[yY][mM][lL]|[jJ][sS][oO][nN]|[tT][oO][mM][lL])|[^/]*\.([pP][eE][mM]|[kK][eE][yY]|[pP]12))$
+;; G1=^<FIX>/home/work/proj(/.*)?/(\.[eE][nN][vV](\.[^/]*)?|[^/]*[sS][eE][cC][rR][eE][tT][^/]*\.([yY][aA][mM][lL]|[yY][mM][lL]|[jJ][sS][oO][nN]|[tT][oO][mM][lL])|[^/]*\.([pP][eE][mM]|[kK][eE][yY]|[pP]12))$
+;; G2=^<FIX>/home/\.pi/agent(/.*)?\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$
+;; G3=^<FIX>/home/work/proj(/.*)?\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$
 ;; F0=<FIX>/home/.aws
 ;; F1=<FIX>/home/.azure
 ;; F2=<FIX>/home/.config/atuin
@@ -211,8 +219,8 @@
 ;; F57=<FIX>/home/Library/Keychains
 ;; F58=<FIX>/home/Library/Safari
 ;; F59=<FIX>/home/Library/WebKit
-;; G0=^<FIX>/home/\.[^/]*_history(/.*)?$
-;; G1=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
+;; G4=^<FIX>/home/\.[^/]*_history(/.*)?$
+;; G5=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
 ;; F60=<FIX>/bin
 ;; F61=<FIX>/home/.bash_login
 ;; F62=<FIX>/home/.bash_logout

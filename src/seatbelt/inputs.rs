@@ -9,6 +9,7 @@
 //! those milestones exist.
 
 use super::emit::LogTag;
+use crate::guard::GuardInputs;
 use crate::policy::{CanonicalPath, Port};
 
 /// Where the proxy listens.
@@ -46,6 +47,8 @@ pub struct RenderInputs {
     pub log_tag: Option<LogTag>,
     /// Files re-allowed after the guard denies and before the floor (milestone 5).
     pub guard_allow: Vec<CanonicalPath>,
+    /// The secrets guard's pins and dependency exemption (milestone 5).
+    pub guard: GuardInputs,
     /// The `hb ctl` broker socket (milestone 8).
     pub ctl_socket: Option<CanonicalPath>,
     /// Directories of `[env] tools`, readable so scripts on `PATH` run.
@@ -84,6 +87,13 @@ impl RenderInputs {
     #[must_use]
     pub fn with_log_tag(mut self, tag: LogTag) -> Self {
         self.log_tag = Some(tag);
+        self
+    }
+
+    /// Sets the guard's pins and dependency exemption.
+    #[must_use]
+    pub fn with_guard(mut self, guard: GuardInputs) -> Self {
+        self.guard = guard;
         self
     }
 

@@ -23,6 +23,7 @@ use snafu::{ResultExt, Snafu, ensure};
 pub use check::InvariantViolation;
 pub use emit::{LogTag, LogTagError, Profile, RenderWarning};
 pub use inputs::{ProxyEndpoint, RenderInputs};
+pub(crate) use pattern::quote;
 
 use crate::config::Policy;
 use crate::policy::FloorRule;
@@ -329,10 +330,15 @@ mod tests {
                 }
                 prop_assert!(profile.text.contains(&format!("(param \"{name}\")")), "{name} unused");
             }
-            // Every denial comes after every allow.
+            // Every denial comes after every allow, except the secrets guard's: it is the one
+            // deny that the template re-allow after it reopens (design 7.1, steps 6 and 7).
             let lines: Vec<&str> = profile.text.lines().collect();
             let last_allow = lines.iter().rposition(|l| l.starts_with("(allow "));
-            let first_deny = lines.iter().position(|l| l.starts_with("(deny ") && !l.starts_with("(deny default"));
+            let first_deny = lines.iter().position(|l| {
+                l.starts_with("(deny ")
+                    && !l.starts_with("(deny default")
+                    && !l.starts_with("(deny file-read-data file-read-xattr file-write*")
+            });
             if let (Some(a), Some(d)) = (last_allow, first_deny) {
                 prop_assert!(a < d);
             }

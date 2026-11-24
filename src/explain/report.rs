@@ -10,7 +10,7 @@
 //! Values that can carry a secret therefore cannot reach a renderer by accident.
 //!
 //! **Ordering.** Groups are fixed: `files`, `fs`, `deny`, `net`, `env`, `tls`, `terminal`, `system`, `ctl`, `mcp`,
-//! `hooks`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
+//! `hooks`, `guard`, `guard_exceptions`, `warnings`. `files` is in closure order (a later file has
 //! higher precedence). Sets are value-sorted, which is the order [`Sourced`] lists already
 //! have. `deny` lists floor rules first (in floor order), then `deny_read`, then `deny_write`.
 //! `hooks` keep first-seen order, which is meaningful. A value's origins are in closure order.
@@ -21,6 +21,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::config::{Closure, FileSource, FsAccess, FsDecision, Loaded, Policy};
+use crate::guard::patterns;
 use crate::origin::{KeyPath, Layer, Located, Origin, Source, Sourced};
 use crate::policy::{
     Argv, CanonicalPath, FloorEffect, FloorGroup, FloorRule, GlobSegment, HomeDir, PathPattern,
@@ -312,6 +313,20 @@ pub struct PathQuery {
     pub note: String,
 }
 
+/// The secrets guard (design 8): where it applies and what it matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuardReport {
+    /// The directories it covers: every writable grant.
+    pub roots: Vec<String>,
+    /// The guarded names.
+    pub patterns: Vec<String>,
+    /// Name endings that stay editable.
+    pub templates: Vec<String>,
+    /// Directory names below which key and secret-named files (not `.env*`) are re-allowed, with
+    /// the directories that hold secrets pinned. Applied when the project can be scanned.
+    pub dependency_dirs: Vec<String>,
+}
+
 /// What `hb explain` reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
@@ -341,6 +356,8 @@ pub struct Report {
     pub mcp: Vec<McpRow>,
     /// Host-side hooks.
     pub hooks: Vec<HookRow>,
+    /// The secrets guard.
+    pub guard: GuardReport,
     /// Secrets-guard exceptions.
     pub guard_exceptions: Vec<Row<String>>,
     /// Warnings.
@@ -536,8 +553,33 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
             .iter()
             .map(|hook| b.hook_row(hook, options.show_args))
             .collect(),
+        guard: GuardReport {
+            roots: policy
+                .fs
+                .write
+                .iter()
+                .map(|g| g.value.as_str().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            patterns: patterns::GUARDED_PATTERNS
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect(),
+            templates: patterns::TEMPLATE_SUFFIXES
+                .iter()
+                .map(|t| format!("*.{t}"))
+                .collect(),
+            dependency_dirs: patterns::DEPENDENCY_DIRS
+                .iter()
+                .map(|d| (*d).to_owned())
+                .collect(),
+        },
         guard_exceptions: b.rows(&policy.guard_exceptions, "guard.exceptions", |g| {
-            g.as_str().to_owned()
+            tail_text(g).map_or_else(
+                || g.base.as_str().to_owned(),
+                |tail| format!("{}/{tail}", g.base.as_str()),
+            )
         }),
         warnings,
         query: options

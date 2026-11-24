@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fdb6c5747146282926bcdbcc8b2448281fd7a3894f46025109ec2e7312866e64 # shrinks to policy = Policy { fs: MergedFs { read: [], write: [Sourced { value: CanonicalPath("/zzmark/|"), sources: [File { file: FileId(0), index: None }] }], deny_read: [], deny_write: [] }, net: MergedNet { allow: [], internal_hosts: [], loopback_ports: [] }, env: MergedEnv { pass: [], set: {}, tools: [] }, tls: MergedTls { system_trust: Some(Sourced { value: false, sources: [File { file: FileId(0), index: None }] }), extra_ca_files: [] }, terminal: MergedTerminal { clipboard_write: None }, ctl: MergedCtl { label: None, containers: [] }, system: MergedSystem { launchctl: None }, mcp: {McpName("s"): Sourced { value: ResolvedMcpServer { command: None, args: [], net: [], bind_ports: [] }, sources: [File { file: FileId(0), index: None }] }}, hooks: [], guard_exceptions: [], floor: Floor { rules: [] } }, proxy = false

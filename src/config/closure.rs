@@ -1632,8 +1632,8 @@ mod tests {
     #[test]
     fn guard_exceptions_follow_the_same_rule_as_hooks() {
         let w = World::new();
-        w.base("[guard]\nexceptions = [\".env.example\"]\n");
-        w.project("[guard]\nexceptions = [\".env\"]\n");
+        w.base("[guard]\nexceptions = [\"~/p/.env.example\"]\n");
+        w.project("[guard]\nexceptions = [\"~/p/.env\"]\n");
         let err = assert_err!(w.load());
         let (path, section, _) = user_only_error(&err);
         assert!(path.ends_with("hamster-ball.toml"), "{path:?}");

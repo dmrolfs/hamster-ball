@@ -45,6 +45,13 @@ system_trust = true
 # your presets can say true; any file can say false.
 # launchctl = true
 
+[guard]
+# Files named .env, *secret*.yaml, *.pem, *.key and the like are unreadable and unchangeable in every
+# directory the hamster ball may write; templates (*.example) and git-tracked files are not. List
+# paths to switch the guard off for them. Only this file and your presets can; each must start
+# with / or ~/ so it names one project, and may end in a glob such as *.secrets.yaml.
+# exceptions = [\"~/work/myproj/.env.local\"]
+
 [net]
 # Hosts allowed to resolve to private, tunnel or other internal addresses, for example a corporate
 # network where github.com or an internal registry answers with a 100.64.x.x address. Only this
@@ -428,6 +435,7 @@ mod tests {
         assert_eq!(resolved.config.tls.system_trust, Some(true));
         assert_eq!(resolved.config.env.pass.len(), 2);
         assert!(BASE_TEMPLATE.contains("# launchctl = true"));
+        assert!(BASE_TEMPLATE.contains("# exceptions = ["));
         assert!(BASE_TEMPLATE.contains("# internal_hosts ="));
         assert!(resolved.config.net.internal_hosts.is_empty());
         assert_eq!(

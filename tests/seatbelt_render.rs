@@ -353,44 +353,40 @@ fn a_users_own_denies_cannot_be_dodged_by_renaming_their_parent_directory() {
 }
 
 #[test]
-fn the_template_reallow_reopens_a_guard_deny_which_a_wildcard_allow_could_not() {
+fn the_reallow_reopens_a_guard_deny_which_a_wildcard_allow_could_not() {
     sandboxed!();
     let w = World::new(PROJECT);
     let proj = w.project.clone();
     write(&proj.join(".env"), "SECRET=1");
     write(&proj.join(".env.example"), "SECRET=");
-    let allow = vec![canonical(&proj.join(".env.example"))];
-    let with = w.render(&RenderInputs::new().with_guard_allow(allow));
+    let secret = canonical(&proj.join(".env"));
+    // The file the guard would deny, re-allowed as a tracked file is.
+    let with = w.render(&RenderInputs::new().with_guard_allow(vec![secret.clone()]));
     let without = w.render(&RenderInputs::new());
-    // The secrets guard is milestone 5; inject a deny shaped as the design says (data and xattr
-    // plus the write class, so names stay visible) into the Guard section, before the re-allow.
-    let canonical_proj = canonical(&proj);
-    let quoted = canonical_proj.as_str().replace('.', "\\.");
-    let guard = format!(
-        "; guard\n(deny file-read-data file-read-xattr file-write* (regex #\"^{quoted}/\\.env.*$\"))\n"
-    );
-    let with_guard = |p: &hamster_ball::seatbelt::Profile| {
-        let mut p = p.clone();
-        let at = p.text.find("; template_allow").unwrap_or(p.text.len());
-        p.text.insert_str(at, &guard);
-        p
-    };
-    let (with, without) = (with_guard(&with), with_guard(&without));
+    // The control: a wildcard `file-read*`/`file-write*` allow of the same file, placed last,
+    // does not reopen a deny that names specific operations.
+    let mut wildcard = without.clone();
+    wildcard.text.push_str(&format!(
+        "(allow file-read* file-write* (literal \"{}\"))\n",
+        secret.as_str()
+    ));
     let home = w.home_dir();
     let sh =
         |p: &hamster_ball::seatbelt::Profile, script: &str| succeeds(&run(p, &home, &proj, script));
-    // The guard denies the secret in both profiles, and leaves its name visible.
-    assert!(!sh(&with, "cat .env") && !sh(&without, "cat .env"));
+    // The guard denies the secret, and leaves its name visible.
+    assert!(!sh(&without, "cat .env"));
     assert!(
-        sh(&with, "/usr/bin/stat .env"),
+        sh(&without, "/usr/bin/stat .env"),
         "names stay visible under the guard"
     );
-    // The re-allowed template is readable and writable only where the re-allow is present.
-    assert!(sh(&with, "cat .env.example && echo x >> .env.example"));
     assert!(
-        !sh(&without, "cat .env.example"),
-        "control: the guard alone denies the template"
+        !sh(&wildcard, "cat .env"),
+        "a wildcard allow cannot reopen it"
     );
+    // The re-allow that names the guard's operations does.
+    assert!(sh(&with, "cat .env && echo x >> .env"));
+    // And the template, reopened by name in every profile.
+    assert!(sh(&without, "cat .env.example && echo x >> .env.example"));
 }
 
 #[test]

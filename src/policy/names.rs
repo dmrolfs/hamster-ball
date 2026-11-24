@@ -30,6 +30,16 @@ pub enum RefTextError {
         max: usize,
     },
 
+    /// A guard exception that is neither absolute nor under the home directory.
+    #[snafu(display(
+        "a guard exception must start with `/` or `~/`: a relative one would switch the guard off in every project (got {})",
+        EscapedBounded::new(text, ERROR_PREVIEW_CHARS)
+    ))]
+    NotAbsolute {
+        /// The rejected value as written.
+        text: String,
+    },
+
     /// The value contains NUL or another control character.
     #[snafu(display(
         "value contains a control character: {}",
@@ -96,13 +106,40 @@ ref_text_type!(
     ExtendRef
 );
 
-ref_text_type!(
-    /// One entry of `guard.exceptions`.
+/// One entry of `guard.exceptions`: where the secrets guard is switched off.
+///
+/// An absolute path or one under `~/`, with the glob tail `fs.deny_read` accepts. A relative entry
+/// is refused: the entry lives in the user's base config, so a relative one would apply to every
+/// project. What the pattern matches is decided when the guard is prepared for a run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GuardException(String);
+
+impl GuardException {
+    /// Parses the value.
     ///
-    /// Only the form is checked here; what an exception matches is defined with the secrets
-    /// guard.
-    GuardException
-);
+    /// # Errors
+    /// See [`RefTextError`]; [`RefTextError::NotAbsolute`] for a relative entry.
+    pub fn parse(text: &str) -> Result<Self, RefTextError> {
+        check(text)?;
+        ensure!(
+            text.starts_with('/') || text.starts_with("~/"),
+            NotAbsoluteSnafu { text }
+        );
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The value as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GuardException {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Longest accepted MCP server name, in bytes.
 pub const MAX_MCP_NAME_BYTES: usize = 64;
@@ -210,7 +247,28 @@ mod tests {
             "agent/kiro"
         );
         assert_ok!(ExtendRef::parse("~/presets/mine.toml"));
-        assert_ok!(GuardException::parse("config/*.secrets.yaml"));
+        assert_ok!(GuardException::parse("~/work/proj/config/*.secrets.yaml"));
+        assert_ok!(GuardException::parse("/srv/proj/.env"));
+    }
+
+    #[test]
+    fn a_relative_guard_exception_is_refused_because_it_would_apply_to_every_project() {
+        for bad in [
+            ".env",
+            "config/*.secrets.yaml",
+            "./.env",
+            "../x/.env",
+            "~",
+            "~user/.env",
+        ] {
+            assert!(
+                matches!(
+                    assert_err!(GuardException::parse(bad), "{bad}"),
+                    RefTextError::NotAbsolute { .. }
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -346,8 +404,8 @@ mod tests {
     #[test]
     fn displays_as_its_text() {
         assert_eq!(
-            assert_ok!(GuardException::parse(".env")).to_string(),
-            ".env"
+            assert_ok!(GuardException::parse("~/.env")).to_string(),
+            "~/.env"
         );
     }
 }

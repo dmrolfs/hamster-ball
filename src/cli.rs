@@ -55,6 +55,10 @@ enum Command {
     /// The agent can write the project directory, so `hb run` runs a project config only when its
     /// exact bytes were approved here. Needs a terminal; there is no way to approve without one.
     Approve(ApproveArgs),
+    /// Report secrets the guard misses: look-alike files, tracked secrets, launchd variables.
+    ///
+    /// Shows file and variable names only, never their contents.
+    Doctor,
     /// Print the Seatbelt profile and parameters this project would run under.
     ///
     /// The proxy parameter is a placeholder: each run's proxy listens on a port chosen at start.
@@ -367,6 +371,7 @@ where
             }
             Err(error) => fail(err, error),
         },
+        Command::Doctor => doctor_command(env, out, err),
         Command::Approve(args) => {
             approve_command(env, &args, terminal_for(supervise).as_mut(), out, err)
         }
@@ -575,6 +580,40 @@ fn ensure_approved(
     Err(ExitCode::from(NOT_APPROVED))
 }
 
+/// `hb doctor`: what the secrets guard cannot see (design section 3).
+fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    use crate::guard::doctor::{Findings, launchd_environment, render, survey};
+    let (_, loaded) = match load_project(env) {
+        Ok(project) => project,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    let roots: Vec<crate::policy::CanonicalPath> = loaded
+        .policy
+        .fs
+        .write
+        .iter()
+        .map(|grant| grant.value.clone())
+        .collect();
+    let prepared = crate::guard::prepare(&roots, std::path::Path::new(crate::guard::SYSTEM_GIT));
+    let (suspects, survey_complete) = survey(&roots, 100_000);
+    let findings = Findings {
+        roots: roots.iter().map(|r| r.as_str().to_owned()).collect(),
+        exemption: prepared.inputs.dependency_exemption,
+        pins: prepared.inputs.pins.len(),
+        tracked: prepared
+            .tracked
+            .iter()
+            .map(|t| t.as_str().to_owned())
+            .collect(),
+        suspects,
+        survey_complete,
+        launchd: launchd_environment(),
+        notes: prepared.notes.iter().map(ToString::to_string).collect(),
+    };
+    let _ = write!(out, "{}", render(&findings));
+    ExitCode::SUCCESS
+}
+
 /// `hb approve`: ask about this project's config and store the answer, or take the approval back.
 fn approve_command(
     env: &Environment,
@@ -640,7 +679,18 @@ fn exit_code(exit: ExitKind) -> ExitCode {
 /// The profile for the current project, with its `-D` parameters as leading comments.
 fn profile(env: &Environment) -> Result<String, crate::Error> {
     let (_, loaded) = load_project(env)?;
-    let inputs = RenderInputs::new().with_proxy(ProxyEndpoint::Placeholder);
+    let roots: Vec<crate::policy::CanonicalPath> = loaded
+        .policy
+        .fs
+        .write
+        .iter()
+        .map(|grant| grant.value.clone())
+        .collect();
+    let guard = crate::guard::prepare(&roots, std::path::Path::new(crate::guard::SYSTEM_GIT));
+    let inputs = RenderInputs::new()
+        .with_proxy(ProxyEndpoint::Placeholder)
+        .with_guard(guard.inputs)
+        .with_guard_allow(guard.tracked);
     let profile = render(&loaded.policy, &inputs)?;
     let mut text = String::from(
         "; hb profile. Run with: sandbox-exec -p <profile> <-D name=value>... -- <command>\n",
@@ -653,6 +703,9 @@ fn profile(env: &Environment) -> Result<String, crate::Error> {
     }
     for warning in &profile.warnings {
         text.push_str(&format!("; warning: {warning}\n"));
+    }
+    for note in &guard.notes {
+        text.push_str(&format!("; warning: {note}\n"));
     }
     text.push_str(&profile.text);
     Ok(text)

@@ -308,6 +308,7 @@ fn the_json_parses_and_has_a_schema_version_and_the_groups_in_order() {
             "ctl",
             "mcp",
             "hooks",
+            "guard",
             "guard_exceptions",
             "warnings"
         ]

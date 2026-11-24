@@ -20,9 +20,9 @@ use snafu::{ResultExt, Snafu};
 
 pub use json::render_json;
 pub use report::{
-    AccessRow, CtlReport, DenyRow, EnvReport, EnvSetRow, FileRow, FsReport, HookRow, McpRow,
-    NetReport, OriginRow, PathQuery, ProjectRow, Report, ReportOptions, Row, SCHEMA_VERSION,
-    TlsReport, WarningRow, build_report,
+    AccessRow, CtlReport, DenyRow, EnvReport, EnvSetRow, FileRow, FsReport, GuardReport, HookRow,
+    McpRow, NetReport, OriginRow, PathQuery, ProjectRow, Report, ReportOptions, Row,
+    SCHEMA_VERSION, TlsReport, WarningRow, build_report,
 };
 pub use text::render_text;
 

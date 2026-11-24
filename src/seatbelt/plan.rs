@@ -12,6 +12,7 @@ use super::inputs::RenderInputs;
 use super::pattern::{children_regex, tail_regex};
 use super::rule::{Filter, Op, ParamKind, ParamValue, Rule, Section};
 use crate::config::Policy;
+use crate::guard::patterns;
 use crate::policy::floor::pin_ancestors;
 use crate::policy::{BindPort, CanonicalPath, Extent, FloorEffect, FloorRule, PathPattern, Port};
 
@@ -89,7 +90,8 @@ pub(crate) fn plan(
     grants(&mut rules, policy, inputs);
     tls(&mut rules, policy);
     network(&mut rules, policy, inputs);
-    template_allow(&mut rules, inputs);
+    guard(&mut rules, policy);
+    template_allow(&mut rules, policy, inputs);
     host_services(&mut rules, policy);
     policy_denies(&mut rules, policy);
     floor(&mut rules, policy, inputs, keep_floor);
@@ -322,19 +324,72 @@ fn network(rules: &mut Vec<Rule>, policy: &Policy, inputs: &RenderInputs) {
     }
 }
 
-fn template_allow(rules: &mut Vec<Rule>, inputs: &RenderInputs) {
-    let files = sorted_paths(inputs.guard_allow.iter());
-    if !files.is_empty() {
-        rules.push(Rule::allow(
-            Section::TemplateAllow,
-            // The same operations the guard denies (design 8), so the re-allow reopens them.
-            &[Op::FileReadData, Op::FileReadXattr, Op::FileWriteAll],
-            files
-                .into_iter()
-                .map(|p| Filter::Literal(pv(ParamKind::Write, p)))
-                .collect(),
-        ));
+/// What the secrets guard denies and re-allows share: content and writes, never metadata.
+const GUARD_OPS: [Op; 3] = [Op::FileReadData, Op::FileReadXattr, Op::FileWriteAll];
+
+/// The directories the secrets guard covers: every writable grant (design 8).
+///
+/// Read-only grants are left out on purpose: toolchains carry CA bundles in `*.pem` files that
+/// TLS needs, and nothing there is the project's own secret.
+fn guard_roots(policy: &Policy) -> Vec<&CanonicalPath> {
+    sorted_paths(policy.fs.write.iter().map(|g| &g.value))
+}
+
+fn regex_filter(text: String) -> Filter {
+    Filter::Regex(ParamValue::new(ParamKind::Regex, text))
+}
+
+/// The secrets guard's deny (design 8): content and writes of guarded names below each root, so
+/// reading, writing, deleting, renaming and hard-linking are all refused and `ls` still works.
+fn guard(rules: &mut Vec<Rule>, policy: &Policy) {
+    let filters: Vec<Filter> = guard_roots(policy)
+        .into_iter()
+        .map(|root| regex_filter(patterns::deny_regex(root.as_str())))
+        .collect();
+    if !filters.is_empty() {
+        rules.push(Rule::deny(Section::Guard, &GUARD_OPS, filters).labelled("guard"));
     }
+}
+
+/// What reopens after the guard, before every floor and policy deny: templates, the dependency
+/// exemption, the user's exceptions and the tracked files.
+fn template_allow(rules: &mut Vec<Rule>, policy: &Policy, inputs: &RenderInputs) {
+    let roots = guard_roots(policy);
+    let mut filters: Vec<Filter> = roots
+        .iter()
+        .map(|root| regex_filter(patterns::template_regex(root.as_str())))
+        .collect();
+    if inputs.guard.dependency_exemption {
+        filters.extend(
+            roots
+                .iter()
+                .map(|root| regex_filter(patterns::dependency_regex(root.as_str()))),
+        );
+    }
+    for exception in &policy.guard_exceptions {
+        filters.extend(exception_filters(&exception.value));
+    }
+    filters.extend(
+        sorted_paths(inputs.guard_allow.iter())
+            .into_iter()
+            .map(|p| Filter::Literal(pv(ParamKind::Write, p))),
+    );
+    if !filters.is_empty() {
+        // The same operations the guard denies (design 8), so the re-allow reopens them.
+        rules.push(Rule::allow(Section::TemplateAllow, &GUARD_OPS, filters));
+    }
+}
+
+/// An exception as allow filters: a literal file, or a regex for a glob tail, for the path and
+/// for its symbolic-link alias.
+fn exception_filters(pattern: &PathPattern) -> Vec<Filter> {
+    std::iter::once(&pattern.base)
+        .chain(pattern.alias.as_ref())
+        .map(|path| match &pattern.tail {
+            Some(tail) => regex_filter(tail_regex(path.as_str(), tail)),
+            None => Filter::Literal(pv(ParamKind::Write, path)),
+        })
+        .collect()
 }
 
 /// The filters that select what `pattern` covers, at `extent`, for a deny of `kind` paths.
@@ -489,6 +544,14 @@ fn floor(
         }
     }
     pins.extend(user_pins(policy, inputs));
+    pins.extend(inputs.guard.pins.iter().map(|path| {
+        Rule::deny(
+            Section::Pins,
+            &[Op::FileWriteUnlink],
+            vec![Filter::Literal(pv(ParamKind::Deny, path))],
+        )
+        .labelled("pin")
+    }));
     floor_rules.sort_by_key(sort_key);
     floor_rules.dedup();
     pins.sort_by_key(sort_key);
@@ -1126,6 +1189,143 @@ mod tests {
         policy.fs.deny_write = vec![Sourced::new(pattern("/Users/me/p/vend"), src())];
         let rules = rendered(&policy, &RenderInputs::new());
         assert_eq!(pin_paths(&rules), ["/Users/me/p"]);
+    }
+
+    fn guarded_policy(roots: &[&str]) -> Policy {
+        let mut policy = policy_with(vec![]);
+        policy.fs.write = roots.iter().map(|r| Sourced::new(cp(r), src())).collect();
+        policy
+    }
+
+    fn section_rules(rules: &[Rule], section: Section) -> Vec<&Rule> {
+        rules.iter().filter(|r| r.section == section).collect()
+    }
+
+    #[test]
+    fn every_write_root_gets_a_guard_deny_that_names_content_and_writes_but_not_metadata() {
+        let policy = guarded_policy(&["/Users/me/a", "/Users/me/b"]);
+        let rules = rendered(&policy, &RenderInputs::new());
+        assert_ok!(check(&rules));
+        let guard = section_rules(&rules, Section::Guard);
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].action, Action::Deny);
+        assert_eq!(
+            guard[0].ops,
+            [Op::FileReadData, Op::FileReadXattr, Op::FileWriteAll]
+        );
+        assert_eq!(
+            filter_texts(guard[0]),
+            [
+                crate::guard::patterns::deny_regex("/Users/me/a"),
+                crate::guard::patterns::deny_regex("/Users/me/b")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_only_grant_is_not_guarded() {
+        let mut policy = guarded_policy(&["/Users/me/a"]);
+        policy.fs.read = vec![Sourced::new(cp("/opt/homebrew"), src())];
+        let rules = rendered(&policy, &RenderInputs::new());
+        let guard = section_rules(&rules, Section::Guard);
+        assert_eq!(
+            filter_texts(guard[0]),
+            [crate::guard::patterns::deny_regex("/Users/me/a")]
+        );
+    }
+
+    #[test]
+    fn with_no_write_grant_there_is_no_guard() {
+        let rules = rendered(&policy_with(vec![]), &RenderInputs::new());
+        assert!(section_rules(&rules, Section::Guard).is_empty());
+        assert!(section_rules(&rules, Section::TemplateAllow).is_empty());
+    }
+
+    #[test]
+    fn templates_are_reallowed_inside_each_root_only_and_after_the_guard() {
+        let policy = guarded_policy(&["/Users/me/a"]);
+        let rules = rendered(&policy, &RenderInputs::new());
+        let template = section_rules(&rules, Section::TemplateAllow);
+        assert_eq!(template.len(), 1);
+        assert_eq!(template[0].action, Action::Allow);
+        assert_eq!(
+            template[0].ops,
+            [Op::FileReadData, Op::FileReadXattr, Op::FileWriteAll]
+        );
+        assert_eq!(
+            filter_texts(template[0]),
+            [crate::guard::patterns::template_regex("/Users/me/a")]
+        );
+        let guard_at = assert_some!(rules.iter().position(|r| r.section == Section::Guard));
+        let template_at = assert_some!(
+            rules
+                .iter()
+                .position(|r| r.section == Section::TemplateAllow)
+        );
+        assert!(guard_at < template_at);
+    }
+
+    #[test]
+    fn the_dependency_exemption_is_emitted_only_when_asked_for() {
+        let policy = guarded_policy(&["/Users/me/a"]);
+        let without = rendered(&policy, &RenderInputs::new());
+        assert_eq!(section_rules(&without, Section::TemplateAllow).len(), 1);
+        let inputs = RenderInputs::new().with_guard(crate::guard::GuardInputs {
+            pins: Vec::new(),
+            dependency_exemption: true,
+        });
+        let with = rendered(&policy, &inputs);
+        assert_ok!(check(&with));
+        let texts: Vec<String> = section_rules(&with, Section::TemplateAllow)
+            .iter()
+            .flat_map(|r| filter_texts(r))
+            .collect();
+        assert!(
+            texts.contains(&crate::guard::patterns::dependency_regex("/Users/me/a")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn guard_pins_are_unlink_pins_and_sorted_with_the_others() {
+        let policy = guarded_policy(&["/Users/me/a"]);
+        let inputs = RenderInputs::new().with_guard(crate::guard::GuardInputs {
+            pins: vec![cp("/Users/me/a/certs"), cp("/Users/me/a")],
+            dependency_exemption: true,
+        });
+        let rules = rendered(&policy, &inputs);
+        assert_ok!(check(&rules));
+        assert_eq!(pin_paths(&rules), ["/Users/me/a", "/Users/me/a/certs"]);
+    }
+
+    #[test]
+    fn a_policy_exception_is_reallowed_as_a_literal_or_a_regex_inside_the_template_section() {
+        let mut policy = guarded_policy(&["/Users/me/a"]);
+        policy.guard_exceptions = vec![
+            Sourced::new(pattern("/Users/me/a/.env.active"), src()),
+            Sourced::new(
+                PathPattern {
+                    base: cp("/Users/me/a/config"),
+                    alias: None,
+                    tail: Some(assert_ok!(GlobTail::parse(&["*.secrets.yaml"]))),
+                },
+                src(),
+            ),
+        ];
+        let rules = rendered(&policy, &RenderInputs::new());
+        assert_ok!(check(&rules));
+        let template = section_rules(&rules, Section::TemplateAllow);
+        let texts: Vec<String> = template.iter().flat_map(|r| filter_texts(r)).collect();
+        assert!(
+            texts.contains(&"/Users/me/a/.env.active".to_owned()),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("^/Users/me/a/config/") && t.contains("secrets")),
+            "{texts:?}"
+        );
     }
 
     #[test]
