@@ -1,7 +1,10 @@
 # agent/kiro: kiro-cli 3.5.0, measured 2026-11-23 with `kiro-cli chat --no-interactive` behind the proxy.
 #
 # `~/Library/Application Support/kiro-cli` holds the login database and the agent server (a Node
-# program under `kas/`) that kiro-cli starts. It is written, because the login token is refreshed there.
+# program under `kas/`) that kiro-cli starts. It is written, because the login token is refreshed there,
+# except for the programs a plain `kiro-cli` runs outside the sandbox (`node`, `bun`, `tui.js`,
+# `bunfig.toml`, `kas`): the agent must not be able to change them. kiro runs without them being
+# writable; it cannot update its own agent server from inside hb, so update it outside.
 # `~/.kiro` holds sessions, settings and logs.
 #
 # Hosts a one-shot chat contacted: app.kiro.dev, runtime / management / telemetry .us-east-1.kiro.dev and
@@ -16,6 +19,13 @@
 # runs passed in about 9 s each.
 [fs]
 write = ["~/.kiro", "~/Library/Application Support/kiro-cli"]
+deny_write = [
+  "~/Library/Application Support/kiro-cli/bun",
+  "~/Library/Application Support/kiro-cli/bunfig.toml",
+  "~/Library/Application Support/kiro-cli/kas",
+  "~/Library/Application Support/kiro-cli/node",
+  "~/Library/Application Support/kiro-cli/tui.js",
+]
 
 [net]
 allow = [

@@ -24,7 +24,10 @@ pub trait BuiltinPresets {
 pub struct EmbeddedPresets;
 
 /// `(name, text)` pairs. Keep sorted by name.
-const EMBEDDED: &[(&str, &str)] = &[("agent/kiro", include_str!("../../presets/agent/kiro.toml"))];
+const EMBEDDED: &[(&str, &str)] = &[
+    ("agent/kiro", include_str!("../../presets/agent/kiro.toml")),
+    ("agent/pi", include_str!("../../presets/agent/pi.toml")),
+];
 
 /// The text registered under `name` in `table`.
 fn lookup<'a>(table: &[(&'a str, &'a str)], name: &PresetName) -> Option<&'a str> {

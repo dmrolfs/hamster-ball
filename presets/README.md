@@ -64,6 +64,18 @@ config holds only what the variables give it, so a result depends on the preset.
 |---|---|
 | `HB_CONFORMANCE=1` | turn the checks on |
 | `HB_CONFORMANCE_PROJECT=<file>` | appended to the throwaway project's config: what the preset leaves to you (a provider host in `[net] allow`, a gateway port in `loopback_ports`). No `extends` |
-| `HB_CONFORMANCE_BASE=<file>` | the private user base config (default: `[tls] system_trust = true`); put `net.internal_hosts` for your network here |
+| `HB_CONFORMANCE_BASE=<file>` | the private user base config (default: `[tls] system_trust = true`); put `net.internal_hosts` for your network and `tls.extra_ca_files` for a private gateway CA here |
 | `HB_CONFORMANCE_TIMEOUT=<seconds>` | the limit for one agent (default 180) |
 | `HB_CONFORMANCE_ARGS_<AGENT>="..."` | replaces the agent's arguments (`AGENT` in upper case, `-` as `_`) |
+
+Example for pi against a remote gateway with a private CA (`provider.toml` is the project file, `base.toml` the base):
+
+```sh
+# provider.toml:   [net]
+#                  allow = ["gateway.example.com"]
+# base.toml:       [tls]
+#                  system_trust = true
+#                  extra_ca_files = ["~/.config/gateway/ca.pem"]
+HB_CONFORMANCE=1 HB_CONFORMANCE_PROJECT=provider.toml HB_CONFORMANCE_BASE=base.toml \
+  cargo test --features test-support --test conformance -- --nocapture pi
+```

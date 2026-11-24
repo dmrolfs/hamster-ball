@@ -1,0 +1,25 @@
+# agent/pi: pi 1.6.0, measured 2026-11-23 with `pi --provider here -p` behind the proxy.
+#
+# `~/.pi/agent` holds pi's state, login, packages and its launcher. It is written, except `bin` and
+# `install`: those are what a plain `pi` runs outside the sandbox, so the agent must not be able to
+# change them. pi runs without them being writable; its update check (`install/update.lock`) is denied.
+# `tools = ["node"]` is needed (the launcher is a `#!/usr/bin/env node` script) and also makes the Node
+# install readable, so there is no separate read of `~/.nvm`.
+#
+# No hosts: the model provider is yours. Put it in your own config:
+#   [net]  allow = ["your-gateway.example.com"]   a gateway reached over HTTPS (the check used a remote one)
+#   [net]  loopback_ports = [18089]               a gateway on this machine (pi's default provider is
+#                                                 localhost:18089); loopback ports are not proxied
+#   [tls]  extra_ca_files = ["~/path/to/ca.pem"]  a gateway with a private CA (hb sets NODE_EXTRA_CA_CERTS;
+#                                                 without it pi fails with DEPTH_ZERO_SELF_SIGNED_CERT)
+#
+# Denied and harmless: ~/.agents/skills (user skills are not loaded), ~/.config/gcloud and Keychains probes.
+[env]
+tools = ["node"]
+
+[fs]
+write = ["~/.pi/agent"]
+deny_write = ["~/.pi/agent/bin", "~/.pi/agent/install"]
+
+[tls]
+system_trust = true
