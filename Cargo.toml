@@ -38,6 +38,7 @@ rustix = { version = "1.1", default-features = false, features = ["std", "proces
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
+sha2 = { version = "0.11", default-features = false }
 snafu = "0.9.2"
 strum = { version = "0.28.0", features = ["derive"] }
 toml = "1.2.1"

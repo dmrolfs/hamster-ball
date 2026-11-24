@@ -40,6 +40,7 @@ fn expect(w: &World, extra_env: &[(&str, &str)], body: &str) -> String {
 
 /// Like [`expect`]. With `answer_queries` false the script answers terminal queries itself.
 fn expect_with(w: &World, extra_env: &[(&str, &str)], answer_queries: bool, body: &str) -> String {
+    w.approve();
     let mut script = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
          set env(HB_TD_GRACE_MS) 500\nset env(TERM) xterm-256color\nset timeout 20\nset stty_init {{rows 24 columns 80}}\n",

@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use claims::assert_ok;
-use hamster_ball::config::{LoadRequest, Loaded, StaticPresets, discover, load};
+use hamster_ball::approval::{ApprovalStore, Fingerprint};
+use hamster_ball::config::{EmbeddedPresets, LoadRequest, Loaded, StaticPresets, discover, load};
 use hamster_ball::policy::{CanonicalPath, HomeDir};
 use hamster_ball::seatbelt::{Profile, RenderInputs, render, render_filtered};
 use hamster_ball::session::{Outcome, RunSpec, run as session_run};
-use hamster_ball::system::{Environment, FloorEnvironment, UserConfigDir};
+use hamster_ball::system::{Environment, FloorEnvironment, StateDir, UserConfigDir};
 use tempfile::TempDir;
 
 pub mod proxy;
@@ -123,6 +124,31 @@ impl World {
     /// but its home, project, tool `PATH` and temp directory come from variables, because the real
     /// `hb` takes its home from the passwd database (D28) and so cannot load a fixture project.
     pub fn drive(&self, testdrive: &str, args: &[&str]) -> Command {
+        self.approve();
+        self.drive_unapproved(testdrive, args)
+    }
+
+    /// Records the project's config as it is now as approved, as the owner's `y` at the prompt would.
+    ///
+    /// A config that does not load is left alone: the run then fails for that reason. The store is
+    /// the world's own, under its temporary home.
+    pub fn approve(&self) {
+        let Ok(discovery) = discover(&self.project, &self.home) else {
+            return;
+        };
+        let user = UserConfigDir::locate(&self.home);
+        let Ok(loaded) = load(
+            &LoadRequest::new(&self.home, &discovery, &user, &self.env.floor)
+                .with_builtins(&EmbeddedPresets),
+        ) else {
+            return;
+        };
+        let store = ApprovalStore::new(&StateDir::locate(&self.home));
+        assert_ok!(store.approve(discovery.root.path(), &Fingerprint::of(&loaded.closure)));
+    }
+
+    /// Like [`World::drive`], without approving the config first.
+    pub fn drive_unapproved(&self, testdrive: &str, args: &[&str]) -> Command {
         // A process started from a background job or under `nohup` has INT, QUIT or HUP ignored,
         // and an ignored signal stays ignored through exec. perl resets them first, so what the
         // test sees does not depend on how cargo was started; perl then becomes the driver.
@@ -135,12 +161,18 @@ impl World {
         .args(args)
         .env_clear()
         .current_dir(&self.project);
-        self.drive_env(&mut cmd);
+        self.drive_env_unapproved(&mut cmd);
         cmd
     }
 
     /// Sets the variables `hb-testdrive` reads on `cmd`, for a command that starts it indirectly.
     pub fn drive_env(&self, cmd: &mut Command) {
+        self.approve();
+        self.drive_env_unapproved(cmd);
+    }
+
+    /// Like [`World::drive_env`], without approving the config first.
+    pub fn drive_env_unapproved(&self, cmd: &mut Command) {
         cmd.env("HB_TD_HOME", self.home_dir())
             .env("HB_TD_CWD", &self.project)
             .env("HB_TD_PATH", self.base.join("bin"))

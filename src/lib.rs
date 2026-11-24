@@ -15,6 +15,7 @@
 //! never interpolates its `source`; callers print the chain with [`snafu::Report`]. Any
 //! user-controlled text in a message is escaped (see [`text::Escaped`]).
 
+pub mod approval;
 pub mod cli;
 pub mod config;
 #[cfg(feature = "test-support")]

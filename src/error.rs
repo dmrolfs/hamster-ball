@@ -4,6 +4,7 @@
 
 use snafu::Snafu;
 
+use crate::approval::{ApproveError, GateError, StoreError};
 use crate::config::{
     ConfigTextError, DiscoverError, EntryError, ExtendsError, LoadError, MergeErrors, ProjectError,
     ResolveErrors,
@@ -25,6 +26,27 @@ use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum Error {
+    /// Asking for approval of a project's config failed.
+    #[snafu(transparent)]
+    Gate {
+        /// The underlying error.
+        source: GateError,
+    },
+
+    /// The approval store could not be changed.
+    #[snafu(transparent)]
+    Store {
+        /// The underlying error.
+        source: StoreError,
+    },
+
+    /// `hb approve` was started where it must not be.
+    #[snafu(transparent)]
+    Approve {
+        /// The underlying error.
+        source: ApproveError,
+    },
+
     /// A path was not in canonical form.
     #[snafu(transparent)]
     Path {

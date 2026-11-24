@@ -26,8 +26,10 @@ pub use report::{
 };
 pub use text::render_text;
 
+use crate::approval::{ApprovalStore, Fingerprint, Standing};
 use crate::config::{ProjectError, load_project};
 use crate::policy::PathError;
+use crate::system::StateDir;
 use crate::system::{Environment, PathResolver};
 
 /// How to print the report.
@@ -144,7 +146,17 @@ pub fn explain(request: &ExplainRequest<'_>) -> Result<String, ExplainError> {
         .as_ref()
         .map(|(spelling, r)| (*spelling, &r.target, r.alias.as_ref()));
 
-    let report = build_report(&loaded, &options);
+    let mut report = build_report(&loaded, &options);
+    let store = ApprovalStore::new(&StateDir::locate(&env.home));
+    if let Standing::Unapproved(why) =
+        store.standing(discovery.root.path(), &Fingerprint::of(&loaded.closure))
+    {
+        report.warnings.push(WarningRow {
+            kind: "not_approved".to_owned(),
+            message: format!("{why}; `hb run` will not start until you run `hb approve`"),
+            origins: Vec::new(),
+        });
+    }
     match request.format {
         Format::Text => Ok(render_text(&report)),
         Format::Json => render_json(&report).context(RenderSnafu),

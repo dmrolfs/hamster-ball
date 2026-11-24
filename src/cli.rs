@@ -22,7 +22,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::sys::signal::{Signal, raise};
 use snafu::Report;
 
-use crate::config::load_project;
+use crate::approval::{
+    ApprovalStore, ApproveError, Candidate, NoTerminal, StdTerminal, Terminal, Verdict, require,
+};
+use crate::config::{Discovery, Loaded, discover, load_project};
 use crate::explain::{ExplainRequest, Format, explain};
 use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::session::signals::{block_supervised, unblock_supervised};
@@ -30,7 +33,7 @@ use crate::session::{
     self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, PtyMode, RunError, RunSpec, SESSION_MARKER,
     SignalMode, StdioMode, check_nesting, exec_sandbox_exec, run_guard,
 };
-use crate::system::{Environment, UserConfigDir};
+use crate::system::{Environment, StateDir, UserConfigDir};
 use crate::text::Escaped;
 
 /// Run AI coding agents inside a hamster ball.
@@ -47,6 +50,11 @@ enum Command {
     Init,
     /// Show every effective rule for this project and where it came from.
     Explain(ExplainArgs),
+    /// Review and approve this project's config, or take the approval back.
+    ///
+    /// The agent can write the project directory, so `hb run` runs a project config only when its
+    /// exact bytes were approved here. Needs a terminal; there is no way to approve without one.
+    Approve(ApproveArgs),
     /// Print the Seatbelt profile and parameters this project would run under.
     ///
     /// The proxy parameter is a placeholder: each run's proxy listens on a port chosen at start.
@@ -62,6 +70,13 @@ enum Command {
     /// Internal: end the agent and the log stream if hb is killed. Started by `hb run`, never by hand.
     #[command(name = "__guard", hide = true)]
     Guard(GuardArgs),
+}
+
+#[derive(Debug, Args)]
+struct ApproveArgs {
+    /// Remove this project's approval. Needs no terminal.
+    #[arg(long)]
+    revoke: bool,
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +367,9 @@ where
             }
             Err(error) => fail(err, error),
         },
+        Command::Approve(args) => {
+            approve_command(env, &args, terminal_for(supervise).as_mut(), out, err)
+        }
         Command::Run(args) => run_command(env, args, err, supervise, reraise),
         Command::Child(_) | Command::Guard(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
@@ -463,19 +481,24 @@ fn run_command_with(
     supervise: Option<Supervision>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode {
+    let inside_hb = env.vars.get(SESSION_MARKER).is_some();
+    if let Err(error) = check_nesting(inside_hb) {
+        return fail(err, crate::Error::from(RunError::from(error)));
+    }
+    let (discovery, loaded) = match load_project(env) {
+        Ok(project) => project,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    // The question comes before signals are taken over, so Ctrl-C at the prompt ends `hb`.
+    let mut terminal = terminal_for(supervise);
+    if let Err(code) = ensure_approved(env, &discovery, &loaded, terminal.as_mut(), err) {
+        return code;
+    }
     if supervise.is_some() {
         if let Err(error) = block_supervised() {
             return fail(err, crate::Error::from(RunError::from(error)));
         }
     }
-    let inside_hb = env.vars.get(SESSION_MARKER).is_some();
-    if let Err(error) = check_nesting(inside_hb) {
-        return fail(err, crate::Error::from(RunError::from(error)));
-    }
-    let loaded = match load_project(env) {
-        Ok((_, loaded)) => loaded,
-        Err(error) => return fail(err, crate::Error::from(error)),
-    };
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let mut spec = RunSpec::new(command)
         .stdio(StdioMode::Inherit)
@@ -503,6 +526,107 @@ fn run_command_with(
                 *reraise = reraise_for(outcome.exit);
             }
             exit_code(outcome.exit)
+        }
+        Err(error) => fail(err, crate::Error::from(error)),
+    }
+}
+
+/// The exit code for a config that is not approved (`EX_CONFIG`). A command that `hb run` runs
+/// can also exit with 78; the message on stderr tells the two apart.
+const NOT_APPROVED: u8 = 78;
+
+/// The terminal to ask at: the process's own for the `hb` binary, none for the in-process entry
+/// point, which tests call and which must never wait for a person.
+fn terminal_for(supervise: Option<Supervision>) -> Box<dyn Terminal> {
+    if supervise.is_some() {
+        Box::new(StdTerminal)
+    } else {
+        Box::new(NoTerminal)
+    }
+}
+
+fn approval_store(env: &Environment) -> ApprovalStore {
+    ApprovalStore::new(&StateDir::locate(&env.home))
+}
+
+/// Lets the run go ahead only if the project's config is approved, asking when it can.
+///
+/// `Err` carries the exit code to stop with; the reason has been printed to `err`.
+fn ensure_approved(
+    env: &Environment,
+    discovery: &Discovery,
+    loaded: &Loaded,
+    terminal: &mut dyn Terminal,
+    err: &mut dyn Write,
+) -> Result<(), ExitCode> {
+    let candidate = Candidate::new(env, discovery, loaded);
+    let verdict = require(&candidate, &approval_store(env), terminal, err)
+        .map_err(|error| fail(err, crate::Error::from(error)))?;
+    if verdict.allows_run() {
+        return Ok(());
+    }
+    let _ = match verdict {
+        Verdict::NoTerminal(why) => writeln!(
+            err,
+            "hb: {why}. Run `hb approve` in a terminal to review and approve it. Nothing was run."
+        ),
+        _ => writeln!(err, "hb: the config was not approved. Nothing was run."),
+    };
+    Err(ExitCode::from(NOT_APPROVED))
+}
+
+/// `hb approve`: ask about this project's config and store the answer, or take the approval back.
+fn approve_command(
+    env: &Environment,
+    args: &ApproveArgs,
+    terminal: &mut dyn Terminal,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if env.vars.get(SESSION_MARKER).is_some() {
+        return fail(err, crate::Error::from(ApproveError::InsideBall));
+    }
+    let store = approval_store(env);
+    if args.revoke {
+        let discovery = match discover(&env.cwd, &env.home) {
+            Ok(discovery) => discovery,
+            Err(error) => return fail(err, crate::Error::from(error)),
+        };
+        let root = Escaped(discovery.root.path().as_str());
+        return match store.revoke(discovery.root.path()) {
+            Ok(true) => {
+                let _ = writeln!(out, "revoked the approval of {root}");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                let _ = writeln!(out, "{root} was not approved");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(err, crate::Error::from(error)),
+        };
+    }
+    let (discovery, loaded) = match load_project(env) {
+        Ok(project) => project,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    let candidate = Candidate::new(env, &discovery, &loaded);
+    let root = Escaped(candidate.root().as_str()).to_string();
+    match require(&candidate, &store, terminal, err) {
+        Ok(Verdict::AlreadyApproved) => {
+            let _ = writeln!(out, "{root} is already approved");
+            ExitCode::SUCCESS
+        }
+        Ok(Verdict::Approved) => {
+            let _ = writeln!(out, "approved {root}");
+            ExitCode::SUCCESS
+        }
+        Ok(Verdict::NoTerminal(why)) => {
+            let _ = writeln!(err, "hb: {why}. `hb approve` needs a terminal to ask you.");
+            ExitCode::from(NOT_APPROVED)
+        }
+        Ok(_) => {
+            let _ = writeln!(err, "hb: the config was not approved.");
+            ExitCode::from(NOT_APPROVED)
         }
         Err(error) => fail(err, crate::Error::from(error)),
     }

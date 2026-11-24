@@ -438,6 +438,7 @@ fn on_a_terminal_a_sigkilled_run_leaves_no_agent_and_no_log_stream() {
         &script,
         "$|=1; print \"child=$$\\n\"; sleep 1 for 1..120;\n",
     );
+    w.approve();
     let exp = w.base.join("kill.exp");
     let body = format!(
         "set env(HB_TD_HOME) {{{home}}}\nset env(HB_TD_CWD) {{{cwd}}}\nset env(HB_TD_PATH) {{{path}}}\nset env(HB_TD_TMP) {{{tmp}}}\n\

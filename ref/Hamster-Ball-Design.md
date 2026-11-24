@@ -64,7 +64,8 @@ cd ~/work/myproj
 hb kiro-cli chat          # run any command in the hamster ball (default action is `run`)
 hb run -- cargo test      # explicit form
 hb explain                # effective policy, with the source file of every rule
-hb approve                # review and approve this project's hamster-ball.toml
+hb approve                # review and approve this project's hamster-ball.toml (needs a terminal)
+hb approve --revoke       # take the approval back (no terminal needed)
 hb doctor                 # warn about unprotected secret-looking files, missing ports, stale caches
 hb warm                   # populate MCP and tool caches (the only step that may reach registries)
 hb profile                # print the generated Seatbelt profile
@@ -360,6 +361,27 @@ changed by the agent, or by a `git pull` of someone else's change.
   a directory the agent can write. `hb explain` says when the variable is set and ignored.
 - Without a terminal, an unapproved config is a hard error (exit code 78). It is never auto-approved.
 - This is an approval store like `direnv allow`. It is not an access log.
+
+**How it works (hb-ghd.4, D77).**
+
+- **Fingerprint.** SHA-256 over length-prefixed (canonical path, exact bytes) pairs of the approval files in closure order,
+  with a version prefix. A changed byte, a renamed, added, removed or reordered file all change it; modification times are
+  never read. Moving the project gives another record, because the record is keyed by the canonical root.
+- **Record.** `approvals/<sha256 of the canonical root>.toml`: `format = 1`, `root`, `closure_sha256`, and each file's path and
+  digest (the per-file digests only let the prompt say which file changed). The directory is mode 0700, the record 0600, written
+  to a temporary name and renamed. A record or directory that is unreadable, a link, owned by someone else, writable by group or
+  others, over 256 KiB, malformed, of another format or root, or has a bad digest counts as **not approved**, with the reason shown.
+- **The question.** `hb run` and `hb approve` print why, the project root, each file with a short digest, and what the project
+  **adds beyond your base**: every value no file of your base chain also gives, including what a preset the project names grants.
+  An `env.set` value and an MCP server's arguments are shown (they decide what runs), bounded and with control characters escaped.
+  `Approve this config? [y/N]` takes only `y` or `yes`, typed at a terminal (stdin and stderr both terminals).
+- **No terminal, or a no.** `hb run` exits **78** without starting the command, and says so. A command that `hb run` runs can also
+  exit with 78; the message tells them apart. `hb approve` without a terminal exits 78 too, and has no `--yes`.
+- **Unaffected.** `hb explain` and `hb profile` run nothing and need no approval; `hb explain` adds a warning when the config is not
+  approved. The library entry point (`cli::run`, used by tests) never prompts. `hb approve` refuses inside a hamster ball.
+- **Revoke.** `hb approve --revoke` removes the project's record, needs no terminal (it only narrows), and says whether there was one.
+- **Not covered.** Built-in presets are not hashed, so a newer `hb` that changes a preset changes what a project that names it
+  grants without a new question. That is the trust you put in the binary you installed.
 
 ## 6. The floor
 
@@ -1157,3 +1179,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` warning when the system has a proxy or PAC | owner, hb-ghd.3 |
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
+| D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |

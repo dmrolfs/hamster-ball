@@ -76,6 +76,7 @@ fn on_a_terminal_the_denials_are_printed_after_the_child_ends_not_in_the_middle_
         return;
     }
     let (w, script) = world_and_script();
+    w.approve();
     let exp = w.base.join("deny.exp");
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\

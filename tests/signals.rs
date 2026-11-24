@@ -381,6 +381,7 @@ fn a_bash_loop_around_hb_stops_on_ctrl_c_which_an_exit_130_would_not() {
 fn on_a_terminal(w: &World, script_name: &str, child_script: &str) -> String {
     let script = w.project.join(script_name);
     common::write(&script, child_script);
+    w.approve();
     let td = w.base.join("drive.exp");
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\

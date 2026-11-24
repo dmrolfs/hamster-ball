@@ -23,8 +23,9 @@ macro_rules! sandboxed {
     };
 }
 
-/// Runs `hb <args>` in the fixture world and returns the exit code and what it wrote to stderr.
+/// Runs `hb <args>` in the fixture world, with its config approved, and returns the exit code and what it wrote to stderr.
 fn hb(w: &World, args: &[&str]) -> (ExitCode, String) {
+    w.approve();
     let mut out = Vec::new();
     let mut err = Vec::new();
     let argv = std::iter::once("hb").chain(args.iter().copied());
