@@ -77,6 +77,37 @@ system_trust = true
 pass = [\"LANG\", \"COLORTERM\"]
 ";
 
+/// The template with a `read` line for the git files that exist under `home`.
+///
+/// A git config the ball cannot read is fatal to every git command (git treats `EPERM` as an
+/// error, where it ignores a missing file), so `hb init` grants the ones this machine has. Only
+/// existing paths are written: a grant for a missing one is reported as `not granted: missing` on
+/// every run.
+#[must_use]
+pub fn base_template(home: &HomeDir) -> String {
+    let home = home.path().as_path();
+    let grants: Vec<&str> = [
+        ("~/.gitconfig", ".gitconfig"),
+        ("~/.config/git", ".config/git"),
+    ]
+    .into_iter()
+    .filter(|(_, rel)| home.join(rel).exists())
+    .map(|(shown, _)| shown)
+    .collect();
+    if grants.is_empty() {
+        return BASE_TEMPLATE.to_owned();
+    }
+    let quoted: Vec<String> = grants.iter().map(|g| format!("\"{g}\"")).collect();
+    BASE_TEMPLATE.replacen(
+        "write = [\".\"]\n",
+        &format!(
+            "write = [\".\"]\n# git reads these for your name and settings; if the ball cannot read an existing one, every git command fails.\nread = [{}]\n",
+            quoted.join(", ")
+        ),
+        1,
+    )
+}
+
 /// Where `hb` keeps approvals: `<home>/.local/state/hamster-ball`.
 ///
 /// `XDG_STATE_HOME` is deliberately not consulted. A project's `.envrc` (after `direnv allow`)
@@ -236,7 +267,7 @@ impl UserConfigDir {
     ///
     /// # Errors
     /// [`UserConfigError::BaseExists`] if the file exists, or [`UserConfigError::Create`].
-    pub fn init_base(&self) -> Result<PathBuf, UserConfigError> {
+    pub fn init_base(&self, home: &HomeDir) -> Result<PathBuf, UserConfigError> {
         let base = self.base_file();
         DirBuilder::new()
             .recursive(true)
@@ -257,7 +288,7 @@ impl UserConfigDir {
             }
             Err(error) => return Err(error).context(CreateSnafu { path: base }),
         };
-        file.write_all(BASE_TEMPLATE.as_bytes())
+        file.write_all(base_template(home).as_bytes())
             .context(CreateSnafu { path: base.clone() })?;
         Ok(base)
     }
@@ -341,7 +372,7 @@ mod tests {
         let tree = Tree::new();
         let dir = UserConfigDir::locate(tree.home());
         assert_none!(assert_ok!(dir.canonical()));
-        assert_ok!(dir.init_base());
+        assert_ok!(dir.init_base(tree.home()));
         assert_some!(assert_ok!(dir.canonical()));
     }
 
@@ -363,7 +394,7 @@ mod tests {
         let dir = UserConfigDir::locate(tree.home());
         let created = tree.inside_home(".config/hamster-ball");
         let _guard = ModeGuard::set(&created, 0o500);
-        let err = assert_err!(dir.init_base());
+        let err = assert_err!(dir.init_base(tree.home()));
         assert!(matches!(err, UserConfigError::Create { .. }), "{err:?}");
         assert!(!dir.base_file().exists());
     }
@@ -395,9 +426,12 @@ mod tests {
     fn init_base_creates_a_private_directory_and_file_with_the_template() {
         let tree = Tree::new();
         let dir = UserConfigDir::locate(tree.home());
-        let base = assert_ok!(dir.init_base());
+        let base = assert_ok!(dir.init_base(tree.home()));
         assert_eq!(base, dir.base_file());
-        assert_eq!(assert_ok!(fs::read_to_string(&base)), BASE_TEMPLATE);
+        assert_eq!(
+            assert_ok!(fs::read_to_string(&base)),
+            base_template(tree.home())
+        );
         assert_eq!(assert_ok!(fs::metadata(&base)).mode() & 0o777, 0o600);
         assert_eq!(assert_ok!(fs::metadata(dir.dir())).mode() & 0o777, 0o700);
     }
@@ -406,9 +440,9 @@ mod tests {
     fn init_base_never_overwrites_an_existing_base() {
         let tree = Tree::new();
         let dir = UserConfigDir::locate(tree.home());
-        assert_ok!(dir.init_base());
+        assert_ok!(dir.init_base(tree.home()));
         assert_ok!(fs::write(dir.base_file(), b"# my edits\n"));
-        let err = assert_err!(dir.init_base());
+        let err = assert_err!(dir.init_base(tree.home()));
         assert!(matches!(err, UserConfigError::BaseExists { .. }), "{err:?}");
         assert_eq!(
             assert_ok!(fs::read_to_string(dir.base_file())),
@@ -423,9 +457,57 @@ mod tests {
         assert_ok!(fs::create_dir_all(dir.dir()));
         assert_ok!(fs::write(dir.base_file(), b""));
         assert!(matches!(
-            assert_err!(dir.init_base()),
+            assert_err!(dir.init_base(tree.home())),
             UserConfigError::BaseExists { .. }
         ));
+    }
+
+    #[test]
+    fn the_template_reads_only_the_git_files_that_exist_so_git_works_and_nothing_warns() {
+        let tree = Tree::new();
+        let none = base_template(tree.home());
+        assert_eq!(none, BASE_TEMPLATE, "no git files, no read line");
+        assert!(!none.contains("\nread ="));
+        assert_ok!(fs::write(tree.home_path().join(".gitconfig"), "[user]\n"));
+        let one = base_template(tree.home());
+        assert!(one.contains("\nread = [\"~/.gitconfig\"]\n"), "{one}");
+        assert_ok!(fs::create_dir_all(tree.home_path().join(".config/git")));
+        let both = base_template(tree.home());
+        assert!(
+            both.contains("\nread = [\"~/.gitconfig\", \"~/.config/git\"]\n"),
+            "{both}"
+        );
+        assert!(both.contains("git"), "a comment says why");
+        // Only the directory: still a grant, since `git` reads `~/.config/git/config` and `ignore` there.
+        assert_ok!(fs::remove_file(tree.home_path().join(".gitconfig")));
+        let dir_only = base_template(tree.home());
+        assert!(
+            dir_only.contains("\nread = [\"~/.config/git\"]\n"),
+            "{dir_only}"
+        );
+    }
+
+    #[test]
+    fn a_template_with_git_grants_is_valid_config_that_resolves_them() {
+        use crate::config::{ConfigText, ResolveContext, resolve_file};
+        use crate::origin::Layer;
+        let tree = Tree::new();
+        assert_ok!(fs::write(tree.home_path().join(".gitconfig"), "[user]\n"));
+        assert_ok!(fs::create_dir_all(tree.home_path().join(".config/git")));
+        let root = tree.project_root("work/proj");
+        let dir = UserConfigDir::locate(tree.home());
+        let base = assert_ok!(dir.init_base(tree.home()));
+        let text = assert_ok!(ConfigText::read_with(
+            &base,
+            Layer::UserBase,
+            crate::config::SymlinkPolicy::Refuse
+        ));
+        let resolved = assert_ok!(resolve_file(
+            &text,
+            &ResolveContext::new(tree.home(), &root)
+        ));
+        assert_eq!(resolved.config.fs.read.len(), 2);
+        assert!(resolved.diagnostics.skipped.is_empty());
     }
 
     #[test]
@@ -435,7 +517,7 @@ mod tests {
         let tree = Tree::new();
         let root = tree.project_root("work/proj");
         let dir = UserConfigDir::locate(tree.home());
-        let base = assert_ok!(dir.init_base());
+        let base = assert_ok!(dir.init_base(tree.home()));
         let text = assert_ok!(ConfigText::read_with(
             &base,
             Layer::UserBase,
@@ -468,8 +550,8 @@ mod tests {
     fn errors_follow_the_display_convention_and_say_what_to_do() {
         let tree = Tree::new();
         let dir = UserConfigDir::locate(tree.home());
-        assert_ok!(dir.init_base());
-        let err = assert_err!(dir.init_base());
+        assert_ok!(dir.init_base(tree.home()));
+        let err = assert_err!(dir.init_base(tree.home()));
         assert!(err.to_string().contains("never overwrites"), "{err}");
         crate::error::conventions::assert_display_excludes_sources(&err);
     }

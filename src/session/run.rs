@@ -36,6 +36,7 @@ use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
+use crate::policy::HostRule;
 use crate::policy::{CanonicalPath, PathError, ToolName};
 use crate::proxy::ProxyError;
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
@@ -112,6 +113,19 @@ pub struct RunSpec {
     pub proxy_summary: bool,
     /// Adjusts the proxy before it starts. For tests.
     pub proxy_tuning: Option<ProxyTuning>,
+    /// Makes this a `hb warm` run: see [`WarmSpec`].
+    pub warm: Option<WarmSpec>,
+}
+
+/// What makes a run a warm run (design 10, hb-ghd.7.3).
+///
+/// The files, environment and tools are the policy's, as in any run. The network is not: the
+/// proxy allows exactly `allowlist`, and no launcher scripts are written, so the tools run online
+/// with hb's cache named in their environment instead of offline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmSpec {
+    /// The only hosts the proxy allows.
+    pub allowlist: Vec<HostRule>,
 }
 
 impl RunSpec {
@@ -127,7 +141,15 @@ impl RunSpec {
             proxy_log: None,
             proxy_summary: true,
             proxy_tuning: None,
+            warm: None,
         }
+    }
+
+    /// Makes this a warm run.
+    #[must_use]
+    pub fn warm(mut self, warm: WarmSpec) -> Self {
+        self.warm = Some(warm);
+        self
     }
 
     /// Logs every proxy connection, to `sink`.
@@ -446,10 +468,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
     // the session directory (with whatever they wrote) goes with it.
     let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
-    let launchers = offline
-        .as_ref()
-        .map(|plan| plan.install(session.path()))
-        .transpose()?;
+    let (launchers, warm_cache) = match (&offline, &spec.warm) {
+        (Some(plan), None) => (Some(plan.install(session.path())?), None),
+        (Some(plan), Some(_)) => (None, Some(plan.install_cache()?)),
+        (None, _) => (None, None),
+    };
 
     let loopback: Vec<_> = loaded
         .policy
@@ -466,7 +489,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         spec.denials.as_ref(),
         spec.proxy_log.as_ref(),
     ));
-    let proxy = ProxyRun::start(&loaded.policy, trail, spec.proxy_tuning.as_ref())?;
+    let allowlist = spec.warm.as_ref().map_or_else(
+        || loaded.policy.run_allowlist(),
+        |warm| warm.allowlist.clone(),
+    );
+    let proxy = ProxyRun::start(&loaded.policy, allowlist, trail, spec.proxy_tuning.as_ref())?;
     let proxy_url = proxy.url();
 
     let tool_dirs = tools.dirs();
@@ -474,8 +501,12 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let mut inputs = RenderInputs::new()
         .with_session_dir(session.path().clone())
         .with_exec_dirs(tool_dirs.clone());
-    if let Some(installed) = &launchers {
-        inputs = inputs.with_cache_dir(installed.cache_root().clone());
+    let cache_root = launchers
+        .as_ref()
+        .map(|installed| installed.cache_root())
+        .or(warm_cache.as_ref());
+    if let Some(root) = cache_root {
+        inputs = inputs.with_cache_dir(root.clone());
     }
     let roots: Vec<CanonicalPath> = loaded
         .policy
@@ -510,6 +541,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         .collect();
     let ca_bundle = write_bundle(session.path(), &ca_files)?;
 
+    let mut child_vars = hook_outputs.vars().clone();
+    if let Some(root) = &warm_cache {
+        child_vars.extend(super::offline::cache_vars(root));
+    }
     let stdin_is_tty = stdin_is_tty(spec.stdio, io::stdin().is_terminal());
     let child_env = ChildEnv::build(&EnvInputs {
         parent: &env.vars,
@@ -524,7 +559,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             ca_bundle: ca_bundle.as_ref(),
         },
         proxy: Some(&proxy_url),
-        hook_vars: hook_outputs.vars(),
+        hook_vars: &child_vars,
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let helper = match (spec.signals, &pty) {

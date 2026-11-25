@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use super::denials::{Collector, DenialSink, Denials};
 use crate::config::Policy;
-use crate::policy::Port;
+use crate::policy::{HostRule, Port};
 use crate::proxy::{
     AuditEvent, AuditSink, Decision, ProxyConfig, ProxyError, ProxyHandle, ProxyUrl,
 };
@@ -217,16 +217,17 @@ pub struct ProxyRun {
 }
 
 impl ProxyRun {
-    /// Starts the proxy for `policy`.
+    /// Starts the proxy for `policy`, allowing exactly `allowlist`.
     ///
     /// # Errors
     /// [`ProxyError`] if it cannot listen or start its thread.
     pub fn start(
         policy: &Policy,
+        allowlist: Vec<HostRule>,
         trail: Arc<ProxyTrail>,
         tuning: Option<&ProxyTuning>,
     ) -> Result<Self, ProxyError> {
-        let mut config = ProxyConfig::new(policy.run_allowlist())
+        let mut config = ProxyConfig::new(allowlist)
             .with_internal_hosts(
                 policy
                     .net

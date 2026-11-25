@@ -2470,7 +2470,13 @@
   "offline": {
     "enabled": true,
     "launchers": [],
-    "cache_root": "<FIX>/home/.cache/hamster-ball"
+    "cache_root": "<FIX>/home/.cache/hamster-ball",
+    "servers": [
+      {
+        "name": "serena",
+        "status": "not warmed"
+      }
+    ]
   },
   "hooks": [
     {

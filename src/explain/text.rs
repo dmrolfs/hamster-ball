@@ -200,6 +200,9 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
     for launcher in &report.offline.launchers {
         writeln!(out, "  {}  runs {}", launcher.tool, t.show(&launcher.runs))?;
     }
+    for server in &report.offline.servers {
+        writeln!(out, "  server {}  {}", Escaped(&server.name), server.status)?;
+    }
     if let Some(root) = &report.offline.cache_root {
         writeln!(
             out,

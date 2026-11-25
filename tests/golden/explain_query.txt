@@ -157,6 +157,7 @@ mcp
   serena: uvx 3 args hidden  may listen on 24282 (profile-wide, not loopback-only)  <- [2] mcp.serena
 
 offline launchers (uvx and npx start from hb's own cache, with --offline)
+  server serena  not warmed
   cache  ~/.cache/hamster-ball (read and write, not your own caches)
 
 hooks (run on the host, in order)

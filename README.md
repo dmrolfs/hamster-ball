@@ -42,13 +42,14 @@ Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design li
 
 | Built and tested | Not built yet |
 |---|---|
-| layered config, `hb explain`, `hb profile` | `hb warm` and MCP server handling (milestone 7); `[mcp.*]` `net` and `bind_ports` are enforced, but `hb` does not yet start, warm or cache servers |
+| layered config, `hb explain`, `hb profile` | `hb doctor` checks for MCP servers that were never warmed, use `@latest` or an unpinned git source (milestone 7.4) |
 | `hb run`: Seatbelt profile, empty environment, pty, signals | `hb ctl` for project containers (milestone 8); `[ctl]` is parsed only |
 | HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
 | approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
 | secrets guard, `hb doctor` | |
 | host-side hooks, Bedrock credentials | |
-| presets for kiro-cli, pi, claude and opencode | |
+| presets for kiro-cli, pi, claude and opencode | an opt-in test of the measured MCP servers (milestone 7.5) |
+| MCP servers: `[mcp.*]` hosts and ports, offline `uvx`/`npx` launchers, `hb warm` | |
 
 ## Getting started
 
@@ -78,7 +79,7 @@ hb --version
    hb init        # writes ~/.config/hamster-ball/base.toml, never overwrites
    ```
 
-   The file is commented. It makes every project writable (`[fs] write = ["."]`: a project is not granted on its own, so a
+   The file is commented. It also lets git read the `~/.gitconfig` and `~/.config/git` that exist on your machine (git fails every command if it cannot read its config), and it makes every project writable (`[fs] write = ["."]`: a project is not granted on its own, so a
    base without that line leaves the agent unable to read the project). On a network that inspects TLS (Zscaler and similar)
    leave `tls.system_trust = true`.
 
@@ -138,6 +139,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 | `hb run [--log-denials] [--log-proxy] [--no-proxy-summary] [--] <command>...` | Runs the command in the ball and exits with its status (`128 + n` for a signal). Needs an approved config. |
 | `hb explain [--format text\|json] [--show-args] [--path <path>]` | Prints every effective rule with the file it came from, what the floor overrides, skipped grants and warnings (including a project that no grant covers). Runs nothing, needs no approval. `--path` answers one question about one path (merged config and floor only). |
 | `hb approve [--revoke]` | Shows what the project adds beyond your base and asks `Approve this config? [y/N]`. Needs a terminal. `--revoke` takes the approval back and needs none. |
+| `hb warm [--timeout SECS] [--log-denials] [--log-proxy] [NAME...]` | Fills hb's offline cache: starts each declared `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable, and waits for it to answer an MCP `initialize`. The only command that reaches a registry. Needs an approved config; refuses inside a ball. |
 | `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, and secret-looking launchd variable names. Prints names, never contents. |
 | `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
 
@@ -148,7 +150,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 3. It scans for secret files, lists tracked ones, and runs your pre-run hooks on the host.
 4. It starts a proxy on `127.0.0.1` with a random port and a per-run credential, and creates a private session directory
    (this run's `TMPDIR`).
-5. With a declared `[mcp.*]` that has a `command`, it also writes offline `uvx` and `npx` launchers first on `PATH` (see `hb explain`).
+5. With a declared `[mcp.*]` that has a `command`, it also writes offline `uvx` and `npx` launchers first on `PATH` (see `hb explain`), and warns before starting about each such server that `hb warm` has not warmed.
 6. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
    it sets itself and the ones you list, on a pty of its own when stdin is a terminal.
 7. When the command ends it stops the proxy, removes the session directory (hook files included) and exits with the command's status.
@@ -215,7 +217,7 @@ exceptions = ["~/work/myproj/.env.local"]   # base and your presets only; absolu
 
 [mcp.context7]                           # a remote MCP server: no command, only the host it needs at run time
 net = ["mcp.context7.com"]               # host or host:port; joins net.allow
-# warm_net = ["pypi.org"]                # hosts only `hb warm` may reach for this server (not built yet)
+# warm_net = ["pypi.org"]                # hosts only `hb warm` may reach for this server, beside the registries
 # bind_ports = [24282, 24283]            # loopback ports the server may listen on (profile-wide)
 
 [hooks.pre_run.bedrock]                  # base and your presets only; see Credentials
@@ -251,6 +253,35 @@ different Node, a non-Homebrew opencode) need their own `fs.read` grant for the 
 
 Preset grants for programs the agent could replace are write-denied on purpose: a plain `claude` or `pi` that you run outside
 the ball must never run something the agent planted. Keep that in mind when you widen a write grant over an install directory.
+
+### MCP servers
+
+Agents start MCP servers with `uvx` and `npx`, which download packages at every start. In the ball no registry is open, so `hb` splits
+that into two steps.
+
+1. **Declare** each server in your base or project, and list the launchers in `[env] tools` so `hb` can find the real ones:
+
+   ```toml
+   [env]
+   tools = ["uvx", "npx", "node"]
+
+   [mcp.time]
+   command = "uvx"
+   args = ["mcp-server-time"]            # the same command and arguments the agent runs
+
+   [mcp.serena]
+   command = "uvx"
+   args = ["--from", "git+https://github.com/oraios/serena@<full-sha>", "serena", "start-mcp-server"]
+   bind_ports = [24282, 24283, 24284, 24285, 24286, 24287, 24288, 24289]   # its dashboard listens on the first free one
+   ```
+
+2. **Warm** once, outside the ball: `hb warm`. It starts each declared `uvx`/`npx` server in the ball with only the registries open and keeps what it
+   downloaded in `~/.cache/hamster-ball` (hb's own cache, never your `~/.cache/uv` or `~/.npm`). Warm again after you change a server's arguments.
+
+After that `hb run` puts `uvx` and `npx` launchers first on the child's `PATH`: each starts the real tool with `--offline` and hb's cache, so a server starts
+from the cache with no network. Only those two names change: `uv sync`, `npm install` and a program called by absolute path behave as before. A remote
+MCP server has no command; give it `[mcp.context7] net = ["mcp.context7.com"]`. A server's own files (serena's `~/.serena`) are ordinary `[fs]` grants.
+`hb explain` shows the launchers, the cache and whether each server is warmed.
 
 ### Network access
 
@@ -433,7 +464,9 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | A hook fails or times out and nothing starts | The run stops before the agent. Run the hook command by hand to see its error; raise `timeout_secs` (at most 300). |
 | claude is about 20 s slower inside the ball | Expected: its OTEL and `awsAuthRefresh` helpers cannot run and it waits for them. |
 | claude fails with `AWS authentication failed ... check AWS permissions and model access` | The credentials reached Bedrock but your role cannot invoke the model. The same failure happens outside the ball. |
-| An MCP server started with `npx` or `uvx` says the package is not available offline | With a declared `[mcp.*]` that has a `command`, `hb` makes `uvx` and `npx` start from its own cache (`~/.cache/hamster-ball`) with `--offline`; no registry is reachable. The cache is filled by `hb warm` (milestone 7, not built yet). `hb explain` shows the launchers. |
+| `warning: mcp server X has not been warmed (or its command changed): run hb warm` | `hb run` starts `uvx` and `npx` servers from hb's own cache with `--offline`, and that cache is empty or was filled for other arguments. Run `hb warm` outside the ball. |
+| An MCP server started with `npx` or `uvx` says the package is not available offline | The cache lacks it. Run `hb warm` (it warms exactly the command and arguments in `[mcp.<name>]`, so keep them equal to what the agent runs). A git source needs a pinned revision (`git+https://host/repo@<sha>`): an unpinned one cannot start offline even from a warm cache. |
+| `warning: git inside the ball will fail with `unable to access`` | `~/.gitconfig` or `~/.config/git/config` exists and the ball cannot read it, and git treats that as fatal. Add the path to `[fs] read` in your base (`hb init` writes the ones that exist). |
 | opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Declare each remote one with `[mcp.<name>] net = ["mcp.example.com"]` in your base. `npx` and `uvx` ones are not on the ball's `PATH` unless you list them in `[env] tools`; offline start from a warm cache is milestone 7 (`hb warm` is not built yet). |
 | `hb explain` warns that the approval store location is ignored | `XDG_STATE_HOME` is set; `hb` ignores it on purpose. |
 | Grants differ from what you wrote | `hb explain` lists skipped grants (missing path) and floor overrides. |

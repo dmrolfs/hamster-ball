@@ -864,6 +864,16 @@ Measured: each of your MCP servers started inside the hamster ball and answered 
   `exec`s, so stdin, stdout, signals and the process are the tool's own: a wrapper that kept the tool as a child lost stdin (a background job
   in a non-interactive `sh`) or left the tool running after a TERM (measured). Before the `exec` it prints a hint naming `hb warm` to stderr when
   `<cache>/warmed` is missing; a package missing from a warmed cache keeps uv's or npm's own failure text.
+- **`hb warm` (hb-ghd.7.3, D84).** For each declared server whose `command` is a bare `uvx` or `npx` (the only ones that reach a registry), `hb warm` runs
+  one ball session through the same code as `hb run` (same files, environment and tools; the cache granted, its three variables set in the child's
+  environment, no launcher scripts, so no `--offline`) with the proxy allowlist replaced by `pypi.org`, `files.pythonhosted.org`,
+  `registry.npmjs.org`, the host of each `git+https://HOST/...` argument (`github.com` also brings `api.github.com` and `raw.githubusercontent.com`) and
+  the server's `warm_net`. `net.allow` and `[mcp] net` are not in it; `internal_hosts` is kept. The ball runs `/usr/bin/perl` with a probe script that starts the
+  server in its own process group, sends an MCP `initialize`, waits for the result (default 300 s), prints the last 20 stderr lines on failure, and
+  ends the group. A success writes a stamp under `~/.local/state/hamster-ball/warm/` (digest of command and arguments, time, hb version; the floor
+  denies the directory to the ball) and the marker `<cache>/warmed`. `hb run` warns before starting about each such server with no stamp or a stale one;
+  `hb explain` shows the status. It needs an approved config and refuses inside a ball. An unpinned `git+` source cannot start offline even from a
+  warm cache (uv must resolve HEAD): pin `@<full sha>`.
 - **hb's own cache** is `~/.cache/hamster-ball/{uv,uv-tools,npm}`, made 0700 on the host and granted read-write through the profile's cache
   parameter, not through `fs.write`, so it is not a secrets-guard root (uv unpacks `certifi/cacert.pem` into its cache). It is never the
   user's `~/.cache/uv` or `~/.npm`: uv writes to its cache even offline (a read-only cache fails), so a shared one would be agent-writable
@@ -1253,3 +1263,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D81 | opencode preset (hb-ghd.6.3): narrow Homebrew reads instead of `/opt/homebrew` (it holds database data under `var`); config directory read-only; `deny_write` on the plugin cache and downloaded tools so the agent cannot plant code that a plain `opencode` runs; conformance by a made-up API key and `opencode.ai`'s 401, because a provider-less `run` depends on free-tier quota and retried for over 100 s (one run in 34 s); `Agent` has an `env` field that the harness sets in its own project preset; `Expect::Word` matches a phrase of consecutive whole words | agreed |
 | D82 | The project directory is granted by a file, not implicitly: `hb init` writes `[fs] write = ["."]` into the base, and `hb explain` and `hb run` warn when no read or write grant covers the project (`Policy::project_grant_warning`). `hb <command>` without `run` is not built: the usage line and `--help` show `hb run -- <program>` instead | agreed |
 | D83 | Offline MCP launchers (hb-ghd.7.2): `uvx` and `npx` scripts first on `PATH` that `exec` the real tool with `--offline` and hb's own cache, only when a declared `[mcp.*]` has a command; the hint naming `hb warm` is printed before the `exec` (a wrapper that keeps the tool as a child loses stdin or orphans the tool); the cache is hb's, outside the user's caches and the guard's roots | agreed |
+| D84 | `hb warm` (hb-ghd.7.3): only `uvx`/`npx` servers are warmed or warned about; the probe is the system perl in the ball (no hb binary runs there); warm is the same ball as a run with only the network replaced (registries, git hosts, `warm_net`); stamps in the denied state directory, advisory; `hb run` and `hb explain` warn about a git config file the ball cannot read (git treats EPERM as fatal), and `hb init` grants the git files that exist | agreed |

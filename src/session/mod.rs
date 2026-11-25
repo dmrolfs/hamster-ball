@@ -9,6 +9,7 @@ pub mod dir;
 pub mod env;
 pub mod fds;
 mod fence;
+pub mod gitconfig;
 pub mod guardian;
 pub mod hooks;
 mod interactive;
@@ -40,7 +41,8 @@ pub use pty::{Pty, PtyError, Winsize};
 pub use pump::Pump;
 pub use relay::Relay;
 pub use run::{
-    DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, run,
+    DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, WarmSpec,
+    run,
 };
 pub use signals::{Escalation, Step};
 pub use terminal::{RawMode, TerminalError};

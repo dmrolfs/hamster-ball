@@ -28,7 +28,8 @@ use crate::policy::{
     HostRule, PathPattern,
 };
 use crate::session::offline::OfflinePlan;
-use crate::system::find_tools;
+use crate::system::{StateDir, find_tools};
+use crate::warm::stamp::{Standing, WarmStore};
 
 /// The version of the JSON shape. Additive fields keep it; a rename or removal bumps it.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -102,6 +103,17 @@ pub struct OfflineReport {
     pub launchers: Vec<LauncherRow>,
     /// Where hb's own cache lives, read and write for the ball; `None` when off.
     pub cache_root: Option<String>,
+    /// Each server `hb warm` can warm, and whether it has been.
+    pub servers: Vec<WarmRow>,
+}
+
+/// Whether one server was warmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarmRow {
+    /// The `[mcp.<name>]` name.
+    pub name: String,
+    /// `warmed`, `not warmed`, or `changed` (warmed with another command or arguments).
+    pub status: String,
 }
 
 /// One offline launcher.
@@ -496,7 +508,29 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         cache_root: plan
             .as_ref()
             .map(|plan| plan.cache_root().to_string_lossy().into_owned()),
+        servers: {
+            let store = WarmStore::new(&StateDir::locate(options.home));
+            crate::warm::servers(policy)
+                .iter()
+                .map(|server| WarmRow {
+                    name: server.name.clone(),
+                    status: match crate::warm::standing(&store, options.root, server) {
+                        Standing::Warmed => "warmed",
+                        Standing::Changed => "changed",
+                        Standing::Never => "not warmed",
+                    }
+                    .to_owned(),
+                })
+                .collect()
+        },
     };
+    warnings.extend(
+        crate::session::gitconfig::warning(policy, options.home).map(|message| WarningRow {
+            kind: "git_config_unreadable".to_owned(),
+            message,
+            origins: Vec::new(),
+        }),
+    );
     warnings.extend(b.skipped_allows());
     warnings.extend(b.shadowed_grants(policy, options.root));
     if options.xdg_state_home_set {

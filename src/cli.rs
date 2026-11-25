@@ -69,6 +69,13 @@ enum Command {
     ///
     /// The proxy parameter is a placeholder: each run's proxy listens on a port chosen at start.
     Profile,
+    /// Fill hb's offline cache for the MCP servers a project declares (the only command that reaches the registries).
+    ///
+    /// Starts each `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run
+    /// uses, with only the package registries (and the server's `warm_net`) reachable, and waits
+    /// for it to answer an MCP `initialize`. `hb run` then starts those servers from the cache with
+    /// no registry. Run it outside any hamster ball.
+    Warm(WarmArgs),
     /// Run a command inside the hamster ball and exit with its status.
     ///
     /// The command starts with an empty environment: only HOME, PATH, TMPDIR, TERM and the names
@@ -87,6 +94,25 @@ struct ApproveArgs {
     /// Remove this project's approval. Needs no terminal.
     #[arg(long)]
     revoke: bool,
+}
+
+#[derive(Debug, Args)]
+struct WarmArgs {
+    /// Show what the sandbox denied while each server started.
+    #[arg(long)]
+    log_denials: bool,
+
+    /// Show every connection the proxy handled: host, port, whether it was allowed, and bytes.
+    #[arg(long)]
+    log_proxy: bool,
+
+    /// Seconds each server gets to answer before it is stopped.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    timeout: u64,
+
+    /// The servers to warm; none means every one that starts `uvx` or `npx`.
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -363,7 +389,7 @@ where
     };
 
     match command {
-        Command::Init => match UserConfigDir::locate(&env.home).init_base() {
+        Command::Init => match UserConfigDir::locate(&env.home).init_base(&env.home) {
             Ok(path) => {
                 let _ = writeln!(out, "created {}", path.display());
                 ExitCode::SUCCESS
@@ -382,6 +408,7 @@ where
             approve_command(env, &args, terminal_for(supervise).as_mut(), out, err)
         }
         Command::Run(args) => run_command(env, args, err, supervise, reraise),
+        Command::Warm(args) => warm_command(env, &args, out, err, supervise, reraise),
         Command::Child(_) | Command::Guard(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
@@ -514,6 +541,13 @@ fn run_command_with(
     if let Some(warning) = loaded.policy.project_grant_warning(discovery.root.path()) {
         let _ = writeln!(err, "warning: {warning}");
     }
+    if let Some(warning) = crate::session::gitconfig::warning(&loaded.policy, &env.home) {
+        let _ = writeln!(err, "warning: {warning}");
+    }
+    let warm_store = crate::warm::stamp::WarmStore::new(&StateDir::locate(&env.home));
+    for warning in crate::warm::cold_warnings(&loaded.policy, &warm_store, discovery.root.path()) {
+        let _ = writeln!(err, "warning: {warning}");
+    }
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let mut spec = RunSpec::new(command)
         .stdio(StdioMode::Inherit)
@@ -543,6 +577,106 @@ fn run_command_with(
             exit_code(outcome.exit)
         }
         Err(error) => fail(err, crate::Error::from(error)),
+    }
+}
+
+/// `hb warm`: fill the offline cache for the declared `uvx` and `npx` servers.
+fn warm_command(
+    env: &Environment,
+    args: &WarmArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    supervise: Option<Supervision>,
+    reraise: &mut Option<Signal>,
+) -> ExitCode {
+    use crate::warm::{self, Logging, Warmed};
+    if env.vars.get(SESSION_MARKER).is_some() {
+        let _ = writeln!(
+            err,
+            "error: hb warm reaches the package registries and must run outside the ball"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (discovery, loaded) = match load_project(env) {
+        Ok(project) => project,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    let mut terminal = terminal_for(supervise);
+    if let Err(code) = ensure_approved(env, &discovery, &loaded, terminal.as_mut(), err) {
+        return code;
+    }
+    let selection = match warm::select(&loaded.policy, &args.names) {
+        Ok(selection) => selection,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
+    for name in &selection.nothing_to_warm {
+        let _ = writeln!(out, "nothing to warm: {name} does not start uvx or npx");
+    }
+    if selection.warm.is_empty() {
+        if selection.nothing_to_warm.is_empty() {
+            let _ = writeln!(out, "nothing to warm: no [mcp.*] server starts uvx or npx");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if supervise.is_some() {
+        if let Err(error) = block_supervised() {
+            return fail(err, crate::Error::from(RunError::from(error)));
+        }
+    }
+    let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
+    let at_terminal = std::io::stderr().is_terminal();
+    let limit = Duration::from_secs(args.timeout);
+    let mut failed = false;
+    for server in &selection.warm {
+        let logging = Logging {
+            denials: args.log_denials.then(|| denial_sink(at_terminal)),
+            proxy_log: args.log_proxy.then(|| proxy_log_sink(at_terminal)),
+        };
+        let (result, outcome) =
+            match warm::warm_server(env, &loaded, server, limit, signals, logging) {
+                Ok(done) => done,
+                Err(error) => return fail(err, crate::Error::from(error)),
+            };
+        for warning in &outcome.warnings {
+            let _ = writeln!(err, "warning: {warning}");
+        }
+        for line in denial_summary(&outcome.denials)
+            .into_iter()
+            .chain(proxy_log_lines(&outcome.proxy_log))
+        {
+            let _ = writeln!(err, "{line}");
+        }
+        match result {
+            Warmed::Answered { took } => {
+                match warm::record_success(env, discovery.root.path(), server) {
+                    Ok(()) => {
+                        let _ = writeln!(out, "warmed {} ({} s)", server.name, took.as_secs());
+                    }
+                    Err(message) => {
+                        failed = true;
+                        let _ = writeln!(out, "FAILED {}: {message}", server.name);
+                    }
+                }
+            }
+            Warmed::Failed { why } => {
+                failed = true;
+                let _ = writeln!(out, "FAILED {}", server.name);
+                for line in why.lines() {
+                    let _ = writeln!(err, "  | {line}");
+                }
+            }
+        }
+        if supervise.is_some() {
+            if let Some(signal) = reraise_for(outcome.exit) {
+                *reraise = Some(signal);
+                return exit_code(outcome.exit);
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

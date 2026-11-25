@@ -134,7 +134,12 @@ fn the_hint_names_hb_warm_until_the_cache_is_marked_warmed() {
     sandboxed!();
     let w = world(SERVER);
     let cold = run(&w, "uvx a");
-    assert!(cold.stderr.contains("run `hb warm`"), "{}", cold.stderr);
+    assert!(
+        cold.stderr
+            .contains("hb has not warmed its offline cache; run `hb warm`"),
+        "{}",
+        cold.stderr
+    );
     assert!(
         cold.stdout.contains("fake-uvx"),
         "the tool still runs: {}",
@@ -142,7 +147,11 @@ fn the_hint_names_hb_warm_until_the_cache_is_marked_warmed() {
     );
     write(&cache(&w).join("warmed"), "");
     let warm = run(&w, "uvx a");
-    assert!(!warm.stderr.contains("hb warm"), "{}", warm.stderr);
+    assert!(
+        !warm.stderr.contains("hb has not warmed its offline cache"),
+        "{}",
+        warm.stderr
+    );
 }
 
 #[test]

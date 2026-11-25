@@ -26,6 +26,20 @@ use crate::system::{EnvironmentError, FloorError, HomeError, UserConfigError};
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum Error {
+    /// `hb warm` was asked for a server that does not exist.
+    #[snafu(transparent)]
+    UnknownServer {
+        /// The underlying error.
+        source: crate::warm::UnknownServer,
+    },
+
+    /// `hb warm` could not start a server's probe.
+    #[snafu(transparent)]
+    Warm {
+        /// The underlying error.
+        source: crate::warm::StartError,
+    },
+
     /// Asking for approval of a project's config failed.
     #[snafu(transparent)]
     Gate {

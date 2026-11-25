@@ -20,7 +20,7 @@ use snafu::{ResultExt, Snafu};
 use strum::{AsRefStr, Display, EnumIter, EnumString, IntoEnumIterator};
 
 use crate::config::Policy;
-use crate::policy::{CanonicalPath, HomeDir, PathError};
+use crate::policy::{CanonicalPath, EnvName, HomeDir, PathError};
 use crate::system::ToolLookup;
 
 /// The directory under the home that holds hb's own caches.
@@ -29,6 +29,12 @@ const CACHE_DIR: &str = ".cache/hamster-ball";
 pub const WARMED_MARKER: &str = "warmed";
 /// The cache's subdirectories, each created private.
 const CACHE_SUBDIRS: [&str; 3] = ["uv", "uv-tools", "npm"];
+
+/// Where hb's own cache lives: `~/.cache/hamster-ball`.
+#[must_use]
+pub fn cache_root(home: &HomeDir) -> PathBuf {
+    home.path().as_path().join(CACHE_DIR)
+}
 
 /// The launchers hb replaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, AsRefStr, EnumIter, EnumString)]
@@ -181,7 +187,7 @@ impl OfflinePlan {
             .collect();
         Some(Self {
             launchers,
-            cache_root: home.path().as_path().join(CACHE_DIR),
+            cache_root: cache_root(home),
             warnings,
         })
     }
@@ -204,11 +210,11 @@ impl OfflinePlan {
         &self.warnings
     }
 
-    /// Creates the cache directories and writes the scripts under `session`.
+    /// Creates the cache directories and returns the resolved cache root.
     ///
     /// # Errors
-    /// [`OfflineError`] when a directory or a script cannot be made.
-    pub fn install(&self, session: &CanonicalPath) -> Result<Installed, OfflineError> {
+    /// [`OfflineError`] when a directory cannot be made or resolved.
+    pub fn install_cache(&self) -> Result<CanonicalPath, OfflineError> {
         private_dir(&self.cache_root)?;
         for sub in CACHE_SUBDIRS {
             private_dir(&self.cache_root.join(sub))?;
@@ -216,9 +222,15 @@ impl OfflinePlan {
         let resolved = fs::canonicalize(&self.cache_root).context(ResolveSnafu {
             path: self.cache_root.clone(),
         })?;
-        let cache_root = CanonicalPath::from_canonical(&resolved).context(NotCanonicalSnafu {
-            path: resolved.clone(),
-        })?;
+        CanonicalPath::from_canonical(&resolved).context(NotCanonicalSnafu { path: resolved })
+    }
+
+    /// Creates the cache directories and writes the scripts under `session`.
+    ///
+    /// # Errors
+    /// [`OfflineError`] when a directory or a script cannot be made.
+    pub fn install(&self, session: &CanonicalPath) -> Result<Installed, OfflineError> {
+        let cache_root = self.install_cache()?;
         let bin = session.as_path().join("bin");
         private_dir(&bin)?;
         for launcher in &self.launchers {
@@ -240,6 +252,40 @@ impl OfflinePlan {
             cache_root,
         })
     }
+}
+
+/// The variables that point `uv` and `npm` at the cache under `cache_root`, as `hb warm` sets
+/// them for the server it starts (a run sets them inside the launcher scripts instead).
+///
+/// # Panics
+/// Never: the names are fixed and valid.
+#[must_use]
+pub fn cache_vars(cache_root: &CanonicalPath) -> Vec<(EnvName, CanonicalPath)> {
+    [
+        ("UV_CACHE_DIR", "uv"),
+        ("UV_TOOL_DIR", "uv-tools"),
+        ("npm_config_cache", "npm"),
+    ]
+    .into_iter()
+    .filter_map(|(name, sub)| {
+        let dir = CanonicalPath::from_canonical(cache_root.as_path().join(sub)).ok()?;
+        Some((EnvName::parse(name).ok()?, dir))
+    })
+    .collect()
+}
+
+/// Says the cache under `cache_root` has been warmed: the launcher scripts stop printing their hint.
+///
+/// # Errors
+/// The I/O error if the marker cannot be written.
+pub fn mark_warmed(cache_root: &Path) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(cache_root.join(WARMED_MARKER))
+        .map(drop)
 }
 
 /// Creates `path` (and missing parents) private to the user; an existing directory is left alone.

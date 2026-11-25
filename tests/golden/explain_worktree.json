@@ -2701,7 +2701,8 @@
   "offline": {
     "enabled": false,
     "launchers": [],
-    "cache_root": null
+    "cache_root": null,
+    "servers": []
   },
   "hooks": [
     {

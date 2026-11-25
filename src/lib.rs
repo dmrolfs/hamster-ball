@@ -31,6 +31,7 @@ pub mod session;
 pub(crate) mod sys;
 pub mod system;
 pub mod text;
+pub mod warm;
 
 #[cfg(test)]
 #[path = "../build/psl_gen.rs"]
