@@ -845,14 +845,16 @@ It has not been prototyped.
 
 ## 10. MCP servers and tool caches
 
-Measured: each of your MCP servers started inside the hamster ball and answered an MCP `initialize`.
+Measured (hb-ghd.7.5, `tests/mcp_offline.rs`, opt-in with `HB_MCP=1`): each server below answered an MCP `initialize` inside the hamster ball, started
+by hb's offline launchers from hb's own cache after `hb warm`, in 1 to 2 s, and the proxy logged no connection at all except serena's refused ones.
 
-| Server | Hosts needed on first start | Offline from warm cache |
+| Server | Hosts `hb warm` needed | Offline after `hb warm` |
 |---|---|---|
-| time, fetch (uvx) | `pypi.org`, `files.pythonhosted.org` | yes, `uvx --offline` |
-| serena (uvx from git) | `api.github.com`, `raw.githubusercontent.com`, `oraios-software.de`, `pypi.org` | its web dashboard binds a loopback port (24282, then upward until one is free; a denied bind makes it scan every port): run it with `--enable-web-dashboard false`, or list `bind_ports` |
-| reddit, ripgrep, browsermap, sequential-thinking (npx) | `registry.npmjs.org` | yes, `npx --offline` |
-| obscura, lean-ctx | none | n/a |
+| time, fetch (`uvx`) | `pypi.org`, `files.pythonhosted.org` | yes |
+| reddit, ripgrep (`@latest`), browsermap (`@latest`), sequential-thinking (`npx`) | `registry.npmjs.org` | yes |
+| serena (`uvx --from git+https://github.com/oraios/serena@<full sha>`) | the registries, `github.com`, `api.github.com`, `raw.githubusercontent.com` | yes, with a full-revision pin (an unpinned source cannot start offline, even warm), `bind_ports` over several ports (its dashboard listens on the first free one from 24282 and other instances hold the first ones), `~/.serena` writable. While running it asks for `pypi.org` and `oraios-software.de` (version and news checks): refused and harmless |
+| a package never warmed | n/a | fails offline with uv's or npm's own text; `hb run` and `hb doctor` say `run hb warm` |
+| obscura, lean-ctx (a program of their own) | none | not looked at: nothing to warm |
 
 - Agent presets list only the agent's own hosts. MCP servers are declared in `[mcp.<name>]` and each
   contributes its own run-time hosts (normally none).
@@ -1270,3 +1272,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D83 | Offline MCP launchers (hb-ghd.7.2): `uvx` and `npx` scripts first on `PATH` that `exec` the real tool with `--offline` and hb's own cache, only when a declared `[mcp.*]` has a command; the hint naming `hb warm` is printed before the `exec` (a wrapper that keeps the tool as a child loses stdin or orphans the tool); the cache is hb's, outside the user's caches and the guard's roots | agreed |
 | D84 | `hb warm` (hb-ghd.7.3): only `uvx`/`npx` servers are warmed or warned about; the probe is the system perl in the ball (no hb binary runs there); warm is the same ball as a run with only the network replaced (registries, git hosts, `warm_net`); stamps in the denied state directory, advisory; `hb run` and `hb explain` warn about a git config file the ball cannot read (git treats EPERM as fatal), and `hb init` grants the git files that exist | agreed |
 | D85 | `hb doctor` MCP section (hb-ghd.7.4): flags any non-version `@tag` (not only `@latest`) and unpinned `git+` sources, shows only the flagged argument without URL credentials, includes the missing-launcher warning, and does not flag bare package names | agreed |
+| D86 | MCP offline check (hb-ghd.7.5): an opt-in test at library level (`warm_server`, then `session::run` with the probe) against the real home, toolchain and hb's real cache, the network at warm time only; serena's revision is resolved with `git ls-remote` unless given; strict zero proxy lines for the six, no allowed connection for serena; `WarmStore::forget` removes the stamps it made | agreed |

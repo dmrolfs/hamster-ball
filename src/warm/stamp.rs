@@ -152,6 +152,19 @@ impl WarmStore {
         })
     }
 
+    /// Removes the stamp of `server` in the project at `root`. `true` if there was one.
+    ///
+    /// # Errors
+    /// [`StampError::Write`] when the file exists and cannot be removed.
+    pub fn forget(&self, root: &CanonicalPath, server: &str) -> Result<bool, StampError> {
+        let path = self.path(root, server);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(StampError::Write { path, source }),
+        }
+    }
+
     /// Whether `server` of the project at `root` was warmed with `digest`.
     #[must_use]
     pub fn standing(&self, root: &CanonicalPath, server: &str, digest: &str) -> Standing {
@@ -214,7 +227,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use claims::assert_ok;
+    use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -340,6 +353,32 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn forgetting_removes_one_stamp_and_says_whether_there_was_one() {
+        let f = fixture();
+        let d = digest("uvx", &["t"]);
+        assert_ok!(f.store.record(&f.root, "a", &d, at(1)));
+        assert_ok!(f.store.record(&f.root, "b", &d, at(1)));
+        assert!(assert_ok!(f.store.forget(&f.root, "a")));
+        assert_eq!(f.store.standing(&f.root, "a", &d), Standing::Never);
+        assert_eq!(f.store.standing(&f.root, "b", &d), Standing::Warmed);
+        assert!(!assert_ok!(f.store.forget(&f.root, "a")), "already gone");
+        let empty = fixture();
+        assert!(
+            !assert_ok!(empty.store.forget(&empty.root, "x")),
+            "no store at all"
+        );
+    }
+
+    #[test]
+    fn a_stamp_that_cannot_be_removed_is_an_error_and_not_a_missing_stamp() {
+        let f = fixture();
+        assert_ok!(f.store.record(&f.root, "other", &digest("uvx", &[]), at(1)));
+        // A directory where the stamp file would be: removing it fails for a reason other than "not found".
+        assert_ok!(fs::create_dir(f.store.path(&f.root, "stuck")));
+        assert_err!(f.store.forget(&f.root, "stuck"));
     }
 
     #[test]

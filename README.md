@@ -48,7 +48,7 @@ Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design li
 | approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
 | secrets guard, `hb doctor` | |
 | host-side hooks, Bedrock credentials | |
-| presets for kiro-cli, pi, claude and opencode | an opt-in test of the measured MCP servers (milestone 7.5) |
+| presets for kiro-cli, pi, claude and opencode | |
 | MCP servers: `[mcp.*]` hosts and ports, offline `uvx`/`npx` launchers, `hb warm` | |
 
 ## Getting started
@@ -281,7 +281,9 @@ that into two steps.
 After that `hb run` puts `uvx` and `npx` launchers first on the child's `PATH`: each starts the real tool with `--offline` and hb's cache, so a server starts
 from the cache with no network. Only those two names change: `uv sync`, `npm install` and a program called by absolute path behave as before. A remote
 MCP server has no command; give it `[mcp.context7] net = ["mcp.context7.com"]`. A server's own files (serena's `~/.serena`) are ordinary `[fs]` grants.
-`hb explain` shows the launchers, the cache and whether each server is warmed.
+`hb explain` shows the launchers, the cache and whether each server is warmed. Measured on the servers above (time, fetch, reddit, ripgrep, browsermap,
+sequential-thinking and a pinned serena): each answers an MCP `initialize` in the ball in 1 to 2 seconds with no proxy connection (`mcp_offline`, see Development).
+Serena needs a full-revision pin, several `bind_ports`, and `~/.serena` writable, and asks for `pypi.org` and `oraios-software.de` while running (refused, harmless).
 
 ### Network access
 
@@ -485,6 +487,9 @@ HB_REQUIRE_SANDBOX=1 cargo test --all-features  # fail instead of skipping when 
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
 ```
 
+- The offline MCP servers are proved against the real tools by an opt-in test that uses your home, your `uvx`, `npx` and `node`, hb's real cache and the network:
+  `HB_MCP=1 cargo test --features test-support --test mcp_offline -- --nocapture` (variables in [presets/README.md](presets/README.md)). The first run downloads
+  about 500 MB into `~/.cache/hamster-ball`; later runs take under a minute.
 - The code is a library (`hamster_ball`) and a thin binary (`hb`). `hb-testdrive` is a test-only copy of `hb` that takes its
   environment from variables (feature `test-support`).
 - Linting is strict: no `unsafe`, no `unwrap` or `expect` outside tests. Errors use `snafu`. Every file starts with two `ABOUTME:` lines.

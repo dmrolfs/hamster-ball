@@ -80,6 +80,26 @@ HB_CONFORMANCE=1 HB_CONFORMANCE_PROJECT=provider.toml HB_CONFORMANCE_BASE=base.t
   cargo test --features test-support --test conformance -- --nocapture pi
 ```
 
+## Proving the MCP servers offline
+
+```sh
+HB_MCP=1 cargo test --features test-support --test mcp_offline -- --nocapture
+```
+
+Warms the servers a user has measured (time, fetch, reddit, ripgrep, browsermap, sequential-thinking, and serena at a pinned revision) with the code of `hb warm`,
+then starts each in the ball through hb's offline launchers and checks it answers an MCP `initialize` with no proxy connection (serena: no allowed one). It also
+checks that every server is reported cold before warming and that an uncached package fails with the tool's own words. It uses your home, your `uvx`/`npx`/`node`,
+hb's real cache `~/.cache/hamster-ball` (the first run downloads about 500 MB) and the network, and removes the stamps it makes.
+
+| Variable | Meaning |
+|---|---|
+| `HB_MCP=1` | turn the check on |
+| `HB_MCP_SERVERS=time,fetch,serena` | only these (default: all that this machine can run) |
+| `HB_MCP_BASE=<file>` | appended to the private base config: `net.internal_hosts` for a corporate network (github.com, api.github.com, raw.githubusercontent.com) |
+| `HB_MCP_PROJECT=<file>` | appended to the throwaway project config |
+| `HB_MCP_TIMEOUT=<seconds>` | the limit for one server (default 300) |
+| `HB_MCP_SERENA_REV=<40 hex>` | serena's revision (default: HEAD, from `git ls-remote`) |
+
 An agent that starts MCP servers from your own config (opencode reads `~/.config/opencode/opencode.json`) asks for their hosts too,
 and the check fails on each one the preset does not allow. For a check on such a machine, list them in the project file, and put a
 host that resolves to a private address (a corporate proxy's range) in `net.internal_hosts` of the base file:
