@@ -285,6 +285,20 @@ pub enum RunError {
         source: ToolsError,
     },
 
+    /// `hb ctl` could not be set up.
+    #[snafu(transparent)]
+    Ctl {
+        /// The underlying error.
+        source: super::ctl::CtlError,
+    },
+
+    /// The session directory is too deep for a unix socket.
+    #[snafu(display("the path {path} is too long for the hb ctl socket"))]
+    CtlSocketPath {
+        /// The socket path.
+        path: String,
+    },
+
     /// The per-user temporary directory is not known.
     #[snafu(display(
         "the per-user temporary directory is unknown, so there is nowhere for the session directory"
@@ -473,6 +487,34 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         (Some(plan), Some(_)) => (None, Some(plan.install_cache()?)),
         (None, _) => (None, None),
     };
+    // `hb ctl` (design 9.3). A warm run starts no agent, so it gets none. The guardian is started
+    // first and told about the socket before it exists, so an `hb` killed at any point after
+    // this leaves no socket behind.
+    let ctl_scope = spec
+        .warm
+        .is_none()
+        .then(|| super::ctl::scope_of(&loaded.policy))
+        .flatten();
+    let helper = match (spec.signals, &pty, &ctl_scope) {
+        (SignalMode::Off, None, None) => None,
+        _ => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
+    };
+    let mut guardian = helper.map(Guardian::start).transpose()?;
+    let ctl = match ctl_scope {
+        Some(scope) => {
+            let hb = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
+            Some(start_ctl(
+                env,
+                loaded,
+                &session,
+                hb,
+                scope,
+                guardian.as_mut(),
+                &mut warnings,
+            )?)
+        }
+        None => None,
+    };
 
     let loopback: Vec<_> = loaded
         .policy
@@ -529,6 +571,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     if let Some(pty) = &pty {
         inputs = inputs.with_tty(pty.slave_path().clone());
     }
+    if let Some(ctl) = &ctl {
+        inputs = inputs
+            .with_ctl_socket(ctl.socket.clone())
+            .with_mount_pins(ctl.pins.clone());
+    }
     let profile = render(&loaded.policy, &inputs)?;
     warnings.extend(profile.warnings.iter().map(ToString::to_string));
 
@@ -551,7 +598,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         home: &env.home,
         session_dir: session.path(),
         tool_dirs: &tool_dirs,
-        shim_dir: launchers.as_ref().map(|installed| installed.bin_dir()),
+        shim_dir: launchers
+            .as_ref()
+            .map(|installed| installed.bin_dir())
+            .or(ctl.as_ref().map(|c| &c.bin)),
         stdin_is_tty,
         env: &loaded.policy.env,
         tls: TlsEnv {
@@ -560,12 +610,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         },
         proxy: Some(&proxy_url),
         hook_vars: &child_vars,
+        ctl_socket: ctl.as_ref().map(|c| &c.socket),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
-    let helper = match (spec.signals, &pty) {
-        (SignalMode::Off, None) => None,
-        _ => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
-    };
     let launcher = launcher_words(helper, pty.is_some());
     check_size(&profile, &child_env, &spec.argv, &launcher)?;
     let watch = match spec.signals {
@@ -604,28 +651,27 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     }
     // If hb is killed (SIGKILL cannot be handled) nothing in hb can end the agent or the log
     // stream, so a guard process does. It exists whenever hb supervises the run.
-    let mut guard = helper.map(Guardian::start).transpose()?;
-    if let (Some(guard), Some(_), Some(terminal)) = (guard.as_mut(), &pty, user_terminal()) {
+    if let (Some(guardian), Some(_), Some(terminal)) = (guardian.as_mut(), &pty, user_terminal()) {
         // So that if hb is killed while it holds the terminal raw, the guard can say what happened.
-        guard.terminal(&terminal)?;
+        guardian.terminal(&terminal)?;
     }
     // The log is listening before the child starts, so its first denials are not missed.
     let log = match (&tag, &spec.denials) {
         (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
         _ => None,
     };
-    if let (Some(guard), Some(log)) = (guard.as_mut(), &log) {
-        guard.watch(Target::Child(pid_of(log.pid())))?;
+    if let (Some(guardian), Some(log)) = (guardian.as_mut(), &log) {
+        guardian.watch(Target::Child(pid_of(log.pid())))?;
     }
     let mut child = command.spawn().context(SpawnSnafu)?;
-    if let Some(guard) = guard.as_mut() {
+    if let Some(guardian) = guardian.as_mut() {
         // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
         let target = if pty.is_some() || !stdin_is_tty {
             Target::Group(pid_of(child.id()))
         } else {
             Target::Child(pid_of(child.id()))
         };
-        if let Err(error) = guard.watch(target) {
+        if let Err(error) = guardian.watch(target) {
             abort_child(&mut child);
             return Err(error.into());
         }
@@ -653,9 +699,12 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     running.pumps = pumps;
     let waited = running.wait_for_exit(spec.stdio);
     let denials = log.map(LogStream::finish).unwrap_or_default();
+    if let Some(ctl) = ctl {
+        ctl.broker.finish();
+    }
     // Everything hb started has ended and been reaped, so the guard has nothing left to do.
-    if let Some(guard) = guard {
-        guard.release();
+    if let Some(guardian) = guardian {
+        guardian.release();
     }
     let Waited {
         exit,
@@ -679,6 +728,50 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         warnings,
         denials,
         proxy_log: seen.log,
+    })
+}
+
+/// What `hb ctl` adds to a run: the broker, and the two things the child needs from it.
+struct CtlRun {
+    broker: crate::ctl::broker::Broker,
+    pins: Vec<CanonicalPath>,
+    socket: CanonicalPath,
+    bin: CanonicalPath,
+}
+
+/// Starts the broker and writes the `hb` wrapper. The socket is registered with the guardian
+/// before it is bound. Startup notes (a container that failed its checks) go into `warnings`.
+fn start_ctl(
+    env: &Environment,
+    loaded: &Loaded,
+    session: &SessionDir,
+    hb: &Path,
+    scope: crate::ctl::scope::Scope,
+    mut guard: Option<&mut Guardian>,
+    warnings: &mut Vec<String>,
+) -> Result<CtlRun, RunError> {
+    let socket_path = session.path().as_path().join(super::ctl::SOCKET_NAME);
+    ensure!(
+        super::ctl::socket_fits(session.path()),
+        CtlSocketPathSnafu {
+            path: socket_path.display().to_string()
+        }
+    );
+    let handle = guard.as_ref().map(|g| g.handle());
+    if let Some(guard) = guard.as_mut() {
+        guard.socket(&socket_path)?;
+    }
+    let bin = session.path().as_path().join("bin");
+    super::ctl::install_wrapper(&bin, hb)?;
+    let started = super::ctl::start(env, loaded.root.path(), session.path(), scope, handle)?;
+    warnings.extend(started.service.warnings);
+    let bin =
+        CanonicalPath::from_canonical(&bin).map_err(|source| RunError::TempDirPath { source })?;
+    Ok(CtlRun {
+        broker: started.service.broker,
+        pins: started.service.pins,
+        socket: started.socket,
+        bin,
     })
 }
 
@@ -1127,6 +1220,7 @@ mod tests {
             tls: TlsEnv::default(),
             proxy: None,
             hook_vars: &std::collections::BTreeMap::new(),
+            ctl_socket: None,
         }))
     }
 

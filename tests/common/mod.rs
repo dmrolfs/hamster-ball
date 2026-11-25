@@ -56,6 +56,11 @@ impl World {
         Self::build(assert_ok!(TempDir::new_in("/tmp")), base_toml, project_toml)
     }
 
+    /// A world whose tree sits under `parent` (a directory that must already exist).
+    pub fn under(parent: &Path, base_toml: &str, project_toml: &str) -> Self {
+        Self::build(assert_ok!(TempDir::new_in(parent)), base_toml, project_toml)
+    }
+
     /// The same tree as [`World::base`], spelled through the symlink it was created under.
     pub fn spelled(&self, path: &Path) -> PathBuf {
         let real = Path::new("/private/tmp");
@@ -63,11 +68,32 @@ impl World {
             .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/tmp").join(rest))
     }
 
+    /// A world whose project is exactly `project` (an existing directory), with its home and
+    /// the rest of the tree in a temporary directory elsewhere.
+    pub fn with_project_dir(project: &Path, base_toml: &str, project_toml: &str) -> Self {
+        Self::build_at(
+            assert_ok!(TempDir::new_in("/tmp")),
+            Some(assert_ok!(fs::canonicalize(project))),
+            base_toml,
+            project_toml,
+        )
+    }
+
     fn build(dir: TempDir, base_toml: &str, project_toml: &str) -> Self {
+        Self::build_at(dir, None, base_toml, project_toml)
+    }
+
+    fn build_at(
+        dir: TempDir,
+        project_dir: Option<PathBuf>,
+        base_toml: &str,
+        project_toml: &str,
+    ) -> Self {
         let base = assert_ok!(fs::canonicalize(dir.path()));
         let home_path = base.join("home");
-        let project = home_path.join("work/proj");
+        let project = project_dir.unwrap_or_else(|| home_path.join("work/proj"));
         assert_ok!(fs::create_dir_all(&project));
+        assert_ok!(fs::create_dir_all(&home_path));
         let home = HomeDir::new(canonical(&home_path));
         let config_dir = home_path.join(".config/hamster-ball");
         write(&config_dir.join("base.toml"), base_toml);
@@ -99,6 +125,22 @@ impl World {
     /// Replaces the project config (for configs that name paths inside this world).
     pub fn set_project(&self, project_toml: &str) {
         write(&self.project.join("hamster-ball.toml"), project_toml);
+    }
+
+    /// Replaces the user's base config.
+    pub fn set_base(&self, text: &str) {
+        write(
+            &self.home_dir().join(".config/hamster-ball/base.toml"),
+            text,
+        );
+    }
+
+    /// Adds `text` to the user's base config (for sections only the user's own files may hold).
+    pub fn append_to_base(&self, text: &str) {
+        let base = self.home_dir().join(".config/hamster-ball/base.toml");
+        let mut current = fs::read_to_string(&base).unwrap_or_default();
+        current.push_str(text);
+        write(&base, &current);
     }
 
     pub fn home_dir(&self) -> PathBuf {

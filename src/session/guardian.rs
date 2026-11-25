@@ -20,6 +20,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,10 +38,12 @@ use super::signals::{SignalError, Target, clear_mask};
 /// How long the guard lets processes end after SIGTERM before it sends SIGKILL.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(2);
 
-/// How many processes the guard will watch. `hb` registers two.
+/// How many processes the guard will watch: the agent, the log stream and the broker's running commands.
 const MAX_WATCHED: usize = 16;
 /// The longest command line the guard accepts.
-const MAX_LINE: usize = 128;
+const MAX_LINE: usize = 160;
+/// How many sockets the guard will remember (`hb` registers one).
+const MAX_SOCKETS: usize = 2;
 /// How long `release` waits for the guard to exit before it stops waiting.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
@@ -98,6 +101,8 @@ pub(super) enum GuardCommand {
     Release,
     /// The user's terminal, which `hb` is about to put in raw mode.
     Terminal(PathBuf),
+    /// The `hb ctl` socket: remove it if `hb` dies, since a killed `hb` cannot.
+    Socket(PathBuf),
 }
 
 /// Why a line sent to the guard was refused.
@@ -120,6 +125,7 @@ pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
     match words.as_slice() {
         ["release"] => Ok(GuardCommand::Release),
         ["tty", path] => terminal_device(path).map(GuardCommand::Terminal),
+        ["socket", path] => ctl_socket(path).map(GuardCommand::Socket),
         ["watch", kind @ ("group" | "process"), pid] => {
             let pid: i32 = pid.parse().ok().context(BadPidSnafu)?;
             if pid < FIRST_SIGNALLABLE_PID {
@@ -147,6 +153,32 @@ fn terminal_device(path: &str) -> Result<PathBuf, LineError> {
         Ok(path.to_path_buf())
     } else {
         UnknownSnafu.fail()
+    }
+}
+
+/// A path the guard will unlink: an absolute path whose last name is `ctl.sock`, and nothing else.
+fn ctl_socket(path: &str) -> Result<PathBuf, LineError> {
+    let path = Path::new(path);
+    let plain = path.is_absolute()
+        && path.file_name().is_some_and(|n| n == CTL_SOCKET_NAME)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if plain {
+        Ok(path.to_path_buf())
+    } else {
+        UnknownSnafu.fail()
+    }
+}
+
+/// The only file name the guard will remove.
+pub const CTL_SOCKET_NAME: &str = "ctl.sock";
+
+/// Removes `path` if it is still a unix socket. Anything else at that name is left alone.
+fn remove_socket(path: &Path) {
+    use std::os::unix::fs::FileTypeExt;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -223,7 +255,33 @@ const HINT_DELAY: Duration = Duration::from_millis(300);
 #[derive(Debug)]
 pub struct Guardian {
     process: Child,
-    commands: ChildStdin,
+    commands: Arc<Mutex<ChildStdin>>,
+}
+
+/// A clone of the guard's command pipe, so other threads (the `hb ctl` broker's runner) can
+/// register the process groups they start. It does not keep the guard alive: `release` ends it.
+#[derive(Debug, Clone)]
+pub struct GuardHandle {
+    commands: Arc<Mutex<ChildStdin>>,
+}
+
+fn tell(commands: &Mutex<ChildStdin>, text: &str) -> Result<(), GuardianError> {
+    let mut pipe = commands.lock().map_err(|_| GuardianError::Tell {
+        source: io::Error::other("the guard's command pipe is poisoned"),
+    })?;
+    pipe.write_all(text.as_bytes())
+        .and_then(|()| pipe.flush())
+        .context(TellSnafu)
+}
+
+impl GuardHandle {
+    /// Asks the guard to end `target` if `hb` dies before the guard is released.
+    ///
+    /// # Errors
+    /// [`GuardianError::Tell`] if the guard cannot be written to.
+    pub fn watch(&self, target: Target) -> Result<(), GuardianError> {
+        tell(&self.commands, &watch_line(target))
+    }
 }
 
 impl Guardian {
@@ -259,7 +317,10 @@ impl Guardian {
                 source: io::Error::other("the guard has no command pipe"),
             });
         };
-        Ok(Self { process, commands })
+        Ok(Self {
+            process,
+            commands: Arc::new(Mutex::new(commands)),
+        })
     }
 
     /// The guard's process number.
@@ -274,10 +335,37 @@ impl Guardian {
     /// # Errors
     /// [`GuardianError::Tell`] if the guard cannot be written to.
     pub fn terminal(&mut self, path: &Path) -> Result<(), GuardianError> {
-        self.commands
-            .write_all(format!("tty {}\n", path.display()).as_bytes())
-            .and_then(|()| self.commands.flush())
-            .context(TellSnafu)
+        tell(
+            &self.commands,
+            &format!(
+                "tty {}
+",
+                path.display()
+            ),
+        )
+    }
+
+    /// Asks the guard to remove the `hb ctl` socket at `path` if `hb` dies before [`Guardian::release`].
+    ///
+    /// # Errors
+    /// [`GuardianError::Tell`] if the guard cannot be written to.
+    pub fn socket(&mut self, path: &Path) -> Result<(), GuardianError> {
+        tell(
+            &self.commands,
+            &format!(
+                "socket {}
+",
+                path.display()
+            ),
+        )
+    }
+
+    /// A handle other threads can use to register what they start.
+    #[must_use]
+    pub fn handle(&self) -> GuardHandle {
+        GuardHandle {
+            commands: self.commands.clone(),
+        }
     }
 
     /// Asks the guard to end `target` if `hb` dies before [`Guardian::release`].
@@ -285,18 +373,12 @@ impl Guardian {
     /// # Errors
     /// [`GuardianError::Tell`] if the guard cannot be written to.
     pub fn watch(&mut self, target: Target) -> Result<(), GuardianError> {
-        self.commands
-            .write_all(watch_line(target).as_bytes())
-            .and_then(|()| self.commands.flush())
-            .context(TellSnafu)
+        tell(&self.commands, &watch_line(target))
     }
 
     /// Tells the guard `hb` has cleaned up and waits (briefly) for it to exit.
     pub fn release(mut self) {
-        let _ = self
-            .commands
-            .write_all(b"release\n")
-            .and_then(|()| self.commands.flush());
+        let _ = tell(&self.commands, "release\n");
         drop(self.commands);
         let deadline = Instant::now() + RELEASE_WAIT;
         while Instant::now() < deadline {
@@ -375,6 +457,7 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
 
     let mut watched: HashMap<i32, Target> = HashMap::new();
     let mut terminal: Option<TerminalWatch> = None;
+    let mut sockets: Vec<PathBuf> = Vec::new();
     let mut buffered: Vec<u8> = Vec::new();
     let mut pipe_open = true;
     let mut terminating: Option<Instant> = None;
@@ -390,6 +473,9 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
     loop {
         if !pipe_open && terminating.is_none() {
             // `hb` is gone and did not release: end what is left.
+            for socket in &sockets {
+                remove_socket(socket);
+            }
             if watched.is_empty() {
                 return Ok((Ended::HbGone, terminal));
             }
@@ -422,6 +508,7 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                         &mut buffered,
                         &mut watched,
                         &mut terminal,
+                        &mut sockets,
                         &queue,
                     )?;
                     pipe_open = open;
@@ -468,6 +555,7 @@ fn read_commands(
     buffered: &mut Vec<u8>,
     watched: &mut HashMap<i32, Target>,
     terminal: &mut Option<TerminalWatch>,
+    sockets: &mut Vec<PathBuf>,
     queue: &Kqueue,
 ) -> Result<(Next, bool), GuardError> {
     let mut chunk = [0u8; 256];
@@ -487,6 +575,8 @@ fn read_commands(
             Ok(GuardCommand::Release) => return Ok((Next::Release, true)),
             Ok(GuardCommand::Watch(target)) => watch(target, watched, queue),
             Ok(GuardCommand::Terminal(path)) => *terminal = TerminalWatch::open(&path),
+            Ok(GuardCommand::Socket(path)) if sockets.len() < MAX_SOCKETS => sockets.push(path),
+            Ok(GuardCommand::Socket(_)) => {}
             // A line the guard does not understand protects nothing; the next one may.
             Err(_) => {}
         }
@@ -536,6 +626,50 @@ mod tests {
             assert_ok!(parse_line("watch process 77")),
             GuardCommand::Watch(Target::Child(Pid::from_raw(77)))
         );
+    }
+
+    #[test]
+    fn a_socket_line_names_an_absolute_ctl_sock_and_nothing_else() {
+        assert_eq!(
+            assert_ok!(parse_line("socket /var/folders/x/T/hb-1-2-3/ctl.sock")),
+            GuardCommand::Socket(PathBuf::from("/var/folders/x/T/hb-1-2-3/ctl.sock"))
+        );
+        for bad in [
+            "socket",
+            "socket ctl.sock",
+            "socket /etc/passwd",
+            "socket /a/other.sock",
+            "socket /a/../etc/ctl.sock",
+            "socket /a/ctl.sock/x",
+        ] {
+            assert_err!(parse_line(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_unix_socket_is_removed_not_a_file_or_a_directory_or_a_link_target() {
+        use std::os::unix::net::UnixListener;
+        let dir = assert_ok!(tempfile::Builder::new().prefix("hb-g").tempdir_in("/tmp"));
+        let sock = dir.path().join("ctl.sock");
+        let _listener = assert_ok!(UnixListener::bind(&sock));
+        remove_socket(&sock);
+        assert!(!sock.exists());
+        assert_ok!(std::fs::write(&sock, "not a socket"));
+        remove_socket(&sock);
+        assert!(sock.exists(), "a regular file must be left alone");
+        assert_ok!(std::fs::remove_file(&sock));
+        let target = dir.path().join("target.sock");
+        let _t = assert_ok!(UnixListener::bind(&target));
+        assert_ok!(std::os::unix::fs::symlink(&target, &sock));
+        remove_socket(&sock);
+        assert!(
+            target.exists(),
+            "a link must not make the guard remove its target"
+        );
+        assert_ok!(std::fs::remove_file(&sock));
+        assert_ok!(std::fs::create_dir(&sock));
+        remove_socket(&sock);
+        assert!(sock.is_dir());
     }
 
     #[test]

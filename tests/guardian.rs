@@ -475,3 +475,53 @@ fn on_a_terminal_a_sigkilled_run_leaves_no_agent_and_no_log_stream() {
         alive(log)
     );
 }
+
+// ====================================================================================
+// The hb ctl socket
+// ====================================================================================
+
+#[test]
+fn a_killed_hb_has_its_ctl_socket_removed_by_the_guard_and_a_released_one_is_left_alone() {
+    use std::os::unix::net::UnixListener;
+    let dir = assert_ok!(tempfile::Builder::new().prefix("hb-g").tempdir_in("/tmp"));
+    let path = dir.path().join("ctl.sock");
+
+    // hb dies without releasing: the guard unlinks the socket.
+    let _listener = assert_ok!(UnixListener::bind(&path));
+    let mut guardian = assert_ok!(Guardian::start_with(
+        std::path::Path::new(HB),
+        Duration::from_millis(200)
+    ));
+    assert_ok!(guardian.socket(&path));
+    let guard_pid = i32::try_from(guardian.pid()).unwrap_or(i32::MAX);
+    drop(guardian);
+    assert!(
+        within(Duration::from_secs(3), || !path.exists()),
+        "the guard did not remove the socket"
+    );
+    // A guard that has exited but is not yet reaped by this test still answers `kill(pid, 0)`.
+    let gone_or_zombie = |pid: i32| {
+        let out = assert_ok!(
+            Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().is_empty()
+            || String::from_utf8_lossy(&out.stdout).trim().starts_with('Z')
+    };
+    assert!(
+        within(Duration::from_secs(3), || gone_or_zombie(guard_pid)),
+        "the guard did not exit"
+    );
+
+    // hb finishes normally: the guard must not touch it (the broker removes its own).
+    let _again = assert_ok!(UnixListener::bind(&path));
+    let mut guardian = assert_ok!(Guardian::start_with(
+        std::path::Path::new(HB),
+        Duration::from_millis(200)
+    ));
+    assert_ok!(guardian.socket(&path));
+    guardian.release();
+    thread::sleep(Duration::from_millis(300));
+    assert!(path.exists(), "release must leave the socket to the broker");
+}

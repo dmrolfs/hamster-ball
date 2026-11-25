@@ -90,6 +90,8 @@ pub struct EnvInputs<'a> {
     /// The variables the pre-run hooks set, each naming a file in the session directory. They
     /// win over `[env] set`: a hook is the later and more specific word.
     pub hook_vars: &'a BTreeMap<EnvName, CanonicalPath>,
+    /// The `hb ctl` broker socket, when this run has one. Set last, so nothing can override it.
+    pub ctl_socket: Option<&'a CanonicalPath>,
 }
 
 /// What `[env] set` values may contain to name this run's private directory.
@@ -134,6 +136,12 @@ impl ChildEnv {
             vars.insert(OsString::from(name.as_str()), OsString::from(path.as_str()));
         }
         vars.insert(SESSION_MARKER.into(), "1".into());
+        if let Some(socket) = inputs.ctl_socket {
+            vars.insert(
+                crate::ctl::client::SOCKET_VAR.into(),
+                socket.as_str().into(),
+            );
+        }
         vars.insert("HOME".into(), inputs.home.path().as_str().into());
         vars.insert("TMPDIR".into(), inputs.session_dir.as_str().into());
         vars.insert(
@@ -286,6 +294,7 @@ mod tests {
         bundle: Option<CanonicalPath>,
         proxy: Option<ProxyUrl>,
         hook_vars: BTreeMap<EnvName, CanonicalPath>,
+        ctl_socket: Option<CanonicalPath>,
     }
 
     impl Case {
@@ -302,6 +311,7 @@ mod tests {
                 bundle: None,
                 proxy: None,
                 hook_vars: BTreeMap::new(),
+                ctl_socket: None,
             }
         }
 
@@ -320,6 +330,7 @@ mod tests {
                 },
                 proxy: self.proxy.as_ref(),
                 hook_vars: &self.hook_vars,
+                ctl_socket: self.ctl_socket.as_ref(),
             })
         }
 
@@ -605,6 +616,19 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn the_ctl_socket_variable_is_set_from_the_run_and_nothing_else_can_set_it() {
+        let mut case = Case::new();
+        assert!(case.ok().get("HB_CTL_SOCKET").is_none());
+        case.ctl_socket = Some(cp("/private/var/folders/x/T/hb-1-2-3/ctl.sock"));
+        assert_eq!(
+            get(&case.ok(), "HB_CTL_SOCKET"),
+            Some(OsStr::new("/private/var/folders/x/T/hb-1-2-3/ctl.sock"))
+        );
+        // The HB_ prefix is reserved, so neither `pass` nor `set` can put the name in.
+        assert!(EnvName::parse_user("HB_CTL_SOCKET").is_err());
     }
 
     #[test]

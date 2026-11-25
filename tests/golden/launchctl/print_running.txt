@@ -1,0 +1,58 @@
+gui/502/com.hbtest.fx = {
+	active count = 1
+	path = /private/tmp/lj2/com.hbtest.fx.plist
+	type = LaunchAgent
+	state = running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		sleep 300
+	}
+
+	inherited environment = {
+		SSH_AUTH_SOCK => /private/tmp/com.apple.launchd.XXXXXXXXXX/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		pid => 99999
+		SECRET_TOKEN => shh-secret
+		state => FAKE-STATE
+		runs => 77
+		XPC_SERVICE_NAME => com.hbtest.fx
+	}
+
+	domain = gui/502 [100017]
+	asid = 100017
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 66031
+	immediate reason = speculative
+	forks = 0
+	execs = 3
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	last exit code = (never exited)
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = runatload | inferred program
+}

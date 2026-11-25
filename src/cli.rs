@@ -83,12 +83,126 @@ enum Command {
     /// The command starts with an empty environment: only HOME, PATH, TMPDIR, TERM and the names
     /// in `[env] pass` and `[env] set` reach it. A program found through `[env] tools` is on its PATH.
     Run(RunArgs),
+    /// Inside the ball: see and restart the containers and launchd jobs the config lists.
+    ///
+    /// Talks to the run's broker over the one socket the sandbox allows (`HB_CTL_SOCKET`). There is
+    /// no `run`, `exec`, `build`, `rm` or `cp`: only the operations below, on listed targets.
+    Ctl(CtlArgs),
     /// Internal: clear the signal mask and exec sandbox-exec. Started by `hb run`, never by hand.
     #[command(name = "__child", hide = true)]
     Child(ChildArgs),
     /// Internal: end the agent and the log stream if hb is killed. Started by `hb run`, never by hand.
     #[command(name = "__guard", hide = true)]
     Guard(GuardArgs),
+}
+
+#[derive(Debug, Args)]
+struct CtlArgs {
+    #[command(subcommand)]
+    op: CtlOp,
+}
+
+#[derive(Debug, Subcommand)]
+enum CtlOp {
+    /// List the containers in scope with their state, or the one named.
+    Ps {
+        /// A container name.
+        name: Option<String>,
+    },
+    /// The last lines of a container's log.
+    Logs {
+        /// The container.
+        name: String,
+        /// How many lines (at most 2000).
+        #[arg(long, value_name = "N")]
+        tail: Option<u64>,
+    },
+    /// One CPU and memory sample.
+    Stats {
+        /// The container.
+        name: String,
+    },
+    /// Start a stopped container.
+    Start {
+        /// The container.
+        name: String,
+    },
+    /// Stop a container.
+    Stop {
+        /// The container.
+        name: String,
+    },
+    /// Restart a container.
+    Restart {
+        /// The container.
+        name: String,
+    },
+    /// A launchd job listed in `[ctl] launchd`.
+    Launchd {
+        #[command(subcommand)]
+        op: CtlLaunchd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CtlLaunchd {
+    /// State, pid, run count and last exit code (never the job's environment).
+    Status {
+        /// The job label.
+        label: String,
+    },
+    /// Start a loaded job that is not running.
+    Kickstart {
+        /// The job label.
+        label: String,
+    },
+    /// Kill the job's process and start it again.
+    Restart {
+        /// The job label.
+        label: String,
+    },
+}
+
+impl From<CtlOp> for crate::ctl::client::Command {
+    fn from(op: CtlOp) -> Self {
+        use crate::ctl::client::Command as C;
+        use crate::ctl::op::{ContainerOp, LaunchdOp};
+        let named = |op, name| C::Container {
+            op,
+            name: Some(name),
+            tail: None,
+        };
+        match op {
+            CtlOp::Ps { name } => C::Container {
+                op: ContainerOp::Ps,
+                name,
+                tail: None,
+            },
+            CtlOp::Logs { name, tail } => C::Container {
+                op: ContainerOp::Logs,
+                name: Some(name),
+                tail,
+            },
+            CtlOp::Stats { name } => named(ContainerOp::Stats, name),
+            CtlOp::Start { name } => named(ContainerOp::Start, name),
+            CtlOp::Stop { name } => named(ContainerOp::Stop, name),
+            CtlOp::Restart { name } => named(ContainerOp::Restart, name),
+            CtlOp::Launchd { op } => match op {
+                CtlLaunchd::Status { label } => C::Launchd {
+                    op: LaunchdOp::Status,
+                    label,
+                },
+                CtlLaunchd::Kickstart { label } => C::Launchd {
+                    op: LaunchdOp::Kickstart,
+                    label,
+                },
+                CtlLaunchd::Restart { label } => C::Launchd {
+                    op: LaunchdOp::Restart,
+                    label,
+                },
+            },
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -370,6 +484,11 @@ where
         );
     }
 
+    // The client needs only the socket variable: no home, project or config is read inside the ball.
+    if let Command::Ctl(ctl) = command {
+        return ctl_command(ctl.op, out, err);
+    }
+
     // The guard needs nothing from the environment either; it reads its orders from stdin.
     if let Command::Guard(guard) = &command {
         return match run_guard(Duration::from_millis(guard.grace_ms)) {
@@ -411,7 +530,7 @@ where
         }
         Command::Run(args) => run_command(env, args, err, supervise, reraise),
         Command::Warm(args) => warm_command(env, &args, out, err, supervise, reraise),
-        Command::Child(_) | Command::Guard(_) => ExitCode::FAILURE,
+        Command::Child(_) | Command::Guard(_) | Command::Ctl(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())
@@ -579,6 +698,19 @@ fn run_command_with(
             exit_code(outcome.exit)
         }
         Err(error) => fail(err, crate::Error::from(error)),
+    }
+}
+
+/// `hb ctl ...`: one request to the broker of the run this process is inside.
+fn ctl_command(op: CtlOp, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    use crate::ctl::client::{SOCKET_VAR, send, show};
+    let socket = std::env::var_os(SOCKET_VAR).map(std::path::PathBuf::from);
+    match send(socket.as_deref(), op.into()) {
+        Ok(response) => ExitCode::from(show(&response, out, err)),
+        Err(error) => {
+            let _ = writeln!(err, "hb ctl: {}", snafu::Report::from_error(error));
+            ExitCode::from(2)
+        }
     }
 }
 
