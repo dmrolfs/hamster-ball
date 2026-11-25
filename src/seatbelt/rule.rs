@@ -26,7 +26,7 @@ pub enum Section {
     Tls,
     /// Network.
     Network,
-    /// Secrets-guard denies (milestone 5).
+    /// Secrets-guard denies.
     Guard,
     /// Template re-allow, after the guard denies.
     TemplateAllow,

@@ -1,10 +1,11 @@
 <!-- ABOUTME: Design for `hb`, a macOS command that runs AI coding agents in a Seatbelt hamster ball defined by layered TOML config. -->
-<!-- ABOUTME: Covers threat model, config model, enforcement, agent presets, containers, build plan. Status: DRAFT for owner approval. -->
+<!-- ABOUTME: Covers threat model, config model, enforcement, agent presets, containers, build plan. Status: implemented (milestones 1 to 8). -->
 
 # Hamster Ball Design
 
 Project: **hamster-ball** (`github.com/dmrolfs/hamster-ball`, private). Binary: `hb`.
-Status: **draft, awaiting approval** (Plan and Design gate; no code written).
+Status: **implemented**, milestones 1 to 8 (version 0.1). Sections written as plans before the code existed were updated to say what was built; a statement marked Measured
+was run on a real machine, and a statement marked Unverified was not.
 Platform: **macOS only** (tested on macOS 15.7, arm64).
 Language: **Rust**, shipped as one binary named `hb`.
 
@@ -66,10 +67,11 @@ hb run -- cargo test
 hb explain                # effective policy, with the source file of every rule
 hb approve                # review and approve this project's hamster-ball.toml (needs a terminal)
 hb approve --revoke       # take the approval back (no terminal needed)
-hb doctor                 # warn about unprotected secret-looking files, missing ports, stale caches
-hb warm                   # populate MCP and tool caches (the only step that may reach registries)
+hb doctor                 # unprotected secret-looking files, tracked files the guard would deny, secret-looking launchd variables, MCP servers that cannot start offline
+hb warm                   # fill hb's offline cache for declared uvx and npx MCP servers (the only step that may reach registries)
 hb profile                # print the generated Seatbelt profile
-hb ctl ps|logs|stats|start|stop|restart [name]   # inside the hamster ball: manage project containers
+hb ctl ps|logs|stats|start|stop|restart [name]   # inside the hamster ball: see and restart the listed containers
+hb ctl launchd status|kickstart|restart <label>  # inside: the launchd jobs listed in [ctl] launchd
 ```
 
 Install: `cargo install --path .`. `hb` must live in a directory the hamster ball cannot write
@@ -142,8 +144,8 @@ config never applies silently.
   reached, so a path alias of a user preset behaves exactly like the name, and a symlinked or hard-linked user file
   loses the right. A project file, any file inside the project, and any other file (including one the project
   names by absolute path) that defines them is an error naming that file. The error never prints the hook.
-- Even a trusted file's hooks are chosen by the project when it extends that preset. The approval summary (M4) must
-  list every hook that will run, labelled project-selected.
+- Even a trusted file's hooks are chosen by the project when it extends that preset. The approval summary (hb-ghd.4) lists every
+  hook that will run, with the files that define it (`hb approve` and `hb explain` show the origin of each).
 - `hb explain` prints each effective rule with its origin file, so every grant can be audited.
 
 ### 4.2a Extends and the closure
@@ -166,7 +168,7 @@ config never applies silently.
 - A missing `~/.config/hamster-ball/base.toml` is an error that says to run `hb init`, which writes a commented
   template with mode 0600 and never overwrites (D39). `XDG_CONFIG_HOME` is ignored (D39). The template lists `[system] launchctl = false`, commented out, so the one switch only your own files can turn on is easy to find (4.6).
 
-### 4.3 Schema (draft)
+### 4.3 Schema
 
 ```toml
 # ~/work/icehouse/hamster-ball.toml
@@ -311,7 +313,7 @@ the system roots plus the extra CAs for non-Node clients was considered and not 
 What is measured, read-only (`tests/seatbelt_tls.rs`): `scutil --proxy` inside the ball prints the host's proxy settings with
 `configd` granted and an empty dictionary without it, so `configd` is what carries system proxy and PAC settings in, and without it
 they disappear without an error. `uv` panics without `configd` (`tests/tls_handshake.rs`). The same visibility means the agent can read
-the host's proxy configuration while `system_trust` is on; M3 should show that to the user.
+the host's proxy configuration while `system_trust` is on. `hb` does not show or warn about that; it is a known gap (open item 13).
 
 These settings add trusted roots only. They work with Zscaler off, because hosts then present
 public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
@@ -343,7 +345,7 @@ copy re-signed ad hoc, and thinned x86_64 and arm64e copies were tried), because
 the system volume. **Not tested:** an Intel Mac, other macOS versions, and a program that speaks launchd's private XPC protocol
 itself (that is work against macOS, which section 2 puts out of scope). With it on, treat every LaunchAgent you have as something
 the agent can start. `brew services` and a job that needs `bootstrap` do not work either way. The scoped form is `[ctl] launchd` with
-`hb ctl launchd` (9.3, D87): it needs `system.launchctl` to stay off. `hb doctor` (M5) should warn when `launchctl print gui/<uid>` shows a secret-looking name in
+`hb ctl launchd` (9.3, D87): it needs `system.launchctl` to stay off. `hb doctor` (hb-ghd.5) warns, by name only, when `launchctl print gui/<uid>` shows a secret-looking name in
 the launchd environment, because the agent could read it if `launchctl` is on.
 
 Never available, with no switch (measured, `probe_matrix`): LaunchServices (`open -a` starts nothing, `lsappinfo` lists no
@@ -547,7 +549,7 @@ reopened the file; placed before, it did not). Generated order:
 7. Template re-allow (`*.example`, `*.sample`, `*.template`), naming the same operations the guard deny names (a wildcard `file-read*` allow cannot reopen a specific-operation deny; measured).
 7a. Host services: unless `system.launchctl` is on, `(deny process-exec (literal "/bin/launchctl"))` (4.6). After every allow, because a
    later rule on the same operation wins.
-8. Floor (all four effects, 6), pins and `deny_*` rules last, so nothing re-allows them. Read-class denies list the full
+8. Floor (all four effects, 6), pins (the secrets guard's, and the `hb ctl` mount pins of 9.3: `file-write-unlink` and `file-link`) and `deny_*` rules last, so nothing re-allows them. Read-class denies list the full
    read set: `file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable`, plus `file-write*`
    (`file-map-executable` is a child of `file-read-data`; naming it closes mapping a denied file as code through a descriptor
    opened before the sandbox, D62).
@@ -858,6 +860,9 @@ config, on the host.
   active connection's port, not by `podman machine inspect` alone) and, if the shares are wider, warns and refuses both operations with the
   command `podman machine init --volume <project>:<project> --now`. `hb` never changes the machine. `ps`, `logs`, `stats` and `stop` work either way.
   Only one podman machine can run at a time, so this replaces the default machine while it runs, and a new machine has no images or containers.
+  Measured on the owner's machine: a second machine (`podman machine init hb-<project> --volume <project>:<project> --now`) beside the default one
+  leaves the default's images and containers alone; `podman system connection default` selects the machine `podman` and `hb` use. A project
+  that is narrower than the share (a scratch project under the shared repository) is refused as well: every share must be the project or inside it.
 - Cleanup: the broker stops, its commands are killed and the socket is removed when the agent exits. If `hb` is killed with SIGKILL, the guard
   process (D66) removes the socket and ends the broker's running commands; a command that has just started in the microseconds before
   it is registered is left to finish or time out.
@@ -868,8 +873,10 @@ container can. A pin protects a name, not a file that already has a second hard 
 secrets and reaches the agent: the 20 KB cap limits volume, not content. The `launchd` jobs are the owner's: restarting one runs whatever it
 is configured to run, outside the ball. Not checked on an Intel Mac, other macOS versions or other podman versions.
 
-Measured (macOS 15.7, podman 5.7.1): the hamster ball cannot run `podman` or `launchctl`, or reach the VM's SSH port. The seven
-swap attempts (rename or remove the mounted directory, rename the directory above it, rename another directory over it, rename or
+Measured (macOS 15.7, podman 5.7.1; hb-ghd.8.4):
+`hb ctl restart` on the owner's own project-only machine restarted a container (its start time changed) with no warning at start; on the default
+machine from a project narrower than the share, `restart` was refused with the exact command and `ps` worked. The hamster ball cannot run `podman` or `launchctl`, or reach the VM's SSH port. The swap attempts (rename or
+remove the mounted directory, rename the directory above it, rename another directory over it, rename or
 remove the mounted file) are blocked and a hard link from a mounted file is blocked; each has a control without the pin that succeeds
 (`tests/mount_pins.rs`). Editing a mounted file in place, writing, renaming or deleting files inside a mounted directory, creating entries
 next to the mounts and a new directory or symlink all work. Against a real project-only machine, the swap exploit does not expose a canary
@@ -877,8 +884,8 @@ and the same exploit on a machine that shares the canary's directory does (`test
 
 ### 9.4 Stays manual
 
-`up`, `down`, `build`, `run`, `exec`, compose changes, k3d and kubectl cluster operations, anything
-touching the podman machine. The agent tells you what to run. A later, separate option is an approval
+`up`, `down`, `build`, `run`, `exec`, `rm`, `cp`, compose changes, k3d and kubectl cluster operations, anything
+touching the podman machine (including creating the project-only machine of 9.3). The agent tells you what to run. A later, separate option is an approval
 prompt in the same terminal showing the exact command and the diff against the approved compose file.
 It has not been prototyped.
 
@@ -1057,9 +1064,8 @@ would list `github.com`, `api.github.com` and `*.in.<company>.com` once in the b
 reserved ranges stay refused for listed hosts.
 
 Not supported, and what `hb` does about it (D74): an upstream proxy would resolve names itself, so `hb` could no longer pin the address or enforce the
-rebinding checks; it is not built until there is a concrete network to test it against. If every connection fails and the system
-has a proxy or PAC enabled, `hb doctor` (M5, hb-ghd.5) warns that the proxy connects directly, and a connection failure
-is reported as `unreachable` or `timed_out` with the host and port.
+rebinding checks; it is not built until there is a concrete network to test it against. A connection failure is reported as `unreachable` or
+`timed_out` with the host and port. D74 also planned a `hb doctor` warning when the system has a proxy or PAC enabled; it was not built (open item 13).
 
 ## 13. Agent presets (initial contents)
 
@@ -1119,9 +1125,12 @@ values, `ABOUTME` headers, TDD, `claims` and `pretty_assertions` in tests.
 | `approval` | Closure hash, store, grant summary, prompt |
 | `seatbelt` | Policy to SBPL text plus `-D` parameter list. Pure function, golden-file tested |
 | `proxy` | CONNECT and HTTP proxy, allowlist, address checks, logging |
-| `ctl` | Unix-socket broker and client, preflight, pinning inputs |
+| `ctl` | `hb ctl`: request protocol, fixed argv, scope, preflight (allow-list over `podman inspect`), runtime isolation check, bounded command runner, launchd status projection, handler, unix-socket broker, client, start-up service |
+| `warm` | `hb warm`: probe ball, hosts, stamps, the MCP part of `hb doctor` |
+| `explain` | `hb explain`: report, JSON and text, per-path query |
+| `conformance` | The opt-in agent harness (`HB_CONFORMANCE=1`) |
 | `guard` | Secret patterns, git-tracked detection, doctor scan |
-| `session` | Per-session directory (0700), env construction, hooks, pty, spawn, cleanup |
+| `session` | Per-session directory (0700), env construction, hooks, offline launchers, `hb ctl` wiring, guardian process, pty, spawn, cleanup |
 | `cli` | `clap` commands |
 
 Pure core, effects at the edges: `policy` is pure; `system` and the file loading and discovery in `config` hold the I/O (reading files, `realpath`, passwd); `seatbelt` is a pure function of the resolved policy.
@@ -1143,8 +1152,11 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
     the user's own config turns it on (D70).
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
     open: the data-protection keychain and a system proxy or PAC actually being followed (`configd` gates the settings; see 4.5).
-11. **Nested standalone repositories** (D46): `hb doctor` (M5) should flag them and any git-hook manager.
-12. **Output with no pty** (7.3, D67): when stdin is not a terminal but stdout or stderr is, the agent writes to the user's terminal directly. The output filter and the exit fence do not apply, and a terminal's reply to a query goes to the user's shell. Decide whether `hb` should pass such output through a filtering pipe (the agent then sees a stdout that is not a terminal) or leave it and document it.
+11. **Nested standalone repositories** (D46): `hb doctor` should flag them and any git-hook manager. Not built: `hb doctor` does not look for either.
+12. ~~**Output with no pty** (7.3)~~ Done (D67): a stdout or stderr that is a terminal goes through a pipe and the same filter when there is no pty, and the exit fence runs after the run. The agent then sees output that is not a terminal.
+13. **System proxy or PAC** (4.5, 12.1, D74): `hb` does not report that the host has a proxy or PAC configured, and does not warn that the agent can read those settings while `tls.system_trust` is on. Not built.
+14. **Container egress** (9.3): a container the owner started has unrestricted network access, which the agent can use through `hb ctl` operations that run it. Measured, not mitigated in v1 (section 17).
+15. **Secrets in `hb ctl logs`** (9.3): container logs reach the agent, capped at 20 KB, and may hold secrets. Not filtered.
 
 ## 16. Test plan
 
@@ -1207,11 +1219,11 @@ missing rule. LaunchServices is probed with `lsappinfo`, which only asks: it lis
 `sandbox-exec` is deprecated by Apple but is what Codex, Claude Code (`srt`) and Chrome use. The risk is
 accepted. All Seatbelt use is isolated in the `seatbelt` module so a replacement backend is possible.
 
-## 18. Build plan (after approval)
+## 18. Build plan
 
-Proposed milestones, each ending with passing tests:
+The milestones, each ending with passing tests (all built):
 
-1. Repo scaffold, CI config, `config` + `policy` + `floor` + `hb explain`.
+1. Repo scaffold, `config` + `policy` + `floor` + `hb explain`. (No CI config was added; the gates are run by hand: see the README's Development section.)
 2. `seatbelt` generation + `hb run` + environment + paths; integration probe matrix.
 3. `proxy` and network policy; agent presets for kiro-cli and pi.
 4. `approval`, `hb approve`, project-file write-protection.
@@ -1299,7 +1311,7 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D71 | The proxy (`src/proxy`, hb-ghd.3.1) runs on tokio (`rt`, `net`, `io-util`, `time`, `sync`, `macros`) with `httparse`, on its own thread behind `ProxyHandle`; plain HTTP is one request per connection with `Connection: close`; address-literal targets are always refused; the proxy starts for every run, even with an empty allowlist, so the agent gets a `403` with a reason rather than a refused connection | owner, hb-ghd.3 |
 | D72 | `net.allow` entries are `host` or `host:port`, one (pattern, port) rule each, default port 443; a listed host on another port is `port_not_allowed` and the reply names the entry to add | owner, hb-ghd.3.2 |
 | D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
-| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` warning when the system has a proxy or PAC | owner, hb-ghd.3 |
+| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1. The planned `hb doctor` warning for a system proxy or PAC was not built (open item 13) | owner, hb-ghd.3 |
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
 | D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |

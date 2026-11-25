@@ -8,10 +8,10 @@
 //! | code | meaning |
 //! |---|---|
 //! | 0 | success (`explain` with warnings is still 0) |
-//! | 1 | config, load, floor or run-start error, printed with its cause chain |
+//! | 1 | config, load, floor or run-start error, printed with its cause chain (`hb ctl`: a refused or failed request) |
+//! | 2 | usage error (clap's default); `hb ctl` outside a run with a `[ctl]` section |
 //! | n | `hb run`: the command's own exit code, or `128 + signal` |
-//! | 2 | usage error (clap's default) |
-//! | 78 | reserved for an unapproved config (milestone 4) |
+//! | 78 | the project's config is not approved; nothing was run |
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};

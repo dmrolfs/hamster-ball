@@ -1,11 +1,11 @@
 // ABOUTME: BuiltinPresets: the registry of presets compiled into hb, looked up by validated name.
-// ABOUTME: Mechanism only for now; the real preset contents are measured data owned by later milestones.
+// ABOUTME: The registry holds the agent presets (kiro, pi, claude, opencode); their contents are measured data under presets/agent.
 //! Presets compiled into `hb`.
 //!
 //! A built-in preset is ordinary config text, parsed and resolved like any other file, but it
 //! has no path on disk, so it is never approved, hashed or symlink-checked, and it may define
-//! user-only sections. Which presets exist is data owned by the agent-preset milestones
-//! (`hb-ghd.3.x`, `hb-ghd.6.x`); this module is the mechanism that serves them.
+//! user-only sections. The presets themselves are data under `presets/agent`;
+//! this module is the mechanism that serves them.
 
 use crate::policy::PresetName;
 

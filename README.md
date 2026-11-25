@@ -1,5 +1,5 @@
 <!-- ABOUTME: Entry point for hamster-ball: what `hb` does, how to install and use it, the config reference and troubleshooting. -->
-<!-- ABOUTME: Describes what is built today (milestones 1 to 6); the design and its decision log are in ref/Hamster-Ball-Design.md. -->
+<!-- ABOUTME: Describes what is built today (milestones 1 to 8); the design and its decision log are in ref/Hamster-Ball-Design.md. -->
 
 # hamster-ball
 
@@ -39,19 +39,22 @@ The full threat model is section 2 of [ref/Hamster-Ball-Design.md](ref/Hamster-B
 
 ## Status
 
-Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design lists eight milestones; six are built.
+Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design lists eight milestones and all eight are built.
 
-| Built and tested | Not built yet |
+| Built and tested | Not built |
 |---|---|
-| layered config, `hb explain`, `hb profile` | |
-| `hb run`: Seatbelt profile, empty environment, pty, signals | |
-| `hb ctl`: container and launchd broker, preflight, mount pinning (see [Containers and launchd jobs](#containers-and-launchd-jobs)) | |
-| HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
-| approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
+| layered config, `hb explain`, `hb profile` | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
+| `hb run`: Seatbelt profile, empty environment, pty, signals | an upstream HTTP proxy or PAC (the proxy connects directly) |
+| HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | presets for codex and omp |
+| approval of a project's config (`hb approve`) | `hb ctl` for anything but podman containers and launchd jobs |
 | secrets guard, `hb doctor` | |
 | host-side hooks, Bedrock credentials | |
 | presets for kiro-cli, pi, claude and opencode | |
-| MCP servers: `[mcp.*]` hosts and ports, offline `uvx`/`npx` launchers, `hb warm` | |
+| MCP servers: `[mcp.*]` hosts and ports, offline `uvx`/`npx` launchers, `hb warm`, MCP checks in `hb doctor` | |
+| `hb ctl`: container and launchd broker, preflight, mount pinning (see [Containers and launchd jobs](#containers-and-launchd-jobs)) | |
+
+Opt-in tests prove the parts that need real tools: agent presets (`HB_CONFORMANCE`), MCP servers (`HB_MCP`), podman (`HB_PODMAN`) and launchd
+(`HB_LAUNCHD`). See [Development](#development).
 
 ## Getting started
 
@@ -144,7 +147,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 | `hb warm [--timeout SECS] [--log-denials] [--log-proxy] [NAME...]` | Fills hb's offline cache: starts each declared `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable, and waits for it to answer an MCP `initialize`. The only command that reaches a registry. Needs an approved config; refuses inside a ball. |
 | `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, secret-looking launchd variable names, and the `uvx`/`npx` MCP servers that cannot start offline (never warmed, a moving version tag, an unpinned git source, a launcher missing from `[env] tools`). Prints names and the one flagged argument, never contents. Always exits 0. |
 | `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
-| `hb ctl ps\|logs\|stats\|start\|stop\|restart [NAME]`, `hb ctl launchd status\|kickstart\|restart LABEL` | Only inside the ball: see and restart the containers and launchd jobs the config lists. See [Containers and launchd jobs](#containers-and-launchd-jobs). |
+| `hb ctl ps\|logs\|stats\|start\|stop\|restart [NAME]`, `hb ctl launchd status\|kickstart\|restart LABEL` | Only inside the ball (anywhere else it exits 2 and says no `[ctl]` is set up): see and restart the containers and launchd jobs the config lists. See [Containers and launchd jobs](#containers-and-launchd-jobs). |
 
 ### How a run is built
 
@@ -154,9 +157,10 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 4. It starts a proxy on `127.0.0.1` with a random port and a per-run credential, and creates a private session directory
    (this run's `TMPDIR`).
 5. With a declared `[mcp.*]` that has a `command`, it also writes offline `uvx` and `npx` launchers first on `PATH` (see `hb explain`), and warns before starting about each such server that `hb warm` has not warmed.
-6. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
+6. With a `[ctl]` section, it checks each listed container, starts the `hb ctl` broker on a private socket in the session directory, writes an `hb` wrapper first on `PATH`, sets `HB_CTL_SOCKET`, and pins the containers' mount sources in the profile (see [Containers and launchd jobs](#containers-and-launchd-jobs)). A container that fails the checks is named in a warning.
+7. It starts the command under a generated deny-by-default Seatbelt profile, with an empty environment plus the variables
    it sets itself and the ones you list, on a pty of its own when stdin is a terminal.
-7. When the command ends it stops the proxy, removes the session directory (hook files included) and exits with the command's status.
+8. When the command ends it stops the broker and the proxy, removes the session directory (hook files and the socket included) and exits with the command's status.
 
 Paths are canonicalized with `realpath` before they reach the profile, because Seatbelt matches resolved paths. A grant whose
 path does not exist is skipped, and `hb explain` and `hb run` say so: create the directory first.
@@ -198,7 +202,7 @@ deny_write = ["~/.pi/agent/bin"]         # reads stay as granted
 [net]
 allow          = ["crates.io", "*.example.com", "git.example.com:8443"]   # host, *.suffix, optional :port (default 443)
 internal_hosts = ["github.com"]          # your own files only: may resolve to private addresses
-loopback_ports = [5432, 9001]            # services you started yourself; reached directly, not through the proxy
+loopback_ports = [5432, 9001]            # services you started yourself; reached directly, not through the proxy; `hb run` warns if one is not listening
 
 [env]
 pass  = ["LANG", "COLORTERM"]            # copied from your shell
@@ -317,12 +321,27 @@ joined namespace, added capability, device, or `volumes_from`; every bind mount 
 write) cannot be renamed, deleted or linked by the agent, so it cannot swap a mount for a link and then ask for a restart. The files
 inside stay writable. A single file that is itself a mount cannot be saved by "write a temp file and rename": edit it in place.
 
+Which containers to list: the ones the agent should be able to look at and restart. Name them exactly as `podman ps -a` does (`lgw-ledger-pg`),
+or give the compose label every one of them carries (`hb ctl ps` shows what the label matched). The label must be the same wherever it is
+set, so a project cannot widen the scope your base gave. A container name that does not exist is simply never found.
+
 **`start` and `restart` need a podman machine that shares only the project.** A process inside a container is not confined by the
 sandbox: one that runs project code (which the agent can edit) can swap its own mount for a link to any directory the machine
 shares (measured). If the machine shares more (the default is `/Users`, `/private` and `/var/folders`), `hb` says so at start and
-refuses `start` and `restart`; `ps`, `logs`, `stats` and `stop` still work. To fix it, recreate the machine yourself (this removes
-its images, containers and volumes; `hb` never does it): `podman machine init --volume <project>:<project> --now`.
-Only one podman machine runs at a time.
+refuses `start` and `restart`; `ps`, `logs`, `stats` and `stop` still work. `hb` never changes the machine. To get one that shares only the project,
+create a second machine beside your existing one (measured, this keeps the old machine's images and containers):
+
+```sh
+podman machine stop                                   # only one machine runs at a time
+podman machine init hb-myproj --cpus 6 --memory 8192 \
+  --volume /path/to/project:/path/to/project --now    # the same path on both sides; no other --volume
+podman system connection default hb-myproj            # `podman` and `hb` use the machine this points at
+```
+
+The new machine starts empty (pull or build what the project needs), and it serves only that project. To go back:
+`podman machine stop hb-myproj; podman machine start podman-machine-default; podman system connection default podman-machine-default`.
+Every share must be the project root or inside it. A project that sits inside a wider share (for example a scratch project under the shared repo) is refused.
+A machine's name is its first argument; without one, `init` fails while `podman-machine-default` exists. `podman machine rm` deletes a machine's images, containers and volumes.
 
 Not covered: a container you start keeps unrestricted network access; its image and command are trusted; `logs` can show secrets.
 Design: section 9.3 and D87 to D89 in [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md).
@@ -502,7 +521,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | A file is unreadable inside the ball: `.env`, `*.pem`, `*secret*.yaml` | The secrets guard, by design. Use a template (`.env.example`), pass the value with `[env] pass`, or list an exception in your base. |
 | `git push -u`, `git remote add` or `git commit` hooks fail | `.git/config` and `.git/hooks` are write-denied so the agent cannot plant code that git runs outside the ball. Do these outside, and push from your own shell. `git` over HTTPS needs an `allow` entry and has no credentials inside. |
 | `podman` or `docker` does nothing, or `launchctl`, `open`, `pbcopy` fail | By design. Use `hb ctl` for the containers and jobs you list ([Containers and launchd jobs](#containers-and-launchd-jobs)); `launchctl` is a base-only switch. |
-| `hb ctl restart` says the podman VM shares a directory outside the project | By design (see above). Recreate the machine with only the project shared, or use `hb ctl stop` and start the container yourself. |
+| `hb ctl restart` says the podman VM shares a directory outside the project | By design (see above). Use a podman machine that shares only the project (see [Containers and launchd jobs](#containers-and-launchd-jobs)), or use `hb ctl stop` and start the container yourself. |
 | `hb ctl` says a container is "not pinned when hb started" or "did not pass the checks" | Its mounts or settings are new or unsafe. Fix the container (or its compose file) and start a new `hb run`. |
 | An environment variable is missing in the agent | The environment starts empty. Add the name to `[env] pass`, or set a value with `[env] set`. |
 | `[env] pass` or `set` rejected | The name is reserved (`HOME`, `PATH`, `TMPDIR`, `TERM`, `HB_*`, `DYLD_*`, `LD_*`, proxy and TLS names). |
@@ -514,7 +533,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | `warning: mcp server X has not been warmed (or its command changed): run hb warm` | `hb run` starts `uvx` and `npx` servers from hb's own cache with `--offline`, and that cache is empty or was filled for other arguments. Run `hb warm` outside the ball. |
 | An MCP server started with `npx` or `uvx` says the package is not available offline | The cache lacks it. Run `hb warm` (it warms exactly the command and arguments in `[mcp.<name>]`, so keep them equal to what the agent runs). A git source needs a pinned revision (`git+https://host/repo@<sha>`): an unpinned one cannot start offline even from a warm cache. |
 | `warning: git inside the ball will fail with `unable to access`` | `~/.gitconfig` or `~/.config/git/config` exists and the ball cannot read it, and git treats that as fatal. Add the path to `[fs] read` in your base (`hb init` writes the ones that exist). |
-| opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Declare each remote one with `[mcp.<name>] net = ["mcp.example.com"]` in your base. `npx` and `uvx` ones are not on the ball's `PATH` unless you list them in `[env] tools`; offline start from a warm cache is milestone 7 (`hb warm` is not built yet). |
+| opencode asks for MCP hosts (`mcp.example.com`) or fails to start `npx` servers | MCP servers in your own opencode config are not part of the preset. Declare each remote one with `[mcp.<name>] net = ["mcp.example.com"]` in your base. A local one that runs `npx` or `uvx` needs the launcher in `[env] tools` and a warm cache: see [MCP servers](#mcp-servers). |
 | `hb explain` warns that the approval store location is ignored | `XDG_STATE_HOME` is set; `hb` ignores it on purpose. |
 | Grants differ from what you wrote | `hb explain` lists skipped grants (missing path) and floor overrides. |
 
@@ -526,7 +545,7 @@ Do not paste `[env] set` values or hook arguments into one; `hb explain` hides t
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features                       # about 1600 tests; the sandbox ones skip when sandbox-exec is nested
+cargo test --all-features                       # about 1800 tests; the sandbox ones skip when sandbox-exec is nested
 HB_REQUIRE_SANDBOX=1 cargo test --all-features  # fail instead of skipping when the sandbox is not usable
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
 ```

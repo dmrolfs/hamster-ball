@@ -3,10 +3,9 @@
 //! Inputs to [`render`](super::render) beyond the merged policy.
 //!
 //! The policy says what the user allowed; these say what this particular run adds: where the
-//! proxy listens (M3), the session directory and pty (M2.3, M2.4), a tag for denial logs
-//! (M2.3b), files the secrets guard re-allows (M5) and the `hb ctl` socket (M8). Each slot is
-//! optional and emits nothing when empty, so `hb profile` can print a profile before any of
-//! those milestones exist.
+//! proxy listens, the session directory and pty, a tag for denial logs, files the secrets
+//! guard re-allows, the `hb ctl` socket and the mount sources `hb ctl` pins. Each slot is
+//! optional and emits nothing when empty, so `hb profile` can print a profile with no run behind it.
 
 use super::emit::LogTag;
 use crate::guard::GuardInputs;
@@ -47,13 +46,13 @@ pub struct RenderInputs {
     pub tty: Option<CanonicalPath>,
     /// Tags every denial so `--log-denials` can find it.
     pub log_tag: Option<LogTag>,
-    /// Files re-allowed after the guard denies and before the floor (milestone 5).
+    /// Files re-allowed after the guard denies and before the floor.
     pub guard_allow: Vec<CanonicalPath>,
-    /// The secrets guard's pins and dependency exemption (milestone 5).
+    /// The secrets guard's pins and dependency exemption.
     pub guard: GuardInputs,
-    /// The `hb ctl` broker socket (milestone 8).
+    /// The `hb ctl` broker socket.
     pub ctl_socket: Option<CanonicalPath>,
-    /// Bind-mount sources of the containers `hb ctl` may restart, from preflight (milestone 8).
+    /// Bind-mount sources of the containers `hb ctl` may restart, from preflight.
     ///
     /// Each gets an unlink and a link deny, and so does every ancestor a write grant reaches.
     pub mount_pins: Vec<CanonicalPath>,

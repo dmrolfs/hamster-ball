@@ -117,3 +117,25 @@ HB_CONFORMANCE=1 HB_CONFORMANCE_PROJECT=project.toml HB_CONFORMANCE_BASE=base.to
 
 Some criteria need a variable the agent cannot get without a provider (opencode's made-up key). The harness sets those itself in
 `Agent::env`; they reach only the sandboxed run.
+
+## Proving `hb ctl` against real podman and launchd
+
+Two opt-in suites run the broker, preflight and pins against the real tools. Neither needs an agent or a network beyond pulling `alpine`.
+
+```sh
+HB_PODMAN=1 cargo test --test podman_e2e -- --nocapture --test-threads=1
+HB_LAUNCHD=1 cargo test --test launchd_e2e -- --nocapture
+```
+
+`podman_e2e` needs a running podman machine and the `docker.io/library/alpine` image. It starts two labelled containers and one named one, then checks
+`ps`, `logs`, `stats` and `stop`, that an unlabelled container and `run`, `exec` and `cp` are refused, that the VM's SSH port is open outside the ball and
+closed inside it, and that `restart` is refused when the machine shares more than the project. Every container it makes is named `hb-m8-<pid>-...` and is
+removed at the end, also after a failure.
+
+| Variable | Meaning |
+|---|---|
+| `HB_PODMAN=1` | turn the suite on |
+| `HB_PODMAN_DIR=<dir>` | the directory the active podman machine shares and nothing else (made with `podman machine init --volume <dir>:<dir>`); runs the test where the agent swaps a mount source for a link and `restart` must not expose a canary. Without it that test skips |
+
+`launchd_e2e` loads one throwaway job into your own launchd, checks `hb ctl launchd status` and `restart`, that the job's environment never appears and that `launchctl`
+itself is denied, then removes the job.

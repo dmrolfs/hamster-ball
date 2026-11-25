@@ -1,5 +1,5 @@
 // ABOUTME: ConfigText: a bounded, single-read, symlink-aware open of one config file, keeping the exact bytes.
-// ABOUTME: The only place a config file is read; a later milestone hashes ConfigText::bytes(), so no second read may differ.
+// ABOUTME: The only place a config file is read; approval hashes ConfigText::bytes(), so no second read may differ.
 //! Reads one config file exactly once, with the checks an untrusted file needs before anything
 //! parses it: no following a symlink unless explicitly allowed, no blocking on a FIFO, a size
 //! cap enforced before the file is read, and UTF-8 validation.
@@ -181,7 +181,7 @@ pub enum ConfigTextError {
 
 /// The exact bytes of one config file, read once.
 ///
-/// `bytes()` is what a later milestone hashes for approval, and [`ConfigText::as_str`] is the
+/// `bytes()` is what approval hashes, and [`ConfigText::as_str`] is the
 /// same buffer viewed as text, so there is nothing else to re-read later that could disagree
 /// with what was approved.
 #[derive(Debug, Clone, PartialEq, Eq)]

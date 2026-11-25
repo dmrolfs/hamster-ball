@@ -252,7 +252,7 @@ fn escaped_parse_message(message: &str) -> EscapedBounded<'_> {
 /// The validated view of one config file; the only type this module exposes besides the error
 /// and diagnostic types above. Every `raw` type stays `pub(crate)`.
 ///
-/// `#[non_exhaustive]`: later milestones add fields. Only this crate builds one.
+/// `#[non_exhaustive]`: fields get added as settings do. Only this crate builds one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedConfig {

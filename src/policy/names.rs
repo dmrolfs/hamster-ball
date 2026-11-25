@@ -1,5 +1,5 @@
-// ABOUTME: ExtendRef and GuardException: validated text for config values whose meaning later milestones define.
-// ABOUTME: Only form is checked here (non-empty, no control characters, bounded); matching and loading come later.
+// ABOUTME: ExtendRef and GuardException: validated text for the `extends` and `[guard] exceptions` entries.
+// ABOUTME: Only form is checked here (non-empty, no control characters, bounded); config::extends and guard give them meaning.
 //! Reference-like text values from the config file.
 
 use std::fmt;
@@ -102,7 +102,7 @@ ref_text_type!(
     /// One entry of a file's top-level `extends`: a preset name or a path.
     ///
     /// Only the form is checked here; deciding whether it names a built-in preset, a user
-    /// preset or a file, and loading it, belongs to the merge milestone.
+    /// preset or a file, and loading it, is done by `config::extends`.
     ExtendRef
 );
 

@@ -9,7 +9,7 @@
 //! was declared (a [`Sourced`]), so `hb explain` can show them and the approval summary can
 //! tell a genuine addition from a restatement of the base.
 //!
-//! Whether a path is finally denied is decided by Seatbelt rule order (M2.1); the advisory
+//! Whether a path is finally denied is decided by Seatbelt rule order (`seatbelt::plan`); the advisory
 //! query for tests and `explain` is [`Policy::decide`].
 
 use std::collections::{BTreeMap, BTreeSet};
