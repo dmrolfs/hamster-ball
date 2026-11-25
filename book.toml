@@ -1,0 +1,16 @@
+[book]
+title = "The hamster-ball guide"
+description = "Run AI coding agents in a macOS Seatbelt sandbox: concepts, use, configuration and reference."
+authors = ["dmrolfs"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/dmrolfs/hamster-ball"
+edit-url-template = "https://github.com/dmrolfs/hamster-ball/edit/main/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"

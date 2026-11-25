@@ -256,7 +256,7 @@ Keep that in mind if you widen a write grant over an install directory.
 
 To write your own, create `~/.config/hamster-ball/presets/<name>.toml` and use `extends = ["<name>"]`.
 A team preset with `[fs] write = ["."]` and the hosts your toolchain needs saves repeating them.
-How to measure and check a preset is in [presets/README.md](../presets/README.md).
+How to measure and check a preset is in [presets/README.md](https://github.com/dmrolfs/hamster-ball/blob/main/presets/README.md).
 
 ## Approval
 

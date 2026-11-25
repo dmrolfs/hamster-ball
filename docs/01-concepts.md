@@ -93,7 +93,7 @@ Inside the ball the agent cannot do these things.
 - Secrets with unusual names. The guard matches common names. `hb doctor` lists look-alikes, and you can add patterns.
 - Other operating systems.
 
-The full threat model is section 2 of the [design](../ref/Hamster-Ball-Design.md).
+The full threat model is section 2 of the [design](https://github.com/dmrolfs/hamster-ball/blob/main/ref/Hamster-Ball-Design.md).
 
 ## Glossary
 

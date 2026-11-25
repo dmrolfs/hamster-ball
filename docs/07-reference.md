@@ -100,7 +100,7 @@ A key that `hb` does not know is an error that names the file and the key.
 
 Deny wins over every allow.
 `hb explain` prints the 130-odd rules that apply to your machine and reports a grant the floor overrides (`grant_shadowed_by_floor`).
-The full list is section 6 of the [design](../ref/Hamster-Ball-Design.md).
+The full list is section 6 of the [design](https://github.com/dmrolfs/hamster-ball/blob/main/ref/Hamster-Ball-Design.md).
 
 ## Host services
 
@@ -235,8 +235,8 @@ Opt-in suites use real tools:
 | `HB_PODMAN_DIR=<dir>` | The container swap test | A machine created with `--volume <dir>:<dir>` and no other share. |
 | `HB_LAUNCHD=1` | `hb ctl launchd` against real launchd | Loads and unloads one throwaway job. |
 
-Commands and details are in [presets/README.md](../presets/README.md).
+Commands and details are in [presets/README.md](https://github.com/dmrolfs/hamster-ball/blob/main/presets/README.md).
 The code is a library (`hamster_ball`) and a thin binary (`hb`).
 Lints are strict: no `unsafe`, no `unwrap` or `expect` outside tests, errors use `snafu`, and every file starts with two `ABOUTME:` lines.
 
-Back to the [index](README.md).
+The first page of the guide is the introduction, which lists every chapter.

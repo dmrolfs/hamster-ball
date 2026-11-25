@@ -134,7 +134,7 @@ What differs is what each agent needs, and that is what its preset provides.
 | opencode | `agent/opencode` | `hb run -- "$(command -v opencode)"` | Hosts for any MCP servers you use. |
 | Any other command | none | `hb run -- <command>` | Whatever it reads, writes and contacts. |
 
-Each preset file in [`presets/agent/`](../presets/agent) opens with a note on what was measured, what is denied and harmless, and what is not proven.
+Each preset file in [`presets/agent/`](https://github.com/dmrolfs/hamster-ball/tree/main/presets/agent) opens with a note on what was measured, what is denied and harmless, and what is not proven.
 
 ### pi
 

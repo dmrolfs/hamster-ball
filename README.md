@@ -18,7 +18,7 @@ it cannot read your credentials, your browser profiles or the secret files in th
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
-For a longer explanation of the ideas, the parts and worked examples, see the [guide](docs/README.md).
+For a longer explanation of the ideas, the parts and worked examples, see the [guide](docs/README.md), also published as a book at https://dmrolfs.github.io/hamster-ball/ once GitHub Pages is switched on (see Development).
 
 ## What it protects, and what it does not
 
@@ -567,4 +567,5 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
   `HB_CONFORMANCE=1 cargo test --features test-support --test conformance -- --nocapture <agent>`. See [presets/README.md](presets/README.md).
 - [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md) is the design: threat model, config schema, the floor, enforcement,
   proxy, presets, test plan and the numbered decision log (D1 to D90). Each "Measured" statement in it comes from a run on a real machine.
+- The guide in `docs/` is an [mdBook](https://rust-lang.github.io/mdBook/). Build and read it locally with `cargo install mdbook` then `mdbook serve --open`. `.github/workflows/book.yml` builds it on every change under `docs/` and publishes it to GitHub Pages from `main`. One-time setup: in the repository, Settings, Pages, Source: GitHub Actions.
 - Work is tracked with beads (`bd`), epic `hb-ghd`; working notes live in `history/` and are not committed.

@@ -35,9 +35,9 @@ It is written for someone who has not seen the tool before.
 
 ## Other documents
 
-- [README](../README.md): the short version, with the same material in one page.
-- [Design](../ref/Hamster-Ball-Design.md): the full design, every measurement and the numbered decision log (D1 to D90).
-- [Presets](../presets/README.md): how to write an agent preset and check it against the real agent.
+- [README](https://github.com/dmrolfs/hamster-ball/blob/main/README.md): the short version, with the same material in one page.
+- [Design](https://github.com/dmrolfs/hamster-ball/blob/main/ref/Hamster-Ball-Design.md): the full design, every measurement and the numbered decision log (D1 to D90).
+- [Presets](https://github.com/dmrolfs/hamster-ball/blob/main/presets/README.md): how to write an agent preset and check it against the real agent.
 
 ## Terms
 
