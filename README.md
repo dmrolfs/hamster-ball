@@ -29,6 +29,7 @@ it cannot read your credentials, your browser profiles or the secret files in th
 | read `.env.example` and other templates | read `.env`, `*.pem`, `*.key`, `*secret*.yaml` and the like, in any directory it may write |
 | run the programs on a fixed, short `PATH` | change your shell startup files, `~/.gitconfig`, programs on your `PATH`, git hooks, or `hamster-ball.toml` itself |
 | see only the environment variables you pass | run `podman` or `docker`, `launchctl`, `open`, `sudo`, or type into your terminal |
+| use `hb ctl` to see and restart the containers and launchd jobs you list | start, run or exec any other container, or change any other job |
 
 The floor (what is always denied) is compiled into `hb`. No config file can remove an item from it.
 
@@ -43,7 +44,8 @@ Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design li
 | Built and tested | Not built yet |
 |---|---|
 | layered config, `hb explain`, `hb profile` | |
-| `hb run`: Seatbelt profile, empty environment, pty, signals | `hb ctl` for project containers (milestone 8); `[ctl]` is parsed only |
+| `hb run`: Seatbelt profile, empty environment, pty, signals | |
+| `hb ctl`: container and launchd broker, preflight, mount pinning (see [Containers and launchd jobs](#containers-and-launchd-jobs)) | |
 | HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
 | approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
 | secrets guard, `hb doctor` | |
@@ -142,6 +144,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 | `hb warm [--timeout SECS] [--log-denials] [--log-proxy] [NAME...]` | Fills hb's offline cache: starts each declared `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable, and waits for it to answer an MCP `initialize`. The only command that reaches a registry. Needs an approved config; refuses inside a ball. |
 | `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, secret-looking launchd variable names, and the `uvx`/`npx` MCP servers that cannot start offline (never warmed, a moving version tag, an unpinned git source, a launcher missing from `[env] tools`). Prints names and the one flagged argument, never contents. Always exits 0. |
 | `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
+| `hb ctl ps\|logs\|stats\|start\|stop\|restart [NAME]`, `hb ctl launchd status\|kickstart\|restart LABEL` | Only inside the ball: see and restart the containers and launchd jobs the config lists. See [Containers and launchd jobs](#containers-and-launchd-jobs). |
 
 ### How a run is built
 
@@ -175,7 +178,7 @@ Merge rules:
 - Maps (`env.set`) merge by key. The same key with two different values is an error that names both files.
 - Switches never loosen: `tls.system_trust`, `terminal.clipboard_write` and `system.launchctl` are `false` if any file says so.
 - Settings that run code on your machine or switch protections off are accepted only from files that are physically yours (the
-  base, your presets): `hooks`, `guard.exceptions`, `net.internal_hosts`, and `system.launchctl = true`. A project file that has
+  base, your presets): `hooks`, `guard.exceptions`, `net.internal_hosts`, `ctl.launchd`, and `system.launchctl = true`. A project file that has
   one is an error naming the file.
 - Relative paths mean the project root in every layer, so `write = ["."]` in a preset means the project. `~` and `~/...` are
   the only home forms; there is no `$VAR` expansion. Patterns in `deny_read` and `deny_write` may use `*`, `?` and `**`.
@@ -211,6 +214,11 @@ clipboard_write = true                   # false removes the agent's OSC 52 clip
 
 [system]
 launchctl = false                        # true (your own files only) lets the agent run launchctl; see the warning in the design, 4.6
+
+[ctl]
+label      = "com.docker.compose.project=icehouse"   # containers with this label, for `hb ctl`; must be the same in every file
+containers = ["lgw-ledger-pg"]                       # or by exact name
+launchd    = ["com.example.postgres"]                # your own files only: jobs `hb ctl launchd` may start and restart
 
 [guard]
 exceptions = ["~/work/myproj/.env.local"]   # base and your presets only; absolute or ~/ patterns
@@ -284,6 +292,40 @@ MCP server has no command; give it `[mcp.context7] net = ["mcp.context7.com"]`. 
 `hb explain` shows the launchers, the cache and whether each server is warmed. Measured on the servers above (time, fetch, reddit, ripgrep, browsermap,
 sequential-thinking and a pinned serena): each answers an MCP `initialize` in the ball in 1 to 2 seconds with no proxy connection (`mcp_offline`, see Development).
 Serena needs a full-revision pin, several `bind_ports`, and `~/.serena` writable, and asks for `pypi.org` and `oraios-software.de` while running (refused, harmless).
+
+### Containers and launchd jobs
+
+The agent cannot run `podman` (the podman machine shares your home with every container, so a container can read `~/.ssh`) or
+`launchctl`. `hb ctl` is the one way in. A broker inside `hb run` listens on a private socket in the run's directory and runs a short
+list of fixed commands for what you list:
+
+```toml
+[ctl]
+label      = "com.docker.compose.project=icehouse"   # every container with this label
+containers = ["lgw-ledger-pg"]                       # and these, by name
+launchd    = ["com.example.postgres"]                # launchd jobs; only your own files may list them
+```
+
+Inside the ball: `hb ctl ps`, `hb ctl logs NAME --tail 100`, `hb ctl stats NAME`, `hb ctl start|stop|restart NAME`, and
+`hb ctl launchd status|kickstart|restart LABEL`. There is no `run`, `exec`, `build`, `rm` or `cp`. `launchd status` shows the state,
+process number, run count and last exit code, never the job's environment. Output is capped at 20 KB.
+
+What `hb` checks before it lets the agent touch a container: it must be in the list; it must not be privileged or use a host or
+joined namespace, added capability, device, or `volumes_from`; every bind mount must be a real file or directory inside the project
+(no symlink in the path); a volume must be a plain local one. A container that fails is named in a warning when `hb run` starts, and
+`hb ctl` will not start or restart it in that run. The mounted directories (and the directories above them, as far as the agent can
+write) cannot be renamed, deleted or linked by the agent, so it cannot swap a mount for a link and then ask for a restart. The files
+inside stay writable. A single file that is itself a mount cannot be saved by "write a temp file and rename": edit it in place.
+
+**`start` and `restart` need a podman machine that shares only the project.** A process inside a container is not confined by the
+sandbox: one that runs project code (which the agent can edit) can swap its own mount for a link to any directory the machine
+shares (measured). If the machine shares more (the default is `/Users`, `/private` and `/var/folders`), `hb` says so at start and
+refuses `start` and `restart`; `ps`, `logs`, `stats` and `stop` still work. To fix it, recreate the machine yourself (this removes
+its images, containers and volumes; `hb` never does it): `podman machine init --volume <project>:<project> --now`.
+Only one podman machine runs at a time.
+
+Not covered: a container you start keeps unrestricted network access; its image and command are trusted; `logs` can show secrets.
+Design: section 9.3 and D87 to D89 in [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md).
 
 ### Network access
 
@@ -459,7 +501,9 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | `hb cannot run inside another sandbox, because sandbox-exec cannot nest` (exit 1) | macOS cannot nest sandboxes. Run `hb` from a shell that is not inside another agent's sandbox (including another `hb`). |
 | A file is unreadable inside the ball: `.env`, `*.pem`, `*secret*.yaml` | The secrets guard, by design. Use a template (`.env.example`), pass the value with `[env] pass`, or list an exception in your base. |
 | `git push -u`, `git remote add` or `git commit` hooks fail | `.git/config` and `.git/hooks` are write-denied so the agent cannot plant code that git runs outside the ball. Do these outside, and push from your own shell. `git` over HTTPS needs an `allow` entry and has no credentials inside. |
-| `podman` or `docker` does nothing, or `launchctl`, `open`, `pbcopy` fail | By design. Container control is planned (`hb ctl`); `launchctl` is a base-only switch. |
+| `podman` or `docker` does nothing, or `launchctl`, `open`, `pbcopy` fail | By design. Use `hb ctl` for the containers and jobs you list ([Containers and launchd jobs](#containers-and-launchd-jobs)); `launchctl` is a base-only switch. |
+| `hb ctl restart` says the podman VM shares a directory outside the project | By design (see above). Recreate the machine with only the project shared, or use `hb ctl stop` and start the container yourself. |
+| `hb ctl` says a container is "not pinned when hb started" or "did not pass the checks" | Its mounts or settings are new or unsafe. Fix the container (or its compose file) and start a new `hb run`. |
 | An environment variable is missing in the agent | The environment starts empty. Add the name to `[env] pass`, or set a value with `[env] set`. |
 | `[env] pass` or `set` rejected | The name is reserved (`HOME`, `PATH`, `TMPDIR`, `TERM`, `HB_*`, `DYLD_*`, `LD_*`, proxy and TLS names). |
 | `hooks` or `guard`, `net.internal_hosts` rejected in a project | Those sections are accepted only from your base and your presets. Move them there. |
@@ -490,11 +534,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
 - The offline MCP servers are proved against the real tools by an opt-in test that uses your home, your `uvx`, `npx` and `node`, hb's real cache and the network:
   `HB_MCP=1 cargo test --features test-support --test mcp_offline -- --nocapture` (variables in [presets/README.md](presets/README.md)). The first run downloads
   about 500 MB into `~/.cache/hamster-ball`; later runs take under a minute.
+- `hb ctl` is proved against real podman and launchd by opt-in tests: `HB_PODMAN=1 cargo test --test podman_e2e -- --nocapture` (needs a running podman machine and
+  the `alpine` image; add `HB_PODMAN_DIR=<dir>` for a machine created with `--volume <dir>:<dir>` to run the isolated test) and
+  `HB_LAUNCHD=1 cargo test --test launchd_e2e -- --nocapture` (loads and unloads one throwaway job).
 - The code is a library (`hamster_ball`) and a thin binary (`hb`). `hb-testdrive` is a test-only copy of `hb` that takes its
   environment from variables (feature `test-support`).
 - Linting is strict: no `unsafe`, no `unwrap` or `expect` outside tests. Errors use `snafu`. Every file starts with two `ABOUTME:` lines.
 - Agent presets are proved against the real agent by an opt-in harness that spends real requests:
   `HB_CONFORMANCE=1 cargo test --features test-support --test conformance -- --nocapture <agent>`. See [presets/README.md](presets/README.md).
 - [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md) is the design: threat model, config schema, the floor, enforcement,
-  proxy, presets, test plan and the numbered decision log (D1 to D81). Each "Measured" statement in it comes from a run on a real machine.
+  proxy, presets, test plan and the numbered decision log (D1 to D89). Each "Measured" statement in it comes from a run on a real machine.
 - Work is tracked with beads (`bd`), epic `hb-ghd`; working notes live in `history/` and are not committed.

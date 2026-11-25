@@ -200,6 +200,7 @@ launchctl = false                               # default off; only your own fil
 [ctl]                                           # section 9
 label      = "com.docker.compose.project=icehouse"
 containers = []
+launchd    = []                                 # launchd job labels `hb ctl launchd` may start and restart; your own files only
 
 [mcp.serena]                                    # section 10
 command = "uvx"
@@ -326,7 +327,8 @@ Everything else in the profile (paths, hosts, ports) is the grant model of 4.2 t
 | Network | none | any file adds hosts and loopback ports; MCP `bind_ports` | the proxy port and the listed loopback ports | `network-outbound` and `network-bind` rules (7.1 step 5) | `seatbelt_render` network tests |
 | System trust store (`tls.system_trust`) | on in the base | any file may turn it off | TLS verification against the system roots. Also lets `configd` answer, which shows the host's proxy and PAC settings | Mach lookups and the keychain read (4.5) | `seatbelt_tls`, `tls_handshake` |
 | Clipboard writes (`terminal.clipboard_write`) | on | any file may turn it off | OSC 52 writes reach your clipboard | the output filter (7.3) | `pty` |
-| Container control (`ctl`) | none | any file lists containers | `hb ctl` on a labelled or named container (9.3) | the broker | M8 |
+| Container control (`ctl`) | none | any file lists containers | `hb ctl` on a labelled or named container (9.3) | the broker, preflight, pins | `ctl_broker`, `mount_pins`, `podman_e2e` |
+| **launchd jobs (`ctl.launchd`)** | **none** | **only your own files, in any form** | `hb ctl launchd status`, `kickstart` and `restart` for each listed job label (9.3) | the broker; `/bin/launchctl` stays denied | `ctl_broker`, `launchd_e2e` |
 | **Internal addresses (`net.internal_hosts`)** | **none** | **only your own files, in any form** | the listed hosts may resolve to private, unique-local and tunnel addresses (12.1) | proxy address classes (12) | `proxy_hardening` |
 | **`launchctl` (`system.launchctl`)** | **off** | **only your own files may say `true`; any file may say `false`** | run `/bin/launchctl`: see below | `(deny process-exec (literal "/bin/launchctl"))` | `probe_matrix` |
 
@@ -340,8 +342,8 @@ program unless you turn it on. A copy of `launchctl` in the project does not hel
 copy re-signed ad hoc, and thinned x86_64 and arm64e copies were tried), because macOS kills a platform-signed binary that is not on
 the system volume. **Not tested:** an Intel Mac, other macOS versions, and a program that speaks launchd's private XPC protocol
 itself (that is work against macOS, which section 2 puts out of scope). With it on, treat every LaunchAgent you have as something
-the agent can start. `brew services` and a job that needs `bootstrap` do not work either way. A scoped form (`kickstart` for listed
-labels through `hb ctl`) belongs to M8. `hb doctor` (M5) should warn when `launchctl print gui/<uid>` shows a secret-looking name in
+the agent can start. `brew services` and a job that needs `bootstrap` do not work either way. The scoped form is `[ctl] launchd` with
+`hb ctl launchd` (9.3, D87): it needs `system.launchctl` to stay off. `hb doctor` (M5) should warn when `launchctl print gui/<uid>` shows a secret-looking name in
 the launchd environment, because the agent could read it if `launchctl` is on.
 
 Never available, with no switch (measured, `probe_matrix`): LaunchServices (`open -a` starts nothing, `lsappinfo` lists no
@@ -817,24 +819,61 @@ Known ports (read from the projects, not by running them):
 
 ### 9.3 Tier 2: `hb ctl`
 
-A broker inside `hb` listens on one unix socket in the per-session directory. The profile allows the
-hamster ball to connect to that socket and nothing else podman-related.
+A broker inside `hb run` listens on one unix socket, `<session dir>/ctl.sock` (mode 0600), and the profile allows the hamster ball to
+connect to that socket and no other. `hb ctl` is a program inside the ball: `hb` writes `<session>/bin/hb`, a two-line script that runs
+the real `hb`, first on `PATH`, and sets `HB_CTL_SOCKET`. The client reads no config; the broker decides everything from the approved
+config, on the host.
 
-- Operations: `ps`, `logs`, `stats`, `start`, `stop`, `restart`. No `run`, `exec`, `build`, `rm`, `cp`, `compose`, `kube play`.
-- Scope: containers matching the project's compose-project label or an explicit name list
-  (`lgw-ledger-pg` has no label, so it is listed by name).
-- Fixed argument vectors. Container names must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`.
-- **Preflight** at `hb` start and before each operation: every mount source is a real file or
-  directory inside the project (not a symlink), and the container is not privileged and uses no host
-  namespace or device. **Unverified** (not prototyped).
-- **Pinning**: the profile denies unlink, rename and link on each mount source and its ancestors up to the
-  project root. Contents stay writable.
+- Container operations: `ps`, `logs` (tail capped at 2000), `stats`, `start`, `stop`, `restart`. No `run`, `exec`, `build`, `rm`, `cp`,
+  `compose`, `kube play`. The request is one JSON line of at most 4 KiB with a closed set of fields; unknown fields and operations are refused.
+- launchd operations (D87): `hb ctl launchd status|kickstart|restart LABEL`, only for labels in `[ctl] launchd` (your own files only, like
+  hooks). They run `launchctl print|kickstart|kickstart -k gui/<broker uid>/<label>`; `/bin/launchctl` stays denied to the agent. `status` shows
+  state, pid, run count and last exit code and nothing else: `launchctl print` lists the job's environment variables, which can hold
+  secrets, so the broker keeps four fields from the job's own block and never returns the text.
+- Scope: containers matching the project's compose-project label or an explicit name list (`lgw-ledger-pg` has no label, so it is listed by
+  name). The inspected name must equal the requested one (podman resolves an ID prefix).
+- Fixed argument vectors, a name after `--`, and every command that acts on a container uses its full inspected ID, never the name again.
+  Names match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`.
+- Limits: four connections at once, five seconds to send the request, 30 s (reads) or 60 s (changes) per request, 20 KB of output (the end
+  of it, stdout and stderr together). A timeout reports that the outcome is unknown. One change per container or job at a time; a second is
+  refused as busy, not queued.
+- **Preflight** at `hb run` start and before every operation (D88), as an allow-list. Refused: privileged; any added capability, device or
+  device rule; `VolumesFrom`; a security option other than `no-new-privileges`; a PID, UTS, cgroup or user namespace that is not private;
+  an IPC namespace that is host or joined; a network that is not `bridge`, `none`, `pasta` or `slirp4netns`; a mount type other than bind,
+  volume or tmpfs; a volume with a non-`local` driver or any option (a `device` option makes a host directory a volume, measured); a bind
+  whose propagation is not private; a bind source that is not a real file or directory inside the project (no symlink in any component, the
+  OS path equals the spelling podman stores, not a file with more than one hard link); `Binds` and `Mounts` that disagree. Each refusal
+  names the reason and the path. At start a refused container is a warning, gets no pins and no `start` or `restart` in that run.
+- **Pinning**: the profile denies `file-write-unlink` on each mount source and on every ancestor a write grant reaches, and `file-link` on the
+  source. With the usual `write = ["."]` that is the source up to and including the project root; with a wider grant it reaches up to that grant,
+  because the agent can rename any directory it can write. Contents stay writable. A single file that is a mount source cannot be
+  replaced by an atomic rename (the container would keep the old file anyway): edit it in place, or mount its directory.
+- **Start gate** (D89): `start` and `restart` also need every bind source of the container to be among those pinned when `hb run` began,
+  and the container not to have failed preflight then. A container recreated with new mounts needs a new `hb run`. Other operations do not
+  re-resolve mounts and have no such gate.
+- **Runtime isolation** (D89): a process in a container is not under Seatbelt, so pins do not stop it. Measured: a container that runs
+  project code (which the agent can edit) can rename its own mount source and put a symlink in its place, and the next `podman start` follows
+  it to any directory the VM shares. The same swap fails when the target is not shared with the VM. So `start` and `restart` are available
+  only when every directory the active podman machine shares is the project or inside it. `hb` reads the machine's own file (found by the
+  active connection's port, not by `podman machine inspect` alone) and, if the shares are wider, warns and refuses both operations with the
+  command `podman machine init --volume <project>:<project> --now`. `hb` never changes the machine. `ps`, `logs`, `stats` and `stop` work either way.
+  Only one podman machine can run at a time, so this replaces the default machine while it runs, and a new machine has no images or containers.
+- Cleanup: the broker stops, its commands are killed and the socket is removed when the agent exits. If `hb` is killed with SIGKILL, the guard
+  process (D66) removes the socket and ends the broker's running commands; a command that has just started in the microseconds before
+  it is registered is left to finish or time out.
 
-Measured on a prototype: the hamster ball cannot run `podman` or reach the VM's SSH port (`64334`),
-while the same port is open outside the hamster ball. Allowed: `ps`, `logs`, `restart` on a labelled
-container. Refused: a non-project container, `run`, `exec`, two argument-injection attempts.
-Pinning blocked 7 of 7 swap attempts (rename, remove, ancestor rename, rename-over, project-root rename)
-and allowed in-place edits, file creation in pinned directories, and atomic-rename saves of source files.
+**Not covered.** Containers started by the owner keep unrestricted network egress (podman on macOS cannot restrict it). The image and the
+command a container runs are trusted: only mounts and host settings are checked, so project code that a container runs can do whatever the
+container can. A pin protects a name, not a file that already has a second hard link (such a source is refused). Output of `logs` can hold
+secrets and reaches the agent: the 20 KB cap limits volume, not content. The `launchd` jobs are the owner's: restarting one runs whatever it
+is configured to run, outside the ball. Not checked on an Intel Mac, other macOS versions or other podman versions.
+
+Measured (macOS 15.7, podman 5.7.1): the hamster ball cannot run `podman` or `launchctl`, or reach the VM's SSH port. The seven
+swap attempts (rename or remove the mounted directory, rename the directory above it, rename another directory over it, rename or
+remove the mounted file) are blocked and a hard link from a mounted file is blocked; each has a control without the pin that succeeds
+(`tests/mount_pins.rs`). Editing a mounted file in place, writing, renaming or deleting files inside a mounted directory, creating entries
+next to the mounts and a new directory or symlink all work. Against a real project-only machine, the swap exploit does not expose a canary
+and the same exploit on a machine that shares the canary's directory does (`tests/podman_e2e.rs`, opt-in).
 
 ### 9.4 Stays manual
 
@@ -1094,7 +1133,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 3. ~~**Narrow `/private/tmp`**~~ Done in hb-ghd.6.2 (D80): `CLAUDE_CODE_TMPDIR={session_dir}` moves `claude-<uid>` and `cc-socks` into the run's private directory; no `/private/tmp` grant.
 4. **`.git/config` write-deny** (6): blocks `git push -u`. Keep as default and revisit after dogfooding.
 5. **`~/.kube`**: how llm_gateway gets a project-scoped kubeconfig for its local k3d cluster, and the API port.
-6. **Preflight for `hb ctl`** (9.3): implement and test; not prototyped.
+6. ~~**Preflight for `hb ctl`**~~ Done in hb-ghd.8 (D88, D89): an allow-list, a no-symlink walk of every bind source, a volume check and runtime isolation; measured against real podman.
 7. ~~**Claude updater**~~ Done in hb-ghd.6.2 (D80): `DISABLE_AUTOUPDATER=1` is the name the 2.1.328 updater reads; a headless Bedrock run made no update request with or without it, so the setting is unproven by traffic and the read-only install is what stops an update.
 8. **llm_gateway ledger port**: `justfile` and the running container use 15433; two `psql` probes in
    `just/analytics.just` use 15432. Report to that project; not a change for this repo.
@@ -1119,7 +1158,7 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 - **Agent conformance (opt-in, needs installed agents and logins)**: one non-interactive prompt per preset;
   pass means a response through the proxy with no errors caused by the hamster ball. claude and opencode have different
   pass criteria (Bedrock request; reaches the model step).
-- **`hb ctl`**: policy table tests plus a test against real podman when available.
+- **`hb ctl`**: unit tests of the request table, argv, scope, preflight, isolation, status projection, handler order and runner; `tests/mount_pins.rs` and `tests/ctl_broker.rs` under the real `sandbox-exec` with a fake `podman`; opt-in `HB_PODMAN=1 tests/podman_e2e.rs` (real podman; `HB_PODMAN_DIR=<dir>` for a machine that shares only `<dir>`) and `HB_LAUNCHD=1 tests/launchd_e2e.rs` (a throwaway launchd job).
 
 ### 16.1 Probe matrix (hb-ghd.2.5)
 
@@ -1273,3 +1312,6 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D84 | `hb warm` (hb-ghd.7.3): only `uvx`/`npx` servers are warmed or warned about; the probe is the system perl in the ball (no hb binary runs there); warm is the same ball as a run with only the network replaced (registries, git hosts, `warm_net`); stamps in the denied state directory, advisory; `hb run` and `hb explain` warn about a git config file the ball cannot read (git treats EPERM as fatal), and `hb init` grants the git files that exist | agreed |
 | D85 | `hb doctor` MCP section (hb-ghd.7.4): flags any non-version `@tag` (not only `@latest`) and unpinned `git+` sources, shows only the flagged argument without URL credentials, includes the missing-launcher warning, and does not flag bare package names | agreed |
 | D86 | MCP offline check (hb-ghd.7.5): an opt-in test at library level (`warm_server`, then `session::run` with the probe) against the real home, toolchain and hb's real cache, the network at warm time only; serena's revision is resolved with `git ls-remote` unless given; strict zero proxy lines for the six, no allowed connection for serena; `WarmStore::forget` removes the stamps it made | agreed |
+| D87 | `hb ctl` (hb-ghd.8): one broker per run on `<session>/ctl.sock`; synchronous threads (no second runtime), at most four connections, one 4 KiB JSON line, closed operation set, per-target mutation exclusion; commands run by the full inspected container ID after `--`; `hb` reaches the agent through a wrapper script in the session `bin`; `[ctl] launchd` (user-only, like hooks) adds `hb ctl launchd status\|kickstart\|restart` with `launchctl kickstart [-k] gui/<uid>/<label>` and a status projected to four fields (the owner added launchd to M8) |
+| D88 | Preflight is an allow-list (hb-ghd.8.2; oracle review in `history/hb-ghd.8_oracle-preflight-pins.md`): see 9.3 for the refusals; a refused container at start is a warning with no pins and no start or restart; the check runs before every named operation |
+| D89 | Pins and isolation (hb-ghd.8.3): pins are the source plus every ancestor a write grant reaches (not only up to the project root), `file-link` on the source, derived from preflight at start; `start` and `restart` need every source pinned at start; a container process can swap its own mount source (measured), so they also need a podman machine that shares only the project (owner chose "isolate the runtime"); the active machine is found by connection port; the owner recreates the machine, `hb` never does |
