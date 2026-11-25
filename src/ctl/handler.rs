@@ -504,7 +504,7 @@ mod tests {
 
     fn record(name: &str, source: &str) -> String {
         json!([{
-            "Id": ID, "Name": name, "Config": {"Labels": {"com.docker.compose.project": "icehouse"}},
+            "Id": ID, "Name": name, "Config": {"Labels": {"com.docker.compose.project": "myapp"}},
             "HostConfig": {"Privileged": false, "NetworkMode": "bridge", "PidMode": "private", "IpcMode": "shareable",
                 "UsernsMode": "", "UTSMode": "private", "CgroupMode": "private", "CapAdd": [], "SecurityOpt": [],
                 "Devices": [], "Binds": [format!("{source}:/d:rprivate,rbind")], "Tmpfs": {}},
@@ -523,11 +523,11 @@ mod tests {
     }
 
     fn scope() -> Scope {
-        let policy_label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=icehouse"));
+        let policy_label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=myapp"));
         let mut s = Scope::default();
         s.set_for_test(
             Some(policy_label),
-            vec![assert_ok!(ContainerName::parse("lgw-pg"))],
+            vec![assert_ok!(ContainerName::parse("app-db"))],
             vec![assert_ok!(LaunchdLabel::parse("com.example.db"))],
         );
         s
@@ -679,11 +679,11 @@ mod tests {
         w.script.ok("log line");
         let read = handle(&w, r#"{"target":"container","op":"logs","name":"db"}"#);
         assert!(read.ok && read.out == "log line", "{read:?}");
-        w.script.ok(&record("lgw-pg", "/Users/me/proj/data"));
+        w.script.ok(&record("app-db", "/Users/me/proj/data"));
         w.script.ok("done");
         let other = handle(
             &w,
-            r#"{"target":"container","op":"restart","name":"lgw-pg"}"#,
+            r#"{"target":"container","op":"restart","name":"app-db"}"#,
         );
         assert!(other.ok, "{other:?}");
     }
@@ -714,7 +714,7 @@ mod tests {
         }
         assert!(w.script.calls().is_empty());
         w.script.ok(&record("other", "/Users/me/proj/data")
-            .replace(r#""com.docker.compose.project":"icehouse""#, r#""x":"y""#));
+            .replace(r#""com.docker.compose.project":"myapp""#, r#""x":"y""#));
         let r = handle(
             &w,
             r#"{"target":"container","op":"restart","name":"other"}"#,
@@ -732,15 +732,15 @@ mod tests {
         w.script
             .ok(r#"[{"Names":["api"],"State":"running","Image":"secret/image"}]"#);
         w.script
-            .ok(r#"[{"Names":["lgw-pg"],"State":"exited","Command":["x"]}]"#);
+            .ok(r#"[{"Names":["app-db"],"State":"exited","Command":["x"]}]"#);
         let r = handle(&w, r#"{"target":"container","op":"ps"}"#);
         assert!(r.ok);
-        assert_eq!(r.out, "api\trunning\nlgw-pg\texited\n");
+        assert_eq!(r.out, "api\trunning\napp-db\texited\n");
         assert_eq!(
             w.script.calls(),
             [
-                "/opt/homebrew/bin/podman ps -a --format json --filter label=com.docker.compose.project=icehouse".to_owned(),
-                "/opt/homebrew/bin/podman ps -a --format json --filter name=^lgw-pg$".to_owned(),
+                "/opt/homebrew/bin/podman ps -a --format json --filter label=com.docker.compose.project=myapp".to_owned(),
+                "/opt/homebrew/bin/podman ps -a --format json --filter name=^app-db$".to_owned(),
             ]
         );
     }

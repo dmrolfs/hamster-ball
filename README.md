@@ -87,7 +87,7 @@ hb --version
    ```
 
    The file is commented. It also lets git read the `~/.gitconfig` and `~/.config/git` that exist on your machine (git fails every command if it cannot read its config), and it makes every project writable (`[fs] write = ["."]`: a project is not granted on its own, so a
-   base without that line leaves the agent unable to read the project). On a network that inspects TLS (Zscaler and similar)
+   base without that line leaves the agent unable to read the project). On a network that inspects TLS (a corporate TLS-inspecting proxy or tunnel)
    leave `tls.system_trust = true`.
 
 2. **Describe the project.** In the project's root directory:
@@ -222,8 +222,8 @@ clipboard_write = true                   # false removes the agent's OSC 52 clip
 launchctl = false                        # true (your own files only) lets the agent run launchctl; see the warning in the design, 4.6
 
 [ctl]
-label      = "com.docker.compose.project=icehouse"   # containers with this label, for `hb ctl`; must be the same in every file
-containers = ["lgw-ledger-pg"]                       # or by exact name
+label      = "com.docker.compose.project=myapp"   # containers with this label, for `hb ctl`; must be the same in every file
+containers = ["app-db"]                       # or by exact name
 launchd    = ["com.example.postgres"]                # your own files only: jobs `hb ctl launchd` may start and restart
 
 [guard]
@@ -307,8 +307,8 @@ list of fixed commands for what you list:
 
 ```toml
 [ctl]
-label      = "com.docker.compose.project=icehouse"   # every container with this label
-containers = ["lgw-ledger-pg"]                       # and these, by name
+label      = "com.docker.compose.project=myapp"   # every container with this label
+containers = ["app-db"]                       # and these, by name
 launchd    = ["com.example.postgres"]                # launchd jobs; only your own files may list them
 ```
 
@@ -323,7 +323,7 @@ joined namespace, added capability, device, or `volumes_from`; every bind mount 
 write) cannot be renamed, deleted or linked by the agent, so it cannot swap a mount for a link and then ask for a restart. The files
 inside stay writable. A single file that is itself a mount cannot be saved by "write a temp file and rename": edit it in place.
 
-Which containers to list: the ones the agent should be able to look at and restart. Name them exactly as `podman ps -a` does (`lgw-ledger-pg`),
+Which containers to list: the ones the agent should be able to look at and restart. Name them exactly as `podman ps -a` does (`app-db`),
 or give the compose label every one of them carries (`hb ctl ps` shows what the label matched). The label must be the same wherever it is
 set, so a project cannot widen the scope your base gave. A container name that does not exist is simply never found.
 
@@ -361,7 +361,7 @@ the per-run proxy, with a random credential so other local processes cannot use 
 Refusal codes you will see: `not_allowed` (add the host), `port_not_allowed` (add `host:port`), `internal_address` (add the host to
 `net.internal_hosts` in your base), `ip_literal` (use a name), `unresolved` and `unreachable` (the name or route is wrong), `timed_out`.
 
-**Corporate networks.** Measured on a Zscaler client tunnel; nothing in `hb` is specific to it.
+**Corporate networks.** Measured on a corporate client tunnel that inspects TLS; nothing in `hb` is specific to it.
 
 | Need | How |
 |---|---|
@@ -515,10 +515,10 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | `warning: the project directory is not granted`, or `Can't read the current directory (EPERM)` | No grant covers the project. Add `[fs] write = ["."]` to your base (a base made by an older `hb init` lacks it) or to the project file. A grant of a directory inside the project does not count. |
 | `` `~/.cache/claude` was not granted: missing `` | An allow rule for a path that does not exist is skipped. Create the directory, or start the agent once outside the ball. |
 | `hb: proxy: refused host:443 not_allowed` | The agent asked for a host you have not listed. Add it to `[net] allow` if you trust it. |
-| `refused ... (internal_address)` | The name resolves to a private or tunnel address (common for `github.com` behind Zscaler). Add the host to `net.internal_hosts` in your **base**; a project file cannot. |
+| `refused ... (internal_address)` | The name resolves to a private or tunnel address (common for `github.com` behind a corporate tunnel). Add the host to `net.internal_hosts` in your **base**; a project file cannot. |
 | `port_not_allowed` | The host is listed on another port. Add `host:port`. |
 | TLS errors such as `UNABLE_TO_VERIFY_LEAF_SIGNATURE` or `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | The network re-signs the host. Keep `tls.system_trust = true`, or give the CA with `tls.extra_ca_files`. kiro-cli and Python ignore Node's variables. |
-| A connection shows `allowed ... down=0` and nothing comes back | `hb` connected and the far side sent nothing. Seen once on a Zscaler network for about an hour, including for a plain Rust program with no `hb`; the cause was not found. Check the same host with `curl` outside the ball. |
+| A connection shows `allowed ... down=0` and nothing comes back | `hb` connected and the far side sent nothing. Seen once on a corporate tunnel network for about an hour, including for a plain Rust program with no `hb`; the cause was not found. Check the same host with `curl` outside the ball. |
 | `hb cannot run inside another sandbox, because sandbox-exec cannot nest` (exit 1) | macOS cannot nest sandboxes. Run `hb` from a shell that is not inside another agent's sandbox (including another `hb`). |
 | A file is unreadable inside the ball: `.env`, `*.pem`, `*secret*.yaml` | The secrets guard, by design. Use a template (`.env.example`), pass the value with `[env] pass`, or list an exception in your base. |
 | `git push -u`, `git remote add` or `git commit` hooks fail | `.git/config` and `.git/hooks` are write-denied so the agent cannot plant code that git runs outside the ball. Do these outside, and push from your own shell. `git` over HTTPS needs an `allow` entry and has no credentials inside. |
@@ -566,6 +566,6 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
 - Agent presets are proved against the real agent by an opt-in harness that spends real requests:
   `HB_CONFORMANCE=1 cargo test --features test-support --test conformance -- --nocapture <agent>`. See [presets/README.md](presets/README.md).
 - [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md) is the design: threat model, config schema, the floor, enforcement,
-  proxy, presets, test plan and the numbered decision log (D1 to D90). Each "Measured" statement in it comes from a run on a real machine.
+  proxy, presets, test plan and the numbered decision log (D1 to D91). Each "Measured" statement in it comes from a run on a real machine.
 - The guide in `docs/` is an [mdBook](https://rust-lang.github.io/mdBook/). Build and read it locally with `cargo install mdbook` then `mdbook serve --open`. `.github/workflows/book.yml` builds it on every change under `docs/` and publishes it to GitHub Pages from `main`. One-time setup: in the repository, Settings, Pages, Source: GitHub Actions.
 - Work is tracked with beads (`bd`), epic `hb-ghd`; working notes live in `history/` and are not committed.

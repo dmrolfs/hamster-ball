@@ -3,7 +3,7 @@
 
 # Hamster Ball Design
 
-Project: **hamster-ball** (`github.com/dmrolfs/hamster-ball`, private). Binary: `hb`.
+Project: **hamster-ball** (`github.com/dmrolfs/hamster-ball`, public). Binary: `hb`.
 Status: **implemented**, milestones 1 to 8 (version 0.1). Sections written as plans before the code existed were updated to say what was built; a statement marked Measured
 was run on a real machine, and a statement marked Unverified was not.
 Platform: **macOS only** (tested on macOS 15.7, arm64).
@@ -31,7 +31,7 @@ Non-goals:
 - Linux or Windows support.
 - Defense against a deliberately hostile agent with a kernel exploit. A VM is the right tool for that.
 - Letting agents build images or run containers (see section 9).
-- Replacing `omp-supervisor`, which keeps its own sandbox code.
+- Replacing another supervisor tool that keeps its own sandbox code.
 
 ## 2. Threat model
 
@@ -113,7 +113,7 @@ config never applies silently.
 - `hb` refuses a current directory or a discovered root that is "too broad": `/`, `$HOME`, an ancestor of `$HOME`,
   or any path with fewer than two components below `/` (`/Users`, `/private`, `/Volumes`). The same check applies
   to every `fs.read` and `fs.write` grant in every layer (a `write = ["~"]` would otherwise make your whole home
-  writable). Comparison is by path component, so `/Users/rolfs2` is not confused with `/Users/rolfs`.
+  writable). Comparison is by path component, so `/Users/me2` is not confused with `/Users/me`.
   (The old `sb` only checked `PWD == $HOME`; `sandbox.py` checks containment.)
 - The discovered `hamster-ball.toml` and its directory must belong to the real uid and must not be
   world-writable, so a file planted in a shared directory such as `/tmp` (`/private/tmp` has only two
@@ -172,7 +172,7 @@ config never applies silently.
 ### 4.3 Schema
 
 ```toml
-# ~/work/icehouse/hamster-ball.toml
+# ~/work/myapp/hamster-ball.toml
 extends = ["agent/kiro", "agent/pi"]                 # plus your own presets; "rust", "node", "python" and "git" are planned
 
 [fs]
@@ -201,7 +201,7 @@ clipboard_write = true                          # false: remove the agent's OSC 
 launchctl = false                               # default off; only your own files may say true; see 4.6
 
 [ctl]                                           # section 9
-label      = "com.docker.compose.project=icehouse"
+label      = "com.docker.compose.project=myapp"
 containers = []
 launchd    = []                                 # launchd job labels `hb ctl launchd` may start and restart; your own files only
 
@@ -257,7 +257,7 @@ bind_ports = []                                 # ports it may listen on, 1024-6
 
 Measured (Node 24 inside the hamster ball, through the proxy):
 
-| Setting | Zscaler-signed host | AWS host | private gateway |
+| Setting | Host re-signed by the corporate proxy | AWS host | private gateway |
 |---|---|---|---|
 | none | fail | OK | fail |
 | `NODE_USE_SYSTEM_CA=1` | OK | OK | fail |
@@ -292,7 +292,7 @@ be reproduced: both settings worked on Node 24.11, 26.0 and 26.3 under the minim
 the extra bundle (an unreadable path prints `Ignoring extra certs` and looks like "system only"). The four-combination handshake test
 (hb-ghd.2.2) still decides. The user keychain domain is not visible inside the ball (the floor denies `~/Library/Keychains`), so a corporate root installed only there is missing. The floor, not `securityd`, is what keeps the user keychain out: see section 6 and `tests/seatbelt_tls.rs`.
 
-**A real TLS-inspecting proxy (D68, `tests/tls_inspection.rs`, opt-in).** On a machine where Zscaler re-signs `kiro.dev`, `opencode.ai` and
+**A real TLS-inspecting proxy (D68, `tests/tls_inspection.rs`, opt-in).** On a machine where the corporate proxy re-signs `kiro.dev`, `opencode.ai` and
 `context7.com` (and not `example.com`), under the generated profile plus a network allow: Node with `NODE_USE_SYSTEM_CA=1`, Bun and
 `uv --native-tls` verify the re-signed hosts; Node without system trust fails them with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` and still
 verifies `example.com`, which is the inspector-off case. curl failed on the re-signed hosts until `TrustEvaluationAgent` was granted
@@ -316,8 +316,8 @@ What is measured, read-only (`tests/seatbelt_tls.rs`): `scutil --proxy` inside t
 they disappear without an error. `uv` panics without `configd` (`tests/tls_handshake.rs`). The same visibility means the agent can read
 the host's proxy configuration while `system_trust` is on. `hb doctor` lists the proxy settings the system has switched on and says whether the agent can read them (D90).
 
-These settings add trusted roots only. They work with Zscaler off, because hosts then present
-public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
+These settings add trusted roots only. They work with the proxy off, because hosts then present
+public-CA certificates that Node already trusts. Nothing in `hb` is specific to one vendor.
 
 ### 4.6 Host services
 
@@ -495,7 +495,7 @@ Notes:
 
 - `~/.kube` is denied because it can hold credentials for real clusters. A project that needs
   `kubectl` to a local cluster should point `KUBECONFIG` at a project-scoped file.
-  llm_gateway needs this; the exact mechanism is an open item (section 15).
+  A project with a local cluster needs this; the exact mechanism is an open item (section 15).
 - `~/.npmrc` is denied for read as well as write (D43). A private registry needs its auth in a project `.npmrc` that
   reads `${NPM_TOKEN}`, passed with `env.pass`.
 - Denying `.git/config` blocks `git push -u` and `git remote add` inside the hamster ball. This is the
@@ -731,7 +731,7 @@ QUIT (Ctrl-backslash) there.
 
 ### 7.4 Nesting
 
-`sandbox-exec` fails when run inside another macOS sandbox (also documented in `omp-supervisor`): `sandbox-exec: sandbox_apply:
+`sandbox-exec` fails when run inside another macOS sandbox (also documented by other sandbox tools): `sandbox-exec: sandbox_apply:
 Operation not permitted`, exit 71, whether the outer profile is deny-default or `(allow default)`. `hb` always runs the
 preflight `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` (about 60 ms) before anything else; exit 71 with that text
 means nested, and `hb` stops with a clear message. An environment marker is used only to say "inside hb" in that message,
@@ -753,8 +753,8 @@ On by default; no setup. Denies read, write, delete, rename and hard-link for fi
 - **Git-tracked files are skipped**: the agent can already read them with `git show`. `hb` runs `git ls-files -z` on the host
   with the system `/usr/bin/git`, an empty environment and config, `core.fsmonitor=false`, hooks off and a 5 s limit, and
   re-allows each tracked file with a guarded name (at most 128; symbolic links are left out). No git, or a failure, means nothing
-  is skipped, and the run says so. `hb doctor` lists tracked files the guard would deny. icehouse tracks a `.env`; its contents have
-  not been inspected.
+  is skipped, and the run says so. `hb doctor` lists tracked files the guard would deny. One of the projects read for this design tracks a `.env`; its contents
+  were not inspected.
 - **Exceptions live only in the user base.** `[guard] exceptions` is a list of patterns that must start with `/` or `~/` and use the
   grammar of `fs.deny_read` (a base directory plus a glob tail); a relative entry is refused, because the base applies to every
   project and a relative one would switch the guard off everywhere. A matched file is re-allowed for read and write. A project
@@ -810,15 +810,13 @@ locations (section 6). A file deny alone does not stop a unix-socket `connect()`
 You start services outside the hamster ball (`just up`, `podman-compose up`). The project lists the ports in
 `net.loopback_ports`. `hb` warns at start if a listed port is not listening.
 
-Known ports (read from the projects, not by running them):
+Example ports (a compose project and a cluster project read, not run; the names here are neutral):
 
-- **icehouse** (12 services, 16 bind mounts all inside the project, no privileged or host-network settings):
-  3030, 3031, 3032, 5432, 9001, 9002, 4317, 8080, 8474, 9047, 9902, 16686, 19120, 31010, 32010
-- **llm_gateway** (no compose file; a k3d cluster plus a Postgres container): 18089 (gateway), 15433
-  (ledger Postgres), 3000 and 13099 (Langfuse), 9090 and 15020 (load metrics), 19000 (RustFS test).
+- A compose project with a dozen services, 16 bind mounts all inside the project, and no privileged or host-network settings: its database, API, tracing and query ports (3030, 5432, 8080, 9001 and similar).
+- A project with no compose file, a local Kubernetes cluster and a Postgres container: a gateway port, a database port, an observability UI and a load-metrics port.
   Cluster lifecycle recipes configure the podman VM and stay host-run.
-  The k3d Kubernetes API port was not found.
-  pi's default provider points at `localhost:18089`, so the pi preset in this project needs that port.
+  The cluster's API port was not found.
+  A pi preset for a gateway on this machine needs that gateway's port in `net.loopback_ports`.
 
 ### 9.3 Tier 2: `hb ctl`
 
@@ -833,7 +831,7 @@ config, on the host.
   hooks). They run `launchctl print|kickstart|kickstart -k gui/<broker uid>/<label>`; `/bin/launchctl` stays denied to the agent. `status` shows
   state, pid, run count and last exit code and nothing else: `launchctl print` lists the job's environment variables, which can hold
   secrets, so the broker keeps four fields from the job's own block and never returns the text.
-- Scope: containers matching the project's compose-project label or an explicit name list (`lgw-ledger-pg` has no label, so it is listed by
+- Scope: containers matching the project's compose-project label or an explicit name list (`app-db` has no label, so it is listed by
   name). The inspected name must equal the requested one (podman resolves an ID prefix).
 - Fixed argument vectors, a name after `--`, and every command that acts on a container uses its full inspected ID, never the name again.
   Names match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`.
@@ -885,7 +883,7 @@ and the same exploit on a machine that shares the canary's directory does (`test
 
 ### 9.4 Stays manual
 
-`up`, `down`, `build`, `run`, `exec`, `rm`, `cp`, compose changes, k3d and kubectl cluster operations, anything
+`up`, `down`, `build`, `run`, `exec`, `rm`, `cp`, compose changes, local Kubernetes cluster and kubectl operations, anything
 touching the podman machine (including creating the project-only machine of 9.3). The agent tells you what to run. A later, separate option is an approval
 prompt in the same terminal showing the exact command and the diff against the approved compose file.
 It has not been prototyped.
@@ -1044,7 +1042,7 @@ Built into `hb` (Rust, tokio). One listener on `127.0.0.1`, random port chosen b
 
 ### 12.1 Corporate networks
 
-Measured on a corporate network with a Zscaler client tunnel (macOS 15.7; nothing about it is Zscaler-specific in `hb`): no system proxy or
+Measured on a corporate network with a TLS-inspecting client tunnel (macOS 15.7; nothing about it is vendor-specific in `hb`): no system proxy or
 PAC; direct egress through the tunnel (`utun4`); split DNS (three corporate domains go to an internal resolver, the rest to the
 tunnel's); corporate internal names such as an Artifactory or Confluence host, and some public ones (`github.com`, `api.github.com`)
 resolve into `100.64.0.0/10`, which the tunnel hands out. A name may also return one tunnel address and several public ones.
@@ -1075,10 +1073,10 @@ All measured under the deny-default profile with proxy-only network. Home-relati
 
 | Agent | Read-only | Read-write | Hosts (own) | Notes |
 |---|---|---|---|---|
-| kiro-cli 3.5.0 | none (its binary needs no read grant) | `~/.kiro`, `~/Library/Application Support/kiro-cli` except `node`, `bun`, `tui.js`, `bunfig.toml` and `kas` (`deny_write`: a plain `kiro-cli` runs them outside the sandbox; kiro cannot self-update its agent server inside hb) | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (Zscaler re-signs `kiro.dev`). Measured in hb-ghd.3.5: the 3.3.0 spike also listed `desktop-release.q.us-east-1.amazonaws.com` (update check) and a read of `~/.local/bin/kiro-cli`; 3.5.0 needs neither. Its MCP servers, `~/.gitconfig` and FSEvents are denied harmlessly. |
+| kiro-cli 3.5.0 | none (its binary needs no read grant) | `~/.kiro`, `~/Library/Application Support/kiro-cli` except `node`, `bun`, `tui.js`, `bunfig.toml` and `kas` (`deny_write`: a plain `kiro-cli` runs them outside the sandbox; kiro cannot self-update its agent server inside hb) | `app.kiro.dev`, `runtime.us-east-1.kiro.dev`, `management.us-east-1.kiro.dev`, `telemetry.us-east-1.kiro.dev`, `client-telemetry.us-east-1.amazonaws.com`, `cognito-identity.us-east-1.amazonaws.com` | Probes `~/.local/bin` for write access; denial is harmless. Needs system trust (the corporate proxy re-signs `kiro.dev`). Measured in hb-ghd.3.5: the 3.3.0 spike also listed `desktop-release.q.us-east-1.amazonaws.com` (update check) and a read of `~/.local/bin/kiro-cli`; 3.5.0 needs neither. Its MCP servers, `~/.gitconfig` and FSEvents are denied harmlessly. |
 | pi 1.6.0 | none (`env.tools = ["node"]` makes the Node install readable) | `~/.pi/agent`, except `bin` and `install` (`deny_write`: they hold the launcher a plain `pi` runs outside the sandbox) | none: the provider is user config (`net.allow` for a remote gateway, `loopback_ports` for a local one such as `localhost:18089`, `tls.extra_ca_files` for a private CA) | Measured in hb-ghd.3.6 with provider `here` (a remote gateway behind a self-signed CA). Without the CA file pi fails with `DEPTH_ZERO_SELF_SIGNED_CERT`. Its update check (`install/update.lock`) and `~/.agents/skills` reads are denied harmlessly. A loopback gateway was reached directly with `loopback_ports` (a stub on 18089 saw pi's requests). |
 | claude 2.1.328 | `~/.local/share/claude`, `~/.local/bin/claude` | `~/.claude`, `~/.claude.json`, `~/.cache/claude`, `~/.local/state/claude` | Bedrock: `bedrock-runtime`, `bedrock`, `sts` in `us-east-1` | Credentials via a host hook in the user base (section 11), not in the preset. `CLAUDE_CODE_TMPDIR={session_dir}` keeps claude out of the shared `/private/tmp`; `DISABLE_AUTOUPDATER=1` and the read-only install keep the updater idle (`api.anthropic.com` and `downloads.claude.ai` are not requested in a headless Bedrock run). Sandboxed runs wait about 20 s on the OTEL and `awsAuthRefresh` helpers. |
-| opencode 1.2.0 (Homebrew) | `~/.config/opencode`, and from Homebrew `Cellar`, `opt`, `lib`, `etc/openssl@3` (not all of `/opt/homebrew`, which holds `var`; `~/.bun/install` is not needed) | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode`; `deny_write` on what a plain opencode runs: `~/.cache/opencode/{node_modules,package.json,bun.lock}` and `~/.local/share/opencode/bin` | `models.dev`, `opencode.ai` (Zscaler-signed; system trust) | The config directory can be read-only (opencode skips its dependency install). The `securityd` and preference denials do not stop TLS. MCP servers in the user's opencode config are not part of the preset: `npx`/`uvx` ones fail, remote ones are refused (M7). Run opencode once outside hb after an install or update (default plugin install needs npm). Loopback bind for its in-process server needs `bind_ports`. |
+| opencode 1.2.0 (Homebrew) | `~/.config/opencode`, and from Homebrew `Cellar`, `opt`, `lib`, `etc/openssl@3` (not all of `/opt/homebrew`, which holds `var`; `~/.bun/install` is not needed) | `~/.local/share/opencode`, `~/.cache/opencode`, `~/.local/state/opencode`; `deny_write` on what a plain opencode runs: `~/.cache/opencode/{node_modules,package.json,bun.lock}` and `~/.local/share/opencode/bin` | `models.dev`, `opencode.ai` (re-signed by the corporate proxy; system trust) | The config directory can be read-only (opencode skips its dependency install). The `securityd` and preference denials do not stop TLS. MCP servers in the user's opencode config are not part of the preset: `npx`/`uvx` ones fail, remote ones are refused (M7). Run opencode once outside hb after an install or update (default plugin install needs npm). Loopback bind for its in-process server needs `bind_ports`. |
 | codex, omp | | | | **Not installed here; no preset until tested.** |
 
 Presets are hand-written. Measured: Seatbelt denial logs are incomplete (40 of 40 reported for `sh` and
@@ -1143,11 +1141,10 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
 2. ~~**Proxy credentials in the URL** (12)~~ Measured (hb-ghd.3.2): all four accept them and send them on the first request; see 12.
 3. ~~**Narrow `/private/tmp`**~~ Done in hb-ghd.6.2 (D80): `CLAUDE_CODE_TMPDIR={session_dir}` moves `claude-<uid>` and `cc-socks` into the run's private directory; no `/private/tmp` grant.
 4. **`.git/config` write-deny** (6): blocks `git push -u`. Keep as default and revisit after dogfooding.
-5. **`~/.kube`**: how llm_gateway gets a project-scoped kubeconfig for its local k3d cluster, and the API port.
+5. **`~/.kube`**: how a project with a local cluster gets a project-scoped kubeconfig, and the cluster's API port.
 6. ~~**Preflight for `hb ctl`**~~ Done in hb-ghd.8 (D88, D89): an allow-list, a no-symlink walk of every bind source, a volume check and runtime isolation; measured against real podman.
 7. ~~**Claude updater**~~ Done in hb-ghd.6.2 (D80): `DISABLE_AUTOUPDATER=1` is the name the 2.1.328 updater reads; a headless Bedrock run made no update request with or without it, so the setting is unproven by traffic and the read-only install is what stops an update.
-8. **llm_gateway ledger port**: `justfile` and the running container use 15433; two `psql` probes in
-   `just/analytics.just` use 15432. Report to that project; not a change for this repo.
+8. ~~**A project's database port**~~ A port mismatch between one project's justfile and its probes. Not a change for this repo; reported to that project.
 9. Presets for codex and omp once installed.
 10. **AppleEvents and LaunchServices** are measured and closed (16.1): no event reaches a running application and `open -a` starts nothing.
     **launchd** is measured (4.6): job creation is refused from inside, starting and disabling existing jobs is not, so `launchctl` is off unless
@@ -1258,9 +1255,9 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D16 | claude OTEL telemetry not required | confirmed |
 | D17 | Containers: floor deny; tier 1 connect-only; tier 2 `hb ctl`; lifecycle stays manual | agreed |
 | D18 | Secrets guard on by default; templates editable; tracked files skipped; exceptions user-level only | agreed |
-| D19 | Project name `hamster-ball`; binary stays `hb`; GitHub `dmrolfs/hamster-ball`, private until the project-specific details are moved out | chosen by owner (name); private is my default |
+| D19 | Project name `hamster-ball`; binary stays `hb`; GitHub `dmrolfs/hamster-ball`. It was private until the names of the owner's own projects were replaced with neutral examples (D91); it is now public | chosen by owner (name); public by owner decision |
 | D20 | User config and state live under `~/.config/hamster-ball` and `~/.local/state/hamster-ball` (not `sandbox`, which the old `sb` and Linux setup already use as `~/.sandbox`) | change made while renaming; pending owner review |
-| D21 | Binary is `hb` (not `sb`); the project config file is `hamster-ball.toml` (not `sandbox.toml`); "sandbox" becomes "hamster ball" in this repo's prose. Kept as-is: Apple's `sandbox-exec`, `sandbox.py`, Anthropic's "Sandbox Runtime", the legacy `sb` script, `omp-supervisor`'s own sandbox | owner feedback; file name `hamster-ball.toml` is my choice, pending review |
+| D21 | Binary is `hb` (not `sb`); the project config file is `hamster-ball.toml` (not `sandbox.toml`); "sandbox" becomes "hamster ball" in this repo's prose. Kept as-is: Apple's `sandbox-exec`, `sandbox.py`, Anthropic's "Sandbox Runtime", the legacy `sb` script, another supervisor tool's own sandbox | owner feedback; file name `hamster-ball.toml` is my choice, pending review |
 | D22 | Relative filesystem grant paths resolve against the project root in every layer (scoped to grants by D37; `extends` paths resolve against the containing file) | agreed |
 | D23 | `fs.read`/`fs.write` grants (and the project root) that are `/`, `$HOME`, an ancestor of `$HOME`, or shallower than two components are rejected in every layer | agreed |
 | D24 | No `hamster-ball.toml` is a typed `NoProjectConfig` error; no fallback to the cwd | agreed |
@@ -1313,7 +1310,7 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D71 | The proxy (`src/proxy`, hb-ghd.3.1) runs on tokio (`rt`, `net`, `io-util`, `time`, `sync`, `macros`) with `httparse`, on its own thread behind `ProxyHandle`; plain HTTP is one request per connection with `Connection: close`; address-literal targets are always refused; the proxy starts for every run, even with an empty allowlist, so the agent gets a `403` with a reason rather than a refused connection | owner, hb-ghd.3 |
 | D72 | `net.allow` entries are `host` or `host:port`, one (pattern, port) rule each, default port 443; a listed host on another port is `port_not_allowed` and the reply names the entry to add | owner, hb-ghd.3.2 |
 | D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
-| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` listing of the system's proxy settings (D90) | owner, hb-ghd.3 |
+| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a TLS-inspecting client tunnel is measured); documented in 12.1, with a `hb doctor` listing of the system's proxy settings (D90) | owner, hb-ghd.3 |
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
 | D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |
@@ -1330,3 +1327,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D88 | Preflight is an allow-list (hb-ghd.8.2; oracle review in `history/hb-ghd.8_oracle-preflight-pins.md`): see 9.3 for the refusals; a refused container at start is a warning with no pins and no start or restart; the check runs before every named operation |
 | D89 | Pins and isolation (hb-ghd.8.3): pins are the source plus every ancestor a write grant reaches (not only up to the project root), `file-link` on the source, derived from preflight at start; `start` and `restart` need every source pinned at start; a container process can swap its own mount source (measured), so they also need a podman machine that shares only the project (owner chose "isolate the runtime"); the active machine is found by connection port; the owner recreates the machine, `hb` never does |
 | D90 | `hb doctor` reports two more things (hb-ghd.8 follow-up): **git the floor does not protect**: repositories (a `.git` directory or file) below a write grant other than the project's own and the ones above it, hook manager files (`.husky`, `.githooks`, `.git-hooks`, `lefthook*`, `.pre-commit-config.yaml`) and `core.hooksPath` from the project's `.git/config`; walked with the guard's limits (dependency and build directories skipped, symlinks not followed, 100,000 entries), names only. **System proxy settings** from `/usr/sbin/scutil --proxy` (5 s limit): the kinds that are on, host and port, a password in a PAC URL dropped, and whether `tls.system_trust` lets the agent read them. Findings only; the exit code stays 0 and the floor is unchanged (protecting nested repositories would break `git init` and `git clone`, D46) | owner, "address the gaps" |
+| D91 | The repository is public, so the names of the owner's own projects and of a vendor were replaced with neutral ones: example project `myapp`, container `app-db`, a corporate TLS-inspecting tunnel. Section 9.2 keeps the shape of the port survey without the project names. The old names remain in git history; they are names, not credentials, and a history rewrite was not done. A scan of all tracked files and the full history found no keys, tokens, private addresses or personal paths | owner, "proceed with recommendations" |

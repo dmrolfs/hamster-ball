@@ -258,7 +258,7 @@ impl CanonicalPath {
 
     /// Whether `self` equals `other` or is one of its ancestors, compared component by component.
     ///
-    /// `/Users/rolfs` is not an ancestor of `/Users/rolfs2`.
+    /// `/Users/me` is not an ancestor of `/Users/me2`.
     #[must_use]
     pub fn is_same_or_ancestor_of(&self, other: &CanonicalPath) -> bool {
         other.as_path().starts_with(self.as_path())
@@ -303,14 +303,14 @@ mod tests {
     #[test]
     fn accepts_root_and_ordinary_paths() {
         assert_eq!(path("/").as_str(), "/");
-        assert_eq!(path("/Users/rolfs/.ssh").as_str(), "/Users/rolfs/.ssh");
+        assert_eq!(path("/Users/me/.ssh").as_str(), "/Users/me/.ssh");
     }
 
     #[test]
     fn accepts_unicode_and_spaces() {
         assert_eq!(
-            path("/Users/rolfs/caf\u{e9} dir").as_str(),
-            "/Users/rolfs/caf\u{e9} dir"
+            path("/Users/me/caf\u{e9} dir").as_str(),
+            "/Users/me/caf\u{e9} dir"
         );
     }
 
@@ -388,10 +388,10 @@ mod tests {
 
     #[test]
     fn ancestor_comparison_is_component_wise() {
-        let home = path("/Users/rolfs");
-        assert!(home.is_same_or_ancestor_of(&path("/Users/rolfs")));
-        assert!(home.is_same_or_ancestor_of(&path("/Users/rolfs/work")));
-        assert!(!home.is_same_or_ancestor_of(&path("/Users/rolfs2")));
+        let home = path("/Users/me");
+        assert!(home.is_same_or_ancestor_of(&path("/Users/me")));
+        assert!(home.is_same_or_ancestor_of(&path("/Users/me/work")));
+        assert!(!home.is_same_or_ancestor_of(&path("/Users/me2")));
         assert!(!home.is_same_or_ancestor_of(&path("/Users")));
         assert!(path("/").is_same_or_ancestor_of(&home));
     }
@@ -400,7 +400,7 @@ mod tests {
     fn depth_counts_components_below_root() {
         assert_eq!(path("/").depth(), 0);
         assert_eq!(path("/Users").depth(), 1);
-        assert_eq!(path("/Users/rolfs").depth(), 2);
+        assert_eq!(path("/Users/me").depth(), 2);
     }
 
     #[test]

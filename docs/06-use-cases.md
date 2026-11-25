@@ -197,9 +197,9 @@ It cannot run `podman`, so you give it `hb ctl`.
 ```toml
 # ~/.config/hamster-ball/base.toml or the project config
 [ctl]
-containers = ["lgw-ledger-pg"]
+containers = ["app-db"]
 # or every container with a label:
-# label = "com.docker.compose.project=icehouse"
+# label = "com.docker.compose.project=myapp"
 ```
 
 Use the names that `podman ps -a` shows.
@@ -216,14 +216,14 @@ The agent can then run these commands in its shell:
 
 ```sh
 hb ctl ps
-hb ctl logs lgw-ledger-pg --tail 100
-hb ctl restart lgw-ledger-pg      # needs the project-only podman machine of step 5; ps and logs work without it
+hb ctl logs app-db --tail 100
+hb ctl restart app-db      # needs the project-only podman machine of step 5; ps and logs work without it
 ```
 
-An example of a refusal, from a real run:
+An example of a refusal (the container name is an example):
 
 ```
-hb ctl: k3d-llm-gateway-server-0 was not found
+hb ctl: myapp-server-0 was not found
 ```
 
 (A container that is not in scope, or that does not exist, is not found.)

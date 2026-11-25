@@ -637,7 +637,7 @@ mod tests {
     fn record() -> Value {
         json!({
             "Id": ID, "Name": "db",
-            "Config": {"Labels": {"com.docker.compose.project": "icehouse"}},
+            "Config": {"Labels": {"com.docker.compose.project": "myapp"}},
             "HostConfig": {
                 "Privileged": false, "NetworkMode": "bridge", "PidMode": "private", "IpcMode": "shareable",
                 "UsernsMode": "", "UTSMode": "private", "CgroupMode": "private", "CapAdd": [],
@@ -651,7 +651,7 @@ mod tests {
     fn selection<'a>(names: &'a BTreeSet<String>) -> Selection<'a> {
         Selection {
             names,
-            label: Some(("com.docker.compose.project", "icehouse")),
+            label: Some(("com.docker.compose.project", "myapp")),
         }
     }
 

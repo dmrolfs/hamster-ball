@@ -335,7 +335,7 @@ mod tests {
              [tls]\n\
              system_trust = true\n\
              [ctl]\n\
-             label = \"com.docker.compose.project=icehouse\"\n\
+             label = \"com.docker.compose.project=myapp\"\n\
              [mcp.serena]\n\
              command = \"uvx\"\n\
              args = [\"start-mcp-server\"]\n\

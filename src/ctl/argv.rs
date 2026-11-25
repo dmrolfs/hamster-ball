@@ -180,10 +180,10 @@ mod tests {
             text(volume_inspect("v1")),
             ["volume", "inspect", "--format", "json", "--", "v1"]
         );
-        let label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=icehouse"));
+        let label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=myapp"));
         assert_eq!(
             text(list_by_label(&label)).last().map(String::as_str),
-            Some("label=com.docker.compose.project=icehouse")
+            Some("label=com.docker.compose.project=myapp")
         );
     }
 

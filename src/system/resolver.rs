@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn allow_rejects_tilde_user() {
         let fx = Fixture::new();
-        let err = assert_err!(fx.resolver().allow("~rolfs/f.txt"));
+        let err = assert_err!(fx.resolver().allow("~someone/f.txt"));
         assert!(matches!(err, PathError::TildeUser { .. }));
     }
 

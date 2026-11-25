@@ -952,7 +952,7 @@ mod tests {
              [tls]\n\
              system_trust = true\n\
              [ctl]\n\
-             label = \"com.docker.compose.project=icehouse\"\n\
+             label = \"com.docker.compose.project=myapp\"\n\
              containers = [\"pg-1\"]\n\
              [guard]\n\
              exceptions = [\"~/p/.env.example\"]\n\
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(assert_some!(config.env.set.get(&name)).as_str(), "1");
         assert_eq!(config.tls.system_trust, Some(true));
         let label = assert_some!(config.ctl.label.as_ref());
-        assert_eq!(label.to_string(), "com.docker.compose.project=icehouse");
+        assert_eq!(label.to_string(), "com.docker.compose.project=myapp");
         assert_eq!(config.ctl.containers[0].as_str(), "pg-1");
         assert!(
             config.guard.exceptions[0]

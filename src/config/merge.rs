@@ -1235,8 +1235,8 @@ mod tests {
     #[test]
     fn an_equal_ctl_label_in_two_files_merges_and_one_label_alone_is_kept() {
         let policy = merged(vec![
-            user("base", with_label(Some("app=icehouse"))),
-            project(with_label(Some("app=icehouse"))),
+            user("base", with_label(Some("app=myapp"))),
+            project(with_label(Some("app=myapp"))),
         ]);
         assert_eq!(assert_some!(policy.ctl.label).sources.len(), 2);
         let policy = merged(vec![
@@ -1249,7 +1249,7 @@ mod tests {
     #[test]
     fn a_differing_ctl_label_is_a_conflict_so_a_project_cannot_override_the_base_scope() {
         let files = closure(vec![
-            user("base", with_label(Some("app=icehouse"))),
+            user("base", with_label(Some("app=myapp"))),
             project(with_label(Some("app=other"))),
         ]);
         let errors = assert_err!(merge(&files, Floor::empty()));

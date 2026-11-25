@@ -36,7 +36,7 @@ pub const BASE_TEMPLATE: &str = "\
 write = [\".\"]
 
 [tls]
-# Trust the system certificate store (needed behind a TLS-inspecting proxy such as Zscaler).
+# Trust the system certificate store (needed behind a corporate TLS-inspecting proxy or tunnel).
 system_trust = true
 
 [terminal]

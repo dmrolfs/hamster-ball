@@ -102,9 +102,9 @@ mod tests {
     fn scope() -> Scope {
         Scope {
             label: Some(assert_ok!(ContainerLabel::parse(
-                "com.docker.compose.project=icehouse"
+                "com.docker.compose.project=myapp"
             ))),
-            containers: [assert_ok!(ContainerName::parse("lgw-ledger-pg"))].into(),
+            containers: [assert_ok!(ContainerName::parse("app-db"))].into(),
             launchd: [assert_ok!(LaunchdLabel::parse("com.example.db"))].into(),
         }
     }
@@ -113,20 +113,20 @@ mod tests {
     fn test_scope_admits_exact_name_or_exact_label_value_only() {
         let s = scope();
         assert!(s.admits(Candidate {
-            name: "lgw-ledger-pg",
+            name: "app-db",
             label_value: None
         }));
         assert!(s.admits(Candidate {
             name: "api",
-            label_value: Some("icehouse")
+            label_value: Some("myapp")
         }));
         assert!(!s.admits(Candidate {
-            name: "lgw-ledger-pg2",
+            name: "app-db2",
             label_value: None
         }));
         assert!(!s.admits(Candidate {
             name: "api",
-            label_value: Some("icehouse2")
+            label_value: Some("myapp2")
         }));
         assert!(!s.admits(Candidate {
             name: "api",
@@ -142,7 +142,7 @@ mod tests {
     fn test_container_labels_never_authorize_a_launchd_job() {
         let s = scope();
         assert!(s.admits_launchd(&assert_ok!(LaunchdLabel::parse("com.example.db"))));
-        assert!(!s.admits_launchd(&assert_ok!(LaunchdLabel::parse("icehouse"))));
+        assert!(!s.admits_launchd(&assert_ok!(LaunchdLabel::parse("myapp"))));
         assert!(!s.admits_launchd(&assert_ok!(LaunchdLabel::parse("com.example.db2"))));
     }
 

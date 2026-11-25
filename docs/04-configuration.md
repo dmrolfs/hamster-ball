@@ -90,7 +90,7 @@ Wildcards over a public suffix or a whole cloud domain, such as `*.github.io` or
 List the exact hosts.
 
 `internal_hosts` matters on a corporate network.
-A tunnel such as Zscaler can make a public name, like `github.com`, resolve to a private address.
+A corporate tunnel can make a public name, like `github.com`, resolve to a private address.
 The proxy refuses private addresses by default.
 List the host in `internal_hosts` in your base to allow it.
 
@@ -143,8 +143,8 @@ Prefer `[ctl] launchd`, which allows named jobs only.
 
 ```toml
 [ctl]
-label      = "com.docker.compose.project=icehouse"   # every container with this label
-containers = ["lgw-ledger-pg"]                       # and these, by exact name
+label      = "com.docker.compose.project=myapp"   # every container with this label
+containers = ["app-db"]                       # and these, by exact name
 launchd    = ["com.example.postgres"]                # your own files only
 ```
 

@@ -43,7 +43,7 @@ The file is commented. It contains a few settings you should know about:
 | Setting | What it does |
 |---|---|
 | `[fs] write = ["."]` | Grants read and write on the project. A project is neither readable nor writable until a file grants it, and this line is that grant. |
-| `[tls] system_trust = true` | Trusts the system certificate store. Keep it on if your network inspects TLS (Zscaler and similar). |
+| `[tls] system_trust = true` | Trusts the system certificate store. Keep it on if your network inspects TLS (a corporate TLS-inspecting proxy or tunnel). |
 | `read` entries for `~/.gitconfig` and `~/.config/git` | Added only if those exist. Git fails every command if it cannot read its own config. |
 | `[env] pass = ["LANG", "COLORTERM"]` | Copies these two variables from your shell. |
 

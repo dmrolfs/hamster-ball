@@ -281,8 +281,8 @@ mod tests {
         for good in [
             "a",
             "0",
-            "lgw-ledger-pg",
-            "icehouse_postgres_1",
+            "app-db",
+            "myapp_postgres_1",
             "a.b-c_d",
             &"a".repeat(MAX_CONTAINER_NAME_BYTES),
         ] {
@@ -345,10 +345,10 @@ mod tests {
 
     #[test]
     fn container_label_accepts_key_equals_value() {
-        let label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=icehouse"));
+        let label = assert_ok!(ContainerLabel::parse("com.docker.compose.project=myapp"));
         assert_eq!(label.key(), "com.docker.compose.project");
-        assert_eq!(label.value(), "icehouse");
-        assert_eq!(label.to_string(), "com.docker.compose.project=icehouse");
+        assert_eq!(label.value(), "myapp");
+        assert_eq!(label.to_string(), "com.docker.compose.project=myapp");
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl ProjectRoot {
 ///
 /// The same predicate guards the project root and every `fs.read` and `fs.write` grant, so
 /// a rule such as `write = ["~"]` cannot bypass the project-root check. Comparison is by path
-/// component, so `/Users/rolfs2` is not confused with `/Users/rolfs`.
+/// component, so `/Users/me2` is not confused with `/Users/me`.
 #[must_use]
 pub fn broadness(path: &CanonicalPath, home: &HomeDir) -> Option<BroadRoot> {
     if path.depth() == 0 {
@@ -98,7 +98,7 @@ mod tests {
     }
 
     fn home() -> HomeDir {
-        HomeDir::new(path("/Users/rolfs"))
+        HomeDir::new(path("/Users/me"))
     }
 
     // ====================================================================================
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn broadness_flags_the_home_directory_itself() {
         assert_eq!(
-            broadness(&path("/Users/rolfs"), &home()),
+            broadness(&path("/Users/me"), &home()),
             Some(BroadRoot::Home)
         );
     }
@@ -140,9 +140,9 @@ mod tests {
     #[test]
     fn broadness_allows_subdirectories_of_home() {
         for p in [
-            "/Users/rolfs/work",
-            "/Users/rolfs/work/app/src",
-            "/Users/rolfs/.config",
+            "/Users/me/work",
+            "/Users/me/work/app/src",
+            "/Users/me/.config",
         ] {
             assert_eq!(broadness(&path(p), &home()), None, "{p}");
         }
@@ -150,8 +150,8 @@ mod tests {
 
     #[test]
     fn broadness_allows_a_sibling_whose_name_starts_with_the_home_name() {
-        assert_eq!(broadness(&path("/Users/rolfs2"), &home()), None);
-        assert_eq!(broadness(&path("/Users/rolfs2/work"), &home()), None);
+        assert_eq!(broadness(&path("/Users/me2"), &home()), None);
+        assert_eq!(broadness(&path("/Users/me2/work"), &home()), None);
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
             Some(BroadRoot::HomeAncestor)
         );
         assert_eq!(broadness(&path("/home/dev"), &other), Some(BroadRoot::Home));
-        assert_eq!(broadness(&path("/Users/rolfs"), &other), None);
+        assert_eq!(broadness(&path("/Users/me"), &other), None);
     }
 
     // ====================================================================================
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn project_root_new_rejects_broad_roots() {
-        for p in ["/", "/Users", "/Users/rolfs", "/private"] {
+        for p in ["/", "/Users", "/Users/me", "/private"] {
             let err = assert_err!(ProjectRoot::new(path(p), &home()), "{p}");
             assert!(matches!(err, RootError::TooBroad { .. }), "{p}: {err:?}");
         }
@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn project_root_new_accepts_a_project_directory() {
-        let root = assert_ok!(ProjectRoot::new(path("/Users/rolfs/work/app"), &home()));
-        assert_eq!(root.path().as_str(), "/Users/rolfs/work/app");
+        let root = assert_ok!(ProjectRoot::new(path("/Users/me/work/app"), &home()));
+        assert_eq!(root.path().as_str(), "/Users/me/work/app");
     }
 
     #[test]
@@ -218,6 +218,6 @@ mod tests {
 
     #[test]
     fn home_dir_exposes_its_path() {
-        assert_eq!(home().path().as_str(), "/Users/rolfs");
+        assert_eq!(home().path().as_str(), "/Users/me");
     }
 }

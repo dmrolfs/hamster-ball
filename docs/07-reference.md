@@ -158,7 +158,7 @@ It keeps no headers or bodies.
 
 ## Corporate networks
 
-Measured on a Zscaler client tunnel. Nothing in `hb` is specific to it.
+Measured on a corporate client tunnel that inspects TLS. Nothing in `hb` is specific to it.
 
 | Need | How |
 |---|---|
@@ -183,10 +183,10 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | `warning: the project directory is not granted`, or `Can't read the current directory (EPERM)` | No grant covers the project. Add `[fs] write = ["."]` to your base or the project file. A grant of a directory inside the project does not count. |
 | `` `~/.cache/claude` was not granted: missing `` | A grant for a path that does not exist is skipped. Create the directory, or start the agent once outside the ball. |
 | `hb: proxy: refused host:443 not_allowed` | The agent asked for a host you have not listed. Add it to `[net] allow` if you trust it. |
-| `internal_address` | The name resolves to a private or tunnel address (common for `github.com` behind Zscaler). Add it to `net.internal_hosts` in your base config. A project file cannot. |
+| `internal_address` | The name resolves to a private or tunnel address (common for `github.com` behind a corporate tunnel). Add it to `net.internal_hosts` in your base config. A project file cannot. |
 | `port_not_allowed` | The host is listed on another port. Add `host:port`. |
 | TLS errors such as `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | The network re-signs the host. Keep `tls.system_trust = true`, or give the CA with `tls.extra_ca_files`. kiro-cli and Python ignore Node's variables. |
-| A connection shows `allowed ... down=0` and nothing comes back | `hb` connected and the far side sent nothing. Seen once on a Zscaler network for about an hour, also for a plain Rust program with no `hb`. The cause was not found. Check the host with `curl` outside the ball. |
+| A connection shows `allowed ... down=0` and nothing comes back | `hb` connected and the far side sent nothing. Seen once on a corporate tunnel network for about an hour, also for a plain Rust program with no `hb`. The cause was not found. Check the host with `curl` outside the ball. |
 | `hb cannot run inside another sandbox` (exit 1) | macOS cannot nest sandboxes. Run `hb` from a shell that is not inside another agent's sandbox, including another `hb`. |
 | A file is unreadable: `.env`, `*.pem`, `*secret*.yaml` | The secrets guard, by design. Use a template, pass the value with `[env] pass`, or list an exception in your base config. |
 | `git push -u`, `git remote add` or git hooks fail | `.git/config` and `.git/hooks` are write-denied so the agent cannot plant code that git runs outside the ball. Do these outside, and push from your own shell. Git over HTTPS needs an `allow` entry and has no credentials inside. |
