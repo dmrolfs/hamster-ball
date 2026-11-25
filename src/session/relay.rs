@@ -22,6 +22,24 @@ pub(super) const DRAIN_QUIET: Duration = Duration::from_millis(150);
 pub(super) const DRAIN_MAX: Duration = Duration::from_secs(2);
 pub(super) const BUFFER: usize = 8192;
 
+/// How long a relay keeps draining after the child has ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drain {
+    /// How long the master may stay silent before the relay stops.
+    quiet: Duration,
+    /// The most time spent draining.
+    max: Duration,
+}
+
+impl Default for Drain {
+    fn default() -> Self {
+        Self {
+            quiet: DRAIN_QUIET,
+            max: DRAIN_MAX,
+        }
+    }
+}
+
 /// Where the relay thread is with respect to a pause request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gate {
@@ -74,6 +92,16 @@ impl Relay {
         output: OwnedFd,
         clipboard: ClipboardPolicy,
     ) -> io::Result<Self> {
+        Self::spawn(input, master, output, clipboard, Drain::default())
+    }
+
+    fn spawn(
+        input: OwnedFd,
+        master: File,
+        output: OwnedFd,
+        clipboard: ClipboardPolicy,
+        drain: Drain,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             gate: Mutex::new(Gate::Open),
@@ -90,6 +118,7 @@ impl Relay {
                     File::from(output),
                     &theirs,
                     &mut filter,
+                    drain,
                 );
                 filter.clipboard_use()
             })?;
@@ -185,6 +214,7 @@ fn run(
     mut output: File,
     shared: &Shared,
     filter: &mut Sanitizer,
+    drain: Drain,
 ) {
     let mut input_open = true;
     let mut draining_since: Option<Instant> = None;
@@ -218,7 +248,7 @@ fn run(
             input_open = false;
         }
         if let Some(since) = draining_since {
-            if !master_ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX {
+            if !master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max {
                 end_of_output(filter, &mut output);
                 return;
             }
@@ -255,6 +285,10 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_draining(Drain::default())
+    }
+
+    fn rig_draining(drain: Drain) -> Rig {
         let outer = assert_ok!(Pty::open());
         let inner = assert_ok!(Pty::open());
         let outer_slave = open_slave(&outer);
@@ -266,10 +300,12 @@ mod tests {
                 assert_ok!(slave.try_clone()).into()
             )));
         }
-        let relay = assert_ok!(Relay::start(
+        let relay = assert_ok!(Relay::spawn(
             assert_ok!(outer_slave.try_clone()).into(),
             assert_ok!(inner.clone_master()),
             outer_slave.into(),
+            ClipboardPolicy::default(),
+            drain,
         ));
         Rig {
             user: assert_ok!(outer.clone_master()),
@@ -532,26 +568,28 @@ mod tests {
 
     #[test]
     fn a_child_that_never_stops_writing_cannot_keep_the_relay_from_finishing() {
-        let rig = rig();
+        // A quiet limit far above any scheduling pause in this test's writer thread: the relay
+        // ends a drain when the master has been silent for `quiet`, so a writer that is merely
+        // slow to be scheduled under a busy test run must not look like a silent child.
+        let drain = Drain {
+            quiet: Duration::from_millis(900),
+            max: Duration::from_millis(1500),
+        };
+        let rig = rig_draining(drain);
         let mut child = assert_ok!(rig.child.try_clone());
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
-        // The child writes whenever the pty has room, one byte at a time, so the relay always
-        // finds output waiting. A timed writer (a write every 20 ms) fails under load: a pause of
-        // DRAIN_QUIET in the writer's own scheduling is a quiet gap, and the relay rightly ends.
         let writer = thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                let mut fds = [PollFd::new(child.as_fd(), PollFlags::POLLOUT)];
-                if poll(&mut fds, PollTimeout::from(5u8)).is_ok_and(|n| n > 0) {
-                    let _ = child.write(b"n");
-                }
+                let _ = child.write_all(b"noise");
+                thread::sleep(Duration::from_millis(20));
             }
         });
         // Keep the screen side drained so the writer is not what ends the relay.
         let mut user = assert_ok!(rig._outer.clone_master());
         let reader = thread::spawn(move || {
             let mut buffer = [0u8; 4096];
-            let end = Instant::now() + Duration::from_secs(6);
+            let end = Instant::now() + Duration::from_secs(4);
             while Instant::now() < end {
                 let mut fds = [PollFd::new(user.as_fd(), PollFlags::POLLIN)];
                 if poll(&mut fds, PollTimeout::from(50u8)).is_ok_and(|n| n > 0) {
@@ -565,8 +603,8 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         let _ = writer.join();
         let _ = reader.join();
-        assert!(took >= DRAIN_MAX - Duration::from_millis(200), "{took:?}");
-        assert!(took < DRAIN_MAX + Duration::from_secs(1), "{took:?}");
+        assert!(took >= drain.max - Duration::from_millis(200), "{took:?}");
+        assert!(took < drain.max + Duration::from_secs(1), "{took:?}");
     }
 
     #[test]
