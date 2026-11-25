@@ -6,6 +6,7 @@
 //! offline launchers replace, so they are the only servers whose start reaches a registry. Another
 //! command fetches nothing, so there is nothing to warm and no warning.
 
+pub mod doctor;
 pub mod hosts;
 pub mod probe;
 pub mod stamp;

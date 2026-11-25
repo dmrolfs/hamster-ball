@@ -874,6 +874,11 @@ Measured: each of your MCP servers started inside the hamster ball and answered 
   denies the directory to the ball) and the marker `<cache>/warmed`. `hb run` warns before starting about each such server with no stamp or a stale one;
   `hb explain` shows the status. It needs an approved config and refuses inside a ball. An unpinned `git+` source cannot start offline even from a
   warm cache (uv must resolve HEAD): pin `@<full sha>`.
+- **`hb doctor` (hb-ghd.7.4, D85).** For each server `hb warm` can warm it names: never warmed or warmed with other arguments; an argument whose package
+  spec ends in a tag that is not a version or a range (`pkg@latest`, `@scope/pkg@next`; a bare name is not flagged, it is whatever the last `hb warm`
+  cached); a `git+` source whose URL does not end in a full revision (`@<40 hex>` for uv, measured; `#<40 hex>` for npm, not measured offline), which uv
+  cannot start offline even from a warm cache; and a launcher `[env] tools` does not list. It prints the server and the one flagged argument, bounded and
+  escaped, with `user:password@` removed from a URL, never the other arguments. The exit code stays 0.
 - **hb's own cache** is `~/.cache/hamster-ball/{uv,uv-tools,npm}`, made 0700 on the host and granted read-write through the profile's cache
   parameter, not through `fs.write`, so it is not a secrets-guard root (uv unpacks `certifi/cacert.pem` into its cache). It is never the
   user's `~/.cache/uv` or `~/.npm`: uv writes to its cache even offline (a read-only cache fails), so a shared one would be agent-writable
@@ -1264,3 +1269,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D82 | The project directory is granted by a file, not implicitly: `hb init` writes `[fs] write = ["."]` into the base, and `hb explain` and `hb run` warn when no read or write grant covers the project (`Policy::project_grant_warning`). `hb <command>` without `run` is not built: the usage line and `--help` show `hb run -- <program>` instead | agreed |
 | D83 | Offline MCP launchers (hb-ghd.7.2): `uvx` and `npx` scripts first on `PATH` that `exec` the real tool with `--offline` and hb's own cache, only when a declared `[mcp.*]` has a command; the hint naming `hb warm` is printed before the `exec` (a wrapper that keeps the tool as a child loses stdin or orphans the tool); the cache is hb's, outside the user's caches and the guard's roots | agreed |
 | D84 | `hb warm` (hb-ghd.7.3): only `uvx`/`npx` servers are warmed or warned about; the probe is the system perl in the ball (no hb binary runs there); warm is the same ball as a run with only the network replaced (registries, git hosts, `warm_net`); stamps in the denied state directory, advisory; `hb run` and `hb explain` warn about a git config file the ball cannot read (git treats EPERM as fatal), and `hb init` grants the git files that exist | agreed |
+| D85 | `hb doctor` MCP section (hb-ghd.7.4): flags any non-version `@tag` (not only `@latest`) and unpinned `git+` sources, shows only the flagged argument without URL credentials, includes the missing-launcher warning, and does not flag bare package names | agreed |

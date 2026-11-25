@@ -42,7 +42,7 @@ Version 0.1, macOS only (built and measured on macOS 15.7, arm64). The design li
 
 | Built and tested | Not built yet |
 |---|---|
-| layered config, `hb explain`, `hb profile` | `hb doctor` checks for MCP servers that were never warmed, use `@latest` or an unpinned git source (milestone 7.4) |
+| layered config, `hb explain`, `hb profile` | |
 | `hb run`: Seatbelt profile, empty environment, pty, signals | `hb ctl` for project containers (milestone 8); `[ctl]` is parsed only |
 | HTTP proxy with a host allowlist, TLS trust settings, corporate-network settings | the language presets `rust`, `node`, `python`, `git` (write your own: see [Presets](#presets)) |
 | approval of a project's config (`hb approve`) | a proxy that talks to an upstream HTTP proxy or PAC (the proxy connects directly) |
@@ -140,7 +140,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 | `hb explain [--format text\|json] [--show-args] [--path <path>]` | Prints every effective rule with the file it came from, what the floor overrides, skipped grants and warnings (including a project that no grant covers). Runs nothing, needs no approval. `--path` answers one question about one path (merged config and floor only). |
 | `hb approve [--revoke]` | Shows what the project adds beyond your base and asks `Approve this config? [y/N]`. Needs a terminal. `--revoke` takes the approval back and needs none. |
 | `hb warm [--timeout SECS] [--log-denials] [--log-proxy] [NAME...]` | Fills hb's offline cache: starts each declared `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable, and waits for it to answer an MCP `initialize`. The only command that reaches a registry. Needs an approved config; refuses inside a ball. |
-| `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, and secret-looking launchd variable names. Prints names, never contents. |
+| `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, secret-looking launchd variable names, and the `uvx`/`npx` MCP servers that cannot start offline (never warmed, a moving version tag, an unpinned git source, a launcher missing from `[env] tools`). Prints names and the one flagged argument, never contents. Always exits 0. |
 | `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
 
 ### How a run is built
@@ -464,6 +464,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | A hook fails or times out and nothing starts | The run stops before the agent. Run the hook command by hand to see its error; raise `timeout_secs` (at most 300). |
 | claude is about 20 s slower inside the ball | Expected: its OTEL and `awsAuthRefresh` helpers cannot run and it waits for them. |
 | claude fails with `AWS authentication failed ... check AWS permissions and model access` | The credentials reached Bedrock but your role cannot invoke the model. The same failure happens outside the ball. |
+| `hb doctor` says an MCP server `moves` or has a git source with no full revision | `pkg@latest` (any `@tag` that is not a version) resolves to something new whenever `hb warm` runs again: pin a version (`pkg@1.2.3`). A `git+` source needs `@<40 hex>` (uv) or `#<40 hex>` (npm; its offline start is not measured): find the value with `git ls-remote <url> HEAD`, and use the same argument in the agent's own config. Then run `hb warm`. A package with no version is not flagged: it is whatever the last `hb warm` cached. |
 | `warning: mcp server X has not been warmed (or its command changed): run hb warm` | `hb run` starts `uvx` and `npx` servers from hb's own cache with `--offline`, and that cache is empty or was filled for other arguments. Run `hb warm` outside the ball. |
 | An MCP server started with `npx` or `uvx` says the package is not available offline | The cache lacks it. Run `hb warm` (it warms exactly the command and arguments in `[mcp.<name>]`, so keep them equal to what the agent runs). A git source needs a pinned revision (`git+https://host/repo@<sha>`): an unpinned one cannot start offline even from a warm cache. |
 | `warning: git inside the ball will fail with `unable to access`` | `~/.gitconfig` or `~/.config/git/config` exists and the ball cannot read it, and git treats that as fatal. Add the path to `[fs] read` in your base (`hb init` writes the ones that exist). |

@@ -61,9 +61,11 @@ enum Command {
     /// The agent can write the project directory, so `hb run` runs a project config only when its
     /// exact bytes were approved here. Needs a terminal; there is no way to approve without one.
     Approve(ApproveArgs),
-    /// Report secrets the guard misses: look-alike files, tracked secrets, launchd variables.
+    /// Report what hb cannot see: secrets the guard misses, and MCP servers that cannot start offline.
     ///
-    /// Shows file and variable names only, never their contents.
+    /// Secrets: look-alike files, tracked files, launchd variables (names only, never contents).
+    /// MCP: `uvx` and `npx` servers never warmed, with a moving version tag or an unpinned git
+    /// source, or whose launcher `[env] tools` lacks (the one flagged argument, never the others).
     Doctor,
     /// Print the Seatbelt profile and parameters this project would run under.
     ///
@@ -727,7 +729,7 @@ fn ensure_approved(
 /// `hb doctor`: what the secrets guard cannot see (design section 3).
 fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     use crate::guard::doctor::{Findings, launchd_environment, render, survey};
-    let (_, loaded) = match load_project(env) {
+    let (discovery, loaded) = match load_project(env) {
         Ok(project) => project,
         Err(error) => return fail(err, crate::Error::from(error)),
     };
@@ -755,6 +757,9 @@ fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -
         notes: prepared.notes.iter().map(ToString::to_string).collect(),
     };
     let _ = write!(out, "{}", render(&findings));
+    let warm_store = crate::warm::stamp::WarmStore::new(&StateDir::locate(&env.home));
+    let mcp = crate::warm::doctor::findings(&loaded.policy, &warm_store, discovery.root.path());
+    let _ = write!(out, "{}", crate::warm::doctor::render(&loaded.policy, &mcp));
     ExitCode::SUCCESS
 }
 
