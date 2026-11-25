@@ -121,6 +121,61 @@ fn doctor_has_a_launchd_section_and_a_clean_project_says_none() {
 }
 
 #[test]
+fn doctor_names_a_nested_repository_a_hook_manager_and_a_hooks_path_but_not_the_projects_own_git() {
+    let w = World::new(PROJECT);
+    assert_ok!(std::fs::create_dir_all(w.project.join(".git")));
+    write(
+        &w.project.join(".git/config"),
+        "[core]\n\thooksPath = .husky/_\n",
+    );
+    assert_ok!(std::fs::create_dir_all(w.project.join("vendor/lib/.git")));
+    assert_ok!(std::fs::create_dir_all(w.project.join(".husky")));
+    write(&w.project.join("lefthook.yml"), "");
+    let (code, out, err) = doctor(&w);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let git = section(&out, "git the floor does not protect");
+    assert!(git.contains("repository below a write grant:"), "{out}");
+    assert!(git.contains("vendor/lib"), "{out}");
+    assert!(
+        !git.contains(&format!("{}\n", w.project.display())),
+        "{out}"
+    );
+    assert!(git.contains("husky:") && git.contains(".husky"), "{out}");
+    assert!(
+        git.contains("lefthook:") && git.contains("lefthook.yml"),
+        "{out}"
+    );
+    assert!(
+        git.contains("core.hooksPath is set in .git/config: .husky/_"),
+        "{out}"
+    );
+}
+
+#[test]
+fn doctor_has_a_git_section_and_a_proxy_section_and_a_plain_project_has_no_git_findings() {
+    let w = World::new(PROJECT);
+    let (code, out, _) = doctor(&w);
+    assert_eq!(code, ExitCode::SUCCESS);
+    let git = section(&out, "git the floor does not protect");
+    assert!(git.contains("(none)"), "{out}");
+    assert!(out.contains("system proxy settings"), "{out}");
+}
+
+#[test]
+fn doctor_says_whether_the_agent_can_read_the_system_proxy_settings_by_system_trust() {
+    let on = World::with_base("[tls]\nsystem_trust = true\n", PROJECT);
+    let (_, out, _) = doctor(&on);
+    assert!(out.contains("the agent can read these settings"), "{out}");
+    assert!(!out.contains("the agent cannot read"), "{out}");
+    let off = World::with_base("[tls]\nsystem_trust = false\n", PROJECT);
+    let (_, out, _) = doctor(&off);
+    assert!(
+        out.contains("the agent cannot read these settings"),
+        "{out}"
+    );
+}
+
+#[test]
 fn doctor_outside_a_project_is_an_error_that_prints_nothing_to_stdout() {
     let mut w = World::new(PROJECT);
     w.env.cwd = w.home_dir();

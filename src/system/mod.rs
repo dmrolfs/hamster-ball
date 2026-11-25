@@ -11,6 +11,7 @@
 pub mod environment;
 pub mod floor;
 pub mod home;
+pub mod proxy_settings;
 pub mod resolver;
 pub mod tools;
 pub mod userdir;

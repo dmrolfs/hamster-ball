@@ -5,6 +5,7 @@
 pub mod doctor;
 pub mod patterns;
 pub mod prepare;
+pub mod repos;
 pub mod scan;
 pub mod tracked;
 

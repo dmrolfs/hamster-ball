@@ -67,7 +67,8 @@ hb run -- cargo test
 hb explain                # effective policy, with the source file of every rule
 hb approve                # review and approve this project's hamster-ball.toml (needs a terminal)
 hb approve --revoke       # take the approval back (no terminal needed)
-hb doctor                 # unprotected secret-looking files, tracked files the guard would deny, secret-looking launchd variables, MCP servers that cannot start offline
+hb doctor                 # unprotected secret-looking files, tracked files the guard would deny, secret-looking launchd variables,
+                          # git hooks the floor does not cover, system proxy settings, MCP servers that cannot start offline
 hb warm                   # fill hb's offline cache for declared uvx and npx MCP servers (the only step that may reach registries)
 hb profile                # print the generated Seatbelt profile
 hb ctl ps|logs|stats|start|stop|restart [name]   # inside the hamster ball: see and restart the listed containers
@@ -313,7 +314,7 @@ the system roots plus the extra CAs for non-Node clients was considered and not 
 What is measured, read-only (`tests/seatbelt_tls.rs`): `scutil --proxy` inside the ball prints the host's proxy settings with
 `configd` granted and an empty dictionary without it, so `configd` is what carries system proxy and PAC settings in, and without it
 they disappear without an error. `uv` panics without `configd` (`tests/tls_handshake.rs`). The same visibility means the agent can read
-the host's proxy configuration while `system_trust` is on. `hb` does not show or warn about that; it is a known gap (open item 13).
+the host's proxy configuration while `system_trust` is on. `hb doctor` lists the proxy settings the system has switched on and says whether the agent can read them (D90).
 
 These settings add trusted roots only. They work with Zscaler off, because hosts then present
 public-CA certificates that Node already trusts. Nothing in `hb` is Zscaler-specific.
@@ -1065,7 +1066,8 @@ reserved ranges stay refused for listed hosts.
 
 Not supported, and what `hb` does about it (D74): an upstream proxy would resolve names itself, so `hb` could no longer pin the address or enforce the
 rebinding checks; it is not built until there is a concrete network to test it against. A connection failure is reported as `unreachable` or
-`timed_out` with the host and port. D74 also planned a `hb doctor` warning when the system has a proxy or PAC enabled; it was not built (open item 13).
+`timed_out` with the host and port. `hb doctor` lists the HTTP, HTTPS, SOCKS, FTP, PAC and auto-discovery settings the system has on (from `scutil --proxy`;
+host and port only, a password in a PAC URL is dropped) and says that `hb` does not follow them (D74, D90).
 
 ## 13. Agent presets (initial contents)
 
@@ -1152,9 +1154,9 @@ Pure core, effects at the edges: `policy` is pure; `system` and the file loading
     the user's own config turns it on (D70).
     Reaching user keychain items through `securityd` is measured (section 6, D62): not possible without a pre-sandbox handle. Still
     open: the data-protection keychain and a system proxy or PAC actually being followed (`configd` gates the settings; see 4.5).
-11. **Nested standalone repositories** (D46): `hb doctor` should flag them and any git-hook manager. Not built: `hb doctor` does not look for either.
+11. ~~**Nested standalone repositories** (D46)~~ Done (D90): `hb doctor` lists repositories below a write grant, hook managers and `core.hooksPath`. The floor still does not protect them.
 12. ~~**Output with no pty** (7.3)~~ Done (D67): a stdout or stderr that is a terminal goes through a pipe and the same filter when there is no pty, and the exit fence runs after the run. The agent then sees output that is not a terminal.
-13. **System proxy or PAC** (4.5, 12.1, D74): `hb` does not report that the host has a proxy or PAC configured, and does not warn that the agent can read those settings while `tls.system_trust` is on. Not built.
+13. ~~**System proxy or PAC** (4.5, 12.1, D74)~~ Done (D90): `hb doctor` lists the system's proxy settings and whether the agent can read them. Following an upstream proxy or PAC is still not built.
 14. **Container egress** (9.3): a container the owner started has unrestricted network access, which the agent can use through `hb ctl` operations that run it. Measured, not mitigated in v1 (section 17).
 15. **Secrets in `hb ctl logs`** (9.3): container logs reach the agent, capped at 20 KB, and may hold secrets. Not filtered.
 
@@ -1311,7 +1313,7 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D71 | The proxy (`src/proxy`, hb-ghd.3.1) runs on tokio (`rt`, `net`, `io-util`, `time`, `sync`, `macros`) with `httparse`, on its own thread behind `ProxyHandle`; plain HTTP is one request per connection with `Connection: close`; address-literal targets are always refused; the proxy starts for every run, even with an empty allowlist, so the agent gets a `403` with a reason rather than a refused connection | owner, hb-ghd.3 |
 | D72 | `net.allow` entries are `host` or `host:port`, one (pattern, port) rule each, default port 443; a listed host on another port is `port_not_allowed` and the reply names the entry to add | owner, hb-ghd.3.2 |
 | D73 | `net.internal_hosts` (only the user's own files, any spelling) lists the hosts whose names may resolve to private, unique-local, tunnel (`100.64.0.0/10`, `198.18.0.0/15`) and site-local addresses; loopback, link-local, multicast and reserved ranges are never allowed; IPv4-mapped, NAT64 and 6to4 addresses are classified by the IPv4 address they carry. Per host, not a global switch, because corporate internal names resolve into the tunnel range | owner, hb-ghd.3 |
-| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1. The planned `hb doctor` warning for a system proxy or PAC was not built (open item 13) | owner, hb-ghd.3 |
+| D74 | No upstream-proxy, PAC or NTLM support in v1 (only a Zscaler-style tunnel is measured); documented in 12.1, with a `hb doctor` listing of the system's proxy settings (D90) | owner, hb-ghd.3 |
 | D75 | The proxy's refusals go through the `--log-denials` stream and every connection through `--log-proxy`; a run with refusals ends with one warning (hidden by `--no-proxy-summary`, and skipped when `--log-denials` shows them); a `407` is not a refusal; closed `loopback_ports` are a start-up warning, never an error | owner, hb-ghd.3 |
 | D76 | Presets are checked against the real agent by an opt-in harness (`hamster_ball::conformance`, `HB_CONFORMANCE=1`): a throwaway project extending only `agent/<name>`, the real home and a private user config, one question per agent with a per-agent criterion, and any refused connection fails the check; the run is time-limited through a process-group wrapper | owner, hb-ghd.3.4 |
 | D77 | Approval (`src/approval`, hb-ghd.4): fingerprint = SHA-256 over length-prefixed (canonical path, bytes) of the approval files in closure order; one owner-only record per canonical root under `~/.local/state/hamster-ball/approvals`; an untrusted record counts as not approved; the grant summary is every value the base chain does not also give and shows `env.set` values and MCP arguments; only a typed `y`/`yes` at a terminal approves, otherwise `hb run` exits 78 (`hb approve` too, with no `--yes`); `hb approve --revoke` needs no terminal; `hb explain` warns when unapproved; the in-process `cli::run` never prompts | owner, hb-ghd.4 |
@@ -1327,3 +1329,4 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D87 | `hb ctl` (hb-ghd.8): one broker per run on `<session>/ctl.sock`; synchronous threads (no second runtime), at most four connections, one 4 KiB JSON line, closed operation set, per-target mutation exclusion; commands run by the full inspected container ID after `--`; `hb` reaches the agent through a wrapper script in the session `bin`; `[ctl] launchd` (user-only, like hooks) adds `hb ctl launchd status\|kickstart\|restart` with `launchctl kickstart [-k] gui/<uid>/<label>` and a status projected to four fields (the owner added launchd to M8) |
 | D88 | Preflight is an allow-list (hb-ghd.8.2; oracle review in `history/hb-ghd.8_oracle-preflight-pins.md`): see 9.3 for the refusals; a refused container at start is a warning with no pins and no start or restart; the check runs before every named operation |
 | D89 | Pins and isolation (hb-ghd.8.3): pins are the source plus every ancestor a write grant reaches (not only up to the project root), `file-link` on the source, derived from preflight at start; `start` and `restart` need every source pinned at start; a container process can swap its own mount source (measured), so they also need a podman machine that shares only the project (owner chose "isolate the runtime"); the active machine is found by connection port; the owner recreates the machine, `hb` never does |
+| D90 | `hb doctor` reports two more things (hb-ghd.8 follow-up): **git the floor does not protect**: repositories (a `.git` directory or file) below a write grant other than the project's own and the ones above it, hook manager files (`.husky`, `.githooks`, `.git-hooks`, `lefthook*`, `.pre-commit-config.yaml`) and `core.hooksPath` from the project's `.git/config`; walked with the guard's limits (dependency and build directories skipped, symlinks not followed, 100,000 entries), names only. **System proxy settings** from `/usr/sbin/scutil --proxy` (5 s limit): the kinds that are on, host and port, a password in a PAC URL dropped, and whether `tls.system_trust` lets the agent read them. Findings only; the exit code stays 0 and the floor is unchanged (protecting nested repositories would break `git init` and `git clone`, D46) | owner, "address the gaps" |

@@ -61,9 +61,11 @@ enum Command {
     /// The agent can write the project directory, so `hb run` runs a project config only when its
     /// exact bytes were approved here. Needs a terminal; there is no way to approve without one.
     Approve(ApproveArgs),
-    /// Report what hb cannot see: secrets the guard misses, and MCP servers that cannot start offline.
+    /// Report what hb cannot see: secrets the guard misses, git it does not protect, system proxies, and MCP servers that cannot start offline.
     ///
     /// Secrets: look-alike files, tracked files, launchd variables (names only, never contents).
+    /// Git: repositories below a write grant, hook managers and `core.hooksPath`, which the floor
+    /// does not cover. Proxy: the system proxy and PAC settings, which hb does not follow.
     /// MCP: `uvx` and `npx` servers never warmed, with a moving version tag or an unpinned git
     /// source, or whose launcher `[env] tools` lacks (the one flagged argument, never the others).
     Doctor,
@@ -861,6 +863,7 @@ fn ensure_approved(
 /// `hb doctor`: what the secrets guard cannot see (design section 3).
 fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     use crate::guard::doctor::{Findings, launchd_environment, render, survey};
+    use crate::guard::repos::survey_repos;
     let (discovery, loaded) = match load_project(env) {
         Ok(project) => project,
         Err(error) => return fail(err, crate::Error::from(error)),
@@ -887,6 +890,14 @@ fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -
         survey_complete,
         launchd: launchd_environment(),
         notes: prepared.notes.iter().map(ToString::to_string).collect(),
+        repos: survey_repos(&roots, discovery.root.path(), 100_000),
+        proxies: crate::system::proxy_settings::system_proxies(),
+        proxies_readable: loaded
+            .policy
+            .tls
+            .system_trust
+            .as_ref()
+            .is_some_and(|trust| trust.value),
     };
     let _ = write!(out, "{}", render(&findings));
     let warm_store = crate::warm::stamp::WarmStore::new(&StateDir::locate(&env.home));

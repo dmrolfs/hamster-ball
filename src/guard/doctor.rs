@@ -6,8 +6,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::patterns::{is_guarded, is_template};
+use super::repos::RepoFindings;
 use super::scan::walk_files;
 use crate::policy::CanonicalPath;
+use crate::system::proxy_settings::ProxySetting;
 use crate::text::Escaped;
 
 /// Most entries of one list shown.
@@ -179,6 +181,12 @@ pub struct Findings {
     pub launchd: Vec<String>,
     /// What the guard could not do in full, as sentences.
     pub notes: Vec<String>,
+    /// Git outside the floor's reach: nested repositories and hook managers.
+    pub repos: RepoFindings,
+    /// The proxies the system has switched on, and whether `tls.system_trust` lets the agent read them.
+    pub proxies: Vec<ProxySetting>,
+    /// Whether the agent can read the system proxy settings (`tls.system_trust` is on).
+    pub proxies_readable: bool,
 }
 
 fn list(out: &mut String, title: &str, lines: &[String]) {
@@ -257,7 +265,65 @@ pub fn render(findings: &Findings) -> String {
             .map(|n| Escaped(n).to_string())
             .collect::<Vec<_>>(),
     );
+    render_git(&mut out, &findings.repos);
+    render_proxies(&mut out, &findings.proxies, findings.proxies_readable);
     out
+}
+
+/// The git section: repositories and hook managers that the floor does not cover.
+fn render_git(out: &mut String, repos: &RepoFindings) {
+    let mut lines: Vec<String> = repos
+        .nested
+        .iter()
+        .map(|p| format!("repository below a write grant: {}", Escaped(p)))
+        .collect();
+    lines.extend(
+        repos
+            .managers
+            .iter()
+            .map(|(path, manager)| format!("{manager}: {}", Escaped(path))),
+    );
+    if let Some(path) = &repos.hooks_path {
+        lines.push(format!(
+            "core.hooksPath is set in .git/config: {}",
+            Escaped(path)
+        ));
+    }
+    if !repos.complete {
+        lines.push("the survey stopped early: the project is large".to_owned());
+    }
+    list(
+        out,
+        "git the floor does not protect (git runs hooks outside the ball; the agent can write these, so deny them with `fs.deny_write` or run git from your own shell)",
+        &lines,
+    );
+}
+
+/// The system proxy section.
+fn render_proxies(out: &mut String, proxies: &[ProxySetting], readable: bool) {
+    let lines: Vec<String> = proxies
+        .iter()
+        .map(|p| match &p.target {
+            Some(target) => format!("{}: {}", p.kind, Escaped(target)),
+            None => p.kind.to_owned(),
+        })
+        .collect();
+    list(
+        out,
+        "system proxy settings (`hb` connects directly and does not follow them, so connections may fail)",
+        &lines,
+    );
+    let _ = if readable {
+        writeln!(
+            out,
+            "  the agent can read these settings (`tls.system_trust` is on)"
+        )
+    } else {
+        writeln!(
+            out,
+            "  the agent cannot read these settings (`tls.system_trust` is off)"
+        )
+    };
 }
 
 #[cfg(test)]
@@ -464,8 +530,41 @@ gui/501 = {
             survey_complete: true,
             launchd: vec!["GITHUB_TOKEN".to_owned()],
             notes: vec!["git could not list the tracked files".to_owned()],
+            repos: RepoFindings {
+                nested: vec!["/p/vendor/\u{1b}[2Jlib".to_owned()],
+                managers: vec![("/p/.husky".to_owned(), "husky")],
+                hooks_path: Some(".husky/_".to_owned()),
+                complete: false,
+            },
+            proxies: vec![
+                ProxySetting {
+                    kind: "PAC file",
+                    target: Some("http://pac.example/wpad.dat".to_owned()),
+                },
+                ProxySetting {
+                    kind: "HTTPS",
+                    target: Some("proxy.example:8080".to_owned()),
+                },
+            ],
+            proxies_readable: true,
         };
         let text = render(&findings);
+        assert!(
+            text.contains("repository below a write grant: /p/vendor/"),
+            "{text}"
+        );
+        assert!(text.contains("husky: /p/.husky"), "{text}");
+        assert!(
+            text.contains("core.hooksPath is set in .git/config: .husky/_"),
+            "{text}"
+        );
+        assert!(text.contains("the survey stopped early"), "{text}");
+        assert!(
+            text.contains("PAC file: http://pac.example/wpad.dat"),
+            "{text}"
+        );
+        assert!(text.contains("HTTPS: proxy.example:8080"), "{text}");
+        assert!(text.contains("the agent can read these settings"), "{text}");
         assert!(text.contains("on: key and certificate files"), "{text}");
         assert!(
             text.contains("3 directories holding secrets are pinned"),
@@ -488,7 +587,7 @@ gui/501 = {
             survey_complete: true,
             ..Findings::default()
         });
-        assert_eq!(text.matches("(none)").count(), 3);
+        assert_eq!(text.matches("(none)").count(), 5);
         assert!(text.contains("off: those files stay denied"));
         let many = Findings {
             tracked: (0..60).map(|i| format!("/p/{i}.key")).collect(),
@@ -505,5 +604,17 @@ gui/501 = {
             ..Findings::default()
         });
         assert!(text.contains("the survey stopped early"), "{text}");
+    }
+
+    #[test]
+    fn a_clean_report_says_none_for_git_and_proxies_and_says_when_the_agent_cannot_read_them() {
+        let text = render(&Findings::default());
+        assert!(text.contains("git the floor does not protect"), "{text}");
+        assert!(text.contains("system proxy settings"), "{text}");
+        assert!(
+            text.contains("the agent cannot read these settings"),
+            "{text}"
+        );
+        assert_eq!(text.matches("(none)").count(), 4, "{text}");
     }
 }
