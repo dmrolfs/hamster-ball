@@ -18,6 +18,8 @@ it cannot read your credentials, your browser profiles or the secret files in th
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
+For a longer explanation of the ideas, the parts and worked examples, see the [guide](docs/README.md).
+
 ## What it protects, and what it does not
 
 `hb` limits what an agent can do when it is wrong, confused or tricked by text it reads. Inside the ball:
