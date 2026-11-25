@@ -92,6 +92,9 @@ pub enum Op {
     /// `file-write-unlink`.
     #[strum(serialize = "file-write-unlink")]
     FileWriteUnlink,
+    /// `file-link`: creating a hard link whose source is the path.
+    #[strum(serialize = "file-link")]
+    FileLink,
     /// `file-ioctl`.
     #[strum(serialize = "file-ioctl")]
     FileIoctl,
@@ -372,6 +375,7 @@ mod tests {
         assert_eq!(Op::FileReadAll.to_string(), "file-read*");
         assert_eq!(Op::FileWriteAll.to_string(), "file-write*");
         assert_eq!(Op::FileWriteUnlink.to_string(), "file-write-unlink");
+        assert_eq!(Op::FileLink.to_string(), "file-link");
         assert_eq!(Op::IpcPosixSem.to_string(), "ipc-posix-sem");
         assert_eq!(Op::UserPreferenceRead.to_string(), "user-preference-read");
     }

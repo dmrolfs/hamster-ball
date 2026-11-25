@@ -188,11 +188,12 @@ fn check_action(index: usize, rule: &Rule) -> Result<(), InvariantViolation> {
     }
     match rule.action {
         Action::Allow => {
-            if rule.ops.contains(&Op::FileWriteUnlink) {
-                return Err(InvariantViolation::SpecificWriteAllow {
-                    index,
-                    op: Op::FileWriteUnlink,
-                });
+            if let Some(&op) = rule
+                .ops
+                .iter()
+                .find(|op| matches!(op, Op::FileWriteUnlink | Op::FileLink))
+            {
+                return Err(InvariantViolation::SpecificWriteAllow { index, op });
             }
             // A specific read allow is safe only where every later deny lists the same
             // operations: the global metadata allow, and the template re-allow of a guard deny.
@@ -246,6 +247,7 @@ fn fits(op: Op, filter: &Filter) -> bool {
         Op::FileReadAll
         | Op::FileWriteAll
         | Op::FileWriteUnlink
+        | Op::FileLink
         | Op::FileReadData
         | Op::FileReadMetadata
         | Op::FileReadXattr

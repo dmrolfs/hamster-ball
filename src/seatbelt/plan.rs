@@ -502,6 +502,47 @@ fn user_pins(policy: &Policy, inputs: &RenderInputs) -> Vec<Rule> {
         .collect()
 }
 
+/// Pins for the bind-mount sources of containers `hb ctl` may restart (design 9.3).
+///
+/// `podman restart` resolves a source path again, so a mounted directory swapped for a symlink
+/// would be followed. Each source gets an unlink and a link deny (the link deny stops a hard link
+/// being made from it). Each ancestor a write grant reaches gets an unlink deny, so renaming the
+/// directory above a source fails too. The ancestors stop where the write grants stop: nothing
+/// above that can be renamed by the agent anyway.
+fn mount_pins(policy: &Policy, inputs: &RenderInputs) -> Vec<Rule> {
+    let writable: Vec<&CanonicalPath> = policy
+        .fs
+        .write
+        .iter()
+        .map(|g| &g.value)
+        .chain(inputs.session_dir.iter())
+        .collect();
+    let deny = |op: Op, path: &CanonicalPath| {
+        Rule::deny(
+            Section::Pins,
+            &[op],
+            vec![Filter::Literal(pv(ParamKind::Deny, path))],
+        )
+        .labelled("mount-pin")
+    };
+    let mut rules = Vec::new();
+    for source in &inputs.mount_pins {
+        rules.push(deny(Op::FileWriteUnlink, source));
+        rules.push(deny(Op::FileLink, source));
+        let pattern = PathPattern {
+            base: source.clone(),
+            alias: None,
+            tail: None,
+        };
+        rules.extend(
+            pin_ancestors(&pattern, Extent::Node, &writable)
+                .iter()
+                .map(|ancestor| deny(Op::FileWriteUnlink, ancestor)),
+        );
+    }
+    rules
+}
+
 fn floor(
     rules: &mut Vec<Rule>,
     policy: &Policy,
@@ -552,6 +593,7 @@ fn floor(
         }
     }
     pins.extend(user_pins(policy, inputs));
+    pins.extend(mount_pins(policy, inputs));
     pins.extend(inputs.guard.pins.iter().map(|path| {
         Rule::deny(
             Section::Pins,
@@ -1227,6 +1269,94 @@ mod tests {
         policy.fs.deny_write = vec![Sourced::new(pattern("/Users/me/p/vend"), src())];
         let rules = rendered(&policy, &RenderInputs::new());
         assert_eq!(pin_paths(&rules), ["/Users/me/p"]);
+    }
+
+    fn mount_pin_rules(rules: &[Rule], op: Op) -> Vec<String> {
+        let mut paths: Vec<String> = rules
+            .iter()
+            .filter(|r| r.section == Section::Pins && r.ops == [op])
+            .flat_map(filter_texts)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn mount_sources_and_the_ancestors_a_write_grant_reaches_get_unlink_and_link_denies() {
+        let mut policy = policy_with(vec![]);
+        policy.fs.write = vec![Sourced::new(cp("/Users/me/p"), src())];
+        let inputs = RenderInputs::new().with_mount_pins(vec![
+            cp("/Users/me/p/var/data"),
+            cp("/Users/me/p/cfg/app.yaml"),
+        ]);
+        let rules = rendered(&policy, &inputs);
+        assert_ok!(check(&rules));
+        let expected = [
+            "/Users/me/p",
+            "/Users/me/p/cfg",
+            "/Users/me/p/cfg/app.yaml",
+            "/Users/me/p/var",
+            "/Users/me/p/var/data",
+        ];
+        assert_eq!(mount_pin_rules(&rules, Op::FileWriteUnlink), expected);
+        // The link deny is for the sources themselves; ancestors may gain a hard link.
+        assert_eq!(
+            mount_pin_rules(&rules, Op::FileLink),
+            ["/Users/me/p/cfg/app.yaml", "/Users/me/p/var/data"]
+        );
+    }
+
+    #[test]
+    fn a_write_grant_above_the_project_pulls_the_pins_up_to_it_and_never_past_it() {
+        let mut policy = policy_with(vec![]);
+        policy.fs.write = vec![Sourced::new(cp("/Users/me/work"), src())];
+        let inputs = RenderInputs::new().with_mount_pins(vec![cp("/Users/me/work/p/data")]);
+        let pins = mount_pin_rules(&rendered(&policy, &inputs), Op::FileWriteUnlink);
+        assert_eq!(
+            pins,
+            [
+                "/Users/me/work",
+                "/Users/me/work/p",
+                "/Users/me/work/p/data"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_outside_every_write_grant_is_pinned_itself_but_no_ancestor_is() {
+        let mut policy = policy_with(vec![]);
+        policy.fs.write = vec![Sourced::new(cp("/Users/me/other"), src())];
+        let inputs = RenderInputs::new().with_mount_pins(vec![cp("/Users/me/p/data")]);
+        let rules = rendered(&policy, &inputs);
+        assert_eq!(
+            mount_pin_rules(&rules, Op::FileWriteUnlink),
+            ["/Users/me/p/data"]
+        );
+    }
+
+    #[test]
+    fn mount_pins_are_unique_deny_only_and_come_after_every_allow() {
+        let mut policy = policy_with(vec![]);
+        policy.fs.write = vec![Sourced::new(cp("/Users/me/p"), src())];
+        let inputs = RenderInputs::new()
+            .with_mount_pins(vec![cp("/Users/me/p/data"), cp("/Users/me/p/data")]);
+        let rules = rendered(&policy, &inputs);
+        assert_ok!(check(&rules));
+        assert_eq!(
+            mount_pin_rules(&rules, Op::FileWriteUnlink),
+            ["/Users/me/p", "/Users/me/p/data"]
+        );
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.ops.contains(&Op::FileLink))
+                .all(|r| r.action == Action::Deny && r.section == Section::Pins)
+        );
+        assert!(
+            rendered(&policy, &RenderInputs::new())
+                .iter()
+                .all(|r| !r.ops.contains(&Op::FileLink))
+        );
     }
 
     fn guarded_policy(roots: &[&str]) -> Policy {

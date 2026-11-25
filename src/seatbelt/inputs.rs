@@ -53,6 +53,10 @@ pub struct RenderInputs {
     pub guard: GuardInputs,
     /// The `hb ctl` broker socket (milestone 8).
     pub ctl_socket: Option<CanonicalPath>,
+    /// Bind-mount sources of the containers `hb ctl` may restart, from preflight (milestone 8).
+    ///
+    /// Each gets an unlink and a link deny, and so does every ancestor a write grant reaches.
+    pub mount_pins: Vec<CanonicalPath>,
     /// Directories of `[env] tools`, readable so scripts on `PATH` run.
     pub exec_dirs: Vec<CanonicalPath>,
 }
@@ -117,6 +121,13 @@ impl RenderInputs {
     #[must_use]
     pub fn with_ctl_socket(mut self, socket: CanonicalPath) -> Self {
         self.ctl_socket = Some(socket);
+        self
+    }
+
+    /// Sets the mount sources to pin.
+    #[must_use]
+    pub fn with_mount_pins(mut self, sources: Vec<CanonicalPath>) -> Self {
+        self.mount_pins = sources;
         self
     }
 
