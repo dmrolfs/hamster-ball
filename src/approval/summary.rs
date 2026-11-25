@@ -81,6 +81,7 @@ impl GrantSummary {
             out.row("ctl.label", label);
         }
         out.rows("ctl.containers", &report.ctl.containers);
+        out.rows("ctl.launchd", &report.ctl.launchd);
         for mcp in &report.mcp {
             let mut value = format!("{} = {}", mcp.name, mcp.command.as_deref().unwrap_or("?"));
             for arg in mcp.args.iter().flatten() {

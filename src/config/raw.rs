@@ -87,6 +87,7 @@ pub(crate) struct RawSystem {
 pub(crate) struct RawCtl {
     pub(crate) label: Option<String>,
     pub(crate) containers: Vec<String>,
+    pub(crate) launchd: Vec<String>,
 }
 
 /// One `[mcp.<name>]` entry.
@@ -168,7 +169,8 @@ pub(crate) fn parse_str(source: &str, file: &Path) -> Result<RawConfig, ParseErr
 ///
 /// `hooks` run unsandboxed on the host, `guard.exceptions` switch secret protection off and
 /// `system.launchctl = true` lets the agent start, unload and disable the user's launchd jobs and
-/// `net.internal_hosts` lets named hosts resolve into private networks, so
+/// `net.internal_hosts` lets named hosts resolve into private networks and `ctl.launchd` lets the
+/// agent restart launchd jobs that run outside the ball, so
 /// only files the user controls may carry them (see `closure`). This probe answers "does the
 /// key appear" without depending on the sections' shape, so it keeps working when the hooks
 /// schema changes, and it sees `hooks = []` that the typed schema cannot tell from absence.
@@ -182,12 +184,18 @@ pub(crate) struct UserOnlySections {
     pub(crate) launchctl_on: bool,
     /// `net.internal_hosts` appears in any TOML spelling (it widens what a name may resolve to).
     pub(crate) internal_hosts: bool,
+    /// `ctl.launchd` appears in any TOML spelling (it lets the agent restart jobs that run outside the ball).
+    pub(crate) ctl_launchd: bool,
 }
 
 impl UserOnlySections {
     /// Whether any user-only section is present.
     pub(crate) fn any(self) -> bool {
-        self.hooks || self.guard_exceptions || self.launchctl_on || self.internal_hosts
+        self.hooks
+            || self.guard_exceptions
+            || self.launchctl_on
+            || self.internal_hosts
+            || self.ctl_launchd
     }
 }
 
@@ -197,6 +205,12 @@ struct UserOnlyProbe {
     guard: Option<GuardProbe>,
     system: Option<SystemProbe>,
     net: Option<NetProbe>,
+    ctl: Option<CtlProbe>,
+}
+
+#[derive(Deserialize, Default)]
+struct CtlProbe {
+    launchd: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize, Default)]
@@ -227,6 +241,7 @@ pub(crate) fn user_only_sections(source: &str) -> UserOnlySections {
             .system
             .is_some_and(|system| system.launchctl == Some(true)),
         internal_hosts: probe.net.is_some_and(|net| net.internal_hosts.is_some()),
+        ctl_launchd: probe.ctl.is_some_and(|ctl| ctl.launchd.is_some()),
     }
 }
 

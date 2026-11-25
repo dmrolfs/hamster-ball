@@ -12,8 +12,9 @@ use crate::config::{
 use crate::explain::ExplainError;
 use crate::policy::{
     ArgWordError, ArgvError, ContainerLabelError, ContainerNameError, EnvNameError, EnvValueError,
-    ExtendTargetError, GlobTailError, HostNameError, HostPatternError, HostRuleError, McpNameError,
-    PathError, PathPatternError, PortError, PresetNameError, RefTextError, RootError,
+    ExtendTargetError, GlobTailError, HostNameError, HostPatternError, HostRuleError,
+    LaunchdLabelError, McpNameError, PathError, PathPatternError, PortError, PresetNameError,
+    RefTextError, RootError,
 };
 use crate::seatbelt::RenderError;
 use crate::session::{GuardError, HelperError, RunError};
@@ -136,6 +137,13 @@ pub enum Error {
     GlobTail {
         /// The underlying error.
         source: GlobTailError,
+    },
+
+    /// A launchd label was invalid.
+    #[snafu(transparent)]
+    LaunchdLabel {
+        /// The underlying error.
+        source: LaunchdLabelError,
     },
 
     /// A container label selector was invalid.

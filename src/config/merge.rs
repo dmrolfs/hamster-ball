@@ -23,7 +23,7 @@ use super::resolve::{ResolvedConfig, ResolvedMcpServer};
 use crate::origin::{KeyPath, Layer, Origin, Source, Sourced};
 use crate::policy::{
     BindPort, CanonicalPath, ContainerLabel, ContainerName, EnvName, EnvValue, Floor, Hook,
-    HookName, HostPattern, HostRule, McpName, PathPattern, Port, ToolName,
+    HookName, HostPattern, HostRule, LaunchdLabel, McpName, PathPattern, Port, ToolName,
 };
 use crate::sys::path_preview;
 
@@ -143,6 +143,8 @@ pub struct MergedCtl {
     pub label: Option<Sourced<ContainerLabel>>,
     /// Container names `hb ctl` may operate on.
     pub containers: Vec<Sourced<ContainerName>>,
+    /// launchd jobs `hb ctl launchd` may start and restart (only the user's own files may list them).
+    pub launchd: Vec<Sourced<LaunchdLabel>>,
 }
 
 /// The merged policy of a whole closure, and the floor it can never loosen.
@@ -356,6 +358,7 @@ pub fn merge(files: &[ClosureFile], floor: Floor) -> Result<Policy, MergeErrors>
         ctl: MergedCtl {
             label: label(files, &mut collected),
             containers: union(files, |c| positions(&c.ctl.containers)),
+            launchd: union(files, |c| positions(&c.ctl.launchd)),
         },
         mcp: keyed(
             files,
@@ -559,6 +562,7 @@ fn reassert_user_only(files: &[ClosureFile], collected: &mut Collected) {
                 "guard.exceptions",
                 !file.resolved.guard.exceptions.is_empty(),
             ),
+            ("ctl.launchd", !file.resolved.ctl.launchd.is_empty()),
         ] {
             if present {
                 collected.push(MergeError::UserOnlySection {

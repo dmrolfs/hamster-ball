@@ -1,6 +1,6 @@
-// ABOUTME: ContainerName and ContainerLabel: validated container selectors for `hb ctl`, safe as one argv element.
+// ABOUTME: ContainerName, ContainerLabel and LaunchdLabel: validated selectors for `hb ctl`, each safe as one argv element.
 // ABOUTME: Name grammar from the design: ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ (no leading dash, so it cannot become a flag).
-//! The [`ContainerName`] and [`ContainerLabel`] value types.
+//! The [`ContainerName`], [`ContainerLabel`] and [`LaunchdLabel`] value types.
 
 use std::fmt;
 
@@ -196,6 +196,80 @@ impl fmt::Display for ContainerLabel {
     }
 }
 
+/// Longest accepted launchd label, in bytes.
+pub const MAX_LAUNCHD_LABEL_BYTES: usize = 128;
+
+/// Why a string is not an acceptable launchd label.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum LaunchdLabelError {
+    /// The label is empty.
+    #[snafu(display("launchd label is empty"))]
+    EmptyLaunchd,
+
+    /// The label is longer than [`MAX_LAUNCHD_LABEL_BYTES`].
+    #[snafu(display("launchd label is {len} bytes long; the limit is {max}"))]
+    LaunchdTooLong {
+        /// Length in bytes.
+        len: usize,
+        /// The limit that was exceeded.
+        max: usize,
+    },
+
+    /// The label starts with something other than a letter or digit, or has a character outside `[A-Za-z0-9_.-]`.
+    #[snafu(display(
+        "launchd label must start with a letter or digit and use only letters, digits, `_`, `.` and `-`: {}",
+        Escaped(label)
+    ))]
+    InvalidLaunchd {
+        /// The rejected label.
+        label: String,
+    },
+}
+
+/// The label of a launchd job in the user's login session, such as `com.example.postgres`.
+///
+/// `hb ctl launchd` may start or restart only the jobs a config lists. The grammar keeps the
+/// label one plain argv word (it cannot start with `-` or hold `/`, so it cannot change the
+/// `gui/<uid>/<label>` target into another domain).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaunchdLabel(String);
+
+impl LaunchdLabel {
+    /// Parses a launchd label.
+    ///
+    /// # Errors
+    /// [`LaunchdLabelError`] for an empty, over-long or malformed label.
+    pub fn parse(label: &str) -> Result<Self, LaunchdLabelError> {
+        ensure!(!label.is_empty(), EmptyLaunchdSnafu);
+        ensure!(
+            label.len() <= MAX_LAUNCHD_LABEL_BYTES,
+            LaunchdTooLongSnafu {
+                len: label.len(),
+                max: MAX_LAUNCHD_LABEL_BYTES
+            }
+        );
+        let ok = label.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        ensure!(ok, InvalidLaunchdSnafu { label });
+        Ok(Self(label.to_owned()))
+    }
+
+    /// The label as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LaunchdLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +435,46 @@ mod tests {
         let name = assert_ok!(ContainerName::parse("pg-1.db"));
         assert_eq!(name.to_string(), "pg-1.db");
         assert_eq!(name.as_str(), "pg-1.db");
+    }
+
+    #[test]
+    fn launchd_label_accepts_reverse_dns_names() {
+        let longest = "a".repeat(MAX_LAUNCHD_LABEL_BYTES);
+        for good in [
+            "a",
+            "com.example.postgres",
+            "homebrew.mxcl.postgresql-16",
+            &longest,
+        ] {
+            assert_eq!(
+                assert_ok!(LaunchdLabel::parse(good), "{good}").as_str(),
+                good
+            );
+        }
+    }
+
+    #[test]
+    fn launchd_label_rejects_what_could_change_the_target_or_become_a_flag() {
+        for bad in [
+            "",
+            "-k",
+            ".x",
+            "a/b",
+            "a b",
+            "a;id",
+            "gui/501/x",
+            "a\nb",
+            "a\u{e9}",
+            "a:b",
+            "a@b",
+        ] {
+            assert_err!(LaunchdLabel::parse(bad), "{bad:?}");
+        }
+        assert!(matches!(
+            assert_err!(LaunchdLabel::parse(
+                &"a".repeat(MAX_LAUNCHD_LABEL_BYTES + 1)
+            )),
+            LaunchdLabelError::LaunchdTooLong { .. }
+        ));
     }
 }

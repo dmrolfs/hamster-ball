@@ -2442,7 +2442,8 @@
         }
       ]
     },
-    "containers": []
+    "containers": [],
+    "launchd": []
   },
   "mcp": [
     {

@@ -275,6 +275,8 @@ pub struct CtlReport {
     pub label: Option<Row<String>>,
     /// Named containers.
     pub containers: Vec<Row<String>>,
+    /// launchd jobs `hb ctl launchd` may start and restart.
+    pub launchd: Vec<Row<String>>,
 }
 
 /// One MCP server.
@@ -641,6 +643,9 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
             }),
             containers: b.rows(&policy.ctl.containers, "ctl.containers", |c| {
                 c.as_str().to_owned()
+            }),
+            launchd: b.rows(&policy.ctl.launchd, "ctl.launchd", |l| {
+                l.as_str().to_owned()
             }),
         },
         mcp: policy

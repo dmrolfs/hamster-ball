@@ -168,7 +168,9 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
     section(
         out,
         "ctl",
-        report.ctl.label.is_none() && report.ctl.containers.is_empty(),
+        report.ctl.label.is_none()
+            && report.ctl.containers.is_empty()
+            && report.ctl.launchd.is_empty(),
     )?;
     if let Some(label) = &report.ctl.label {
         writeln!(
@@ -184,6 +186,15 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
             "  container {}  {}",
             Escaped(&container.value),
             origins(&container.origins, t)
+        )?;
+    }
+
+    for job in &report.ctl.launchd {
+        writeln!(
+            out,
+            "  launchd {}  {}",
+            Escaped(&job.value),
+            origins(&job.origins, t)
         )?;
     }
 

@@ -20,7 +20,10 @@ pub mod pattern;
 pub mod port;
 
 pub use argv::{ArgWord, ArgWordError, Argv, ArgvError};
-pub use ctl::{ContainerLabel, ContainerLabelError, ContainerName, ContainerNameError};
+pub use ctl::{
+    ContainerLabel, ContainerLabelError, ContainerName, ContainerNameError, LaunchdLabel,
+    LaunchdLabelError,
+};
 pub use env::{
     EnvName, EnvNameError, EnvValue, EnvValueError, MAX_TOOL_NAME_BYTES, ToolName, ToolNameError,
 };

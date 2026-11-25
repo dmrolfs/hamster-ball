@@ -32,7 +32,7 @@ use super::raw::user_only_sections;
 use super::resolve::{Diagnostics, ResolveContext, ResolveErrors, ResolvedConfig, resolve_file};
 use super::text::{ConfigText, ConfigTextError, FileRole};
 use crate::origin::{FileId, KeyPath, Layer, Origin, Source};
-use crate::policy::{CanonicalPath, HomeDir, PresetName};
+use crate::policy::{CanonicalPath, HomeDir, PresetName, ProjectRoot};
 use crate::sys::path_preview;
 use crate::system::{
     FloorDiagnostic, FloorEnvironment, FloorError, FloorInputs, UserConfigDir, UserConfigError,
@@ -172,7 +172,7 @@ pub enum LoadError {
     UserOnlySection {
         /// The file that defines the section.
         path: PathBuf,
-        /// The section: `hooks`, `guard.exceptions`, `system.launchctl = true` or `net.internal_hosts`.
+        /// The section: `hooks`, `guard.exceptions`, `system.launchctl = true`, `ctl.launchd` or `net.internal_hosts`.
         section: &'static str,
         /// Where the file is.
         location: FileLocation,
@@ -345,6 +345,8 @@ pub struct Loaded {
     pub policy: Policy,
     /// Things the floor builder noticed that are not errors.
     pub floor_diagnostics: Vec<FloorDiagnostic>,
+    /// The project this was loaded for.
+    pub root: ProjectRoot,
 }
 
 /// Loads the config closure for `request`, builds the floor, and merges them into one policy.
@@ -388,6 +390,7 @@ pub fn load(request: &LoadRequest<'_>) -> Result<Loaded, LoadError> {
         closure,
         policy,
         floor_diagnostics: built.diagnostics,
+        root: request.project.root.clone(),
     })
 }
 
@@ -627,6 +630,8 @@ impl<'a> Loader<'a> {
             "guard.exceptions"
         } else if found.launchctl_on {
             "system.launchctl = true"
+        } else if found.ctl_launchd {
+            "ctl.launchd"
         } else {
             "net.internal_hosts"
         };
@@ -1482,6 +1487,24 @@ mod tests {
         // A project may refuse what the user allowed; saying `false` is harmless anywhere.
         w.project("[system]\nlaunchctl = false\n");
         assert_ok!(w.load());
+    }
+
+    #[test]
+    fn ctl_launchd_in_a_project_file_is_an_error_but_fine_in_the_base() {
+        let w = World::new();
+        w.base("[ctl]\nlaunchd = [\"com.example.db\"]\n");
+        w.project("");
+        let closure = assert_ok!(w.load());
+        assert_eq!(
+            closure.files()[0].resolved.ctl.launchd[0].as_str(),
+            "com.example.db"
+        );
+        let project = w.project("[ctl]\nlaunchd = []\n");
+        let err = assert_err!(w.load());
+        let (path, section, location) = user_only_error(&err);
+        assert_eq!(path, assert_ok!(fs::canonicalize(&project)));
+        assert_eq!(section, "ctl.launchd");
+        assert_eq!(location, FileLocation::InProject);
     }
 
     #[test]

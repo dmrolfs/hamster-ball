@@ -16,9 +16,9 @@ use crate::policy::{
     ArgWord, ArgWordError, Argv, ArgvError, AwsProfile, BindPort, CanonicalPath, ContainerLabel,
     ContainerLabelError, ContainerName, ContainerNameError, EnvName, EnvNameError, EnvValue,
     EnvValueError, ExtendRef, GuardException, HomeDir, Hook, HookError, HookFormat, HookName,
-    HookTimeout, HostPattern, HostPatternError, HostRule, HostRuleError, McpName, McpNameError,
-    OutputFile, PathError, PathPattern, PathPatternError, Port, PortError, ProjectRoot,
-    RefTextError, ToolName, ToolNameError,
+    HookTimeout, HostPattern, HostPatternError, HostRule, HostRuleError, LaunchdLabel,
+    LaunchdLabelError, McpName, McpNameError, OutputFile, PathError, PathPattern, PathPatternError,
+    Port, PortError, ProjectRoot, RefTextError, ToolName, ToolNameError,
 };
 use crate::system::{AllowOutcome, PathResolver, SkippedPath};
 use crate::text::EscapedBounded;
@@ -180,6 +180,12 @@ pub enum EntryError {
     Container {
         /// The underlying error.
         source: ContainerNameError,
+    },
+    /// A `ctl.launchd` label was invalid.
+    #[snafu(transparent)]
+    Launchd {
+        /// The underlying error.
+        source: LaunchdLabelError,
     },
     /// The `ctl.label` selector was invalid.
     #[snafu(transparent)]
@@ -366,6 +372,8 @@ pub struct ResolvedCtl {
     pub label: Option<ContainerLabel>,
     /// Container names this hamster ball may operate on.
     pub containers: Vec<ContainerName>,
+    /// launchd jobs `hb ctl launchd` may start and restart.
+    pub launchd: Vec<LaunchdLabel>,
 }
 
 /// One `[mcp.<name>]` entry.
@@ -485,6 +493,11 @@ impl<'a> Resolution<'a> {
                     KeyPath::root().field("ctl").field("containers"),
                     &parsed.ctl.containers,
                     ContainerName::parse,
+                ),
+                launchd: self.list(
+                    KeyPath::root().field("ctl").field("launchd"),
+                    &parsed.ctl.launchd,
+                    LaunchdLabel::parse,
                 ),
             },
             mcp: self.mcp(&parsed.mcp),
@@ -1294,6 +1307,15 @@ mod tests {
     // ====================================================================================
     // Validated passthrough values (ctl.label, hooks, mcp, extends, guard)
     // ====================================================================================
+
+    #[test]
+    fn ctl_launchd_labels_are_validated_and_reported_by_position() {
+        let fx = Fixture::new();
+        let ok = fx.resolved("[ctl]\nlaunchd = [\"com.example.db\"]\n");
+        assert_eq!(ok.config.ctl.launchd[0].as_str(), "com.example.db");
+        let errors = fx.errors("[ctl]\nlaunchd = [\"ok\", \"-k\"]\n");
+        assert_eq!(key_of(&errors, 0), "ctl.launchd[1]");
+    }
 
     #[test]
     fn an_empty_ctl_label_is_an_error() {
