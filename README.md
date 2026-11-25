@@ -1,4 +1,4 @@
-<!-- ABOUTME: Entry point for hamster-ball: what `hb` does, how to install and use it, the config reference and troubleshooting. -->
+<!-- ABOUTME: Entry point for hamster-ball: what `hb` does, how to install and use it, the config reference and troubleshooting; links to the book. -->
 <!-- ABOUTME: Describes what is built today (milestones 1 to 8); the design and its decision log are in ref/Hamster-Ball-Design.md. -->
 
 # hamster-ball
@@ -10,6 +10,7 @@ Each project describes its ball in a small `hamster-ball.toml`. A base config of
 project can loosen it. The agent reaches the network only through a proxy that checks every host against an allowlist, and
 it cannot read your credentials, your browser profiles or the secret files in the project.
 
+- [The guide (book)](https://dmrolfs.github.io/hamster-ball/)
 - [What it protects, and what it does not](#what-it-protects-and-what-it-does-not)
 - [Status](#status)
 - [Getting started](#getting-started)
@@ -18,7 +19,7 @@ it cannot read your credentials, your browser profiles or the secret files in th
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
-For a longer explanation of the ideas, the parts and worked examples, see the [guide](docs/README.md), also published as a book at https://dmrolfs.github.io/hamster-ball/ once GitHub Pages is switched on (see Development).
+This page is the short version. The guide explains the ideas, the parts and worked examples at more length. It is published as a book at [dmrolfs.github.io/hamster-ball](https://dmrolfs.github.io/hamster-ball/), and the same chapters are in [`docs/`](docs/README.md).
 
 ## What it protects, and what it does not
 
@@ -567,5 +568,5 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
   `HB_CONFORMANCE=1 cargo test --features test-support --test conformance -- --nocapture <agent>`. See [presets/README.md](presets/README.md).
 - [ref/Hamster-Ball-Design.md](ref/Hamster-Ball-Design.md) is the design: threat model, config schema, the floor, enforcement,
   proxy, presets, test plan and the numbered decision log (D1 to D91). Each "Measured" statement in it comes from a run on a real machine.
-- The guide in `docs/` is an [mdBook](https://rust-lang.github.io/mdBook/). Build and read it locally with `cargo install mdbook` then `mdbook serve --open`. `.github/workflows/book.yml` builds it on every change under `docs/` and publishes it to GitHub Pages from `main`. One-time setup: in the repository, Settings, Pages, Source: GitHub Actions.
+- The guide in `docs/` is an [mdBook](https://rust-lang.github.io/mdBook/). Build and read it locally with `cargo install mdbook` then `mdbook serve --open`. `.github/workflows/book.yml` builds it on every change under `docs/` and publishes it to GitHub Pages from `main`. The book is at https://dmrolfs.github.io/hamster-ball/.
 - Work is tracked with beads (`bd`), epic `hb-ghd`; working notes live in `history/` and are not committed.
