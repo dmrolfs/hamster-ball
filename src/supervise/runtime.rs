@@ -63,6 +63,9 @@ pub struct Runtime {
     live: HashMap<SessionId, Live>,
     screens: HashMap<SessionId, Arc<Shared>>,
     last_frame: Option<Instant>,
+    /// A change that has not been drawn yet; kept until a frame is drawn, so one that lands
+    /// inside the frame interval is drawn on the next eligible call and not lost.
+    redraw_pending: bool,
 }
 
 impl Runtime {
@@ -78,6 +81,7 @@ impl Runtime {
             live: HashMap::new(),
             screens: HashMap::new(),
             last_frame: None,
+            redraw_pending: false,
         }
     }
 
@@ -114,7 +118,8 @@ impl Runtime {
     }
 
     /// Whether a redraw is due: something changed (a message, or a dirty screen) and a frame has
-    /// passed since the last one. Calling it with `true` records the frame.
+    /// passed since the last one. A change is remembered until a frame is drawn. Returning `true`
+    /// records the frame.
     pub fn frame_due(&mut self, changed: bool, now: Instant) -> bool {
         // Every screen's flag is cleared, so this must not stop at the first one that was set.
         let mut dirty = false;
@@ -124,9 +129,11 @@ impl Runtime {
         let ready = self
             .last_frame
             .is_none_or(|at| now.duration_since(at) >= FRAME);
-        let due = (changed || dirty) && ready;
+        self.redraw_pending |= changed || dirty;
+        let due = self.redraw_pending && ready;
         if due {
             self.last_frame = Some(now);
+            self.redraw_pending = false;
         }
         due
     }
@@ -346,6 +353,22 @@ mod tests {
             !runtime.frame_due(false, t0 + FRAME * 10),
             "still nothing to draw"
         );
+    }
+
+    #[test]
+    fn a_change_inside_the_frame_interval_is_drawn_at_the_next_frame_without_another_change() {
+        let mut runtime = Runtime::new(paths());
+        let shared = Shared::new(5, 20);
+        runtime.screens.insert(SessionId(1), Arc::clone(&shared));
+        let t0 = Instant::now();
+        assert!(runtime.frame_due(true, t0));
+        // The screen changes once, too soon after the last frame, and then nothing else happens.
+        shared
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(!runtime.frame_due(false, t0 + FRAME / 2));
+        assert!(runtime.frame_due(false, t0 + FRAME), "the change was kept");
+        assert!(!runtime.frame_due(false, t0 + FRAME * 3), "and drawn once");
     }
 
     #[test]
