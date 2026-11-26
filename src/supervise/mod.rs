@@ -5,5 +5,6 @@
 pub mod app;
 pub mod input;
 pub mod launch;
+pub mod runtime;
 pub mod session;
 pub mod terminal;

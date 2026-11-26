@@ -648,7 +648,11 @@ impl App {
             }
             Event::Warning { text } => session.warnings.push(text),
             Event::Stopping {} => {
-                session.phase = Phase::Stopping;
+                // `hb` reports Stopping on its way out after ApprovalRequired too; that session
+                // has no process left to stop and stays on Approve.
+                if session.phase != Phase::Approve {
+                    session.phase = Phase::Stopping;
+                }
             }
             Event::Exited {
                 code,
@@ -681,9 +685,12 @@ impl App {
         let Some(session) = self.current(id, generation) else {
             return Vec::new();
         };
-        // End of input after the final report is the normal close, not a loss.
-        if matches!(session.phase, Phase::Exited | Phase::Failed | Phase::Lost)
-            || session.exit.is_some()
+        // End of input after the final report is the normal close, not a loss; so is the close
+        // after ApprovalRequired, where `hb` exits with nothing running.
+        if matches!(
+            session.phase,
+            Phase::Exited | Phase::Failed | Phase::Lost | Phase::Approve
+        ) || session.exit.is_some()
         {
             return Vec::new();
         }
@@ -1197,6 +1204,48 @@ mod tests {
                 project: PathBuf::from("/work/shop")
             }]
         );
+    }
+
+    #[test]
+    fn the_exact_events_hb_sends_for_an_unapproved_config_leave_the_row_on_approve() {
+        // As `hb run --supervised` sends them: Starting, ApprovalRequired, Stopping, Exited;
+        // then the channel closes and the process is reaped.
+        let mut app = one();
+        let sent = [
+            Event::Starting {},
+            Event::approval_required("/work/shop"),
+            Event::Stopping {},
+            Event::Exited {
+                code: None,
+                signal: None,
+                cleanup: Cleanup::Complete {},
+            },
+        ];
+        for (i, event) in sent.into_iter().enumerate() {
+            assert_eq!(app.update(channel(1, 1, i as u64 + 1, event)), vec![]);
+            let expected = if i == 0 {
+                Phase::Starting
+            } else {
+                Phase::Approve
+            };
+            assert_eq!(only(&app).phase, expected, "after event {}", i + 1);
+        }
+        assert_eq!(
+            app.update(Msg::ChannelLost {
+                id: SessionId(1),
+                generation: 1
+            }),
+            vec![],
+            "the close after ApprovalRequired is normal"
+        );
+        app.update(Msg::ProcessExited {
+            id: SessionId(1),
+            generation: 1,
+            code: Some(78),
+            signal: None,
+        });
+        assert_eq!(only(&app).phase, Phase::Approve);
+        assert_none!(only(&app).failure.as_ref());
     }
 
     #[test]
