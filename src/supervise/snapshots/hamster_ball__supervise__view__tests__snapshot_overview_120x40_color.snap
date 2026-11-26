@@ -1,0 +1,48 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene(), 120, 40, COLOR)"
+---
+┌ Sessions ────────────────┐┌ shopfront · claude · Running · /work/shopfront · keys: to the supervisor ────────────────┐
+│> 1 shopfront Running     ││$ claude                                                                                  │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve       ││Welcome to shopfront                                                                      │
+  styles:              yyyyyyy         BBBBBBB
+│  3 docs Exited 0         ││> fix the cart total                                                                      │
+│                          ││done                                                                                      │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
+┌ shopfront ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Denials (2) │ Proxy (3) (2 dropped)                                                                                  │
+  styles:   RRRRRRRRRRR
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+│file-read ~/.ssh/id_rsa                                                                                               │
+│proxy refused api.other.com:443 not_allowed                                                                           │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ OVERVIEW  Enter interact · n new · s stop · r restart · a approve · Tab switch · ? help · q quit

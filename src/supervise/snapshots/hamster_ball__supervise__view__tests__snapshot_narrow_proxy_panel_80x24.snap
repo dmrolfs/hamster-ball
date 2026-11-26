@@ -1,0 +1,32 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene, 80, 24, COLOR)"
+---
+┌ shopfront ───────────────────────────────────────────────────────────────────┐
+│ Denials (2) │ Proxy (3) (2 dropped)                                          │
+  styles:                 RRRRRRRRRRRRRRRRRRRRR
+└──────────────────────────────────────────────────────────────────────────────┘
+│Target                                  Verdict      Sent         Received    │
+  styles:  BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+│api.example.com:443                     allowed      1200 up      48000 down  │
+│api.other.com:443                       refused not_ 1200 up      48000 down  │
+  styles:                                          rrrrrrrrrrrr
+│registry.npmjs.org:443                  allowed      1200 up      48000 down  │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ OVERVIEW  Enter interact · n new · s stop · r restart · a approve · Tab switch
