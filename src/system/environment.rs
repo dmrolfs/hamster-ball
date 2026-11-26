@@ -156,6 +156,17 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn the_supervisor_descriptor_variable_is_never_part_of_the_snapshot() {
+        let pairs = [
+            (OsString::from("HB_SUPERVISOR_FD"), OsString::from("9")),
+            (OsString::from("LANG"), OsString::from("C")),
+        ];
+        let vars = ParentVars::from_pairs(pairs);
+        assert_eq!(vars.get("HB_SUPERVISOR_FD"), None);
+        assert_eq!(vars.get("LANG"), Some(OsStr::new("C")));
+    }
+
+    #[test]
     fn a_new_environment_has_nothing_but_cwd_and_home() {
         let tree = Tree::new();
         let env = Environment::new(tree.home_path(), tree.home().clone());
