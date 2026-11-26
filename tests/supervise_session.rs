@@ -253,3 +253,39 @@ fn pump_two(
     }
     done(app)
 }
+
+#[test]
+fn a_spawn_that_fails_leaves_no_process_behind_and_returns_the_error() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    w.approve();
+    let launch = spec(&w, &["/bin/sh", "-c", "sleep 300"]);
+    let vars: Vec<(&str, std::ffi::OsString)> = vec![
+        ("HB_TD_HOME", w.home_dir().into_os_string()),
+        ("HB_TD_CWD", w.project.clone().into_os_string()),
+        ("HB_TD_PATH", w.base.join("bin").into_os_string()),
+        ("HB_TD_TMP", w.base.join("tmp").into_os_string()),
+    ];
+    let extra: Vec<(&str, &std::ffi::OsStr)> =
+        vars.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+    let started = assert_ok!(start_with_env(
+        &PathBuf::from(DRIVE),
+        &PathBuf::from(SUPERVISE),
+        &launch,
+        30,
+        100,
+        &extra
+    ));
+    let pid = assert_ok!(i32::try_from(started.child.id()));
+    // A channel that is already closed: the handshake cannot be written, so spawn fails after the
+    // process exists and before any thread runs. Everything must be undone on that path.
+    assert_ok!(started.channel.shutdown(std::net::Shutdown::Both));
+    let (tx, _rx) = sync_channel(INBOX);
+    let result = spawn(SessionId(1), 1, started, Shared::new(30, 100), tx);
+    assert!(result.is_err(), "spawn went on with a closed channel");
+    // The process was killed and reaped by spawn itself: nothing is left to signal.
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+        "hb ({pid}) is still there after a failed spawn"
+    );
+}

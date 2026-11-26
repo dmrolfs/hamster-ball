@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use snafu::Snafu;
+
 use super::app::{Generation, Msg, SessionId};
 use super::launch::Started;
 use super::outbox::{self, InputError, Outbox, STALL};
@@ -98,91 +100,129 @@ impl std::fmt::Debug for Worker {
     }
 }
 
-/// Starts the three threads for a launched session and sends `hb` its handshake.
+/// Starts the four threads for a launched session and sends `hb` its handshake.
 ///
 /// `messages` is the app's bounded inbox.
 ///
 /// # Errors
-/// An [`std::io::Error`] if a descriptor cannot be duplicated or a thread cannot start; the
-/// process is killed and reaped in that case.
+/// An [`io::Error`] if a descriptor cannot be duplicated or a thread cannot start. Nothing is left
+/// behind: the channel is closed, which ends every thread already started, and the process is
+/// killed and reaped.
 pub fn spawn(
     id: SessionId,
     generation: Generation,
     started: Started,
     shared: Arc<Shared>,
     messages: SyncSender<Msg>,
-) -> std::io::Result<Worker> {
+) -> io::Result<Worker> {
     let Started {
-        mut child,
+        child,
         channel,
         terminal,
     } = started;
     let outbox = Arc::new(Outbox::new());
     let kill = Arc::new(AtomicBool::new(false));
-    let wiring = Wiring {
-        id,
-        generation,
-        outbox: &outbox,
-        kill: &kill,
-    };
-    match spawn_threads(&wiring, &channel, &terminal, &shared, &messages) {
-        Ok((mut threads, channel_reader)) => {
-            let stop_asked = Arc::new(Mutex::new(None));
-            let asked = Arc::clone(&stop_asked);
-            let kill_now = Arc::clone(&kill);
-            let outbox_for_reaper = Arc::clone(&outbox);
-            let inbox = messages.clone();
-            // The child is shared with the reaper through a cell, so that if the thread cannot
-            // start the child is still here to be killed rather than lost in an unrun closure.
-            let cell = Arc::new(Mutex::new(Some(child)));
-            let for_reaper = Arc::clone(&cell);
-            let reaper = thread::Builder::new()
-                .name(format!("hb-reap-{}", id.0))
-                .spawn(move || {
-                    let taken = for_reaper.lock().ok().and_then(|mut slot| slot.take());
-                    if let Some(mut child) = taken {
-                        reap(
-                            id,
-                            generation,
-                            &mut child,
-                            channel_reader,
-                            &Stopping {
-                                asked: &asked,
-                                kill: &kill_now,
-                                outbox: &outbox_for_reaper,
-                            },
-                            &inbox,
-                        );
-                    }
-                });
-            match reaper {
-                Ok(handle) => threads.push(handle),
-                Err(error) => {
-                    if let Some(mut child) = cell.lock().ok().and_then(|mut slot| slot.take()) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                    return Err(error);
-                }
-            }
-            Ok(Worker {
-                shared,
-                terminal,
-                channel,
-                outbox,
-                stop_asked,
-                kill,
-                threads,
-            })
-        }
+    // The child is held in a cell, so that whichever step fails it is still here to be killed
+    // rather than lost in a closure that never ran.
+    let cell = Arc::new(Mutex::new(Some(child)));
+    let built = build(
+        &Wiring {
+            id,
+            generation,
+            outbox: &outbox,
+            kill: &kill,
+        },
+        &Parts {
+            channel: &channel,
+            terminal: &terminal,
+            shared: &shared,
+            messages: &messages,
+            cell: &cell,
+        },
+    );
+    match built {
+        Ok((threads, stop_asked)) => Ok(Worker {
+            shared,
+            terminal,
+            channel,
+            outbox,
+            stop_asked,
+            kill,
+            threads,
+        }),
         Err(error) => {
+            // One way out for every failure: ends the writer and the readers already running (the
+            // channel closing wakes the channel reader, cancel wakes the others), then the process.
             outbox.cancel();
             let _ = channel.shutdown(Shutdown::Both);
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(mut child) = cell.lock().ok().and_then(|mut slot| slot.take()) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             Err(error)
         }
     }
+}
+
+/// The descriptors and shared state a worker is built from.
+struct Parts<'a> {
+    channel: &'a UnixStream,
+    terminal: &'a File,
+    shared: &'a Arc<Shared>,
+    messages: &'a SyncSender<Msg>,
+    cell: &'a Arc<Mutex<Option<std::process::Child>>>,
+}
+
+type Built = (Vec<JoinHandle<()>>, Arc<Mutex<Option<Instant>>>);
+
+/// Starts every thread. On error some may be running; [`spawn`] ends them.
+fn build(wiring: &Wiring<'_>, parts: &Parts<'_>) -> io::Result<Built> {
+    let (mut threads, channel_reader) = spawn_threads(
+        wiring,
+        parts.channel,
+        parts.terminal,
+        parts.shared,
+        parts.messages,
+    )?;
+    let stop_asked = Arc::new(Mutex::new(None));
+    let handle = spawn_reaper(wiring, parts, channel_reader, &stop_asked)?;
+    threads.push(handle);
+    Ok((threads, stop_asked))
+}
+
+fn spawn_reaper(
+    wiring: &Wiring<'_>,
+    parts: &Parts<'_>,
+    channel_reader: JoinHandle<()>,
+    stop_asked: &Arc<Mutex<Option<Instant>>>,
+) -> io::Result<JoinHandle<()>> {
+    let (id, generation) = (wiring.id, wiring.generation);
+    let asked = Arc::clone(stop_asked);
+    let kill = Arc::clone(wiring.kill);
+    let outbox = Arc::clone(wiring.outbox);
+    let channel = parts.channel.try_clone()?;
+    let inbox = parts.messages.clone();
+    let cell = Arc::clone(parts.cell);
+    thread::Builder::new()
+        .name(format!("hb-reap-{}", id.0))
+        .spawn(move || {
+            let taken = cell.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(mut child) = taken {
+                reap(
+                    id,
+                    generation,
+                    &mut child,
+                    channel_reader,
+                    &Stopping {
+                        asked: &asked,
+                        kill: &kill,
+                        outbox: &outbox,
+                        channel: &channel,
+                    },
+                    &inbox,
+                );
+            }
+        })
 }
 
 /// What the threads of one session share besides their descriptors.
@@ -305,6 +345,30 @@ struct Stopping<'a> {
     kill: &'a AtomicBool,
     /// Cancelled once the process has ended, so the writer does not outlive it.
     outbox: &'a Outbox,
+    /// The supervisor's end of the channel, to close it if the process cannot be waited for.
+    channel: &'a UnixStream,
+}
+
+impl Stopping<'_> {
+    fn close_channel(&self) {
+        let _ = self.channel.shutdown(Shutdown::Both);
+    }
+}
+
+/// How a session's process ended, as far as the reaper could tell.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum ReapError {
+    /// The operating system would not say whether the process had ended. It is killed, and the
+    /// session is reported as lost, never as having exited: nothing was observed.
+    #[snafu(display("the process's state could not be read, so it was killed"))]
+    Wait {
+        /// The OS error.
+        source: io::Error,
+    },
+    /// The channel reader panicked, so `hb`'s last reports may not have arrived.
+    #[snafu(display("the channel reader panicked"))]
+    ReaderPanicked,
 }
 
 /// Waits for `hb`, then for the channel reader, then reports the exit.
@@ -312,6 +376,9 @@ struct Stopping<'a> {
 /// The `Exited` event is the last frame `hb` writes and is in the socket before `hb` exits, so
 /// once the reader has seen the end of the channel the app has been sent everything `hb` said.
 /// A process that is still there a grace period after a stop is killed.
+///
+/// An exit is reported only when it was seen. If the process cannot be waited for, or the reader
+/// panicked, the child is killed and reaped (when it can be) and the session is reported lost.
 fn reap(
     id: SessionId,
     generation: Generation,
@@ -320,11 +387,53 @@ fn reap(
     stopping: &Stopping<'_>,
     inbox: &SyncSender<Msg>,
 ) {
-    let status = loop {
+    let waited = wait_for_exit(child, stopping);
+    // Nothing more can be sent to a process that has ended.
+    stopping.outbox.cancel();
+    if waited.is_err() {
+        // Closing the channel is `hb`'s cue to stop, and it ends the reader below.
+        stopping.close_channel();
+    }
+    // The reader ends when `hb` closes its end, which it does as it exits; a descendant that kept
+    // the channel open is not a case: `hb` closes it close-on-exec and the agent never held it.
+    let reader = channel_reader.join();
+    let outcome = match (waited, reader) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(source), _) => Err(ReapError::Wait { source }),
+        (Ok(_), Err(_)) => Err(ReapError::ReaderPanicked),
+    };
+    let msg = match outcome {
+        Ok(status) => Msg::ProcessExited {
+            id,
+            generation,
+            code: status.code(),
+            signal: std::os::unix::process::ExitStatusExt::signal(&status),
+        },
+        Err(error) => Msg::SessionLost {
+            id,
+            generation,
+            reason: snafu::Report::from_error(error).to_string(),
+        },
+    };
+    let _ = inbox.send(msg);
+}
+
+/// Polls until the process has ended, killing it when asked to or when its stop is overdue.
+/// An error from the operating system is not an exit: the child is killed and the error returned.
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    stopping: &Stopping<'_>,
+) -> io::Result<std::process::ExitStatus> {
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
-            Err(_) => break None,
+            Err(error) => {
+                // Still ours to clean up: kill it and try once more to reap it.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
         let overdue = stopping.kill.load(Ordering::Acquire)
             || stopping
@@ -337,25 +446,7 @@ fn reap(
             let _ = child.kill();
         }
         thread::sleep(REAP_POLL);
-    };
-    // Nothing more can be sent to a process that has ended.
-    stopping.outbox.cancel();
-    // The reader ends when `hb` closes its end, which it does as it exits; a descendant that kept
-    // the channel open is not a case: `hb` closes it close-on-exec and the agent never held it.
-    let _ = channel_reader.join();
-    let (code, signal) = match status {
-        Some(status) => (
-            status.code(),
-            std::os::unix::process::ExitStatusExt::signal(&status),
-        ),
-        None => (None, None),
-    };
-    let _ = inbox.send(Msg::ProcessExited {
-        id,
-        generation,
-        code,
-        signal,
-    });
+    }
 }
 
 impl Worker {

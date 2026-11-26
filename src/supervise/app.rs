@@ -383,6 +383,16 @@ pub enum Msg {
         /// The generation.
         generation: Generation,
     },
+    /// The session's process could not be observed to end, or its reports may be incomplete: it
+    /// was killed, and nothing is known about how it ended.
+    SessionLost {
+        /// The session.
+        id: SessionId,
+        /// The generation.
+        generation: Generation,
+        /// Why, with the causes.
+        reason: String,
+    },
     /// The `hb` process was reaped.
     ProcessExited {
         /// The session.
@@ -646,6 +656,11 @@ impl App {
                 event,
             } => self.channel(id, generation, seq, event),
             Msg::ChannelLost { id, generation } => self.channel_lost(id, generation),
+            Msg::SessionLost {
+                id,
+                generation,
+                reason,
+            } => self.session_lost(id, generation, &reason),
             Msg::ProcessExited {
                 id,
                 generation,
@@ -889,6 +904,21 @@ impl App {
             return Vec::new();
         }
         self.break_session(id, "the channel closed before the session reported its end")
+    }
+
+    /// The process was killed because it could not be observed. A session that had already
+    /// reported its end keeps that report; any other becomes Failed, never Exited.
+    fn session_lost(&mut self, id: SessionId, generation: Generation, reason: &str) -> Vec<Effect> {
+        let Some(session) = self.current(id, generation) else {
+            return Vec::new();
+        };
+        if session.exit.is_some() || session.phase == Phase::Approve {
+            return Vec::new();
+        }
+        session.phase = Phase::Failed;
+        session.failure = Some(reason.to_owned());
+        self.alert(id, format!("lost: {reason}"));
+        Vec::new()
     }
 
     fn process_exited(
@@ -1612,6 +1642,51 @@ mod tests {
             assert_eq!(only(&app).phase, Phase::Approve);
             assert!(app.alerts().last().is_some_and(|a| a.text.contains(words)));
         }
+    }
+
+    fn lost(id: u32, generation: Generation) -> Msg {
+        Msg::SessionLost {
+            id: SessionId(id),
+            generation,
+            reason: "the process's state could not be read, so it was killed".into(),
+        }
+    }
+
+    #[test]
+    fn a_session_lost_is_failed_never_exited_and_says_why() {
+        let mut app = running();
+        assert_eq!(app.update(lost(1, 1)), vec![]);
+        let session = only(&app);
+        assert_eq!(session.phase, Phase::Failed);
+        assert_none!(session.exit.as_ref());
+        assert!(
+            session
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("killed"))
+        );
+        assert!(app.alerts().last().is_some_and(|a| a.text.contains("lost")));
+    }
+
+    #[test]
+    fn a_session_lost_after_the_session_reported_its_end_or_for_an_old_generation_changes_nothing()
+    {
+        let mut app = running();
+        app.update(Msg::Channel {
+            id: SessionId(1),
+            generation: 1,
+            seq: 3,
+            event: Event::Exited {
+                code: Some(0),
+                signal: None,
+                cleanup: crate::session::supervised::Cleanup::Complete {},
+            },
+        });
+        let before = only(&app).clone();
+        assert_eq!(app.update(lost(1, 1)), vec![]);
+        assert_eq!(only(&app), &before);
+        assert_eq!(app.update(lost(1, 9)), vec![]);
+        assert_eq!(only(&app), &before);
     }
 
     #[test]
