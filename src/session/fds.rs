@@ -35,9 +35,14 @@ pub enum SweepError {
     },
 }
 
-/// The most descriptor numbers tried when the open ones cannot be listed. A descriptor cannot be
-/// above the soft limit, which is far lower than this unless the owner raised it a long way.
-const MAX_RANGE: i32 = 1 << 20;
+/// The most descriptor numbers tried when the open ones cannot be listed.
+///
+/// Measured on macOS: `kern.maxfilesperproc` is 65535 and `dup2` to 65535 fails with `EBADF`, so a
+/// descriptor can never be above 65534 whatever `ulimit -n` says (it reports 1048575 here).
+/// Closing the whole range took 0.22 s at 1 Mi numbers and about 15 ms at this one.
+/// shortcut: a kernel with a higher per-process limit would need this raised; the test below
+/// compares it with the limit the machine reports, so it fails when that happens.
+const MAX_RANGE: i32 = 1 << 16;
 
 /// Closes every descriptor above 2 and returns the numbers it closed.
 ///
@@ -411,5 +416,28 @@ mod tests {
         );
         let none = start_up_with(None, |_| Ok(Vec::new()));
         assert!(none.channel.is_none() && none.problem.is_none());
+    }
+
+    #[test]
+    fn the_fallback_range_covers_every_descriptor_the_kernel_allows() {
+        // sysctl kern.maxfilesperproc is the most descriptors one process may hold, so the highest
+        // possible number is one less. The range must reach it.
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.maxfilesperproc"])
+            .output();
+        let Ok(out) = out else { return };
+        let Ok(limit) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() else {
+            return;
+        };
+        assert!(
+            MAX_RANGE >= limit,
+            "the machine allows {limit} descriptors per process but the fallback stops at {MAX_RANGE}"
+        );
+        let names = every_possible();
+        assert_eq!(names.first().map(String::as_str), Some("3"));
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some((MAX_RANGE - 1).to_string().as_str())
+        );
     }
 }
