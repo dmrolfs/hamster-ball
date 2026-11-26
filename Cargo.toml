@@ -18,12 +18,12 @@ path = "src/lib.rs"
 name = "hb"
 path = "src/bin/hb.rs"
 
-# A copy of `hb` that takes its Environment from variables, so tests can run the real
-# process-level behaviour (signals, exit status) against a fixture project. Built only for tests.
 [[bin]]
 name = "hb-supervise"
 path = "src/bin/hb-supervise.rs"
 
+# A copy of `hb` that takes its Environment from variables, so tests can run the real
+# process-level behaviour (signals, exit status) against a fixture project. Built only for tests.
 [[bin]]
 name = "hb-testdrive"
 path = "src/bin/hb-testdrive.rs"

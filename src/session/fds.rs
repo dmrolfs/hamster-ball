@@ -8,7 +8,10 @@
 //! [`close_inherited_fds`] first thing in `main`. Library callers must not: it closes every
 //! descriptor of the calling process, including ones other code owns.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 
 use nix::unistd::close;
 
@@ -20,6 +23,11 @@ const FD_DIR: &str = "/dev/fd";
 /// Call it once, before opening anything, in a program that is only `hb`. Descriptors 0, 1 and 2
 /// stay: they are the child's standard streams.
 pub fn close_inherited_fds() -> Vec<i32> {
+    close_inherited_fds_except(None)
+}
+
+/// [`close_inherited_fds`], sparing `keep`: the supervisor channel claimed by [`claim_channel`].
+pub fn close_inherited_fds_except(keep: Option<RawFd>) -> Vec<i32> {
     let names: Vec<String> = fs::read_dir(FD_DIR)
         .map(|dir| {
             dir.flatten()
@@ -31,8 +39,41 @@ pub fn close_inherited_fds() -> Vec<i32> {
     // failed close of it is expected and ignored.
     inherited_from(names.iter().map(String::as_str))
         .into_iter()
+        .filter(|fd| Some(*fd) != keep)
         .filter(|fd| close(*fd).is_ok())
         .collect()
+}
+
+/// Takes the supervisor channel the launcher left open as descriptor `number`.
+///
+/// The descriptor is reopened through `/dev/fd`, which gives a new descriptor that is
+/// close-on-exec from the start, so nothing `hb` runs inherits it. The original is not
+/// close-on-exec; the sweep ([`close_inherited_fds_except`]) closes it. This takes no `unsafe`:
+/// `from_raw_fd` would.
+///
+/// # Errors
+/// An [`io::Error`] if `number` is not an open descriptor, is not a unix socket, or is 0, 1 or 2.
+pub fn claim_channel(number: RawFd) -> io::Result<UnixStream> {
+    if number <= 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the channel descriptor must be above 2",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{FD_DIR}/{number}"))?;
+    let stream = UnixStream::from(OwnedFd::from(file));
+    // Fails unless this is a socket.
+    stream.local_addr()?;
+    Ok(stream)
+}
+
+/// The descriptor of `stream`, to spare in the sweep.
+#[must_use]
+pub fn raw(stream: &UnixStream) -> RawFd {
+    stream.as_raw_fd()
 }
 
 /// The descriptor numbers above 2 among `names`, sorted and without repeats.
@@ -82,6 +123,41 @@ mod tests {
         assert_eq!(
             inherited_from(["2147483648", "99999999999"]),
             Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn a_claimed_channel_is_a_new_close_on_exec_descriptor_that_talks_to_the_peer() {
+        use claims::{assert_err, assert_ok};
+        use std::io::{Read, Write};
+        let (mut peer, ours) = assert_ok!(UnixStream::pair());
+        let number = ours.as_raw_fd();
+        let mut claimed = assert_ok!(claim_channel(number));
+        assert_ne!(raw(&claimed), number);
+        let flags = assert_ok!(rustix::io::fcntl_getfd(&claimed));
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "the claimed descriptor leaks"
+        );
+        assert_ok!(claimed.write_all(b"x"));
+        let mut byte = [0u8; 1];
+        assert_ok!(peer.read_exact(&mut byte));
+        assert_eq!(&byte, b"x");
+        // Not a socket, and not a descriptor, are both refused.
+        let file = assert_ok!(fs::File::open("/dev/null"));
+        assert_err!(claim_channel(file.as_raw_fd()));
+        assert_err!(claim_channel(2));
+        assert_err!(claim_channel(2_000_000));
+    }
+
+    #[test]
+    fn the_sweep_spares_only_the_kept_descriptor() {
+        assert_eq!(
+            inherited_from(["3", "4", "5"])
+                .into_iter()
+                .filter(|fd| Some(*fd) != Some(4))
+                .collect::<Vec<_>>(),
+            vec![3, 5]
         );
     }
 }
