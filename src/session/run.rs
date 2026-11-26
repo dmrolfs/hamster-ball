@@ -23,7 +23,7 @@ use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag}
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 use super::fence::settle;
-use super::guardian::{Guardian, GuardianError};
+use super::guardian::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
 use super::offline::{OfflineError, OfflinePlan};
@@ -660,10 +660,32 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
         _ => None,
     };
-    if let (Some(guardian), Some(log)) = (guardian.as_mut(), &log) {
-        guardian.watch(Target::Child(pid_of(log.pid())))?;
-    }
-    let mut child = command.spawn().context(SpawnSnafu)?;
+    let log = match (guardian.as_mut(), log) {
+        (Some(guardian), Some(log)) => match guardian.watch(Target::Child(pid_of(log.pid()))) {
+            Ok(WatchOutcome::Armed) => Some(log),
+            // The log stream never exits by itself, so Gone or a refusal means it is unprotected.
+            Ok(WatchOutcome::Gone) => {
+                let _ = log.finish();
+                return Err(RunError::from(GuardianError::Refused {
+                    reason: WatchRefusal::Invalid,
+                }));
+            }
+            Err(error) => {
+                let _ = log.finish();
+                return Err(error.into());
+            }
+        },
+        (_, log) => log,
+    };
+    let mut child = match command.spawn().context(SpawnSnafu) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(log) = log {
+                let _ = log.finish();
+            }
+            return Err(error);
+        }
+    };
     if let Some(guardian) = guardian.as_mut() {
         // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
         let target = if pty.is_some() || !stdin_is_tty {
@@ -671,8 +693,22 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         } else {
             Target::Child(pid_of(child.id()))
         };
-        if let Err(error) = guardian.watch(target) {
+        let protected = match guardian.watch(target) {
+            Ok(WatchOutcome::Armed) => Ok(()),
+            // Gone is acceptable only when the owned child has really exited (a fast command).
+            Ok(WatchOutcome::Gone) => match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                _ => Err(GuardianError::Refused {
+                    reason: WatchRefusal::Invalid,
+                }),
+            },
+            Err(error) => Err(error),
+        };
+        if let Err(error) = protected {
             abort_child(&mut child);
+            if let Some(log) = log {
+                let _ = log.finish();
+            }
             return Err(error.into());
         }
     }

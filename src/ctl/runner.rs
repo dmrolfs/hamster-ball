@@ -18,6 +18,7 @@ use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu};
 
 use crate::session::GuardHandle;
+use crate::session::guardian::{GuardianError, WatchOutcome, WatchRefusal};
 use crate::session::signals::Target;
 
 /// How the output of a command is kept.
@@ -53,6 +54,12 @@ pub enum RunError {
         program: PathBuf,
         /// The OS error.
         source: std::io::Error,
+    },
+    /// The cleanup guard did not protect the command, so it was killed before its result was used.
+    #[snafu(display("the cleanup guard did not protect the command"))]
+    Guard {
+        /// Why the guard did not arm.
+        source: GuardianError,
     },
     /// The deadline passed; the process group was killed. The command may still have taken effect.
     #[snafu(display("timed out after {} s", limit.as_secs()))]
@@ -140,11 +147,12 @@ impl Host {
     }
 
     /// Registers every command's process group with the cleanup guard, so a killed `hb` does not
-    /// leave one running.
+    /// leave one running. A command the guard does not arm is killed and reported as
+    /// [`RunError::Guard`].
     ///
     /// shortcut: the group is registered just after it starts, not before; an `hb` killed in those
-    /// microseconds leaves that one command to finish or time out by itself. Upgrade to a launch
-    /// gate (child waits on a pipe until the guard has acknowledged) if that is ever seen.
+    /// microseconds leaves that one command to finish or time out by itself. The launch gate in
+    /// hb-9lu closes this.
     #[must_use]
     pub fn with_guard(mut self, guard: GuardHandle) -> Self {
         self.guard = Some(guard);
@@ -230,21 +238,23 @@ impl Execute for Host {
             .process_group(0);
         let mut child = command.spawn().context(SpawnSnafu { program })?;
         if let Some(guard) = &self.guard {
-            let registered = i32::try_from(child.id()).map_err(|_| ()).and_then(|pid| {
-                guard
-                    .watch(Target::Group(Pid::from_raw(pid)))
-                    .map_err(|_| ())
-            });
-            if registered.is_err() {
+            let protected = match i32::try_from(child.id()) {
+                Ok(pid) => match guard.watch(Target::Group(Pid::from_raw(pid))) {
+                    Ok(WatchOutcome::Armed) => Ok(()),
+                    // Gone is acceptable only when the leader really exited; the group is killed below.
+                    Ok(WatchOutcome::Gone) if matches!(child.try_wait(), Ok(Some(_))) => Ok(()),
+                    Ok(WatchOutcome::Gone) => Err(GuardianError::Refused {
+                        reason: WatchRefusal::Invalid,
+                    }),
+                    Err(error) => Err(error),
+                },
+                Err(_) => Err(GuardianError::Protocol),
+            };
+            if let Err(source) = protected {
                 // Unregistered means unprotected: do not run it.
                 kill_group(&child);
                 let _ = child.wait();
-                return Err(RunError::Spawn {
-                    program: program.to_path_buf(),
-                    source: std::io::Error::other(
-                        "the cleanup guard could not be told about the command",
-                    ),
-                });
+                return Err(RunError::Guard { source });
             }
         }
         let tail = Arc::new(Mutex::new(Tail {

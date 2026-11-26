@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use claims::assert_ok;
 use common::{EXPECT_GUARD, World, assert_no_expect_timeout, sandbox_available};
-use hamster_ball::session::Guardian;
 use hamster_ball::session::signals::Target;
+use hamster_ball::session::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use pretty_assertions::assert_eq;
 
 const HB: &str = env!("CARGO_BIN_EXE_hb");
 const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
@@ -264,7 +265,10 @@ fn releasing_the_guardian_leaves_what_it_watched_alone_and_ends_the_guard() {
         Duration::from_millis(500)
     ));
     let guard_pid = i32::try_from(guardian.pid()).unwrap_or(i32::MAX);
-    assert_ok!(guardian.watch(Target::Child(Pid::from_raw(pid_of(&victim)))));
+    assert_eq!(
+        assert_ok!(guardian.watch(Target::Child(Pid::from_raw(pid_of(&victim))))),
+        WatchOutcome::Armed
+    );
     let started = Instant::now();
     guardian.release();
     assert!(
@@ -292,10 +296,165 @@ fn dropping_the_guardian_without_a_release_ends_what_it_watched() {
         std::path::Path::new(HB),
         Duration::from_millis(500)
     ));
-    assert_ok!(guardian.watch(Target::Child(Pid::from_raw(pid_of(&victim)))));
+    assert_eq!(
+        assert_ok!(guardian.watch(Target::Child(Pid::from_raw(pid_of(&victim))))),
+        WatchOutcome::Armed
+    );
+    // A retained broker handle must not keep the channel open after the owner is dropped.
+    let retained = guardian.handle();
     drop(guardian);
     let status = assert_ok!(victim.wait());
     assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "{status:?}");
+    assert!(
+        retained
+            .watch(Target::Child(Pid::from_raw(pid_of(&victim))))
+            .is_err()
+    );
+}
+
+fn guardian() -> Guardian {
+    assert_ok!(Guardian::start_with(
+        std::path::Path::new(HB),
+        Duration::from_millis(500)
+    ))
+}
+
+#[test]
+fn concurrent_broker_handles_each_get_the_reply_to_their_own_request() {
+    let guard = guardian();
+    let mut live: Vec<Child> = (0..4).map(|_| started("sleep 1 for 1..60;")).collect();
+    let mut exited = started("exit 0;");
+    let gone = pid_of(&exited);
+    let _ = exited.wait();
+    // live[0] is armed as a process first, so a group watch for it is a deterministic conflict.
+    let conflicted = Pid::from_raw(pid_of(&live[0]));
+    assert_eq!(
+        assert_ok!(guard.handle().watch(Target::Child(conflicted))),
+        WatchOutcome::Armed
+    );
+    // Each request has a different correct answer, so a reply delivered to the wrong caller fails.
+    let mut requests: Vec<(Target, &str)> = live[1..]
+        .iter()
+        .map(|c| (Target::Child(Pid::from_raw(pid_of(c))), "armed"))
+        .collect();
+    requests.push((Target::Child(Pid::from_raw(gone)), "gone"));
+    requests.push((Target::Group(conflicted), "invalid"));
+    let workers: Vec<_> = requests
+        .into_iter()
+        .map(|(target, expected)| {
+            let handle = guard.handle();
+            thread::spawn(move || (expected, handle.watch(target)))
+        })
+        .collect();
+    for worker in workers {
+        let (expected, outcome) = assert_ok!(worker.join().map_err(|_| "worker panicked"));
+        let got = match outcome {
+            Ok(WatchOutcome::Armed) => "armed",
+            Ok(WatchOutcome::Gone) => "gone",
+            Err(GuardianError::Refused {
+                reason: WatchRefusal::Invalid,
+            }) => "invalid",
+            Err(_) => "error",
+        };
+        assert_eq!(got, expected);
+    }
+    guard.release();
+    for victim in &mut live {
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+}
+
+#[test]
+fn broker_watches_beyond_capacity_are_refused_not_reported_as_success() {
+    let guard = guardian();
+    let handle = guard.handle();
+    let mut victims: Vec<Child> = (0..15).map(|_| started("sleep 1 for 1..60;")).collect();
+    let outcomes: Vec<_> = victims
+        .iter()
+        .map(|victim| handle.watch(Target::Child(Pid::from_raw(pid_of(victim)))))
+        .collect();
+    for outcome in &outcomes[..14] {
+        assert!(matches!(outcome, Ok(WatchOutcome::Armed)), "{outcome:?}");
+    }
+    assert!(
+        matches!(
+            outcomes[14],
+            Err(GuardianError::Refused {
+                reason: WatchRefusal::Capacity
+            })
+        ),
+        "{:?}",
+        outcomes[14]
+    );
+    guard.release();
+    for victim in &mut victims {
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+}
+
+#[test]
+fn a_broker_command_the_guard_refuses_is_killed_and_reported() {
+    use hamster_ball::ctl::runner::{Cancel, Capture, Execute, Host, RunError};
+    let guard = guardian();
+    let handle = guard.handle();
+    let mut fill: Vec<Child> = (0..14).map(|_| started("sleep 1 for 1..60;")).collect();
+    for victim in &fill {
+        assert_eq!(
+            assert_ok!(handle.watch(Target::Child(Pid::from_raw(pid_of(victim))))),
+            WatchOutcome::Armed
+        );
+    }
+    let marker = assert_ok!(tempfile::NamedTempFile::new());
+    let path = marker.path().to_owned();
+    drop(marker);
+    let host = Host::new("/usr/bin:/bin", |_| None).with_guard(guard.handle());
+    let script = format!("sleep 1; touch '{}'", path.display());
+    let started_at = Instant::now();
+    let result = host.run(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), script.into()],
+        Capture::Tail(1024),
+        Duration::from_secs(30),
+        &Cancel::default(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(RunError::Guard {
+                source: GuardianError::Refused {
+                    reason: WatchRefusal::Capacity
+                }
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started_at.elapsed()
+    );
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!path.exists(), "the refused command kept running");
+    guard.release();
+    for victim in &mut fill {
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+}
+
+#[test]
+fn a_target_that_already_exited_is_gone_not_armed() {
+    let mut guard = guardian();
+    let mut victim = started("exit 0;");
+    let pid = pid_of(&victim);
+    let _ = victim.wait();
+    assert_eq!(
+        assert_ok!(guard.watch(Target::Child(Pid::from_raw(pid)))),
+        WatchOutcome::Gone
+    );
+    guard.release();
 }
 
 // ====================================================================================
