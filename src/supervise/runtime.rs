@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::app::{App, Effect, Generation, LaunchSpec, Msg, SessionId};
 use super::launch::start_with_env;
+use super::outbox::InputError;
 use super::session::{Shared, Worker, spawn};
 
 /// Frames per second at most.
@@ -214,7 +215,7 @@ impl Runtime {
 
     /// Asks the session's worker to stop, and tracks it until it has ended.
     fn retire(&mut self, id: SessionId) {
-        if let Some(mut live) = self.live.remove(&id) {
+        if let Some(live) = self.live.remove(&id) {
             live.worker.stop();
             self.retiring.push(Retiring {
                 id,
@@ -274,6 +275,7 @@ impl Runtime {
     /// Carries out effects; true when one of them was `Quit`.
     fn run(&mut self, effects: Vec<Effect>) -> bool {
         let mut quit = false;
+        let mut notices: Vec<String> = Vec::new();
         for effect in effects {
             match effect {
                 Effect::Spawn {
@@ -296,8 +298,12 @@ impl Runtime {
                     if let Some(live) = self.live.get_mut(&id)
                         && live.generation == generation
                     {
-                        // A failed write means the terminal is closing; the reaper reports it.
-                        let _ = live.worker.write_input(&bytes);
+                        // Closed means the session is already stopping, which the row shows.
+                        if let Err(error) = live.worker.enqueue_input(bytes)
+                            && matches!(error, InputError::Full { .. })
+                        {
+                            notices.push(error.to_string());
+                        }
                     }
                 }
                 Effect::SuspendForApproval {
@@ -311,6 +317,10 @@ impl Runtime {
                 }),
                 Effect::Quit => quit = true,
             }
+        }
+        // Input the agent did not take is told to the owner, last one wins: the alert line holds one.
+        if let Some(text) = notices.pop() {
+            let _ = self.app.update(Msg::Notice(text));
         }
         quit
     }

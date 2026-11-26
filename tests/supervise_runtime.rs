@@ -275,3 +275,42 @@ fn a_restart_starts_the_new_generation_only_after_the_old_one_has_ended() {
     assert!(second.is_some(), "the new generation never ran");
     assert!(rt.shut_down(Duration::from_secs(20)));
 }
+
+#[test]
+fn an_agent_that_never_reads_its_input_does_not_freeze_the_loop_and_can_still_be_stopped() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    // `stty raw -echo` makes the pty fill instead of discarding; the agent then never reads.
+    rt.send(launch(&w, &["/bin/sh", "-c", "stty raw -echo; sleep 300"]));
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 300"]));
+    assert!(run_until(&mut rt, 60, |r| {
+        phase(r, 1) == Phase::Running && phase(r, 2) == Phase::Running
+    }));
+    let pids: Vec<i32> = [1, 2].iter().filter_map(|id| agent_pid(&rt, *id)).collect();
+    // Far more than a pty holds, sent as many pastes, each of which must return at once.
+    let started = Instant::now();
+    for _ in 0..40 {
+        rt.send(Msg::Input {
+            id: SessionId(1),
+            generation: 1,
+            bytes: vec![b'x'; 64 * 1024],
+        });
+        rt.step();
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the loop waited {:?} on an agent that does not read",
+        started.elapsed()
+    );
+    // The other session is unaffected, and stopping the stuck one (the first row) works.
+    assert_eq!(phase(&rt, 2), Phase::Running);
+    rt.send(Msg::Jump(1));
+    rt.send(Msg::AskStop);
+    rt.send(Msg::Answer(true));
+    assert!(run_until(&mut rt, 60, |r| phase(r, 1) != Phase::Running));
+    assert!(rt.shut_down(Duration::from_secs(20)));
+    for pid in pids {
+        assert!(!alive(pid), "agent {pid} outlived shut_down");
+    }
+}

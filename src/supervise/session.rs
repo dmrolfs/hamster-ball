@@ -19,7 +19,7 @@
 //! after a grace period it is killed, which `hb`'s guardian turns into the agent's cleanup.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use super::app::{Generation, Msg, SessionId};
 use super::launch::Started;
+use super::outbox::{self, InputError, Outbox, STALL};
 use super::terminal::SessionScreen;
 use crate::session::supervised::{
     Command, Hello, decode_ack, decode_frame, encode_line, read_line,
@@ -69,10 +70,13 @@ impl Shared {
 pub struct Worker {
     /// The screen the PTY reader feeds.
     pub shared: Arc<Shared>,
-    /// The session's terminal master: keys and pastes are written here.
+    /// The session's terminal master, kept for its size. Nothing is written through it here: input
+    /// and Stop go through `outbox`, so the loop never waits on a full terminal or socket.
     terminal: File,
-    /// The supervisor's end of the channel: `Stop` is written here.
+    /// The supervisor's end of the channel, kept to close it. `Stop` is written by the writer.
     channel: UnixStream,
+    /// What the writer thread sends: queued input and the Stop request.
+    outbox: Arc<Outbox>,
     /// When a stop was asked for, so the reaper can kill a process that does not end.
     stop_asked: Arc<Mutex<Option<Instant>>>,
     /// Set to make the reaper kill the process now, without waiting out the grace period.
@@ -113,12 +117,20 @@ pub fn spawn(
         channel,
         terminal,
     } = started;
-    match spawn_threads(id, generation, &channel, &terminal, &shared, &messages) {
+    let outbox = Arc::new(Outbox::new());
+    let kill = Arc::new(AtomicBool::new(false));
+    let wiring = Wiring {
+        id,
+        generation,
+        outbox: &outbox,
+        kill: &kill,
+    };
+    match spawn_threads(&wiring, &channel, &terminal, &shared, &messages) {
         Ok((mut threads, channel_reader)) => {
             let stop_asked = Arc::new(Mutex::new(None));
             let asked = Arc::clone(&stop_asked);
-            let kill = Arc::new(AtomicBool::new(false));
             let kill_now = Arc::clone(&kill);
+            let outbox_for_reaper = Arc::clone(&outbox);
             let inbox = messages.clone();
             // The child is shared with the reaper through a cell, so that if the thread cannot
             // start the child is still here to be killed rather than lost in an unrun closure.
@@ -137,6 +149,7 @@ pub fn spawn(
                             &Stopping {
                                 asked: &asked,
                                 kill: &kill_now,
+                                outbox: &outbox_for_reaper,
                             },
                             &inbox,
                         );
@@ -156,12 +169,15 @@ pub fn spawn(
                 shared,
                 terminal,
                 channel,
+                outbox,
                 stop_asked,
                 kill,
                 threads,
             })
         }
         Err(error) => {
+            outbox.cancel();
+            let _ = channel.shutdown(Shutdown::Both);
             let _ = child.kill();
             let _ = child.wait();
             Err(error)
@@ -169,48 +185,126 @@ pub fn spawn(
     }
 }
 
-/// The PTY reader and the channel reader; the channel reader's handle is returned separately so
-/// the reaper can wait for it.
-fn spawn_threads(
+/// What the threads of one session share besides their descriptors.
+struct Wiring<'a> {
     id: SessionId,
     generation: Generation,
+    outbox: &'a Arc<Outbox>,
+    kill: &'a Arc<AtomicBool>,
+}
+
+/// The PTY reader, the writer and the channel reader; the channel reader's handle is returned
+/// separately so the reaper can wait for it.
+fn spawn_threads(
+    wiring: &Wiring<'_>,
     channel: &UnixStream,
     terminal: &File,
     shared: &Arc<Shared>,
     messages: &SyncSender<Msg>,
-) -> std::io::Result<(Vec<JoinHandle<()>>, JoinHandle<()>)> {
-    let mut hello = channel.try_clone()?;
-    let line =
-        encode_line(&Hello::new(u64::from(id.0), generation)).map_err(std::io::Error::other)?;
-    hello.write_all(&line)?;
+) -> io::Result<(Vec<JoinHandle<()>>, JoinHandle<()>)> {
+    let Wiring {
+        id,
+        generation,
+        outbox,
+        kill,
+    } = *wiring;
+    // The flag is on the open file, so it covers every descriptor duplicated from this one: the
+    // PTY reader below must therefore wait with `poll` and treat "would block" as "not yet".
+    outbox::set_nonblocking(terminal)?;
+    // A socket that stays full fails a write after this long instead of hanging it. It covers the
+    // handshake, and Stop, and applies to writes only.
+    channel.set_write_timeout(Some(STALL))?;
+    let line = encode_line(&Hello::new(u64::from(id.0), generation)).map_err(io::Error::other)?;
+    channel.try_clone()?.write_all(&line)?;
     let reader = channel.try_clone()?;
-    let mut terminal = terminal.try_clone()?;
-    let feed = Arc::clone(shared);
-    let pty_thread = thread::Builder::new()
-        .name(format!("hb-pty-{}", id.0))
-        .spawn(move || {
-            let mut buffer = [0u8; 8192];
-            while let Ok(n) = terminal.read(&mut buffer) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut screen) = feed.screen.lock() {
-                    screen.process(&buffer[..n]);
-                }
-                feed.dirty.store(true, Ordering::Release);
-            }
-        })?;
+    let pty_thread = spawn_pty_reader(id, terminal.try_clone()?, shared, outbox)?;
+    let writer_thread = spawn_writer(
+        id,
+        terminal.try_clone()?,
+        channel.try_clone()?,
+        wiring,
+        messages,
+    )?;
     let inbox = messages.clone();
     let channel_thread = thread::Builder::new()
         .name(format!("hb-chan-{}", id.0))
         .spawn(move || read_channel(id, generation, reader, &inbox))?;
-    Ok((vec![pty_thread], channel_thread))
+    let _ = kill;
+    Ok((vec![pty_thread, writer_thread], channel_thread))
+}
+
+fn spawn_pty_reader(
+    id: SessionId,
+    mut terminal: File,
+    shared: &Arc<Shared>,
+    outbox: &Arc<Outbox>,
+) -> io::Result<JoinHandle<()>> {
+    let feed = Arc::clone(shared);
+    let outbox = Arc::clone(outbox);
+    thread::Builder::new()
+        .name(format!("hb-pty-{}", id.0))
+        .spawn(move || {
+            let mut buffer = [0u8; 8192];
+            // Ends on end of output or error, or within a poll of the session being abandoned.
+            while !outbox.is_cancelled() {
+                match terminal.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut screen) = feed.screen.lock() {
+                            screen.process(&buffer[..n]);
+                        }
+                        feed.dirty.store(true, Ordering::Release);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if outbox::wait_readable(&terminal).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // The slave closing is reported as an I/O error on the master.
+                    Err(_) => break,
+                }
+            }
+        })
+}
+
+/// The writer thread: sends queued input and Stop. If it fails the session cannot be steered, so
+/// the process is stopped hard (killed at the reaper's next look, channel closed) and the owner
+/// is told why.
+fn spawn_writer(
+    id: SessionId,
+    terminal: File,
+    mut channel: UnixStream,
+    wiring: &Wiring<'_>,
+    messages: &SyncSender<Msg>,
+) -> io::Result<JoinHandle<()>> {
+    let outbox = Arc::clone(wiring.outbox);
+    let kill = Arc::clone(wiring.kill);
+    let inbox = messages.clone();
+    let stop_line = encode_line(&Command::Stop {}).map_err(io::Error::other)?;
+    thread::Builder::new()
+        .name(format!("hb-write-{}", id.0))
+        .spawn(move || {
+            if let Err(error) = outbox.run(&terminal, &mut channel, &stop_line) {
+                kill.store(true, Ordering::Release);
+                let _ = channel.shutdown(Shutdown::Both);
+                // Not `send`: a full inbox must not hold this thread, and the reaper reports the
+                // end of the session anyway. The notice only says why.
+                let _ = inbox.try_send(Msg::Notice(format!(
+                    "session {} was stopped: {}",
+                    id.0,
+                    snafu::Report::from_error(error)
+                )));
+            }
+        })
 }
 
 /// What tells the reaper to kill a process that does not end.
 struct Stopping<'a> {
     asked: &'a Mutex<Option<Instant>>,
     kill: &'a AtomicBool,
+    /// Cancelled once the process has ended, so the writer does not outlive it.
+    outbox: &'a Outbox,
 }
 
 /// Waits for `hb`, then for the channel reader, then reports the exit.
@@ -244,6 +338,8 @@ fn reap(
         }
         thread::sleep(REAP_POLL);
     };
+    // Nothing more can be sent to a process that has ended.
+    stopping.outbox.cancel();
     // The reader ends when `hb` closes its end, which it does as it exits; a descendant that kept
     // the channel open is not a case: `hb` closes it close-on-exec and the agent never held it.
     let _ = channel_reader.join();
@@ -263,12 +359,13 @@ fn reap(
 }
 
 impl Worker {
-    /// Writes `bytes` to the agent's terminal.
+    /// Queues `bytes` for the agent's terminal, whole or not at all. Never waits.
     ///
     /// # Errors
-    /// An [`std::io::Error`] if the terminal is gone.
-    pub fn write_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.terminal.write_all(bytes)
+    /// [`InputError::Full`] if the agent is not reading its input; [`InputError::Closed`] once the
+    /// session is stopping or its writer failed.
+    pub fn enqueue_input(&self, bytes: Vec<u8>) -> Result<(), InputError> {
+        self.outbox.push(bytes)
     }
 
     /// Sets the terminal's size for the agent and the emulator, together.
@@ -293,11 +390,10 @@ impl Worker {
     }
 
     /// Asks `hb` to stop the session, and starts the clock after which the process is killed.
-    pub fn stop(&mut self) {
+    /// Waiting input is dropped and the Stop goes first. Never waits.
+    pub fn stop(&self) {
         self.start_clock();
-        if let Ok(line) = encode_line(&Command::Stop {}) {
-            let _ = self.channel.write_all(&line);
-        }
+        self.outbox.request_stop();
     }
 
     fn start_clock(&self) {
@@ -318,6 +414,7 @@ impl Worker {
     pub fn abandon(&self) {
         self.start_clock();
         self.kill.store(true, Ordering::Release);
+        self.outbox.cancel();
         let _ = self.channel.shutdown(Shutdown::Both);
     }
 
@@ -329,6 +426,7 @@ impl Worker {
     /// inbox and never finish; [`Runtime::shut_down`](super::runtime::Runtime::shut_down) does.
     pub fn shut_down(mut self, limit: Duration) -> bool {
         self.start_clock();
+        self.outbox.cancel();
         let _ = self.channel.shutdown(Shutdown::Both);
         let deadline = Instant::now() + limit;
         for handle in std::mem::take(&mut self.threads) {

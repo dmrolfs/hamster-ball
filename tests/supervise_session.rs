@@ -146,7 +146,7 @@ fn stopping_a_running_session_ends_it_through_hb_and_reports_the_exit() {
     sandboxed!();
     let w = World::new(PROJECT);
     let mut app = App::new();
-    let (id, mut worker, _shared) = start(&w, &mut app, &["/bin/sh", "-c", "sleep 120"]);
+    let (id, worker, _shared) = start(&w, &mut app, &["/bin/sh", "-c", "sleep 120"]);
     assert!(pump(&mut app, id, 60, |a| phase(a, id) == Phase::Running));
     app.update(Msg::AskStop);
     let effects = app.update(Msg::Answer(true));

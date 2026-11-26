@@ -174,14 +174,13 @@ impl Outbox {
         channel: &mut impl Write,
         stop_line: &[u8],
     ) -> Result<(), WriterError> {
-        let mut stop_sent = false;
         loop {
             if self.is_cancelled() {
                 return Ok(());
             }
             let next = {
                 let mut state = self.lock();
-                if state.stop && !stop_sent {
+                if state.stop {
                     Next::Stop
                 } else if let Some(bytes) = state.queue.pop_front() {
                     state.pending -= bytes.len();
@@ -197,7 +196,8 @@ impl Outbox {
                         .write_all(stop_line)
                         .and_then(|()| channel.flush())
                         .context(ChannelSnafu)?;
-                    stop_sent = true;
+                    // Nothing is sent after Stop: the writer's work is done.
+                    return Ok(());
                 }
                 Next::Input(bytes) => self.write_input(terminal, &bytes)?,
             }
