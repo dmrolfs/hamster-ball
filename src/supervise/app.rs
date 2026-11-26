@@ -221,6 +221,82 @@ pub enum Tab {
     Proxy,
 }
 
+/// Which panel has the owner's attention. A wide terminal shows them all, and the last two pick
+/// the lower tab; a narrow one shows just this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Panel {
+    /// The list of sessions.
+    Sessions,
+    /// The selected session's terminal.
+    Terminal,
+    /// The denials of the selected session.
+    Denials,
+    /// The proxy connections of the selected session.
+    Proxy,
+}
+
+impl Panel {
+    const ORDER: [Self; 4] = [Self::Sessions, Self::Terminal, Self::Denials, Self::Proxy];
+
+    fn shifted(self, forward: bool) -> Self {
+        let at = Self::ORDER.iter().position(|p| *p == self).unwrap_or(0);
+        let len = Self::ORDER.len();
+        Self::ORDER[if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        }]
+    }
+}
+
+/// Which launch field takes typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Field {
+    /// The project directory.
+    Project,
+    /// The agent command.
+    Command,
+}
+
+/// One edit of the launch form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormEdit {
+    /// Type a character into the current field.
+    Char(char),
+    /// Delete the last character of the current field.
+    Backspace,
+    /// Move to the other field.
+    SwitchField,
+    /// Pick a recent project: `true` for an older one, `false` for a newer one.
+    Recent(bool),
+}
+
+/// The launch form: two single-line fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchForm {
+    /// The project directory, as typed.
+    pub project: String,
+    /// The agent command, as typed; split on whitespace when started.
+    pub command: String,
+    /// Which field takes typing.
+    pub field: Field,
+    /// Which entry of [`App::recent_projects`] the fields were last filled from.
+    pub recent: Option<usize>,
+}
+
+impl LaunchForm {
+    fn empty() -> Self {
+        Self {
+            project: String::new(),
+            command: String::new(),
+            field: Field::Project,
+            recent: None,
+        }
+    }
+}
+
 /// A destructive action waiting for a yes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
@@ -242,6 +318,12 @@ pub enum Refusal {
     /// There is no command to run.
     #[snafu(display("the agent command is empty"))]
     EmptyCommand,
+    /// The terminal is too small to show the agent, so keys must not be sent to it unseen.
+    #[snafu(display("the terminal is too small to interact; make it larger"))]
+    TerminalTooSmall,
+    /// The project directory field is empty.
+    #[snafu(display("the project directory is empty"))]
+    EmptyProject,
     /// The action needs a live session and the selected one has ended.
     #[snafu(display("that session is not running"))]
     NotRunning,
@@ -320,8 +402,32 @@ pub enum Msg {
     EnterInteract,
     /// Back to Overview.
     LeaveInteract,
+    /// Bytes for one session's agent, from the keyboard or a paste.
+    Input {
+        /// The session.
+        id: SessionId,
+        /// The generation the owner was looking at when typing.
+        generation: Generation,
+        /// What to write to the agent's terminal.
+        bytes: Vec<u8>,
+    },
+    /// The owner tried to interact where the terminal pane is not shown.
+    TooSmall,
     /// Switch the lower tab.
     NextTab,
+    /// Move to the next (`true`) or previous panel; for terminals too small to show them all.
+    NextPanel(bool),
+    /// Open the launch form; `cwd` is where the supervisor was started, the default project.
+    OpenLaunch {
+        /// The default project directory.
+        cwd: PathBuf,
+    },
+    /// The owner edited the launch form.
+    Form(FormEdit),
+    /// The owner pressed Enter in the launch form.
+    SubmitLaunch,
+    /// The owner left the launch form.
+    CancelLaunch,
     /// Open or close help.
     ToggleHelp,
     /// The owner asked to stop the selected session.
@@ -355,6 +461,15 @@ pub enum Effect {
         /// The generation to stop.
         generation: Generation,
     },
+    /// Write these bytes to the agent's terminal.
+    Write {
+        /// The session.
+        id: SessionId,
+        /// The generation they are for.
+        generation: Generation,
+        /// What to write.
+        bytes: Vec<u8>,
+    },
     /// Give the real terminal back and run `hb approve` in this project.
     SuspendForApproval {
         /// The session.
@@ -377,6 +492,10 @@ pub struct App {
     pub mode: Mode,
     /// The lower tab.
     pub tab: Tab,
+    /// The panel shown when only one fits.
+    pub panel: Panel,
+    /// The launch form, in [`Mode::Launch`].
+    pub form: LaunchForm,
     /// The action waiting for a yes, in [`Mode::Confirm`].
     pub pending: Option<Pending>,
     /// What the owner was last told about a refused request.
@@ -401,6 +520,8 @@ impl App {
             selected: 0,
             mode: Mode::Overview,
             tab: Tab::Denials,
+            panel: Panel::Sessions,
+            form: LaunchForm::empty(),
             pending: None,
             notice: None,
             alerts: Vec::new(),
@@ -468,6 +589,17 @@ impl App {
     /// Applies one message and returns what the caller must now do.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         self.notice = None;
+        let effects = self.apply_msg(msg);
+        // Keys must never keep going to an agent that is no longer running; leave Interact so the
+        // status bar says so.
+        if self.mode == Mode::Interact && self.selected().is_none_or(|s| s.phase != Phase::Running)
+        {
+            self.mode = Mode::Overview;
+        }
+        effects
+    }
+
+    fn apply_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Launch(spec) => self.launch(spec),
             Msg::Spawned { id, generation } => {
@@ -508,6 +640,33 @@ impl App {
                     Tab::Denials => Tab::Proxy,
                     Tab::Proxy => Tab::Denials,
                 };
+                Vec::new()
+            }
+            Msg::Input {
+                id,
+                generation,
+                bytes,
+            } => match self.current(id, generation) {
+                // Bytes for a process that is no longer there, or an older start, are dropped.
+                Some(session) if session.phase == Phase::Running => vec![Effect::Write {
+                    id,
+                    generation,
+                    bytes,
+                }],
+                _ => Vec::new(),
+            },
+            Msg::TooSmall => {
+                self.refuse(&Refusal::TerminalTooSmall);
+                Vec::new()
+            }
+            Msg::NextPanel(forward) => self.next_panel(forward),
+            Msg::OpenLaunch { cwd } => self.open_launch(&cwd),
+            Msg::Form(edit) => self.edit_form(edit),
+            Msg::SubmitLaunch => self.submit_launch(),
+            Msg::CancelLaunch => {
+                if self.mode == Mode::Launch {
+                    self.mode = Mode::Overview;
+                }
                 Vec::new()
             }
             Msg::ToggleHelp => {
@@ -763,7 +922,11 @@ impl App {
             return Vec::new();
         }
         match self.selected() {
-            Some(session) if session.phase == Phase::Running => self.mode = Mode::Interact,
+            Some(session) if session.phase == Phase::Running => {
+                self.mode = Mode::Interact;
+                // A terminal too narrow for every panel must show this one.
+                self.panel = Panel::Terminal;
+            }
             Some(_) => self.refuse(&Refusal::NotRunning),
             None => self.refuse(&Refusal::NoSuchSession),
         }
@@ -896,6 +1059,131 @@ impl App {
                 Vec::new()
             }
         }
+    }
+}
+
+impl App {
+    /// Moves to another panel. The lower tab follows, so a wide terminal shows what the owner
+    /// last chose too.
+    fn next_panel(&mut self, forward: bool) -> Vec<Effect> {
+        if self.mode != Mode::Overview {
+            return Vec::new();
+        }
+        self.panel = self.panel.shifted(forward);
+        match self.panel {
+            Panel::Denials => self.tab = Tab::Denials,
+            Panel::Proxy => self.tab = Tab::Proxy,
+            Panel::Sessions | Panel::Terminal => {}
+        }
+        Vec::new()
+    }
+
+    /// The projects sessions were started in, newest first, each once.
+    #[must_use]
+    pub fn recent_projects(&self) -> Vec<&PathBuf> {
+        let mut seen: Vec<&PathBuf> = Vec::new();
+        for session in self.sessions.iter().rev() {
+            if !seen.contains(&&session.spec.project) {
+                seen.push(&session.spec.project);
+            }
+        }
+        seen
+    }
+
+    /// The command last used in `project`, joined with spaces.
+    fn last_command(&self, project: &std::path::Path) -> String {
+        self.sessions
+            .iter()
+            .rev()
+            .find(|s| s.spec.project == project)
+            .map(|s| s.spec.command.join(" "))
+            .unwrap_or_default()
+    }
+
+    fn open_launch(&mut self, cwd: &std::path::Path) -> Vec<Effect> {
+        if self.mode != Mode::Overview {
+            return Vec::new();
+        }
+        self.form = LaunchForm {
+            project: cwd.display().to_string(),
+            command: self.last_command(cwd),
+            field: Field::Command,
+            recent: None,
+        };
+        self.mode = Mode::Launch;
+        Vec::new()
+    }
+
+    fn edit_form(&mut self, edit: FormEdit) -> Vec<Effect> {
+        if self.mode != Mode::Launch {
+            return Vec::new();
+        }
+        match edit {
+            FormEdit::SwitchField => {
+                self.form.field = match self.form.field {
+                    Field::Project => Field::Command,
+                    Field::Command => Field::Project,
+                };
+            }
+            FormEdit::Char(c) if !c.is_control() => self.field_mut().push(c),
+            FormEdit::Char(_) => {}
+            FormEdit::Backspace => {
+                self.field_mut().pop();
+            }
+            FormEdit::Recent(older) => self.pick_recent(older),
+        }
+        Vec::new()
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.form.field {
+            Field::Project => &mut self.form.project,
+            Field::Command => &mut self.form.command,
+        }
+    }
+
+    /// Fills both fields from a recent project: the first press picks the newest, then each
+    /// moves one along, stopping at the ends.
+    fn pick_recent(&mut self, older: bool) {
+        let recent: Vec<PathBuf> = self.recent_projects().into_iter().cloned().collect();
+        let Some(last) = recent.len().checked_sub(1) else {
+            return;
+        };
+        let target = match (self.form.recent, older) {
+            (None, _) => 0,
+            (Some(at), true) => (at + 1).min(last),
+            (Some(at), false) => at.saturating_sub(1),
+        };
+        self.form.recent = Some(target);
+        self.form.command = self.last_command(&recent[target]);
+        self.form.project = recent[target].display().to_string();
+    }
+
+    /// Starts the session the form describes. A refusal leaves the form open with the reason, so
+    /// the owner can fix a field instead of retyping both.
+    fn submit_launch(&mut self) -> Vec<Effect> {
+        if self.mode != Mode::Launch {
+            return Vec::new();
+        }
+        let project = self.form.project.trim();
+        if project.is_empty() {
+            self.refuse(&Refusal::EmptyProject);
+            return Vec::new();
+        }
+        let spec = LaunchSpec {
+            project: PathBuf::from(project),
+            command: self
+                .form
+                .command
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let effects = self.launch(spec);
+        if !effects.is_empty() {
+            self.mode = Mode::Overview;
+        }
+        effects
     }
 }
 
@@ -1500,5 +1788,228 @@ mod tests {
         assert_eq!(Tab::Proxy.to_string(), "proxy");
         let name: &'static str = Phase::Lost.into();
         assert_eq!(name, "lost");
+    }
+    // ========================================================================
+    // Launch form, panels, input (hb-2hh)
+    // ========================================================================
+
+    fn open_form(app: &mut App, cwd: &str) {
+        app.update(Msg::OpenLaunch {
+            cwd: PathBuf::from(cwd),
+        });
+        assert_eq!(app.mode, Mode::Launch);
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(Msg::Form(FormEdit::Char(c)));
+        }
+    }
+
+    #[test]
+    fn the_form_starts_on_the_command_with_the_cwd_and_that_projects_last_command() {
+        let mut app = App::new();
+        open_form(&mut app, "/work/new");
+        assert_eq!(app.form.project, "/work/new");
+        assert_eq!(app.form.command, "");
+        assert_eq!(app.form.field, Field::Command);
+        app.update(Msg::CancelLaunch);
+        assert_eq!(app.mode, Mode::Overview);
+        // After a session ran there, the form offers the same command again.
+        app.update(Msg::Launch(spec("shop")));
+        open_form(&mut app, "/work/shop");
+        assert_eq!(app.form.command, "claude");
+    }
+
+    #[test]
+    fn typing_edits_the_current_field_and_ignores_control_characters() {
+        let mut app = App::new();
+        open_form(&mut app, "/p");
+        type_text(&mut app, "pi --x\u{7}");
+        assert_eq!(app.form.command, "pi --x");
+        app.update(Msg::Form(FormEdit::Backspace));
+        assert_eq!(app.form.command, "pi --");
+        app.update(Msg::Form(FormEdit::SwitchField));
+        type_text(&mut app, "/q");
+        assert_eq!(app.form.project, "/p/q");
+        // Backspace on an empty field is harmless.
+        app.form.command.clear();
+        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::Backspace));
+        assert_eq!(app.form.command, "");
+    }
+
+    #[test]
+    fn submitting_splits_the_command_launches_selects_and_closes_the_form() {
+        let mut app = App::new();
+        open_form(&mut app, "/work/shop");
+        type_text(&mut app, "  claude   --resume ");
+        let effects = app.update(Msg::SubmitLaunch);
+        assert_eq!(
+            effects,
+            vec![Effect::Spawn {
+                id: SessionId(1),
+                generation: 1,
+                spec: LaunchSpec {
+                    project: PathBuf::from("/work/shop"),
+                    command: vec!["claude".into(), "--resume".into()],
+                },
+            }]
+        );
+        assert_eq!(app.mode, Mode::Overview);
+    }
+
+    #[test]
+    fn a_refused_submit_keeps_the_form_open_with_what_was_typed_and_says_why() {
+        let mut app = App::new();
+        open_form(&mut app, "/work/shop");
+        assert_eq!(app.update(Msg::SubmitLaunch), vec![]);
+        assert_eq!(app.mode, Mode::Launch);
+        assert_eq!(app.notice.as_deref(), Some("the agent command is empty"));
+        app.update(Msg::Form(FormEdit::SwitchField));
+        for _ in 0..10 {
+            app.update(Msg::Form(FormEdit::Backspace));
+        }
+        app.update(Msg::Form(FormEdit::SwitchField));
+        type_text(&mut app, "pi");
+        app.update(Msg::Form(FormEdit::SwitchField));
+        for _ in 0..20 {
+            app.update(Msg::Form(FormEdit::Backspace));
+        }
+        assert_eq!(app.update(Msg::SubmitLaunch), vec![]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("the project directory is empty")
+        );
+        assert_eq!(app.form.command, "pi");
+        assert_eq!(app.mode, Mode::Launch);
+    }
+
+    #[test]
+    fn the_recent_projects_are_newest_first_and_each_once() {
+        let mut app = App::new();
+        for name in ["a", "b", "a", "c"] {
+            app.update(Msg::Launch(spec(name)));
+        }
+        let names: Vec<String> = app
+            .recent_projects()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(names, ["/work/c", "/work/a", "/work/b"]);
+    }
+
+    #[test]
+    fn picking_a_recent_project_fills_both_fields_and_stops_at_the_ends() {
+        let mut app = App::new();
+        for (name, cmd) in [("a", "claude"), ("b", "pi")] {
+            app.update(Msg::Launch(LaunchSpec {
+                project: PathBuf::from(format!("/work/{name}")),
+                command: vec![cmd.to_owned()],
+            }));
+        }
+        open_form(&mut app, "/elsewhere");
+        app.update(Msg::Form(FormEdit::Recent(true)));
+        assert_eq!(
+            (app.form.project.as_str(), app.form.command.as_str()),
+            ("/work/b", "pi")
+        );
+        app.update(Msg::Form(FormEdit::Recent(true)));
+        assert_eq!(app.form.project, "/work/a");
+        app.update(Msg::Form(FormEdit::Recent(true)));
+        assert_eq!(app.form.project, "/work/a", "stops at the oldest");
+        app.update(Msg::Form(FormEdit::Recent(false)));
+        app.update(Msg::Form(FormEdit::Recent(false)));
+        assert_eq!(app.form.project, "/work/b", "stops at the newest");
+        // With nothing to pick from, the fields are left alone.
+        let mut empty = App::new();
+        open_form(&mut empty, "/x");
+        empty.update(Msg::Form(FormEdit::Recent(true)));
+        assert_eq!(empty.form.project, "/x");
+    }
+
+    #[test]
+    fn form_messages_outside_the_form_do_nothing() {
+        let mut app = App::new();
+        assert_eq!(app.update(Msg::Form(FormEdit::Char('x'))), vec![]);
+        assert_eq!(app.update(Msg::SubmitLaunch), vec![]);
+        assert_eq!(app.form, LaunchForm::empty());
+        // And opening it from another mode is refused.
+        app.update(Msg::ToggleHelp);
+        app.update(Msg::OpenLaunch {
+            cwd: PathBuf::from("/x"),
+        });
+        assert_eq!(app.mode, Mode::Help);
+    }
+
+    #[test]
+    fn panels_cycle_both_ways_and_the_lower_tab_follows() {
+        let mut app = one();
+        assert_eq!(app.panel, Panel::Sessions);
+        app.update(Msg::NextPanel(true));
+        assert_eq!(app.panel, Panel::Terminal);
+        app.update(Msg::NextPanel(true));
+        assert_eq!((app.panel, app.tab), (Panel::Denials, Tab::Denials));
+        app.update(Msg::NextPanel(true));
+        assert_eq!((app.panel, app.tab), (Panel::Proxy, Tab::Proxy));
+        app.update(Msg::NextPanel(true));
+        assert_eq!(app.panel, Panel::Sessions);
+        app.update(Msg::NextPanel(false));
+        assert_eq!(app.panel, Panel::Proxy);
+    }
+
+    #[test]
+    fn entering_interact_shows_the_terminal_panel() {
+        let mut app = running();
+        app.update(Msg::EnterInteract);
+        assert_eq!(app.panel, Panel::Terminal);
+    }
+
+    #[test]
+    fn interact_ends_by_itself_when_the_session_stops_running() {
+        let mut app = running();
+        app.update(Msg::EnterInteract);
+        assert_eq!(app.mode, Mode::Interact);
+        feed_from(&mut app, 3, vec![Event::Stopping {}]);
+        assert_eq!(app.mode, Mode::Overview);
+    }
+
+    #[test]
+    fn input_becomes_a_write_only_for_the_current_running_generation() {
+        let mut app = running();
+        let input = |generation| Msg::Input {
+            id: SessionId(1),
+            generation,
+            bytes: b"x".to_vec(),
+        };
+        assert_eq!(
+            app.update(input(1)),
+            vec![Effect::Write {
+                id: SessionId(1),
+                generation: 1,
+                bytes: b"x".to_vec()
+            }]
+        );
+        assert_eq!(app.update(input(2)), vec![]);
+        assert_eq!(
+            app.update(Msg::Input {
+                id: SessionId(9),
+                generation: 1,
+                bytes: b"x".to_vec()
+            }),
+            vec![]
+        );
+        feed_from(&mut app, 3, vec![Event::Stopping {}]);
+        assert_eq!(app.update(input(1)), vec![]);
+    }
+
+    #[test]
+    fn too_small_sets_the_notice_the_owner_reads() {
+        let mut app = running();
+        app.update(Msg::TooSmall);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("the terminal is too small to interact; make it larger")
+        );
     }
 }

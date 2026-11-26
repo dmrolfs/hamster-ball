@@ -159,6 +159,18 @@ impl Runtime {
                         live.worker.stop();
                     }
                 }
+                Effect::Write {
+                    id,
+                    generation,
+                    bytes,
+                } => {
+                    if let Some(live) = self.live.get_mut(&id)
+                        && live.generation == generation
+                    {
+                        // A failed write means the terminal is closing; the reaper reports it.
+                        let _ = live.worker.write_input(&bytes);
+                    }
+                }
                 Effect::SuspendForApproval { .. } => {}
                 Effect::Quit => quit = true,
             }
