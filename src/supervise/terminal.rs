@@ -71,9 +71,107 @@ impl Callbacks for Recorder {
     }
 }
 
+/// The most bytes of one OSC string (title, clipboard, hyperlink) the emulator is given. The
+/// emulator's parser keeps the whole string until it ends, so without this cap an agent could
+/// send `ESC ] 52 ;` and then bytes without end and make the supervisor use all memory.
+/// Everything this supervisor does with an OSC string is to count it, so a cut one loses nothing.
+pub const MAX_OSC_BYTES: usize = 4096;
+
+/// Where the filter thinks the emulator's parser is. Only the entry to and exit from an OSC
+/// string matter, and both are the same from every other state, so the rest is one `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscState {
+    Other,
+    Escape,
+    Osc { kept: usize },
+}
+
+/// Drops the bytes of an OSC string beyond [`MAX_OSC_BYTES`], and nothing else.
+///
+/// It follows the parser's own rules (the `vte` crate's `advance_esc` and `advance_osc_string`):
+/// `ESC ]` starts a string; BEL, CAN, SUB and ESC end it; CAN and SUB return to ground, ESC to
+/// the escape state. Bytes it forwards are exactly those the parser would have been given, so a
+/// string under the cap parses the same, and the terminator that ends a long one always arrives.
+#[derive(Debug, Clone, Copy)]
+struct OscCap {
+    state: OscState,
+}
+
+impl OscCap {
+    const fn new() -> Self {
+        Self {
+            state: OscState::Other,
+        }
+    }
+
+    /// Whether `byte` is passed on. Updates the state.
+    fn keeps(&mut self, byte: u8) -> bool {
+        match self.state {
+            OscState::Other => {
+                if byte == 0x1b {
+                    self.state = OscState::Escape;
+                }
+                true
+            }
+            OscState::Escape => {
+                self.state = match byte {
+                    0x5d => OscState::Osc { kept: 0 },
+                    0x1b | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => OscState::Escape,
+                    _ => OscState::Other,
+                };
+                true
+            }
+            OscState::Osc { kept } => match byte {
+                0x07 | 0x18 | 0x1a => {
+                    self.state = OscState::Other;
+                    true
+                }
+                0x1b => {
+                    self.state = OscState::Escape;
+                    true
+                }
+                _ if kept < MAX_OSC_BYTES => {
+                    self.state = OscState::Osc { kept: kept + 1 };
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// `bytes` without what the cap drops. Borrows when nothing is dropped.
+    fn filter<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        // Most reads hold no escape at all and are not inside a string.
+        if self.state == OscState::Other && !bytes.contains(&0x1b) {
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+        let mut kept = Vec::new();
+        let mut dropped = false;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if self.keeps(byte) {
+                if dropped {
+                    kept.push(byte);
+                }
+            } else if !dropped {
+                dropped = true;
+                kept.extend_from_slice(&bytes[..i]);
+            }
+        }
+        if dropped {
+            std::borrow::Cow::Owned(kept)
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        }
+    }
+}
+
 /// One agent's emulated terminal.
 pub struct SessionScreen {
     parser: Parser<Recorder>,
+    osc: OscCap,
+    /// Bytes given to the parser, so a test can see that the cap is applied here.
+    #[cfg(test)]
+    fed: usize,
 }
 
 impl std::fmt::Debug for SessionScreen {
@@ -96,12 +194,20 @@ impl SessionScreen {
                 SCROLLBACK_LINES,
                 Recorder::default(),
             ),
+            osc: OscCap::new(),
+            #[cfg(test)]
+            fed: 0,
         }
     }
 
     /// Feeds bytes from the agent, in the order they were read.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        let bytes = self.osc.filter(bytes);
+        #[cfg(test)]
+        {
+            self.fed += bytes.len();
+        }
+        self.parser.process(&bytes);
     }
 
     /// Resizes the emulator. A zero size (a hidden pane) is ignored, so the session keeps its
@@ -412,5 +518,101 @@ mod tests {
         assert_eq!(screen.size(), (24, 80));
         screen.scroll_to(usize::MAX);
         assert!(screen.scrolled() <= SCROLLBACK_LINES);
+    }
+    // ========================================================================
+    // OSC cap: an unfinished string cannot grow without bound
+    // ========================================================================
+
+    fn rss_free_len(filter: &mut OscCap, bytes: &[u8]) -> usize {
+        filter.filter(bytes).len()
+    }
+
+    #[test]
+    fn a_long_unterminated_osc_string_is_cut_at_the_cap_whatever_the_chunking() {
+        for chunk in [1usize, 7, 4096, 100_000] {
+            let mut filter = OscCap::new();
+            let mut forwarded = rss_free_len(&mut filter, b"\x1b]52;c;");
+            let payload = vec![b'a'; 1_000_000];
+            for part in payload.chunks(chunk) {
+                forwarded += rss_free_len(&mut filter, part);
+            }
+            // The introducer is 2 bytes; the cap counts bytes after it.
+            assert_eq!(forwarded, 2 + MAX_OSC_BYTES, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn the_screen_never_gives_its_parser_more_than_the_cap_of_one_unfinished_string() {
+        let mut screen = SessionScreen::new(5, 40);
+        screen.process(b"\x1b]52;c;");
+        for _ in 0..64 {
+            screen.process(&vec![b'a'; 1 << 16]);
+        }
+        assert_eq!(screen.fed, 2 + MAX_OSC_BYTES);
+        // The string still ends and the screen still works.
+        screen.process(b"\x07ok");
+        assert!(screen.text().contains("ok"));
+    }
+
+    #[test]
+    fn after_a_cut_string_each_terminator_ends_it_and_the_next_text_is_shown() {
+        for terminator in [&b"\x07"[..], b"\x1b\\", b"\x18", b"\x1a"] {
+            let mut screen = SessionScreen::new(5, 40);
+            let mut bytes = b"\x1b]52;c;".to_vec();
+            bytes.extend(std::iter::repeat_n(b'a', MAX_OSC_BYTES * 3));
+            bytes.extend_from_slice(terminator);
+            bytes.extend_from_slice(b"shown");
+            screen.process(&bytes);
+            let text = screen.text();
+            assert!(text.contains("shown"), "{terminator:?}: {text}");
+            assert!(!text.contains("aaaa"), "{terminator:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_title_or_clipboard_request_still_counts_as_suppressed_even_when_its_payload_was_cut() {
+        let mut screen = SessionScreen::new(5, 40);
+        let mut bytes = b"\x1b]0;".to_vec();
+        bytes.extend(std::iter::repeat_n(b't', MAX_OSC_BYTES * 2));
+        bytes.push(0x07);
+        bytes.extend_from_slice(b"\x1b]52;c;aGk=\x07");
+        screen.process(&bytes);
+        let seen = screen.suppressed();
+        // OSC 0 sets the icon name and the title, so it counts twice (as in the test above).
+        assert_eq!((seen.title_changes, seen.clipboard_writes), (2, 1));
+    }
+
+    #[test]
+    fn the_escape_forms_that_enter_a_string_are_recognized_like_the_parser_does() {
+        // A control byte between ESC and `]` does not stop the string from starting.
+        for entry in [&b"\x1b]"[..], b"\x1b\x00]", b"\x1b\x1b]", b"\x1b\x07]"] {
+            let mut filter = OscCap::new();
+            let mut sent = entry.to_vec();
+            sent.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES * 2));
+            let forwarded = rss_free_len(&mut filter, &sent);
+            assert_eq!(forwarded, entry.len() + MAX_OSC_BYTES, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn the_cap_changes_nothing_the_emulator_would_have_shown_for_strings_under_it() {
+        use proptest::prelude::*;
+        // Short strings of every kind of byte that matters to the parser, in any order.
+        let alphabet = prop::sample::select(vec![
+            0x1b_u8, b']', b'\\', 0x07, 0x18, 0x1a, b';', b'0', b'5', b'2', b'a', b'[', b'm',
+            b'\n', 0x00, 0xe2, 0x82, 0xac,
+        ]);
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(&prop::collection::vec(alphabet, 0..300), |bytes| {
+                let mut plain = Parser::new_with_callbacks(6, 30, 0, Recorder::default());
+                plain.process(&bytes);
+                let mut filtered = SessionScreen::new(6, 30);
+                filtered.process(&bytes);
+                prop_assert_eq!(plain.screen().contents(), filtered.screen().contents());
+                prop_assert_eq!(plain.callbacks().suppressed, filtered.suppressed());
+                Ok(())
+            })
+            .unwrap_or_else(|e| unreachable!("{e}"));
     }
 }
