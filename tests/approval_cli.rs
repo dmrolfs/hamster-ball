@@ -308,6 +308,11 @@ fn the_agent_cannot_read_list_or_change_the_approval_store_or_its_own_config() {
     let before = assert_ok!(fs::read(&record));
     let config = w.project.join("hamster-ball.toml");
     let config_before = assert_ok!(fs::read(&config));
+    let control = sh_in_hb(
+        &w,
+        "echo writable > plain.txt; mv plain.txt moved.txt; cat moved.txt; rm moved.txt",
+    );
+    assert!(hb_succeeds(&control) && hb_text(&control).contains("writable"));
 
     // The control: the same commands work outside the ball, so the sandbox is what stops them.
     for script in [
