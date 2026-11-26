@@ -6,14 +6,23 @@
 
 mod common;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use claims::assert_ok;
 use common::{World, sandbox_available};
+use hamster_ball::ctl::runner::{Cancel, Capture, Execute, Finished, Host, RunError};
+use hamster_ball::session::pty::Pty;
+use hamster_ball::session::{Guardian, GuardianError, WatchRefusal};
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use pretty_assertions::assert_eq;
 
 const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
@@ -289,4 +298,195 @@ fn the_exec_helper_inside_the_ball_adds_no_access() {
         inside.contains("helper=prepared "),
         "the inner driver did not reach the helper: {inside}"
     );
+}
+
+// ====================================================================================
+// A guardian that refuses, and a pty agent
+// ====================================================================================
+
+/// A stand-in for `hb __guard` that answers every watch with `reply` and records the pid it was
+/// asked to watch. The transport is the real one; only the answer is fixed, which is the one way
+/// to get a deterministic `gone` for a helper that is parked at the gate.
+fn fake_guardian(dir: &Path, reply: &str) -> (Guardian, PathBuf) {
+    let log = dir.join("watched");
+    let script = dir.join("fake-guard");
+    let text = format!(
+        r#"#!/usr/bin/python3
+import os, sys
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    words = line.decode().split()
+    if len(words) < 3 or words[0] != "ack":
+        continue
+    if words[2] == "watch":
+        with open("{log}", "a") as f:
+            f.write(words[-1] + "\n")
+        out = "{reply}"
+    else:
+        out = "ok"
+    os.write(1, (words[1] + " " + out + "\n").encode())
+"#,
+        log = log.display(),
+    );
+    common::write(&script, &text);
+    assert_ok!(std::fs::set_permissions(
+        &script,
+        std::fs::Permissions::from_mode(0o755)
+    ));
+    (assert_ok!(Guardian::start(&script)), log)
+}
+
+/// Runs `touch marker` as a broker command through the gate, guarded by `guard`.
+fn touch_through_gate(guard: &Guardian, marker: &Path) -> Result<Finished, RunError> {
+    Host::new("/usr/bin:/bin", |_| None)
+        .with_guard(guard.handle(), DRIVE.into())
+        .run(
+            Path::new("/usr/bin/touch"),
+            &[marker.as_os_str().to_owned()],
+            Capture::Tail(1024),
+            Duration::from_secs(10),
+            &Cancel::default(),
+        )
+}
+
+/// The pid of the helper the guardian was asked to watch.
+fn watched_pid(log: &Path) -> i32 {
+    let text = assert_ok!(std::fs::read_to_string(log));
+    let last = text.lines().last().unwrap_or("");
+    assert_ok!(last.parse::<i32>())
+}
+
+fn assert_helper_reaped(pid: i32) {
+    // A zombie still answers signal 0, so ESRCH means the helper was killed and waited for.
+    assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+}
+
+#[test]
+fn a_command_the_guard_refuses_or_reports_gone_never_runs_and_its_helper_is_reaped() {
+    let cases = [
+        (
+            "refused kernel",
+            GuardianError::Refused {
+                reason: WatchRefusal::Kernel,
+            },
+        ),
+        (
+            "gone",
+            // The helper is parked at the gate, so a gone answer is turned into a refusal.
+            GuardianError::Refused {
+                reason: WatchRefusal::Invalid,
+            },
+        ),
+    ];
+    for (reply, expected) in cases {
+        let dir = assert_ok!(tempfile::tempdir());
+        let marker = dir.path().join("ran");
+        let (guard, log) = fake_guardian(dir.path(), reply);
+        let result = touch_through_gate(&guard, &marker);
+        assert!(
+            matches!(&result, Err(RunError::Guard { source }) if format!("{source:?}") == format!("{expected:?}")),
+            "{reply}: {result:?}"
+        );
+        assert_helper_reaped(watched_pid(&log));
+        assert!(!marker.exists(), "{reply}: the refused command ran");
+    }
+}
+
+#[test]
+fn the_same_command_runs_when_the_guard_arms_it() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let (guard, log) = fake_guardian(dir.path(), "armed");
+    let done = assert_ok!(touch_through_gate(&guard, &marker));
+    assert!(done.success);
+    assert!(marker.exists(), "the armed command did not run");
+    // The reported process is the one that ran, and it has been reaped by now.
+    assert_helper_reaped(watched_pid(&log));
+}
+
+/// What the target prints on the pty: its terminal, its group and the foreground group.
+const WHO: &str = "use POSIX; $|=1; \
+    my $tty = POSIX::ttyname(0) // 'none'; \
+    my $ctty = open(my $t, '<', '/dev/tty') ? 1 : 0; \
+    print 'pid=', $$, ' tty=', $tty, ' ctty=', $ctty, \
+          ' leader=', (getpgrp() == $$ ? 1 : 0), \
+          ' fg=', (POSIX::tcgetpgrp(0) == getpgrp() ? 1 : 0), \"\\n\";";
+
+/// `ps` shows a process's controlling terminal as `ttysNNN`, or `??` when it has none.
+fn controlling_tty_of(pid: i32) -> String {
+    let out = assert_ok!(
+        Command::new("/bin/ps")
+            .args(["-o", "tty=", "-p", &pid.to_string()])
+            .output()
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[test]
+fn a_pty_agent_leads_its_session_and_owns_the_terminal_before_prepared_and_in_the_foreground_after()
+{
+    sandboxed!();
+    let pty = assert_ok!(Pty::open());
+    let slave_name = pty
+        .slave_path()
+        .as_str()
+        .trim_start_matches("/dev/")
+        .to_owned();
+    let (ours, theirs) = assert_ok!(UnixStream::pair());
+    let (_, out, err) = assert_ok!(pty.child_stdio());
+    let mut command = Command::new(DRIVE);
+    // No process_group: the helper's setsid needs a process that does not lead a group.
+    command
+        .args(["__child", "--gate", "--controlling-tty", "--", "-p"])
+        .arg("(version 1)(allow default)")
+        .args(["--", "/usr/bin/perl", "-e", WHO])
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(out)
+        .stderr(err);
+    let mut child = assert_ok!(command.spawn());
+    // The command holds copies of the slave; drop it so the master sees the end of output.
+    drop(command);
+    let stdin = assert_ok!(pty.slave_fd());
+    let mut gate = hamster_ball::session::launch::ParentGate::new(ours);
+    let pid = assert_ok!(gate.prepare(&stdin));
+    drop(stdin);
+    assert_eq!(u32::try_from(pid).ok(), Some(child.id()));
+    // setsid ran before Prepared: the helper leads a group of its own, which it did not at spawn.
+    assert_eq!(
+        assert_ok!(rustix::process::getpgid(rustix::process::Pid::from_raw(
+            pid
+        )))
+        .as_raw_nonzero()
+        .get(),
+        pid,
+        "the helper does not lead its own group before Prepared"
+    );
+    // The slave is its controlling terminal before Prepared, not only after the exec.
+    assert_eq!(controlling_tty_of(pid), slave_name);
+    let mut master = assert_ok!(pty.clone_master());
+    drop(pty.release_slave());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        // macOS ends a pty master with EIO once the last slave descriptor closes.
+        while let Ok(n) = master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        let _ = tx.send(seen);
+    });
+    assert_ok!(gate.release());
+    let seen = assert_ok!(rx.recv_timeout(Duration::from_secs(15)));
+    let status = assert_ok!(child.wait());
+    let text = String::from_utf8_lossy(&seen).replace('\r', "");
+    assert!(status.success(), "{status:?} {text}");
+    // Same pid all the way through the exec chain, and the slave is still its terminal.
+    assert!(text.contains(&format!("pid={pid} ")), "{text}");
+    assert!(text.contains(&format!("tty=/dev/{slave_name} ")), "{text}");
+    assert!(text.contains("ctty=1 leader=1 fg=1"), "{text}");
 }
