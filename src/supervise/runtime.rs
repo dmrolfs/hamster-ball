@@ -57,6 +57,18 @@ struct Retiring {
     abandoned: bool,
 }
 
+/// A review the owner asked for. The loop that owns the real terminal carries it out and answers
+/// with [`Msg::ApprovalFinished`]; the runtime never touches the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    /// The session.
+    pub id: SessionId,
+    /// The generation that asked.
+    pub generation: Generation,
+    /// The project directory to run `hb approve` in.
+    pub project: PathBuf,
+}
+
 /// What a step did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stepped {
@@ -82,6 +94,7 @@ pub struct Runtime {
     /// A change that has not been drawn yet; kept until a frame is drawn, so one that lands
     /// inside the frame interval is drawn on the next eligible call and not lost.
     redraw_pending: bool,
+    approvals: Vec<Approval>,
 }
 
 impl Runtime {
@@ -100,6 +113,7 @@ impl Runtime {
             screens: HashMap::new(),
             last_frame: None,
             redraw_pending: false,
+            approvals: Vec::new(),
         }
     }
 
@@ -179,6 +193,11 @@ impl Runtime {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The reviews asked for since the last call, oldest first.
+    pub fn take_approvals(&mut self) -> Vec<Approval> {
+        std::mem::take(&mut self.approvals)
     }
 
     /// Whether any worker is still ending.
@@ -275,7 +294,15 @@ impl Runtime {
                         let _ = live.worker.write_input(&bytes);
                     }
                 }
-                Effect::SuspendForApproval { .. } => {}
+                Effect::SuspendForApproval {
+                    id,
+                    generation,
+                    project,
+                } => self.approvals.push(Approval {
+                    id,
+                    generation,
+                    project,
+                }),
                 Effect::Quit => quit = true,
             }
         }
@@ -387,6 +414,24 @@ mod tests {
         let session = first(&runtime);
         assert_eq!(session.generation, 2);
         assert_eq!(session.phase, Phase::Failed);
+    }
+
+    #[test]
+    fn a_review_of_a_session_not_waiting_for_approval_hands_the_caller_nothing() {
+        let mut runtime = Runtime::new(paths());
+        runtime.send(Msg::Launch(spec()));
+        let (id, generation) = (first(&runtime).id, first(&runtime).generation);
+        runtime.send(Msg::Channel {
+            id,
+            generation,
+            seq: 1,
+            event: Event::ApprovalRequired {
+                root: "/nonexistent/project".into(),
+            },
+        });
+        // The launch failed (no hb), so the row is Failed and a review is refused.
+        runtime.send(Msg::ReviewApproval);
+        assert_eq!(runtime.take_approvals(), vec![]);
     }
 
     #[test]

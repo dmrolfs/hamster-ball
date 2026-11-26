@@ -440,6 +440,27 @@ pub enum Msg {
     Answer(bool),
     /// The owner asked to review approval for the selected session.
     ReviewApproval,
+    /// `hb approve` ended for this session and generation.
+    ApprovalFinished {
+        /// The session.
+        id: SessionId,
+        /// The generation that asked for the review.
+        generation: Generation,
+        /// How it went.
+        outcome: ApprovalOutcome,
+    },
+}
+
+/// How a review with `hb approve` ended, as far as the supervisor can tell. It never reads
+/// the answer: it sees only whether the command succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// `hb approve` exited 0: the config is approved now (or already was).
+    Approved,
+    /// `hb approve` ended without approving; the row stays on Approve.
+    NotApproved,
+    /// `hb approve` could not be run; the reason, in one line.
+    Failed(String),
 }
 
 /// What the caller must do after an update.
@@ -474,6 +495,8 @@ pub enum Effect {
     SuspendForApproval {
         /// The session.
         id: SessionId,
+        /// The generation that asked, so the result is applied to it and no other.
+        generation: Generation,
         /// Where to run it.
         project: PathBuf,
     },
@@ -682,6 +705,11 @@ impl App {
             Msg::AskQuit => self.ask_quit(),
             Msg::Answer(yes) => self.answer(yes),
             Msg::ReviewApproval => self.review_approval(),
+            Msg::ApprovalFinished {
+                id,
+                generation,
+                outcome,
+            } => self.approval_finished(id, generation, &outcome),
         }
     }
 }
@@ -1039,6 +1067,34 @@ impl App {
         effects
     }
 
+    /// Applies a review's result. Only the generation that asked, and only while it is still
+    /// waiting on approval, may be started again: the owner may have restarted or moved on.
+    fn approval_finished(
+        &mut self,
+        id: SessionId,
+        generation: Generation,
+        outcome: &ApprovalOutcome,
+    ) -> Vec<Effect> {
+        let waiting = self
+            .sessions
+            .iter()
+            .any(|s| s.id == id && s.generation == generation && s.phase == Phase::Approve);
+        if !waiting {
+            return Vec::new();
+        }
+        match outcome {
+            ApprovalOutcome::Approved => self.restart(id),
+            ApprovalOutcome::NotApproved => {
+                self.alert(id, "the config was not approved".to_owned());
+                Vec::new()
+            }
+            ApprovalOutcome::Failed(reason) => {
+                self.alert(id, format!("could not run hb approve: {reason}"));
+                Vec::new()
+            }
+        }
+    }
+
     fn review_approval(&mut self) -> Vec<Effect> {
         if self.mode != Mode::Overview {
             return Vec::new();
@@ -1047,6 +1103,7 @@ impl App {
             Some(session) if session.phase == Phase::Approve => {
                 vec![Effect::SuspendForApproval {
                     id: session.id,
+                    generation: session.generation,
                     project: session.spec.project.clone(),
                 }]
             }
@@ -1489,9 +1546,79 @@ mod tests {
             app.update(Msg::ReviewApproval),
             vec![Effect::SuspendForApproval {
                 id: SessionId(1),
+                generation: 1,
                 project: PathBuf::from("/work/shop")
             }]
         );
+    }
+
+    fn finished(id: u32, generation: Generation, outcome: ApprovalOutcome) -> Msg {
+        Msg::ApprovalFinished {
+            id: SessionId(id),
+            generation,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn an_approved_review_starts_the_same_session_again_as_a_new_generation() {
+        let mut app = App::new();
+        app.update(Msg::Launch(spec("shop")));
+        app.update(Msg::Channel {
+            id: SessionId(1),
+            generation: 1,
+            seq: 1,
+            event: Event::ApprovalRequired {
+                root: "/work/shop".into(),
+            },
+        });
+        assert_eq!(only(&app).phase, Phase::Approve);
+        let effects = app.update(finished(1, 1, ApprovalOutcome::Approved));
+        assert!(matches!(effects[..], [Effect::Spawn { generation: 2, .. }]));
+        // A second, late result for generation 1 starts nothing.
+        assert_eq!(
+            app.update(finished(1, 1, ApprovalOutcome::Approved)),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_review_that_did_not_approve_or_could_not_run_leaves_the_row_and_says_so() {
+        for (outcome, words) in [
+            (ApprovalOutcome::NotApproved, "not approved"),
+            (
+                ApprovalOutcome::Failed("no such file".into()),
+                "no such file",
+            ),
+        ] {
+            let mut app = App::new();
+            app.update(Msg::Launch(spec("shop")));
+            app.update(Msg::Channel {
+                id: SessionId(1),
+                generation: 1,
+                seq: 1,
+                event: Event::ApprovalRequired {
+                    root: "/work/shop".into(),
+                },
+            });
+            assert_eq!(app.update(finished(1, 1, outcome)), vec![]);
+            assert_eq!(only(&app).phase, Phase::Approve);
+            assert!(app.alerts().last().is_some_and(|a| a.text.contains(words)));
+        }
+    }
+
+    #[test]
+    fn a_review_result_for_an_old_generation_or_a_session_not_waiting_is_ignored() {
+        let mut app = running();
+        assert_eq!(
+            app.update(finished(1, 1, ApprovalOutcome::Approved)),
+            vec![]
+        );
+        assert_eq!(
+            app.update(finished(9, 1, ApprovalOutcome::Approved)),
+            vec![]
+        );
+        assert_eq!(only(&app).generation, 1);
     }
 
     #[test]

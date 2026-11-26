@@ -213,6 +213,13 @@ fn a_session_that_asks_for_approval_is_shown_as_approve_and_nothing_ran() {
     assert_eq!(phase(&rt, 1), Phase::Approve);
     assert!(!marker.exists());
     assert_eq!(rt.app.alerts().len(), 1);
+    // The owner's review request reaches the caller, once, naming the generation and project.
+    rt.send(Msg::ReviewApproval);
+    let asked = rt.take_approvals();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!((asked[0].id, asked[0].generation), (SessionId(1), 1));
+    assert_eq!(asked[0].project, w.project);
+    assert!(rt.take_approvals().is_empty());
     assert!(rt.shut_down(Duration::from_secs(10)));
 }
 
