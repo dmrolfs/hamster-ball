@@ -39,7 +39,7 @@ fn fixture() -> Option<Environment> {
 fn main() -> ExitCode {
     let start = hamster_ball::session::start_up();
     if let Some(problem) = start.problem {
-        eprintln!("hb-testdrive: the supervisor channel is not usable: {problem}");
+        eprintln!("hb-testdrive: {}", snafu::Report::from_error(problem));
         return ExitCode::from(2);
     }
     let args: Vec<OsString> = std::env::args_os().collect();

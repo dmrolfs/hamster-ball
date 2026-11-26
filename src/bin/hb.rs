@@ -11,7 +11,7 @@ fn main() -> ExitCode {
     // close-on-exec) when `hb-supervise` passed one.
     let start = hamster_ball::session::start_up();
     if let Some(problem) = start.problem {
-        eprintln!("hb: the supervisor channel is not usable: {problem}");
+        eprintln!("hb: {}", snafu::Report::from_error(problem));
         return ExitCode::from(2);
     }
     // stderr is passed unlocked on purpose: the thread that streams `--log-denials` writes to it

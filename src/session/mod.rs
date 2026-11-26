@@ -33,7 +33,10 @@ pub use child_helper::{HelperError, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
-pub use fds::{StartUp, claim_channel, close_inherited_fds, close_inherited_fds_except, start_up};
+pub use fds::{
+    StartUp, StartUpError, SweepError, claim_channel, close_inherited_fds,
+    close_inherited_fds_except, start_up,
+};
 pub use guardian::{GuardError, GuardHandle, Guardian, GuardianError, run_guard};
 pub use interactive::InteractiveError;
 pub use preflight::{
