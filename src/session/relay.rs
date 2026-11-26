@@ -247,11 +247,11 @@ fn run(
         if input_ready && !copy_chunk(&mut input, &mut master, None) {
             input_open = false;
         }
-        if let Some(since) = draining_since {
-            if !master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max {
-                end_of_output(filter, &mut output);
-                return;
-            }
+        if let Some(since) = draining_since
+            && (!master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max)
+        {
+            end_of_output(filter, &mut output);
+            return;
         }
     }
 }

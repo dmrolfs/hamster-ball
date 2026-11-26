@@ -400,10 +400,10 @@ pub fn load(request: &LoadRequest<'_>) -> Result<Loaded, LoadError> {
 /// See [`LoadError`].
 pub fn load_closure(request: &LoadRequest<'_>) -> Result<Closure, LoadError> {
     let base = request.user_config.base_file();
-    if let Err(error) = fs::symlink_metadata(&base) {
-        if error.kind() == io::ErrorKind::NotFound {
-            return Err(LoadError::BaseMissing { path: base });
-        }
+    if let Err(error) = fs::symlink_metadata(&base)
+        && error.kind() == io::ErrorKind::NotFound
+    {
+        return Err(LoadError::BaseMissing { path: base });
     }
     let user_canonical = request
         .user_config

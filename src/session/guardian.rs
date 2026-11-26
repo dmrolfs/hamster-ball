@@ -412,12 +412,12 @@ enum Next {
 /// ending processes.
 pub fn run_guard(grace: Duration) -> Result<(), GuardError> {
     let (ended, terminal) = guard_loop(grace)?;
-    if ended == Ended::HbGone {
-        if let Some(terminal) = terminal {
-            // Give a shell that puts the terminal back itself time to do it.
-            thread::sleep(HINT_DELAY);
-            terminal.hint_if_raw();
-        }
+    if ended == Ended::HbGone
+        && let Some(terminal) = terminal
+    {
+        // Give a shell that puts the terminal back itself time to do it.
+        thread::sleep(HINT_DELAY);
+        terminal.hint_if_raw();
     }
     Ok(())
 }

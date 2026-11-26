@@ -256,10 +256,10 @@ impl Handler<'_> {
             Ok(v) => v,
             Err(response) => return response,
         };
-        if op.needs_pin_gate() {
-            if let Err(message) = self.gate(&vetted) {
-                return refused(message);
-            }
+        if op.needs_pin_gate()
+            && let Err(message) = self.gate(&vetted)
+        {
+            return refused(message);
         }
         if *op == ContainerOp::Ps {
             return ran(&Finished {

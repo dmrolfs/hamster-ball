@@ -189,10 +189,10 @@ fn reader(mut pipe: impl Read + Send + 'static, tail: Option<Arc<Mutex<Tail>>>) 
             match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
-                    if let Some(tail) = &tail {
-                        if let Ok(mut t) = tail.lock() {
-                            t.push(&chunk[..n]);
-                        }
+                    if let Some(tail) = &tail
+                        && let Ok(mut t) = tail.lock()
+                    {
+                        t.push(&chunk[..n]);
                     }
                 }
             }

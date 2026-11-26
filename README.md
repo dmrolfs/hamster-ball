@@ -64,7 +64,7 @@ Opt-in tests prove the parts that need real tools: agent presets (`HB_CONFORMANC
 ### Requirements
 
 - macOS (15 tested) on Apple silicon. `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
-- Rust 1.85 or newer to build it.
+- Rust 1.88 or newer to build it.
 - An agent you already use and can run outside the ball (log in to it there first).
 
 ### Install
