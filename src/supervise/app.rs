@@ -20,6 +20,8 @@ use crate::session::supervised::{Cleanup, Event};
 
 /// Most sessions at once.
 pub const MAX_SESSIONS: usize = 8;
+/// The most alerts kept; the screen shows the newest.
+pub const MAX_ALERTS: usize = 64;
 /// Most denial lines kept per session.
 pub const DENIAL_RING: usize = 1_000;
 /// Most proxy events kept per session.
@@ -616,6 +618,10 @@ impl App {
             session,
             text: text.into(),
         });
+        // Only the newest are shown; a long session must not collect them without end.
+        if self.alerts.len() > MAX_ALERTS {
+            self.alerts.remove(0);
+        }
     }
 
     fn refuse(&mut self, refusal: &Refusal) {
@@ -1687,6 +1693,29 @@ mod tests {
         assert_eq!(only(&app), &before);
         assert_eq!(app.update(lost(1, 9)), vec![]);
         assert_eq!(only(&app), &before);
+    }
+
+    #[test]
+    fn alerts_are_capped_and_the_newest_are_kept() {
+        let mut app = running();
+        for n in 0..(MAX_ALERTS + 10) {
+            app.update(Msg::ApprovalFinished {
+                id: SessionId(1),
+                generation: 1,
+                outcome: ApprovalOutcome::Failed(format!("n{n}")),
+            });
+        }
+        // Not waiting for approval: nothing is raised.
+        assert_eq!(app.alerts().len(), 0);
+        for n in 0..(MAX_ALERTS + 10) {
+            app.alert(SessionId(1), format!("n{n}"));
+        }
+        assert_eq!(app.alerts().len(), MAX_ALERTS);
+        assert_eq!(
+            app.alerts().last().map(|a| a.text.as_str()),
+            Some(format!("n{}", MAX_ALERTS + 9).as_str())
+        );
+        assert_eq!(app.alerts().first().map(|a| a.text.as_str()), Some("n10"));
     }
 
     #[test]

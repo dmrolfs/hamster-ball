@@ -25,12 +25,6 @@ const FD_DIR: &str = "/dev/fd";
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum SweepError {
-    /// The directory that lists the open descriptors could not be read.
-    #[snafu(display("the list of open descriptors could not be read"))]
-    List {
-        /// The OS error.
-        source: io::Error,
-    },
     /// A descriptor could not be closed.
     #[snafu(display("descriptor {fd} could not be closed"))]
     Close {
@@ -41,13 +35,17 @@ pub enum SweepError {
     },
 }
 
+/// The most descriptor numbers tried when the open ones cannot be listed. A descriptor cannot be
+/// above the soft limit, which is far lower than this unless the owner raised it a long way.
+const MAX_RANGE: i32 = 1 << 20;
+
 /// Closes every descriptor above 2 and returns the numbers it closed.
 ///
 /// Call it once, before opening anything, in a program that is only `hb`. Descriptors 0, 1 and 2
 /// stay: they are the child's standard streams.
 ///
 /// # Errors
-/// [`SweepError`] if the open descriptors cannot be listed, or one cannot be closed.
+/// [`SweepError`] if a descriptor cannot be closed.
 pub fn close_inherited_fds() -> Result<Vec<i32>, SweepError> {
     close_inherited_fds_except(None)
 }
@@ -67,13 +65,25 @@ fn list_open() -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// The sweep, with the listing and the closing passed in so each failure can be tested.
+/// Every number a descriptor could have, for when the open ones cannot be listed: the sandbox
+/// profile denies reading `/dev/fd`, and `hb ctl` and the helpers run inside it. Closing a number
+/// that is not open finds nothing (`EBADF`), which the sweep allows.
+fn every_possible() -> Vec<String> {
+    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    let top = soft.map_or(MAX_RANGE, |n| {
+        i32::try_from(n).unwrap_or(MAX_RANGE).min(MAX_RANGE)
+    });
+    (3..top).map(|fd| fd.to_string()).collect()
+}
+
+/// The sweep, with the listing and the closing passed in so each case can be tested. A listing
+/// that fails is not a reason to leave descriptors open: every possible number is closed instead.
 fn sweep(
     keep: Option<RawFd>,
     list: impl FnOnce() -> io::Result<Vec<String>>,
     mut close_fd: impl FnMut(RawFd) -> Result<(), Errno>,
 ) -> Result<Vec<i32>, SweepError> {
-    let names = list().context(ListSnafu)?;
+    let names = list().unwrap_or_else(|_| every_possible());
     let mut closed = Vec::new();
     for fd in inherited_from(names.iter().map(String::as_str)) {
         if Some(fd) == keep {
@@ -319,15 +329,26 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_list_that_cannot_be_read_is_an_error_not_an_empty_list() {
-        use claims::assert_err;
-        let failed = sweep(
-            None,
+    fn a_descriptor_list_that_cannot_be_read_closes_every_possible_number_instead() {
+        use claims::assert_ok;
+        let mut tried = Vec::new();
+        let closed = assert_ok!(sweep(
+            Some(5),
             || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-            |_| Ok(()),
+            |fd| {
+                tried.push(fd);
+                // Almost none of them are open.
+                if fd == 7 { Ok(()) } else { Err(Errno::EBADF) }
+            },
+        ));
+        assert_eq!(closed, vec![7], "only what was open counts as closed");
+        assert!(
+            tried.len() > 100,
+            "it must try the whole range, tried {}",
+            tried.len()
         );
-        let error = assert_err!(failed);
-        assert!(matches!(error, SweepError::List { .. }), "{error:?}");
+        assert!(!tried.contains(&5), "the kept descriptor is not touched");
+        assert!(!tried.iter().any(|fd| *fd <= 2), "standard streams stay");
     }
 
     #[test]
@@ -366,8 +387,9 @@ mod tests {
         use claims::assert_some;
         let (_peer, number) = original_channel();
         let started = start_up_with(Some(std::ffi::OsStr::new(&number)), |_| {
-            Err(SweepError::List {
-                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            Err(SweepError::Close {
+                fd: 9,
+                source: Errno::EIO,
             })
         });
         assert!(started.channel.is_none());

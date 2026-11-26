@@ -119,8 +119,13 @@ impl TerminalGuard {
         if !self.active {
             return Ok(());
         }
-        self.active = false;
-        restore_modes(&mut io::stdout(), true)
+        // Every step is tried; the guard stays active if any failed, so Drop tries again rather
+        // than leaving the owner's terminal in raw mode for want of one transient error.
+        let restored = restore_modes(&mut io::stdout(), true);
+        if restored.is_ok() {
+            self.active = false;
+        }
+        restored
     }
 
     /// Takes the terminal again after [`TerminalGuard::suspend`].
@@ -149,7 +154,9 @@ impl Drop for TerminalGuard {
 /// Installs a panic hook that restores the terminal first, so the message that follows is
 /// readable, and then runs the hook that was there. Call once, after any other hook is set.
 ///
-/// The hook takes no locks the program holds and joins no threads.
+/// The hook joins no threads and takes none of this program's locks. Restoring does take the
+/// terminal library's own lock for raw mode, so a thread that panics while another holds it is
+/// the one case this cannot promise to be quick.
 pub fn install_panic_hook() {
     let earlier = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -195,6 +202,21 @@ mod tests {
             assert!(text.contains(reset), "{reset:?} missing from {text:?}");
         }
         assert!(text.contains("\x1b[?1000l"), "mouse capture off: {text:?}");
+    }
+
+    #[test]
+    fn a_restore_that_fails_leaves_the_guard_active_so_drop_tries_again() {
+        // Under a test harness stdout is not a terminal, so raw mode cannot be turned off and
+        // restoring reports an error: exactly the case that must stay pending.
+        let mut guard = TerminalGuard { active: true };
+        let result = guard.suspend();
+        if result.is_err() {
+            assert!(guard.is_active(), "a failed restore must stay pending");
+        } else {
+            assert!(!guard.is_active());
+        }
+        // Do not let Drop write reset bytes into the test output.
+        guard.active = false;
     }
 
     #[test]

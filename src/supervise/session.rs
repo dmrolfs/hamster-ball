@@ -548,10 +548,14 @@ fn read_channel(
     stream: UnixStream,
     inbox: &SyncSender<Msg>,
 ) {
+    // Only an `hb` that answers for this launch and generation speaks for this session.
+    let expected = Hello::new(u64::from(id.0), generation);
     let mut reader = BufReader::new(stream);
     // The acknowledgement comes first; anything else, or none, is a lost channel.
-    let acknowledged =
-        matches!(read_line(&mut reader), Ok(Some(line)) if decode_ack(&line).is_ok());
+    let acknowledged = matches!(
+        read_line(&mut reader),
+        Ok(Some(line)) if decode_ack(&line).is_ok_and(|ack| expected.check(&ack).is_ok())
+    );
     if acknowledged {
         while let Ok(Some(line)) = read_line(&mut reader) {
             let Ok(frame) = decode_frame(&line) else {
@@ -570,4 +574,76 @@ fn read_channel(
         }
     }
     let _ = inbox.send(Msg::ChannelLost { id, generation });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::supervised::HelloAck;
+    use claims::assert_ok;
+    use pretty_assertions::assert_eq;
+    use std::sync::mpsc::sync_channel;
+
+    /// What the app would be sent when `hb` answers the handshake with `ack` and then says
+    /// nothing more and closes.
+    fn after_ack(ack: &HelloAck) -> Vec<Msg> {
+        let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+        let (tx, rx) = sync_channel(8);
+        let line = assert_ok!(encode_line(ack));
+        assert_ok!(theirs.write_all(&line));
+        drop(theirs);
+        read_channel(SessionId(7), 3, ours, &tx);
+        drop(tx);
+        rx.iter().collect()
+    }
+
+    #[test]
+    fn an_answer_for_this_launch_and_generation_is_accepted_and_the_close_is_a_loss() {
+        let ack = HelloAck {
+            v: Hello::new(7, 3).v,
+            launch: 7,
+            generation: 3,
+            pid: 1,
+        };
+        assert_eq!(
+            after_ack(&ack),
+            vec![Msg::ChannelLost {
+                id: SessionId(7),
+                generation: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn an_answer_for_another_generation_or_launch_is_not_accepted_and_nothing_follows_it() {
+        // The frame after a wrong handshake must never reach the app, only the loss.
+        for (launch, generation) in [(7, 2), (8, 3)] {
+            let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+            let (tx, rx) = sync_channel(8);
+            let ack = HelloAck {
+                v: Hello::new(7, 3).v,
+                launch,
+                generation,
+                pid: 1,
+            };
+            assert_ok!(theirs.write_all(&assert_ok!(encode_line(&ack))));
+            let frame = assert_ok!(encode_line(&crate::session::supervised::Frame {
+                seq: 1,
+                event: crate::session::supervised::Event::Starting {},
+            }));
+            assert_ok!(theirs.write_all(&frame));
+            drop(theirs);
+            read_channel(SessionId(7), 3, ours, &tx);
+            drop(tx);
+            let got: Vec<Msg> = rx.iter().collect();
+            assert_eq!(
+                got,
+                vec![Msg::ChannelLost {
+                    id: SessionId(7),
+                    generation: 3
+                }],
+                "launch {launch} generation {generation}"
+            );
+        }
+    }
 }
