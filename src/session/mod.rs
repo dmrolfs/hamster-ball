@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod pty;
 pub mod pump;
 pub mod relay;
+pub mod reporter;
 pub mod run;
 pub mod sanitize;
 pub mod signals;
