@@ -77,6 +77,10 @@ impl Callbacks for Recorder {
 /// Everything this supervisor does with an OSC string is to count it, so a cut one loses nothing.
 pub const MAX_OSC_BYTES: usize = 4096;
 
+/// The most bytes the session's reader gives the emulator in one call. See the test that
+/// measures why it must stay small.
+pub const READ_SIZE: usize = 8192;
+
 /// Where the filter thinks the emulator's parser is. Only the entry to and exit from an OSC
 /// string matter, and both are the same from every other state, so the rest is one `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,6 +542,33 @@ mod tests {
             }
             // The introducer is 2 bytes; the cap counts bytes after it.
             assert_eq!(forwarded, 2 + MAX_OSC_BYTES, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn hostile_utf8_read_in_pty_sized_pieces_is_parsed_in_linear_time() {
+        // The emulator's parser takes time quadratic in the size of one call on invalid UTF-8:
+        // measured 7.8 s for 1 MiB in one call and 0.07 s for the same bytes in 8 KiB calls.
+        // The session's reader reads at most 8 KiB at a time, which is what keeps this bounded.
+        // A debug build is about 50 times slower (3.8 s here), so the limit is 20 s there and 2 s
+        // in release. One 1 MiB call would take about 400 s in debug and 8 s in release, so a
+        // READ_SIZE raised far enough to matter fails either way.
+        let limit = if cfg!(debug_assertions) { 20 } else { 2 };
+        for hostile in [&b"\xff"[..], b"\xe2\x82", b"\xc3\x28"] {
+            let mut screen = SessionScreen::new(24, 80);
+            let mut megabyte = Vec::new();
+            while megabyte.len() < (1 << 20) {
+                megabyte.extend_from_slice(hostile);
+            }
+            let started = std::time::Instant::now();
+            for read in megabyte.chunks(READ_SIZE) {
+                screen.process(read);
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(limit),
+                "{hostile:?} took {:?}",
+                started.elapsed()
+            );
         }
     }
 
