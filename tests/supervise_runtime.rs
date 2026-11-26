@@ -215,3 +215,56 @@ fn a_session_that_asks_for_approval_is_shown_as_approve_and_nothing_ran() {
     assert_eq!(rt.app.alerts().len(), 1);
     assert!(rt.shut_down(Duration::from_secs(10)));
 }
+
+#[test]
+fn shutting_down_with_unread_reports_waiting_ends_every_process() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    // shortcut: this does not fill the inbox (hb rate-limits denial reports, so it holds a few
+    // messages); a test that blocks a worker on a full inbox needs a source of many proxy events.
+    rt.send(launch(
+        &w,
+        &[
+            "/bin/sh",
+            "-c",
+            "i=0; while [ $i -lt 100000 ]; do cat /etc/master.passwd 2>/dev/null; i=$((i+1)); done; sleep 120",
+        ],
+    ));
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 120"]));
+    assert!(run_until(&mut rt, 60, |r| phase(r, 2) == Phase::Running));
+    let pids: Vec<i32> = [1, 2].iter().filter_map(|id| agent_pid(&rt, *id)).collect();
+    // Do not step: reports pile up unread, and shut_down must read them as it waits.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(rt.shut_down(Duration::from_secs(30)));
+    assert!(!rt.is_retiring());
+    for pid in pids {
+        assert!(!alive(pid), "agent {pid} outlived shut_down");
+    }
+}
+
+#[test]
+fn a_restart_starts_the_new_generation_only_after_the_old_one_has_ended() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 120"]));
+    assert!(run_until(&mut rt, 60, |r| phase(r, 1) == Phase::Running));
+    let first = assert_some!(agent_pid(&rt, 1));
+    rt.send(Msg::AskRestart);
+    rt.send(Msg::Answer(true));
+    // At no step may both agents be alive.
+    let mut second = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        rt.step();
+        second = agent_pid(&rt, 1).filter(|p| *p != first);
+        if let Some(p) = second {
+            assert!(!alive(first), "generation 1 still alive when 2 ran as {p}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(second.is_some(), "the new generation never ran");
+    assert!(rt.shut_down(Duration::from_secs(20)));
+}

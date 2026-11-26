@@ -44,6 +44,19 @@ struct Live {
     worker: Worker,
 }
 
+/// How long an old generation gets to end before it is abandoned (killed) and its replacement
+/// is refused: the stop grace, plus time for the kill and the last reports.
+const RETIRE_LIMIT: Duration = Duration::from_secs(15);
+
+/// A worker that was asked to stop and is still ending. It stays here, and the inbox stays
+/// drained, until every thread has finished; nothing waits on it with the inbox unread.
+struct Retiring {
+    id: SessionId,
+    worker: Worker,
+    since: Instant,
+    abandoned: bool,
+}
+
 /// What a step did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stepped {
@@ -61,6 +74,9 @@ pub struct Runtime {
     inbox: Receiver<Msg>,
     outbox: SyncSender<Msg>,
     live: HashMap<SessionId, Live>,
+    retiring: Vec<Retiring>,
+    /// The newest start asked for while the session's old worker is still ending.
+    waiting: HashMap<SessionId, (Generation, LaunchSpec)>,
     screens: HashMap<SessionId, Arc<Shared>>,
     last_frame: Option<Instant>,
     /// A change that has not been drawn yet; kept until a frame is drawn, so one that lands
@@ -79,6 +95,8 @@ impl Runtime {
             inbox,
             outbox,
             live: HashMap::new(),
+            retiring: Vec::new(),
+            waiting: HashMap::new(),
             screens: HashMap::new(),
             last_frame: None,
             redraw_pending: false,
@@ -114,6 +132,7 @@ impl Runtime {
             let effects = self.app.update(msg);
             quit |= self.run(effects);
         }
+        self.advance(Instant::now());
         Stepped { applied, quit }
     }
 
@@ -138,15 +157,93 @@ impl Runtime {
         due
     }
 
-    /// Stops every worker and waits, for at most `limit` in all.
+    /// Stops every worker and waits, for at most `limit` in all, reading the inbox as it waits.
+    /// Returns whether every worker ended in time; the rest are killed.
     pub fn shut_down(&mut self, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        let mut all = true;
-        for (_, live) in self.live.drain() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            all &= live.worker.shut_down(left);
+        self.waiting.clear();
+        let ids: Vec<SessionId> = self.live.keys().copied().collect();
+        for id in ids {
+            self.retire(id);
         }
-        all
+        let deadline = Instant::now() + limit;
+        loop {
+            self.step();
+            if self.retiring.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                for old in &mut self.retiring {
+                    old.worker.abandon();
+                }
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether any worker is still ending.
+    #[must_use]
+    pub fn is_retiring(&self) -> bool {
+        !self.retiring.is_empty()
+    }
+
+    /// Asks the session's worker to stop, and tracks it until it has ended.
+    fn retire(&mut self, id: SessionId) {
+        if let Some(mut live) = self.live.remove(&id) {
+            live.worker.stop();
+            self.retiring.push(Retiring {
+                id,
+                worker: live.worker,
+                since: Instant::now(),
+                abandoned: false,
+            });
+        }
+    }
+
+    /// Reaps workers that have ended, abandons ones that have not ended in time, and starts the
+    /// replacements that were waiting for an old worker to end.
+    fn advance(&mut self, now: Instant) {
+        let mut i = 0;
+        while i < self.retiring.len() {
+            if self.retiring[i].worker.is_finished() {
+                self.retiring.swap_remove(i).worker.join();
+            } else {
+                let old = &mut self.retiring[i];
+                if !old.abandoned && now.duration_since(old.since) >= RETIRE_LIMIT {
+                    old.abandoned = true;
+                    old.worker.abandon();
+                    let id = old.id;
+                    self.refuse_replacement(id);
+                }
+                i += 1;
+            }
+        }
+        let ready: Vec<SessionId> = self
+            .waiting
+            .keys()
+            .copied()
+            .filter(|id| !self.retiring.iter().any(|r| r.id == *id))
+            .collect();
+        for id in ready {
+            if let Some((generation, spec)) = self.waiting.remove(&id) {
+                self.start(id, generation, &spec);
+            }
+        }
+    }
+
+    /// The old generation did not end, so the new one is not started: two would overlap.
+    fn refuse_replacement(&mut self, id: SessionId) {
+        if let Some((generation, _)) = self.waiting.remove(&id) {
+            let effects = self.app.update(Msg::SpawnFailed {
+                id,
+                generation,
+                reason: "the previous run did not end in time, so this one was not started"
+                    .to_owned(),
+            });
+            if !effects.is_empty() {
+                let _ = self.run(effects);
+            }
+        }
     }
 
     /// Carries out effects; true when one of them was `Quit`.
@@ -188,11 +285,18 @@ impl Runtime {
     /// Starts the session, and tells the app how it went. A failure becomes a message, so the
     /// app shows it; nothing here decides what a failure means.
     fn spawn(&mut self, id: SessionId, generation: Generation, spec: &LaunchSpec) {
-        // A restart replaces the worker: the old one is closed first, and its late messages
-        // carry the old generation and are dropped by the app.
-        if let Some(old) = self.live.remove(&id) {
-            let _ = old.worker.shut_down(Duration::from_secs(5));
+        // A restart replaces the worker, but only once the old one has ended: its late messages
+        // carry the old generation and the app drops them. Until then the newest start waits.
+        self.retire(id);
+        if self.retiring.iter().any(|r| r.id == id) {
+            self.waiting.insert(id, (generation, spec.clone()));
+            return;
         }
+        self.start(id, generation, spec);
+    }
+
+    /// Starts the session, and tells the app how it went.
+    fn start(&mut self, id: SessionId, generation: Generation, spec: &LaunchSpec) {
         let (rows, cols) = START_SIZE;
         let extra: Vec<(&str, &std::ffi::OsStr)> = self
             .paths

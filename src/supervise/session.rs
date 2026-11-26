@@ -75,7 +75,17 @@ pub struct Worker {
     channel: UnixStream,
     /// When a stop was asked for, so the reaper can kill a process that does not end.
     stop_asked: Arc<Mutex<Option<Instant>>>,
+    /// Set to make the reaper kill the process now, without waiting out the grace period.
+    kill: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+}
+
+impl Drop for Worker {
+    /// A worker that is dropped is abandoned: the process must not outlive the supervisor's
+    /// interest in it. Harmless after `shut_down`, which has already done the same.
+    fn drop(&mut self) {
+        self.abandon();
+    }
 }
 
 impl std::fmt::Debug for Worker {
@@ -107,6 +117,8 @@ pub fn spawn(
         Ok((mut threads, channel_reader)) => {
             let stop_asked = Arc::new(Mutex::new(None));
             let asked = Arc::clone(&stop_asked);
+            let kill = Arc::new(AtomicBool::new(false));
+            let kill_now = Arc::clone(&kill);
             let inbox = messages.clone();
             // The child is shared with the reaper through a cell, so that if the thread cannot
             // start the child is still here to be killed rather than lost in an unrun closure.
@@ -117,7 +129,17 @@ pub fn spawn(
                 .spawn(move || {
                     let taken = for_reaper.lock().ok().and_then(|mut slot| slot.take());
                     if let Some(mut child) = taken {
-                        reap(id, generation, &mut child, channel_reader, &asked, &inbox);
+                        reap(
+                            id,
+                            generation,
+                            &mut child,
+                            channel_reader,
+                            &Stopping {
+                                asked: &asked,
+                                kill: &kill_now,
+                            },
+                            &inbox,
+                        );
                     }
                 });
             match reaper {
@@ -135,6 +157,7 @@ pub fn spawn(
                 terminal,
                 channel,
                 stop_asked,
+                kill,
                 threads,
             })
         }
@@ -184,6 +207,12 @@ fn spawn_threads(
     Ok((vec![pty_thread], channel_thread))
 }
 
+/// What tells the reaper to kill a process that does not end.
+struct Stopping<'a> {
+    asked: &'a Mutex<Option<Instant>>,
+    kill: &'a AtomicBool,
+}
+
 /// Waits for `hb`, then for the channel reader, then reports the exit.
 ///
 /// The `Exited` event is the last frame `hb` writes and is in the socket before `hb` exits, so
@@ -194,7 +223,7 @@ fn reap(
     generation: Generation,
     child: &mut std::process::Child,
     channel_reader: JoinHandle<()>,
-    stop_asked: &Mutex<Option<Instant>>,
+    stopping: &Stopping<'_>,
     inbox: &SyncSender<Msg>,
 ) {
     let status = loop {
@@ -203,11 +232,13 @@ fn reap(
             Ok(None) => {}
             Err(_) => break None,
         }
-        let overdue = stop_asked
-            .lock()
-            .ok()
-            .and_then(|asked| *asked)
-            .is_some_and(|at| at.elapsed() >= STOP_GRACE);
+        let overdue = stopping.kill.load(Ordering::Acquire)
+            || stopping
+                .asked
+                .lock()
+                .ok()
+                .and_then(|asked| *asked)
+                .is_some_and(|at| at.elapsed() >= STOP_GRACE);
         if overdue {
             let _ = child.kill();
         }
@@ -263,22 +294,47 @@ impl Worker {
 
     /// Asks `hb` to stop the session, and starts the clock after which the process is killed.
     pub fn stop(&mut self) {
-        if let Ok(mut asked) = self.stop_asked.lock() {
-            asked.get_or_insert_with(Instant::now);
-        }
+        self.start_clock();
         if let Ok(line) = encode_line(&Command::Stop {}) {
             let _ = self.channel.write_all(&line);
         }
     }
 
+    fn start_clock(&self) {
+        if let Ok(mut asked) = self.stop_asked.lock() {
+            asked.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Whether every thread of the session has ended: the process is reaped and everything it
+    /// said has been delivered.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.threads.iter().all(JoinHandle::is_finished)
+    }
+
+    /// Gives up waiting: closes both ends of the channel, which `hb` treats as a stop and which
+    /// also ends the channel reader, and has the process killed at the reaper's next look.
+    pub fn abandon(&self) {
+        self.start_clock();
+        self.kill.store(true, Ordering::Release);
+        let _ = self.channel.shutdown(Shutdown::Both);
+    }
+
     /// Closes the channel, which `hb` treats as a stop, and waits for the threads to end, for at
     /// most `limit` in all. Returns whether all of them did.
-    pub fn shut_down(self, limit: Duration) -> bool {
+    ///
+    /// The process is killed if it has not ended by then. Nothing here reads the app's inbox, so
+    /// a caller that holds the inbox must keep it drained, or the reader can block on a full
+    /// inbox and never finish; [`Runtime::shut_down`](super::runtime::Runtime::shut_down) does.
+    pub fn shut_down(mut self, limit: Duration) -> bool {
+        self.start_clock();
         let _ = self.channel.shutdown(Shutdown::Both);
         let deadline = Instant::now() + limit;
-        for handle in self.threads {
+        for handle in std::mem::take(&mut self.threads) {
             while !handle.is_finished() {
                 if Instant::now() > deadline {
+                    self.kill.store(true, Ordering::Release);
                     return false;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -286,6 +342,13 @@ impl Worker {
             let _ = handle.join();
         }
         true
+    }
+
+    /// Waits for threads that have already finished. Call it only when [`Worker::is_finished`].
+    pub fn join(mut self) {
+        for handle in std::mem::take(&mut self.threads) {
+            let _ = handle.join();
+        }
     }
 }
 
