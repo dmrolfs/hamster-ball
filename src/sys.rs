@@ -120,6 +120,8 @@ pub(crate) enum BoundedError {
     Spawn(io::Error),
     /// It ran past the time allowed and its process group was killed.
     TimedOut,
+    /// The caller's cancel flag was set and its process group was killed.
+    Cancelled,
 }
 
 /// What a program that ended on its own left behind.
@@ -141,9 +143,21 @@ pub(crate) fn run_bounded(
     timeout: std::time::Duration,
     max_bytes: u64,
 ) -> Result<Finished, BoundedError> {
+    run_cancellable(command, timeout, max_bytes, None)
+}
+
+/// [`run_bounded`] that also ends, with its process group killed, within about 5 ms of `cancel`
+/// being set.
+pub(crate) fn run_cancellable(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    max_bytes: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Finished, BoundedError> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     command
@@ -167,10 +181,14 @@ pub(crate) fn run_bounded(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None)
+                if Instant::now() < deadline
+                    && !cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Ok(None) | Err(_) => {
+                let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
                 if let Ok(pid) = i32::try_from(child.id()) {
                     let _ = nix::sys::signal::killpg(
                         nix::unistd::Pid::from_raw(pid),
@@ -179,7 +197,11 @@ pub(crate) fn run_bounded(
                 }
                 let _ = child.wait();
                 drop(reader);
-                return Err(BoundedError::TimedOut);
+                return Err(if cancelled {
+                    BoundedError::Cancelled
+                } else {
+                    BoundedError::TimedOut
+                });
             }
         }
     };
@@ -234,6 +256,44 @@ mod bounded_tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_cancelled_program_is_killed_with_what_it_started_and_reported_as_cancelled() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&flag);
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = run_cancellable(
+            &mut sh("sleep 20 & wait"),
+            Duration::from_secs(60),
+            1024,
+            Some(&flag),
+        );
+        assert!(matches!(result, Err(BoundedError::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_ok!(timer.join());
+    }
+
+    #[test]
+    fn a_cancel_flag_that_is_never_set_changes_nothing() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let done = assert_ok!(run_cancellable(
+            &mut sh("echo ok"),
+            Duration::from_secs(10),
+            64,
+            Some(&flag)
+        ));
+        assert_eq!(done.stdout, b"ok\n");
     }
 
     #[test]

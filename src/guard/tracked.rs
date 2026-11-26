@@ -132,7 +132,8 @@ fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, 
     match run_bounded(&mut command, timeout, MAX_OUTPUT_BYTES) {
         Ok(done) if done.status.success() => Ok(done.stdout),
         Ok(_) => Err(Listing::NotARepository),
-        Err(BoundedError::TimedOut) => Err(Listing::TimedOut),
+        // Cancelled cannot happen: no cancel flag is passed.
+        Err(BoundedError::TimedOut | BoundedError::Cancelled) => Err(Listing::TimedOut),
         Err(BoundedError::Spawn(_)) => Err(Listing::Unavailable),
     }
 }

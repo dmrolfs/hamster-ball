@@ -481,7 +481,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let session = SessionDir::create(&temp)?;
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
     // the session directory (with whatever they wrote) goes with it.
-    let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
+    let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home, None)?;
     let (launchers, warm_cache) = match (&offline, &spec.warm) {
         (Some(plan), None) => (Some(plan.install(session.path())?), None),
         (Some(plan), Some(_)) => (None, Some(plan.install_cache()?)),
