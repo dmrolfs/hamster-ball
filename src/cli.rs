@@ -31,7 +31,7 @@ use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::session::signals::{block_supervised, unblock_supervised};
 use crate::session::{
     self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, PtyMode, RunError, RunSpec, SESSION_MARKER,
-    SignalMode, StdioMode, check_nesting, exec_sandbox_exec, run_guard,
+    SignalMode, StdioMode, check_nesting, exec_gated, exec_sandbox_exec, run_guard,
 };
 use crate::system::{Environment, StateDir, UserConfigDir};
 use crate::text::Escaped;
@@ -93,6 +93,9 @@ enum Command {
     /// Internal: clear the signal mask and exec sandbox-exec. Started by `hb run`, never by hand.
     #[command(name = "__child", hide = true)]
     Child(ChildArgs),
+    /// Internal: exec a broker command after the cleanup guard has armed. Started by `hb run`.
+    #[command(name = "__exec", hide = true)]
+    Exec(ExecArgs),
     /// Internal: end the agent and the log stream if hb is killed. Started by `hb run`, never by hand.
     #[command(name = "__guard", hide = true)]
     Guard(GuardArgs),
@@ -241,10 +244,20 @@ struct GuardArgs {
 }
 
 #[derive(Debug, Args)]
+struct ExecArgs {
+    /// The absolute program, then its arguments.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
 struct ChildArgs {
     /// Become a session leader and take stdin (the pty slave) as the controlling terminal first.
     #[arg(long)]
     controlling_tty: bool,
+    /// Stdin is a launch-gate socket: receive the real stdin and exec only after release.
+    #[arg(long)]
+    gate: bool,
     /// The arguments for `sandbox-exec`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
@@ -482,8 +495,17 @@ where
     if let Command::Child(child) = &command {
         return fail(
             err,
-            crate::Error::from(exec_sandbox_exec(&child.argv, child.controlling_tty)),
+            crate::Error::from(exec_sandbox_exec(
+                &child.argv,
+                child.controlling_tty,
+                child.gate,
+            )),
         );
+    }
+
+    if let Command::Exec(exec) = &command {
+        let (program, args) = exec.argv.split_first().unwrap_or((&exec.argv[0], &[]));
+        return fail(err, crate::Error::from(exec_gated(program, args)));
     }
 
     // The client needs only the socket variable: no home, project or config is read inside the ball.
@@ -532,7 +554,9 @@ where
         }
         Command::Run(args) => run_command(env, args, err, supervise, reraise),
         Command::Warm(args) => warm_command(env, &args, out, err, supervise, reraise),
-        Command::Child(_) | Command::Guard(_) | Command::Ctl(_) => ExitCode::FAILURE,
+        Command::Child(_) | Command::Exec(_) | Command::Guard(_) | Command::Ctl(_) => {
+            ExitCode::FAILURE
+        }
         Command::Explain(args) => {
             let mut request = ExplainRequest::new(env)
                 .format(args.format.into())

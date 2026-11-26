@@ -15,6 +15,7 @@ mod guard_channel;
 pub mod guardian;
 pub mod hooks;
 mod interactive;
+pub mod launch;
 pub mod offline;
 pub mod ports;
 pub mod preflight;
@@ -28,7 +29,7 @@ pub mod signals;
 pub mod terminal;
 
 pub use ca_bundle::{CaBundleError, write_bundle};
-pub use child_helper::{HelperError, exec_sandbox_exec};
+pub use child_helper::{HelperError, exec_gated, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};

@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -26,6 +27,7 @@ use super::fence::settle;
 use super::guardian::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
+use super::launch::{GateError, ParentGate};
 use super::offline::{OfflineError, OfflinePlan};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
@@ -397,6 +399,13 @@ pub enum RunError {
     ))]
     PtyUnavailable,
 
+    /// The launch gate did not open; the helper was killed before running anything.
+    #[snafu(display("the launch gate did not open"))]
+    Gate {
+        /// The underlying error.
+        source: GateError,
+    },
+
     /// The process that cleans up after a killed hb could not be started or told what to watch.
     #[snafu(transparent)]
     Guardian {
@@ -621,6 +630,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     };
 
     let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
+    // With a guardian the helper is gated: its stdin becomes the gate socket, and the target's
+    // real stdin is sent across it, so nothing runs before the guard has armed its watch.
+    let mut gated_stdin: Option<OwnedFd> = None;
     match &pty {
         Some(pty) => {
             // The helper's setsid makes the child leader of a new session and group, which it
@@ -628,12 +640,16 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             pty.copy_size_from(io::stdin());
             let (stdin, stdout, stderr) = pty.child_stdio().context(SpawnSnafu)?;
             command.stdin(stdin).stdout(stdout).stderr(stderr);
+            gated_stdin = Some(pty.slave_fd().context(SpawnSnafu)?);
         }
         None => {
             // A child in its own group is a background group to a terminal and cannot read it,
             // so without a pty it gets one only when stdin is not a tty (hb-ghd.2.3 decision 1).
             if !stdin_is_tty {
                 command.process_group(0);
+            }
+            if guardian.is_some() {
+                gated_stdin = Some(target_stdin(spec.stdio).context(SpawnSnafu)?);
             }
             if spec.stdio == StdioMode::Capture {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -677,7 +693,14 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         },
         (_, log) => log,
     };
-    let mut child = match command.spawn().context(SpawnSnafu) {
+    let launched = match (guardian.as_mut(), gated_stdin) {
+        (Some(guardian), Some(stdin)) => {
+            let group = pty.is_some() || !stdin_is_tty;
+            gated_spawn(&mut command, stdin, guardian, group)
+        }
+        _ => command.spawn().context(SpawnSnafu),
+    };
+    let mut child = match launched {
         Ok(child) => child,
         Err(error) => {
             if let Some(log) = log {
@@ -686,32 +709,6 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             return Err(error);
         }
     };
-    if let Some(guardian) = guardian.as_mut() {
-        // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
-        let target = if pty.is_some() || !stdin_is_tty {
-            Target::Group(pid_of(child.id()))
-        } else {
-            Target::Child(pid_of(child.id()))
-        };
-        let protected = match guardian.watch(target) {
-            Ok(WatchOutcome::Armed) => Ok(()),
-            // Gone is acceptable only when the owned child has really exited (a fast command).
-            Ok(WatchOutcome::Gone) => match child.try_wait() {
-                Ok(Some(_)) => Ok(()),
-                _ => Err(GuardianError::Refused {
-                    reason: WatchRefusal::Invalid,
-                }),
-            },
-            Err(error) => Err(error),
-        };
-        if let Err(error) = protected {
-            abort_child(&mut child);
-            if let Some(log) = log {
-                let _ = log.finish();
-            }
-            return Err(error.into());
-        }
-    }
     let clipboard = if loaded.policy.terminal.effective_clipboard_write() {
         ClipboardPolicy::Allow
     } else {
@@ -1097,12 +1094,67 @@ impl Running {
     }
 }
 
+/// The descriptor the target should read: `/dev/null` when output is captured, hb's own stdin
+/// otherwise.
+fn target_stdin(stdio: StdioMode) -> io::Result<OwnedFd> {
+    match stdio {
+        StdioMode::Capture => Ok(OwnedFd::from(fs::File::open("/dev/null")?)),
+        StdioMode::Inherit => io::stdin().as_fd().try_clone_to_owned(),
+    }
+}
+
+/// Starts the gated helper, waits for Prepared, arms the guard on the reported process, and only
+/// then releases it. Any failure kills and reaps the helper before it has run the target.
+fn gated_spawn(
+    command: &mut Command,
+    stdin: OwnedFd,
+    guardian: &mut Guardian,
+    group: bool,
+) -> Result<Child, RunError> {
+    let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
+    command.stdin(Stdio::from(OwnedFd::from(theirs)));
+    let mut child = command.spawn().context(SpawnSnafu)?;
+    let mut gate = ParentGate::new(ours);
+    let prepared = gate
+        .prepare(&stdin)
+        .map_err(|source| RunError::Gate { source });
+    drop(stdin);
+    let outcome = prepared.and_then(|pid| {
+        if u32::try_from(pid).ok() != Some(child.id()) {
+            return Err(RunError::Gate {
+                source: GateError::Protocol,
+            });
+        }
+        let pid = Pid::from_raw(pid);
+        let target = if group {
+            Target::Group(pid)
+        } else {
+            Target::Child(pid)
+        };
+        match guardian.watch(target)? {
+            WatchOutcome::Armed => Ok(()),
+            // The helper is still blocked on the gate, so a gone answer is never acceptable here.
+            WatchOutcome::Gone => Err(GuardianError::Refused {
+                reason: WatchRefusal::Invalid,
+            }
+            .into()),
+        }
+    });
+    let released =
+        outcome.and_then(|()| gate.release().map_err(|source| RunError::Gate { source }));
+    if let Err(error) = released {
+        abort_child(&mut child);
+        return Err(error);
+    }
+    Ok(child)
+}
+
 /// The words that start the command: `sandbox-exec`, or the helper that execs it.
 fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString> {
     match helper {
         None => vec![OsString::from(SANDBOX_EXEC)],
         Some(hb) => {
-            let mut words = vec![hb.as_os_str().to_owned(), "__child".into()];
+            let mut words = vec![hb.as_os_str().to_owned(), "__child".into(), "--gate".into()];
             if controlling_tty {
                 words.push("--controlling-tty".into());
             }

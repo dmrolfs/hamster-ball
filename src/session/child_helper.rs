@@ -13,9 +13,11 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use rustix::process::{ioctl_tiocsctty, setsid};
+use rustix::process::{ioctl_tiocsctty, setpgid, setsid};
+use rustix::stdio::dup2_stdin;
 use snafu::Snafu;
 
+use super::launch::{GateError, HelperGate};
 use super::preflight::SANDBOX_EXEC;
 use super::signals::{SignalError, clear_mask};
 
@@ -28,6 +30,17 @@ pub enum HelperError {
     Mask {
         /// The underlying error.
         source: SignalError,
+    },
+
+    /// The gated program was not an absolute path.
+    #[snafu(display("a gated program must be an absolute path"))]
+    NotAbsolute,
+
+    /// The helper could not lead a process group of its own.
+    #[snafu(display("the helper could not start a process group"))]
+    NewGroup {
+        /// The underlying error.
+        source: rustix::io::Errno,
     },
 
     /// The helper could not become the leader of a new session.
@@ -44,6 +57,27 @@ pub enum HelperError {
         source: rustix::io::Errno,
     },
 
+    /// The launch gate did not open, so nothing was run.
+    #[snafu(display("the launch gate did not open"))]
+    Gate {
+        /// The underlying error.
+        source: GateError,
+    },
+
+    /// The received stdin could not be put on descriptor 0.
+    #[snafu(display("the child's stdin could not be restored"))]
+    RestoreStdin {
+        /// The underlying error.
+        source: rustix::io::Errno,
+    },
+
+    /// The gated program could not be started.
+    #[snafu(display("the gated program could not be started"))]
+    ExecProgram {
+        /// The underlying error.
+        source: io::Error,
+    },
+
     /// `sandbox-exec` could not be started.
     #[snafu(display("{SANDBOX_EXEC} could not be started"))]
     Exec {
@@ -56,11 +90,21 @@ pub enum HelperError {
 ///
 /// With `controlling_tty` it first becomes the leader of a new session and takes its stdin, the
 /// child's pty slave, as the controlling terminal, so the agent has job control and a `/dev/tty`
-/// of its own. Returns only if something failed.
-pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool) -> HelperError {
+/// of its own. With `gated`, fd 0 is the launch-gate socket: the helper receives the real stdin
+/// over it, establishes its session, reports Prepared and execs only after Release. Returns only
+/// if something failed; a gate that never opens runs nothing.
+pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool, gated: bool) -> HelperError {
     if let Err(source) = clear_mask() {
         return HelperError::Mask { source };
     }
+    let gate = if gated {
+        match open_gate() {
+            Ok(gate) => Some(gate),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     if controlling_tty {
         if let Err(source) = setsid() {
             return HelperError::NewSession { source };
@@ -69,7 +113,50 @@ pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool) -> HelperErro
             return HelperError::ControllingTty { source };
         }
     }
+    if let Some(gate) = gate {
+        if let Err(source) = gate.wait_for_release(std::process::id()) {
+            return HelperError::Gate { source };
+        }
+    }
     HelperError::Exec {
         source: Command::new(SANDBOX_EXEC).args(args).exec(),
     }
+}
+
+/// The broker's gated launch: `hb __exec <absolute program> <args>`.
+///
+/// Receives the real stdin over the gate on fd 0, leads a new process group so the broker can
+/// signal the whole command, reports Prepared, and execs `program` only after Release. Unlike
+/// [`exec_sandbox_exec`] the program is not sandboxed: the broker runs fixed host commands
+/// (podman, launchctl) from validated arguments, and this helper adds nothing to that authority.
+pub fn exec_gated(program: &OsString, args: &[OsString]) -> HelperError {
+    if !std::path::Path::new(program).is_absolute() {
+        return HelperError::NotAbsolute;
+    }
+    if let Err(source) = clear_mask() {
+        return HelperError::Mask { source };
+    }
+    let gate = match open_gate() {
+        Ok(gate) => gate,
+        Err(error) => return error,
+    };
+    if let Err(source) = setpgid(None, None) {
+        return HelperError::NewGroup { source };
+    }
+    if let Err(source) = gate.wait_for_release(std::process::id()) {
+        return HelperError::Gate { source };
+    }
+    HelperError::ExecProgram {
+        source: Command::new(program).args(args).exec(),
+    }
+}
+
+/// Takes the gate from fd 0 and puts the received stdin in its place.
+fn open_gate() -> Result<HelperGate, HelperError> {
+    let gate = HelperGate::from_stdin().map_err(|source| HelperError::Gate { source })?;
+    let stdin = gate
+        .receive_stdin()
+        .map_err(|source| HelperError::Gate { source })?;
+    dup2_stdin(&stdin).map_err(|source| HelperError::RestoreStdin { source })?;
+    Ok(gate)
 }

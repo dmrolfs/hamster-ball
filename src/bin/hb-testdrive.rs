@@ -44,7 +44,7 @@ fn main() -> ExitCode {
         .map_or(hamster_ball::session::DEFAULT_GRACE, Duration::from_millis);
     let helper = args
         .get(1)
-        .is_some_and(|a| a == "__child" || a == "__guard" || a == "ctl");
+        .is_some_and(|a| a == "__child" || a == "__exec" || a == "__guard" || a == "ctl");
     let env = if helper { None } else { fixture() };
     if env.is_none() && !helper {
         eprintln!("hb-testdrive: the HB_TD_* variables are missing or unusable");

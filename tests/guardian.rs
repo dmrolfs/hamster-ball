@@ -409,8 +409,10 @@ fn a_broker_command_the_guard_refuses_is_killed_and_reported() {
     let marker = assert_ok!(tempfile::NamedTempFile::new());
     let path = marker.path().to_owned();
     drop(marker);
-    let host = Host::new("/usr/bin:/bin", |_| None).with_guard(guard.handle());
-    let script = format!("sleep 1; touch '{}'", path.display());
+    let host = Host::new("/usr/bin:/bin", |_| None).with_guard(guard.handle(), HB.into());
+    // The mark is the target's first action; the generous wait below gives a target released
+    // before arming time to leave it, so the check cannot pass just because the kill was quick.
+    let script = format!("touch '{}'; sleep 1", path.display());
     let started_at = Instant::now();
     let result = host.run(
         std::path::Path::new("/bin/sh"),
@@ -544,10 +546,15 @@ fn a_run_killed_with_sigkill_leaves_neither_the_agent_nor_the_log_stream_behind(
 fn a_run_that_finishes_normally_ends_its_guard_and_nothing_else() {
     sandboxed!();
     let w = World::new(PROJECT);
+    // The agent waits until the test has seen the guard, so the check cannot race a fast run.
+    let go = w.project.join("go");
     let script = w.project.join("short.pl");
     common::write(
         &script,
-        "$|=1; print \"child=$$\\n\"; sleep 1; print \"done\\n\";\n",
+        &format!(
+            "$|=1; print \"child=$$\\n\"; for (1..200) {{ last if -e '{}'; select(undef,undef,undef,0.05) }} print \"done\\n\";\n",
+            go.display()
+        ),
     );
     let mut command = w.drive(
         DRIVE,
@@ -570,6 +577,7 @@ fn a_run_that_finishes_normally_ends_its_guard_and_nothing_else() {
         found
     };
     assert_eq!(guards.len(), 1, "expected one guard under hb: {guards:?}");
+    common::write(&go, "");
     let out = assert_ok!(hb.wait_with_output());
     assert_eq!(
         out.status.code(),
