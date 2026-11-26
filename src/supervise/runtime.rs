@@ -195,6 +195,12 @@ impl Runtime {
         }
     }
 
+    /// Whether a review has been asked for and not yet taken.
+    #[must_use]
+    pub fn has_approvals(&self) -> bool {
+        !self.approvals.is_empty()
+    }
+
     /// The reviews asked for since the last call, oldest first.
     pub fn take_approvals(&mut self) -> Vec<Approval> {
         std::mem::take(&mut self.approvals)

@@ -115,6 +115,11 @@ fn event_loop(
             handled += 1;
             changed = true;
             quit |= handle(event::read()?, screen, runtime, &mut router, cwd)?;
+            // Whatever was typed after the key that asked for a review is not for the supervisor
+            // and not for the review: it is dropped when the review starts.
+            if runtime.has_approvals() {
+                break;
+            }
         }
         if quit {
             return Ok(());
