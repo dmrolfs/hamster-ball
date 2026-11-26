@@ -29,6 +29,7 @@ pub mod policy;
 pub mod proxy;
 pub mod seatbelt;
 pub mod session;
+pub mod supervise;
 pub(crate) mod sys;
 pub mod system;
 pub mod text;
