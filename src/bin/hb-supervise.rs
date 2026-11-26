@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use hamster_ball::supervise::launch::{LAUNCH_ARG, run_helper};
 use hamster_ball::supervise::runtime::Paths;
-use hamster_ball::supervise::ui::{Ended, run};
+use hamster_ball::supervise::ui::{Ended, UiError, run};
+use snafu::{ResultExt, Snafu};
 // Used by the library; named here so the lockfile and MSRV are checked for this binary too.
 use {tui_term as _, vt100 as _};
 
@@ -30,17 +31,28 @@ fn main() -> ExitCode {
         Ok(Ended::Clean) => ExitCode::SUCCESS,
         Ok(Ended::Unclean) => ExitCode::from(1),
         Err(error) => {
-            eprintln!("hb-supervise: {error}");
+            eprintln!("hb-supervise: {}", snafu::Report::from_error(error));
             ExitCode::from(2)
         }
     }
 }
 
+/// Why the supervisor could not start.
+#[derive(Debug, Snafu)]
+enum StartError {
+    /// This program's own path or the current directory could not be found.
+    #[snafu(display("this program's location or the current directory is unknown"))]
+    Paths { source: std::io::Error },
+    /// The supervisor's terminal or signals could not be set up.
+    #[snafu(transparent)]
+    Ui { source: UiError },
+}
+
 /// Finds `hb` next to this program, and runs the UI in the directory it was started from.
-fn supervise() -> std::io::Result<Ended> {
-    let me = std::env::current_exe()?;
+fn supervise() -> Result<Ended, StartError> {
+    let me = std::env::current_exe().context(PathsSnafu)?;
     let hb = me.with_file_name("hb");
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir().context(PathsSnafu)?;
     // Tests point this at a copy of hb that takes its fixture from variables. A release build
     // never reads the variable, so the environment cannot choose which `hb` approves a project.
     #[cfg(feature = "test-support")]
@@ -50,5 +62,5 @@ fn supervise() -> std::io::Result<Ended> {
         me,
         env: Vec::new(),
     };
-    run(paths, &cwd)
+    Ok(run(paths, &cwd)?)
 }

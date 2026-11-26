@@ -73,9 +73,13 @@ fn enter_modes<W: Write>(out: &mut W) -> io::Result<()> {
 }
 
 /// Drops the terminal's unread input, as `tcflush` does. Input the owner typed before a hand-over
-/// must not reach the next reader.
-pub fn flush_input() {
-    let _ = rustix::termios::tcflush(std::io::stdin(), rustix::termios::QueueSelector::IFlush);
+/// must not reach the next reader, so a failure is an error the caller must act on.
+///
+/// # Errors
+/// The OS error if the terminal's queue cannot be flushed (for example, input is not a terminal).
+pub fn flush_input() -> io::Result<()> {
+    rustix::termios::tcflush(std::io::stdin(), rustix::termios::QueueSelector::IFlush)
+        .map_err(io::Error::from)
 }
 
 /// Restores the terminal when dropped.

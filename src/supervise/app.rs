@@ -440,6 +440,9 @@ pub enum Msg {
     Answer(bool),
     /// The owner asked to review approval for the selected session.
     ReviewApproval,
+    /// Something the owner should be told that is not about one session: a line in the alert
+    /// area until the next message.
+    Notice(String),
     /// `hb approve` ended for this session and generation.
     ApprovalFinished {
         /// The session.
@@ -705,6 +708,10 @@ impl App {
             Msg::AskQuit => self.ask_quit(),
             Msg::Answer(yes) => self.answer(yes),
             Msg::ReviewApproval => self.review_approval(),
+            Msg::Notice(text) => {
+                self.notice = Some(text);
+                Vec::new()
+            }
             Msg::ApprovalFinished {
                 id,
                 generation,
@@ -1605,6 +1612,17 @@ mod tests {
             assert_eq!(only(&app).phase, Phase::Approve);
             assert!(app.alerts().last().is_some_and(|a| a.text.contains(words)));
         }
+    }
+
+    #[test]
+    fn a_notice_is_shown_until_the_next_message_and_changes_nothing_else() {
+        let mut app = running();
+        let before = only(&app).clone();
+        assert_eq!(app.update(Msg::Notice("keys dropped".into())), vec![]);
+        assert_eq!(app.notice.as_deref(), Some("keys dropped"));
+        assert_eq!(only(&app), &before);
+        app.update(Msg::Select(0));
+        assert_eq!(app.notice, None);
     }
 
     #[test]

@@ -373,3 +373,60 @@ fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the
     assert_eq!(owner.exit_code(60), Some(0));
     assert_restored(&owner);
 }
+
+/// Starts an unapproved session and asks for its review, leaving the prompt on screen unanswered.
+fn start_review(w: &World) -> Owner {
+    let script = w.project.join("agent.sh");
+    common::write(&script, "sleep 300\n");
+    let mut owner = Owner::start_unapproved(w, &[]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    owner.wait_for("Approve", 60);
+    owner.send(b"a");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !owner.text().contains("Approve this config?") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        owner.text().contains("Approve this config?"),
+        "{:?}",
+        owner.text()
+    );
+    owner
+}
+
+#[test]
+fn sigterm_during_a_review_ends_the_supervisor_instead_of_only_the_review() {
+    sandboxed!();
+    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+        let w = World::new(PROJECT);
+        let mut owner = start_review(&w);
+        assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
+        assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");
+        assert_restored(&owner);
+    }
+}
+
+#[test]
+fn ctrl_c_during_a_review_cancels_the_review_and_returns_to_the_ui_with_the_row_unchanged() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut owner = start_review(&w);
+    // The review runs with the terminal cooked, so Ctrl-C is a signal to the foreground group.
+    owner.send(&[0x03]);
+    owner.wait_for("Approve", 30);
+    owner.wait_for("OVERVIEW", 30);
+    assert_eq!(
+        assert_ok!(owner.child.try_wait()),
+        None,
+        "Ctrl-C ended the supervisor"
+    );
+    assert!(!w.project.join("ran").exists());
+    owner.send(b"q");
+    assert_eq!(owner.exit_code(60), Some(0));
+    assert_restored(&owner);
+}

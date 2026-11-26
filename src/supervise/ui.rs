@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as Key};
@@ -19,6 +19,7 @@ use nix::sys::time::TimeSpec;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
+use snafu::{ResultExt, Snafu};
 
 use super::app::{ApprovalOutcome, Generation, Msg, SessionId};
 use super::keys::{Context, Router};
@@ -32,6 +33,28 @@ pub const QUIT_LIMIT: Duration = Duration::from_secs(20);
 const EVENTS_PER_TURN: usize = 64;
 
 type Screen = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Why the supervisor's loop ended in failure. Whatever the cause, the terminal is restored and
+/// the sessions are stopped before this is reported.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum UiError {
+    /// The owner's terminal could not be read, drawn on or handed over.
+    #[snafu(display("the terminal failed"))]
+    Terminal {
+        /// The OS error.
+        source: io::Error,
+    },
+    /// The kernel's signal queue could not be set up or read, so a stop could go unseen.
+    #[snafu(display("the signal queue failed"))]
+    Signals {
+        /// The OS error.
+        source: io::Error,
+    },
+    /// A thread of the supervisor panicked.
+    #[snafu(display("a supervisor thread panicked"))]
+    Panicked,
+}
 
 /// How the supervisor ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,34 +71,47 @@ pub enum Ended {
 /// again at once, and any failure or panic is printed readably.
 ///
 /// # Errors
-/// The OS error if the terminal cannot be taken.
-pub fn run(paths: Paths, cwd: &std::path::Path) -> io::Result<Ended> {
+/// [`UiError`] if the terminal or the signal queue cannot be set up. A failure after that is
+/// reported on stderr and as [`Ended::Unclean`].
+pub fn run(paths: Paths, cwd: &std::path::Path) -> Result<Ended, UiError> {
     // Before any thread exists, so every thread has them blocked and only the loop sees them.
-    let stop = StopSignals::watch()?;
+    let mut stop = StopSignals::watch()?;
     let hb = paths.hb.clone();
     let env = paths.env.clone();
     let mut runtime = Runtime::new(paths);
-    let mut guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter().context(TerminalSnafu)?;
     install_panic_hook();
+    // The review child lives here, outside the closure that may unwind, so a panic cannot leave it
+    // running: it is killed and reaped below, with the sessions.
+    let mut review_child: Option<Child> = None;
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut screen = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let mut screen =
+            Terminal::new(CrosstermBackend::new(io::stdout())).context(TerminalSnafu)?;
         event_loop(
             &mut guard,
             &mut screen,
             &mut runtime,
             cwd,
             &Reviewer { hb, env },
-            &stop,
+            &mut stop,
+            &mut review_child,
         )
     }));
     // The owner has the shell back before the (bounded) wait for the sessions.
     let restored = guard.suspend();
+    if let Some(mut child) = review_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let stopped = runtime.shut_down(QUIT_LIMIT);
+    if let Err(error) = &restored {
+        eprintln!("hb-supervise: the terminal may not be fully restored: {error}");
+    }
     match outcome {
-        Ok(Ok(())) if stopped && restored.is_ok() => Ok(Ended::Clean),
+        Ok(Ok(())) if stopped && restored.is_ok() && !fatal() => Ok(Ended::Clean),
         Ok(Ok(())) => Ok(Ended::Unclean),
         Ok(Err(error)) => {
-            eprintln!("hb-supervise: {error}");
+            eprintln!("hb-supervise: {}", snafu::Report::from_error(error));
             Ok(Ended::Unclean)
         }
         // The hook has already restored the terminal and printed the panic.
@@ -83,24 +119,37 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> io::Result<Ended> {
     }
 }
 
-/// SIGTERM and SIGHUP, which end the supervisor through the normal path (terminal restored,
-/// sessions stopped) instead of killing it where it stands. They are blocked, so their default
-/// action never runs, and read through a kernel event queue.
+/// The signals that end or interrupt the supervisor.
 ///
-/// shortcut: SIGINT is not watched; in raw mode Ctrl-C is the agent's key, and outside the UI
-/// there is nothing of ours to clean up first. Add it if a cooked-mode phase is ever added.
+/// SIGTERM and SIGHUP end it through the normal path (terminal restored, sessions stopped)
+/// instead of killing it where it stands, and once seen they stay seen: a review that consumed
+/// one must not let the supervisor carry on. SIGINT only arrives while the owner's terminal is
+/// cooked, which is during a review (raw mode makes Ctrl-C a key for the agent): it cancels that
+/// review. They are blocked, so their default action never runs, and read from a kernel queue.
+///
+/// The queue is the supervisor's only way to see a stop, so a failure to read it is an error,
+/// not "no signal".
 struct StopSignals {
     queue: Kqueue,
+    terminate: bool,
+    interrupt: bool,
 }
 
 impl StopSignals {
-    fn watch() -> io::Result<Self> {
+    const WATCHED: [Signal; 3] = [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGINT];
+
+    fn watch() -> Result<Self, UiError> {
         let mut set = SigSet::empty();
-        set.add(Signal::SIGTERM);
-        set.add(Signal::SIGHUP);
-        set.thread_block().map_err(io::Error::from)?;
-        let queue = Kqueue::new().map_err(io::Error::from)?;
-        let changes: Vec<KEvent> = [Signal::SIGTERM, Signal::SIGHUP]
+        for signal in Self::WATCHED {
+            set.add(signal);
+        }
+        set.thread_block()
+            .map_err(io::Error::from)
+            .context(SignalsSnafu)?;
+        let queue = Kqueue::new()
+            .map_err(io::Error::from)
+            .context(SignalsSnafu)?;
+        let changes: Vec<KEvent> = Self::WATCHED
             .iter()
             .map(|signal| {
                 KEvent::new(
@@ -115,12 +164,17 @@ impl StopSignals {
             .collect();
         queue
             .kevent(&changes, &mut [], None)
-            .map_err(io::Error::from)?;
-        Ok(Self { queue })
+            .map_err(io::Error::from)
+            .context(SignalsSnafu)?;
+        Ok(Self {
+            queue,
+            terminate: false,
+            interrupt: false,
+        })
     }
 
-    /// Whether one has arrived since the last call.
-    fn arrived(&self) -> bool {
+    /// Reads what has arrived and remembers it.
+    fn poll(&mut self) -> Result<(), UiError> {
         let blank = KEvent::new(
             0,
             EventFilter::EVFILT_SIGNAL,
@@ -129,9 +183,31 @@ impl StopSignals {
             0,
             0,
         );
-        let mut events = [blank; 2];
+        let mut events = [blank; 4];
         let now = TimeSpec::new(0, 0);
-        matches!(self.queue.kevent(&[], &mut events, Some(*now.as_ref())), Ok(n) if n > 0)
+        let n = self
+            .queue
+            .kevent(&[], &mut events, Some(*now.as_ref()))
+            .map_err(io::Error::from)
+            .context(SignalsSnafu)?;
+        for event in &events[..n] {
+            if event.ident() == Signal::SIGINT as usize {
+                self.interrupt = true;
+            } else {
+                self.terminate = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether SIGTERM or SIGHUP has been seen. Stays true.
+    const fn terminated(&self) -> bool {
+        self.terminate
+    }
+
+    /// Whether SIGINT has been seen since the last call.
+    fn take_interrupt(&mut self) -> bool {
+        std::mem::take(&mut self.interrupt)
     }
 }
 
@@ -141,50 +217,70 @@ struct Reviewer {
     env: Vec<(String, std::ffi::OsString)>,
 }
 
+/// What the loop's pieces share: the terminal, the sessions, the signals and the review child.
+struct Loop<'a> {
+    guard: &'a mut TerminalGuard,
+    screen: &'a mut Screen,
+    runtime: &'a mut Runtime,
+    stop: &'a mut StopSignals,
+    review_child: &'a mut Option<Child>,
+    reviewer: &'a Reviewer,
+    cwd: &'a std::path::Path,
+    router: Router,
+}
+
 fn event_loop(
     guard: &mut TerminalGuard,
     screen: &mut Screen,
     runtime: &mut Runtime,
     cwd: &std::path::Path,
     reviewer: &Reviewer,
-    stop: &StopSignals,
-) -> io::Result<()> {
+    stop: &mut StopSignals,
+    review_child: &mut Option<Child>,
+) -> Result<(), UiError> {
     let look = Look::from_no_color(std::env::var_os("NO_COLOR").as_deref());
-    let mut router = Router::new();
+    let mut ui = Loop {
+        guard,
+        screen,
+        runtime,
+        stop,
+        review_child,
+        reviewer,
+        cwd,
+        router: Router::new(),
+    };
     let mut sized: HashMap<(SessionId, Generation), (u16, u16)> = HashMap::new();
     let mut changed = true;
     loop {
-        let stepped = runtime.step();
+        let stepped = ui.runtime.step();
         changed |= stepped.applied > 0;
         let mut quit = stepped.quit;
-        for approval in runtime.take_approvals() {
-            review(
-                guard,
-                screen,
-                runtime,
-                &mut router,
-                reviewer,
-                stop,
-                &approval,
-            )?;
+        for approval in ui.runtime.take_approvals() {
+            if !ui.review(&approval)? {
+                return Ok(());
+            }
             changed = true;
         }
-        if fatal() || stop.arrived() {
+        ui.stop.poll()?;
+        if fatal() {
+            return Err(UiError::Panicked);
+        }
+        if ui.stop.terminated() {
             return Ok(());
         }
-        fit(screen, runtime, &mut sized)?;
-        if runtime.frame_due(changed, Instant::now()) {
-            draw(screen, runtime, look)?;
+        fit(ui.screen, ui.runtime, &mut sized)?;
+        if ui.runtime.frame_due(changed, Instant::now()) {
+            draw(ui.screen, ui.runtime, look)?;
         }
         changed = false;
         let mut handled = 0;
-        while handled < EVENTS_PER_TURN && event::poll(poll_wait(handled))? {
+        while handled < EVENTS_PER_TURN && event::poll(poll_wait(handled)).context(TerminalSnafu)? {
             handled += 1;
             changed = true;
-            quit |= handle(event::read()?, screen, runtime, &mut router, cwd)?;
+            quit |= ui.handle(event::read().context(TerminalSnafu)?)?;
             // Whatever was typed after the key that asked for a review is not for the supervisor
             // and not for the review: it is dropped when the review starts.
-            if runtime.has_approvals() {
+            if ui.runtime.has_approvals() {
                 break;
             }
         }
@@ -199,13 +295,15 @@ fn poll_wait(handled: usize) -> Duration {
     if handled == 0 { FRAME } else { Duration::ZERO }
 }
 
-fn draw(screen: &mut Screen, runtime: &Runtime, look: Look) -> io::Result<()> {
+fn draw(screen: &mut Screen, runtime: &Runtime, look: Look) -> Result<(), UiError> {
     let lookup = |id: SessionId| runtime.screen(id).cloned();
-    screen.draw(|frame| {
-        #[cfg(feature = "test-support")]
-        test_panic();
-        view::draw(frame, &runtime.app, &lookup, look);
-    })?;
+    screen
+        .draw(|frame| {
+            #[cfg(feature = "test-support")]
+            test_panic();
+            view::draw(frame, &runtime.app, &lookup, look);
+        })
+        .context(TerminalSnafu)?;
     Ok(())
 }
 
@@ -223,8 +321,8 @@ fn fit(
     screen: &Screen,
     runtime: &mut Runtime,
     sized: &mut HashMap<(SessionId, Generation), (u16, u16)>,
-) -> io::Result<()> {
-    let size = screen.size()?;
+) -> Result<(), UiError> {
+    let size = screen.size().context(TerminalSnafu)?;
     let Some((rows, cols)) = view::terminal_size(Rect::new(0, 0, size.width, size.height)) else {
         return Ok(());
     };
@@ -244,124 +342,139 @@ fn fit(
     Ok(())
 }
 
-/// Applies one terminal event; true when the owner confirmed a quit.
-fn handle(
-    event: Key,
-    screen: &Screen,
-    runtime: &mut Runtime,
-    router: &mut Router,
-    cwd: &std::path::Path,
-) -> io::Result<bool> {
-    let size = screen.size()?;
-    let modes = runtime
-        .app
-        .selected()
-        .and_then(|s| runtime.screen(s.id))
-        .and_then(|shared| shared.screen.lock().ok().map(|s| s.modes()))
-        .unwrap_or_default();
-    let ctx = Context {
-        layout: Layout::for_size(size.width, size.height),
-        modes,
-        cwd,
-    };
-    // Releases go to the router too: it ignores them, and that is how a release between the two
-    // presses of `Ctrl-g Ctrl-g` is known not to cancel the pair.
-    let msgs = match event {
-        Key::Key(key) => router.route(&runtime.app, key, &ctx),
-        Key::Paste(text) => router.paste(&runtime.app, &text, &ctx),
-        _ => Vec::new(),
-    };
-    let mut quit = false;
-    for msg in msgs {
-        quit |= runtime.send(msg);
+impl Loop<'_> {
+    /// Applies one terminal event; true when the owner confirmed a quit.
+    fn handle(&mut self, event: Key) -> Result<bool, UiError> {
+        let size = self.screen.size().context(TerminalSnafu)?;
+        let modes = self
+            .runtime
+            .app
+            .selected()
+            .and_then(|s| self.runtime.screen(s.id))
+            .and_then(|shared| shared.screen.lock().ok().map(|s| s.modes()))
+            .unwrap_or_default();
+        let ctx = Context {
+            layout: Layout::for_size(size.width, size.height),
+            modes,
+            cwd: self.cwd,
+        };
+        // Releases go to the router too: it ignores them, and that is how a release between the
+        // two presses of `Ctrl-g Ctrl-g` is known not to cancel the pair.
+        let msgs = match event {
+            Key::Key(key) => self.router.route(&self.runtime.app, key, &ctx),
+            Key::Paste(text) => self.router.paste(&self.runtime.app, &text, &ctx),
+            _ => Vec::new(),
+        };
+        let mut quit = false;
+        for msg in msgs {
+            quit |= self.runtime.send(msg);
+        }
+        Ok(quit)
     }
-    Ok(quit)
-}
 
-/// Gives the real terminal to `hb approve` for one session, and takes it back.
-///
-/// Nothing the owner typed before reaches the review: pending events are dropped and the
-/// terminal's input queue is flushed, both before the review starts and after it ends. The
-/// supervisor types nothing into the review and never reads its answer; it sees only the exit
-/// status. The inbox keeps being read the whole time.
-fn review(
-    guard: &mut TerminalGuard,
-    screen: &mut Screen,
-    runtime: &mut Runtime,
-    router: &mut Router,
-    reviewer: &Reviewer,
-    stop: &StopSignals,
-    approval: &Approval,
-) -> io::Result<()> {
-    *router = Router::new();
-    drain_events()?;
-    let outcome = match guard.suspend() {
-        Ok(()) => run_review(runtime, reviewer, stop, approval),
-        Err(error) => {
-            ApprovalOutcome::Failed(format!("the terminal could not be given back: {error}"))
-        }
-    };
-    drain_events()?;
-    flush_input();
-    guard.resume()?;
-    // `clear` would ask the terminal where the cursor is and wait for the reply, which fails right
-    // after a hand-over; `resize` clears the same area and forgets what was drawn, with no query.
-    let size = screen.size()?;
-    screen.resize(Rect::new(0, 0, size.width, size.height))?;
-    *router = Router::new();
-    runtime.send(Msg::ApprovalFinished {
-        id: approval.id,
-        generation: approval.generation,
-        outcome,
-    });
-    Ok(())
-}
-
-fn run_review(
-    runtime: &mut Runtime,
-    reviewer: &Reviewer,
-    stop: &StopSignals,
-    approval: &Approval,
-) -> ApprovalOutcome {
-    flush_input();
-    let mut command = Command::new(&reviewer.hb);
-    command
-        .arg("approve")
-        .current_dir(&approval.project)
-        // The review is not a session: it must not see a supervisor channel.
-        .env_remove(crate::session::supervised::SUPERVISOR_FD_VAR)
-        .envs(reviewer.env.iter().map(|(k, v)| (k, v)));
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return ApprovalOutcome::Failed(error.to_string()),
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return ApprovalOutcome::Approved,
-            Ok(Some(_)) => return ApprovalOutcome::NotApproved,
-            Ok(None) => {}
+    /// Gives the real terminal to `hb approve` for one session, and takes it back. False when the
+    /// supervisor was told to stop meanwhile, in which case the UI is not resumed.
+    ///
+    /// Nothing the owner typed before reaches the review: pending events are dropped and the
+    /// terminal's input queue is flushed, both before the review starts and after it ends, and
+    /// if the flush fails the review is not started. The supervisor types nothing into the review
+    /// and never reads its answer; it sees only the exit status. The inbox keeps being read the
+    /// whole time.
+    fn review(&mut self, approval: &Approval) -> Result<bool, UiError> {
+        self.router = Router::new();
+        drain_events()?;
+        let outcome = match self.guard.suspend() {
+            Ok(()) => match flush_input() {
+                Ok(()) => self.run_review(approval),
+                Err(error) => ApprovalOutcome::Failed(format!(
+                    "the terminal's pending input could not be dropped, so no review was started: {error}"
+                )),
+            },
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return ApprovalOutcome::Failed(error.to_string());
+                ApprovalOutcome::Failed(format!("the terminal could not be given back: {error}"))
             }
+        };
+        if self.stop.terminated() || fatal() {
+            return Ok(false);
         }
-        // Other sessions go on being read while the owner answers.
-        runtime.step();
-        if stop.arrived() || fatal() {
-            let _ = child.kill();
+        drain_events()?;
+        // A flush that fails here leaves possible stale keys for the UI; say so, stay in the UI.
+        let flushed = flush_input();
+        self.guard.resume().context(TerminalSnafu)?;
+        // `clear` would ask the terminal where the cursor is and wait for the reply, which fails
+        // right after a hand-over; `resize` clears the same area and forgets what was drawn.
+        let size = self.screen.size().context(TerminalSnafu)?;
+        self.screen
+            .resize(Rect::new(0, 0, size.width, size.height))
+            .context(TerminalSnafu)?;
+        self.router = Router::new();
+        self.runtime.send(Msg::ApprovalFinished {
+            id: approval.id,
+            generation: approval.generation,
+            outcome,
+        });
+        if let Err(error) = flushed {
+            self.runtime.send(Msg::Notice(format!(
+                "pending keys could not be dropped after the review: {error}"
+            )));
+        }
+        Ok(true)
+    }
+
+    fn run_review(&mut self, approval: &Approval) -> ApprovalOutcome {
+        let mut command = Command::new(&self.reviewer.hb);
+        command
+            .arg("approve")
+            .current_dir(&approval.project)
+            .envs(self.reviewer.env.iter().map(|(k, v)| (k, v)))
+            // After the extra variables, so nothing can put the channel back: the review is not
+            // a session and must not see a supervisor channel.
+            .env_remove(crate::session::supervised::SUPERVISOR_FD_VAR);
+        match command.spawn() {
+            Ok(child) => *self.review_child = Some(child),
+            Err(error) => return ApprovalOutcome::Failed(error.to_string()),
+        }
+        let outcome = self.wait_for_review();
+        // Ended or cancelled, the child is reaped before anything else happens.
+        if let Some(mut child) = self.review_child.take() {
+            if outcome.is_none() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
-            return ApprovalOutcome::Failed("the supervisor was told to stop".to_owned());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        outcome.unwrap_or(ApprovalOutcome::NotApproved)
+    }
+
+    /// `None` when the review was cut short (a stop or Ctrl-C); the child is then still there.
+    fn wait_for_review(&mut self) -> Option<ApprovalOutcome> {
+        loop {
+            let child = self.review_child.as_mut()?;
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Some(ApprovalOutcome::Approved),
+                Ok(Some(_)) => return Some(ApprovalOutcome::NotApproved),
+                Ok(None) => {}
+                Err(error) => return Some(ApprovalOutcome::Failed(error.to_string())),
+            }
+            // Other sessions go on being read while the owner answers.
+            self.runtime.step();
+            // A signal the queue could not report is a stop we cannot see: treat it as one.
+            if self.stop.poll().is_err()
+                || self.stop.terminated()
+                || self.stop.take_interrupt()
+                || fatal()
+            {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
 /// Drops terminal events already read or waiting, without waiting for more.
-fn drain_events() -> io::Result<()> {
+fn drain_events() -> Result<(), UiError> {
     let mut dropped = 0;
-    while event::poll(Duration::ZERO)? {
-        let _ = event::read()?;
+    while event::poll(Duration::ZERO).context(TerminalSnafu)? {
+        let _ = event::read().context(TerminalSnafu)?;
         dropped += 1;
         // Continuous input would never end this; the flush after it drops the rest.
         if dropped >= 10_000 {
