@@ -5,7 +5,8 @@
 //! The rule lives in [`Escalation`], which takes the time as an argument so it can be tested
 //! without signals or sleeping. The thread that applies it is [`Supervisor`].
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -127,6 +128,8 @@ pub struct Watch {
 
 /// The identifier of the "stop" event.
 const STOP_ID: usize = 0;
+/// The identifier of the "the supervisor is gone or said stop" event.
+const DISCONNECT_ID: usize = 1;
 
 impl Watch {
     /// Registers INT, TERM and HUP (and WINCH when `window` is set) with a new kernel event queue.
@@ -158,9 +161,49 @@ impl Watch {
             0,
             0,
         ));
+        changes.push(KEvent::new(
+            DISCONNECT_ID,
+            EventFilter::EVFILT_USER,
+            EvFlags::EV_ADD.union(EvFlags::EV_CLEAR),
+            FilterFlag::empty(),
+            0,
+            0,
+        ));
         queue.kevent(&changes, &mut [], None).context(KqueueSnafu)?;
         Ok(Self {
             queue: Arc::new(queue),
+        })
+    }
+
+    /// A handle that makes the thread treat a stop as if SIGTERM had arrived.
+    #[must_use]
+    pub fn trigger(&self) -> Trigger {
+        Trigger {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+
+    /// Starts a thread that, until it is finished, turns INT, TERM, HUP and a [`Trigger`] into a
+    /// flag, so work that runs before the child exists (the pre-run hooks) can be stopped.
+    ///
+    /// Events it reads are not seen by the thread [`Watch::start`] makes later, which is why a
+    /// run that was stopped must not go on to start a child. Events that arrive after it ends
+    /// stay queued for that thread.
+    ///
+    /// # Errors
+    /// [`SignalError::Thread`] if the thread cannot be started.
+    pub fn guard_setup(&self) -> Result<Setup, SignalError> {
+        let queue = Arc::clone(&self.queue);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stopped);
+        let handle = thread::Builder::new()
+            .name("hb-setup-signals".to_owned())
+            .spawn(move || await_stop(&queue, &flag))
+            .context(ThreadSnafu)?;
+        Ok(Setup {
+            queue: Arc::clone(&self.queue),
+            stopped,
+            handle: Some(handle),
         })
     }
 
@@ -184,6 +227,154 @@ impl Watch {
             queue: self.queue,
             handle,
         })
+    }
+}
+
+/// Fires the "stop" event of a [`Watch`].
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    queue: Arc<Kqueue>,
+}
+
+impl Trigger {
+    fn fire(&self) {
+        let event = KEvent::new(
+            DISCONNECT_ID,
+            EventFilter::EVFILT_USER,
+            EvFlags::empty(),
+            FilterFlag::NOTE_TRIGGER,
+            0,
+            0,
+        );
+        // A failure leaves a watch that will not see the stop; there is nothing better to do.
+        let _ = self.queue.kevent(&[event], &mut [], None);
+    }
+}
+
+/// A stop that can be asked for before the run has a watch, and is not lost if it is.
+///
+/// The channel reader holds one and calls [`StopSignal::request`]; `run` attaches the watch's
+/// trigger once it exists. Whichever comes second makes the stop happen.
+#[derive(Debug, Default)]
+pub struct StopSignal {
+    requested: AtomicBool,
+    trigger: Mutex<Option<Trigger>>,
+}
+
+impl StopSignal {
+    /// A signal nobody has asked for yet.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Asks the run to stop as SIGTERM would. Can be called from any thread, any number of times.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        if let Ok(trigger) = self.trigger.lock()
+            && let Some(trigger) = trigger.as_ref()
+        {
+            trigger.fire();
+        }
+    }
+
+    /// Whether a stop has been asked for.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Connects the watch. A stop asked for earlier fires now.
+    pub fn attach(&self, trigger: Trigger) {
+        if let Ok(mut slot) = self.trigger.lock() {
+            *slot = Some(trigger.clone());
+        }
+        if self.is_requested() {
+            trigger.fire();
+        }
+    }
+}
+
+/// The thread [`Watch::guard_setup`] starts. Dropping it stops the thread.
+#[derive(Debug)]
+pub struct Setup {
+    queue: Arc<Kqueue>,
+    stopped: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Setup {
+    /// The flag the thread sets when a stop arrives, for [`run_pre_run`](super::hooks::run_pre_run).
+    #[must_use]
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped)
+    }
+
+    /// Stops the thread and says whether a stop arrived while it ran.
+    #[must_use]
+    pub fn finish(mut self) -> bool {
+        self.end();
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn end(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let stop = KEvent::new(
+            STOP_ID,
+            EventFilter::EVFILT_USER,
+            EvFlags::empty(),
+            FilterFlag::NOTE_TRIGGER,
+            0,
+            0,
+        );
+        // As in `Supervisor::finish`: do not join a thread that was not told to stop.
+        if self.queue.kevent(&[stop], &mut [], None).is_ok() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The setup thread's body: any signal or the disconnect event sets `stopped`.
+fn await_stop(queue: &Kqueue, stopped: &AtomicBool) {
+    let blank = KEvent::new(
+        0,
+        EventFilter::EVFILT_USER,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    let mut events = [blank; 4];
+    loop {
+        let ready = match queue.kevent(&[], &mut events, None) {
+            Ok(n) => n,
+            Err(Errno::EINTR) => continue,
+            Err(_) => return,
+        };
+        let mut ended = false;
+        for event in &events[..ready] {
+            match (event.filter(), event.ident()) {
+                (Ok(EventFilter::EVFILT_USER), STOP_ID) => ended = true,
+                (Ok(EventFilter::EVFILT_USER), DISCONNECT_ID) => {
+                    stopped.store(true, Ordering::SeqCst)
+                }
+                (Ok(EventFilter::EVFILT_SIGNAL), ident) if ident != WINCH as usize => {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        if ended {
+            return;
+        }
     }
 }
 
@@ -243,6 +434,9 @@ fn supervise(
         }
         for event in &events[..ready] {
             match event.filter() {
+                Ok(EventFilter::EVFILT_USER) if event.ident() == DISCONNECT_ID => {
+                    apply(rule.on_signal(Signal::SIGTERM, Instant::now()), target);
+                }
                 Ok(EventFilter::EVFILT_USER) => return,
                 Ok(EventFilter::EVFILT_SIGNAL) => {
                     let Ok(signal) = i32::try_from(event.ident())
@@ -354,6 +548,7 @@ impl Escalation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claims::assert_ok;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -402,6 +597,89 @@ mod tests {
         let outcome =
             thread::spawn(|| matches!(Watch::prepare(false), Err(SignalError::NotBlocked))).join();
         assert!(outcome.unwrap_or(false));
+    }
+
+    /// Runs `body` in a fresh thread with the supervised signals blocked, as `hb` has them.
+    fn blocked<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        thread::spawn(move || {
+            let _ = block_supervised();
+            body()
+        })
+        .join()
+        .ok()
+    }
+
+    #[test]
+    fn the_setup_thread_sets_its_flag_for_a_stop_request_and_ends_cleanly() {
+        let got = blocked(|| {
+            let watch = Watch::prepare(false).ok()?;
+            let stop = StopSignal::new();
+            stop.attach(watch.trigger());
+            let setup = watch.guard_setup().ok()?;
+            let flag = setup.flag();
+            let before = flag.load(Ordering::SeqCst);
+            stop.request();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Some((before, setup.finish()))
+        });
+        assert_eq!(got, Some(Some((false, true))));
+    }
+
+    #[test]
+    fn a_stop_asked_for_before_the_watch_exists_fires_when_it_is_attached() {
+        let got = blocked(|| {
+            let stop = StopSignal::new();
+            stop.request();
+            let watch = Watch::prepare(false).ok()?;
+            let setup = watch.guard_setup().ok()?;
+            stop.attach(watch.trigger());
+            let flag = setup.flag();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Some(setup.finish())
+        });
+        assert_eq!(got, Some(Some(true)));
+    }
+
+    #[test]
+    fn a_setup_thread_that_saw_nothing_reports_no_stop_and_a_dropped_one_ends() {
+        let got = blocked(|| {
+            let watch = Watch::prepare(false).ok()?;
+            let setup = watch.guard_setup().ok()?;
+            let quiet = setup.finish();
+            let again = watch.guard_setup().ok()?;
+            drop(again);
+            Some(quiet)
+        });
+        assert_eq!(got, Some(Some(false)));
+    }
+
+    #[test]
+    fn a_stop_request_after_the_setup_thread_ended_is_left_for_the_watch_thread() {
+        // A live child, started from an unblocked thread so it can receive SIGTERM.
+        let mut child = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+        let got = blocked(move || {
+            let watch = Watch::prepare(false).ok()?;
+            let stop = StopSignal::new();
+            stop.attach(watch.trigger());
+            let setup = watch.guard_setup().ok()?;
+            let _ = setup.finish();
+            let rule = Escalation::new(Duration::from_secs(10), false);
+            let supervisor = watch.start(Target::Child(pid), rule, None).ok()?;
+            stop.request();
+            thread::sleep(Duration::from_millis(500));
+            supervisor.finish();
+            Some(())
+        });
+        let status = assert_ok!(child.wait());
+        let got = got.map(|_| std::os::unix::process::ExitStatusExt::signal(&status));
+        assert_eq!(got, Some(Some(15)));
     }
 
     #[test]
