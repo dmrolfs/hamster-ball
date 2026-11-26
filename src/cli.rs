@@ -903,6 +903,14 @@ fn approval_store(env: &Environment) -> ApprovalStore {
     ApprovalStore::new(&StateDir::locate(&env.home))
 }
 
+/// Why a config with a very long value is not offered for approval.
+fn too_long_message(setting: &str) -> String {
+    format!(
+        "hb: a `{setting}` value in this project's config is longer than {} characters, too long to review in full, so it is not offered for approval. Shorten it, for example by moving the command into a script file in the project.",
+        crate::approval::MAX_VALUE_CHARS
+    )
+}
+
 /// Lets the run go ahead only if the project's config is approved, asking when it can.
 ///
 /// `Err` carries the exit code to stop with; the reason has been printed to `err`.
@@ -924,6 +932,9 @@ fn ensure_approved(
             err,
             "hb: {why}. Run `hb approve` in a terminal to review and approve it. Nothing was run."
         ),
+        Verdict::TooLongToReview(setting) => {
+            writeln!(err, "{} Nothing was run.", too_long_message(setting))
+        }
         _ => writeln!(err, "hb: the config was not approved. Nothing was run."),
     };
     Err(ExitCode::from(NOT_APPROVED))
@@ -1022,6 +1033,10 @@ fn approve_command(
         }
         Ok(Verdict::NoTerminal(why)) => {
             let _ = writeln!(err, "hb: {why}. `hb approve` needs a terminal to ask you.");
+            ExitCode::from(NOT_APPROVED)
+        }
+        Ok(Verdict::TooLongToReview(setting)) => {
+            let _ = writeln!(err, "{}", too_long_message(setting));
             ExitCode::from(NOT_APPROVED)
         }
         Ok(_) => {

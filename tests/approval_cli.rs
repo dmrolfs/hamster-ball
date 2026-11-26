@@ -389,3 +389,36 @@ fn a_terminal_for_input_alone_is_not_enough_when_the_questions_would_go_to_a_fil
     assert_eq!(exit, NOT_APPROVED, "{text}");
     assert_eq!(records(&w), 0);
 }
+
+#[test]
+fn a_value_too_long_to_review_is_refused_before_any_question_and_a_yes_does_nothing() {
+    sandboxed!();
+    let long = "x".repeat(hamster_ball::approval::MAX_VALUE_CHARS + 1);
+    let w = World::new(&format!(
+        "[fs]\nwrite = [\".\"]\n[env]\nset = {{ BIG = \"{long}\" }}\n"
+    ));
+    if !std::path::Path::new("/usr/bin/expect").exists() {
+        return;
+    }
+    // At a terminal, `y` typed right away: if a question were put, this would approve.
+    let exp = w.base.join("long.exp");
+    let body = format!(
+        "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
+         set timeout 30\n{guard}spawn {drive} approve\nsend \"y\\r\"\n\
+         expect eof\ncatch wait result\nputs \"EXIT=[lindex $result 3]\"\n",
+        home = w.home_dir().display(),
+        cwd = w.project.display(),
+        path = w.base.join("bin").display(),
+        tmp = w.base.join("tmp").display(),
+        drive = DRIVE,
+        guard = EXPECT_GUARD,
+    );
+    common::write(&exp, &body);
+    let out = assert_ok!(Command::new("/usr/bin/expect").arg(&exp).output());
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_no_expect_timeout(&text);
+    assert!(text.contains("too long to review in full"), "{text}");
+    assert!(!text.contains("Approve this config?"), "{text}");
+    assert!(text.contains("EXIT=78"), "{text}");
+    assert_eq!(records(&w), 0, "nothing may be stored");
+}

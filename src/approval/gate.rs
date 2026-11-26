@@ -104,6 +104,8 @@ pub enum Verdict {
     Declined,
     /// Nobody could be asked, and the config is not approved.
     NoTerminal(Why),
+    /// A value in the config is too long to review in full, so nothing was asked.
+    TooLongToReview(&'static str),
 }
 
 impl Verdict {
@@ -133,6 +135,10 @@ pub fn require(
     };
     if !terminal.is_interactive() {
         return Ok(Verdict::NoTerminal(why));
+    }
+    // Before anything is shown: a yes must never cover a value the owner could not read.
+    if let Some(setting) = candidate.summary.too_long() {
+        return Ok(Verdict::TooLongToReview(setting));
     }
     show(candidate, &why, out).map_err(|source| GateError::Show { source })?;
     let answer = terminal

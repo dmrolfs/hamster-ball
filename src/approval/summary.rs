@@ -9,10 +9,12 @@ use std::path::Path;
 use crate::config::{Closure, Discovery, Loaded};
 use crate::explain::{OriginRow, Report, ReportOptions, Row, build_report};
 use crate::system::Environment;
-use crate::text::{Escaped, EscapedBounded};
+use crate::text::Escaped;
 
-/// The most characters of one value shown.
-const MAX_VALUE_CHARS: usize = 300;
+/// The most characters of one value the owner is asked to review. A longer one is not shown cut:
+/// the end of a command is often the part that matters, and a yes to a summary that hides it is
+/// not a review. Approval is refused instead (see [`GrantSummary::too_long`]).
+pub const MAX_VALUE_CHARS: usize = 4000;
 
 /// One thing the project adds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +88,7 @@ impl GrantSummary {
             let mut value = format!("{} = {}", mcp.name, mcp.command.as_deref().unwrap_or("?"));
             for arg in mcp.args.iter().flatten() {
                 value.push(' ');
-                value.push_str(arg);
+                value.push_str(&quote_arg(arg));
             }
             if !mcp.net.is_empty() {
                 value.push_str(&format!("; net: {}", mcp.net.join(", ")));
@@ -104,7 +106,7 @@ impl GrantSummary {
             let mut value = format!("{}: {}", hook.name, hook.program);
             for arg in hook.args.iter().flatten() {
                 value.push(' ');
-                value.push_str(arg);
+                value.push_str(&quote_arg(arg));
             }
             out.add("hooks", value, &hook.origins);
         }
@@ -118,6 +120,15 @@ impl GrantSummary {
     #[must_use]
     pub fn additions(&self) -> &[Addition] {
         &self.additions
+    }
+
+    /// The first setting with a value too long to review in full, if any.
+    #[must_use]
+    pub fn too_long(&self) -> Option<&'static str> {
+        self.additions
+            .iter()
+            .find(|a| a.value.chars().count() > MAX_VALUE_CHARS)
+            .map(|a| a.setting)
     }
 
     /// Whether the project adds nothing.
@@ -144,11 +155,25 @@ impl fmt::Display for GrantSummary {
                 f,
                 "  {:width$}  {}  (from {})",
                 addition.setting,
-                EscapedBounded::new(&addition.value, MAX_VALUE_CHARS),
+                Escaped(&addition.value),
                 Escaped(&addition.from),
             )?;
         }
         Ok(())
+    }
+}
+
+/// An argument as a shell would need it written, so `a "b c"` and `a b c` read differently.
+/// Plain words are left as they are.
+fn quote_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
