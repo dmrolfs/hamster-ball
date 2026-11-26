@@ -13,6 +13,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as Key};
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::time::TimeSpec;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -47,6 +50,8 @@ pub enum Ended {
 /// # Errors
 /// The OS error if the terminal cannot be taken.
 pub fn run(paths: Paths, cwd: &std::path::Path) -> io::Result<Ended> {
+    // Before any thread exists, so every thread has them blocked and only the loop sees them.
+    let stop = StopSignals::watch()?;
     let hb = paths.hb.clone();
     let env = paths.env.clone();
     let mut runtime = Runtime::new(paths);
@@ -60,6 +65,7 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> io::Result<Ended> {
             &mut runtime,
             cwd,
             &Reviewer { hb, env },
+            &stop,
         )
     }));
     // The owner has the shell back before the (bounded) wait for the sessions.
@@ -77,6 +83,58 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> io::Result<Ended> {
     }
 }
 
+/// SIGTERM and SIGHUP, which end the supervisor through the normal path (terminal restored,
+/// sessions stopped) instead of killing it where it stands. They are blocked, so their default
+/// action never runs, and read through a kernel event queue.
+///
+/// shortcut: SIGINT is not watched; in raw mode Ctrl-C is the agent's key, and outside the UI
+/// there is nothing of ours to clean up first. Add it if a cooked-mode phase is ever added.
+struct StopSignals {
+    queue: Kqueue,
+}
+
+impl StopSignals {
+    fn watch() -> io::Result<Self> {
+        let mut set = SigSet::empty();
+        set.add(Signal::SIGTERM);
+        set.add(Signal::SIGHUP);
+        set.thread_block().map_err(io::Error::from)?;
+        let queue = Kqueue::new().map_err(io::Error::from)?;
+        let changes: Vec<KEvent> = [Signal::SIGTERM, Signal::SIGHUP]
+            .iter()
+            .map(|signal| {
+                KEvent::new(
+                    *signal as usize,
+                    EventFilter::EVFILT_SIGNAL,
+                    EvFlags::EV_ADD | EvFlags::EV_ENABLE,
+                    FilterFlag::empty(),
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        queue
+            .kevent(&changes, &mut [], None)
+            .map_err(io::Error::from)?;
+        Ok(Self { queue })
+    }
+
+    /// Whether one has arrived since the last call.
+    fn arrived(&self) -> bool {
+        let blank = KEvent::new(
+            0,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
+        );
+        let mut events = [blank; 2];
+        let now = TimeSpec::new(0, 0);
+        matches!(self.queue.kevent(&[], &mut events, Some(*now.as_ref())), Ok(n) if n > 0)
+    }
+}
+
 /// How `hb approve` is run.
 struct Reviewer {
     hb: std::path::PathBuf,
@@ -89,6 +147,7 @@ fn event_loop(
     runtime: &mut Runtime,
     cwd: &std::path::Path,
     reviewer: &Reviewer,
+    stop: &StopSignals,
 ) -> io::Result<()> {
     let look = Look::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     let mut router = Router::new();
@@ -99,10 +158,18 @@ fn event_loop(
         changed |= stepped.applied > 0;
         let mut quit = stepped.quit;
         for approval in runtime.take_approvals() {
-            review(guard, screen, runtime, &mut router, reviewer, &approval)?;
+            review(
+                guard,
+                screen,
+                runtime,
+                &mut router,
+                reviewer,
+                stop,
+                &approval,
+            )?;
             changed = true;
         }
-        if fatal() {
+        if fatal() || stop.arrived() {
             return Ok(());
         }
         fit(screen, runtime, &mut sized)?;
@@ -223,12 +290,13 @@ fn review(
     runtime: &mut Runtime,
     router: &mut Router,
     reviewer: &Reviewer,
+    stop: &StopSignals,
     approval: &Approval,
 ) -> io::Result<()> {
     *router = Router::new();
     drain_events()?;
     let outcome = match guard.suspend() {
-        Ok(()) => run_review(runtime, reviewer, approval),
+        Ok(()) => run_review(runtime, reviewer, stop, approval),
         Err(error) => {
             ApprovalOutcome::Failed(format!("the terminal could not be given back: {error}"))
         }
@@ -246,7 +314,12 @@ fn review(
     Ok(())
 }
 
-fn run_review(runtime: &mut Runtime, reviewer: &Reviewer, approval: &Approval) -> ApprovalOutcome {
+fn run_review(
+    runtime: &mut Runtime,
+    reviewer: &Reviewer,
+    stop: &StopSignals,
+    approval: &Approval,
+) -> ApprovalOutcome {
     flush_input();
     let mut command = Command::new(&reviewer.hb);
     command
@@ -272,6 +345,11 @@ fn run_review(runtime: &mut Runtime, reviewer: &Reviewer, approval: &Approval) -
         }
         // Other sessions go on being read while the owner answers.
         runtime.step();
+        if stop.arrived() || fatal() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ApprovalOutcome::Failed("the supervisor was told to stop".to_owned());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

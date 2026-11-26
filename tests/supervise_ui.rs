@@ -255,3 +255,39 @@ fn a_session_does_not_outlive_a_supervisor_that_is_killed() {
     }
     assert!(!alive(pid), "the agent outlived a killed supervisor");
 }
+
+#[test]
+fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
+    sandboxed!();
+    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+        let w = World::new(PROJECT);
+        let marker = w.project.join("agent.pid");
+        let script = w.project.join("agent.sh");
+        common::write(
+            &script,
+            &format!("echo $$ > '{}'\nsleep 300\n", marker.display()),
+        );
+        let mut owner = Owner::start(&w, &[]);
+        owner.wait_for("Sessions", 30);
+        owner.send(b"n");
+        owner.wait_for("Launch a session", 10);
+        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+            owner.send(&[key]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "{signal:?}: no agent; {}", owner.screen());
+        let pid: i32 = assert_some!(
+            std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+        );
+        assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
+        // Not 0: the owner did not ask for this. Not a signal death either: it ended itself.
+        assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");
+        assert_restored(&owner);
+        assert!(!alive(pid), "{signal:?}: the agent outlived the supervisor");
+    }
+}
