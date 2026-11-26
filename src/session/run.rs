@@ -33,7 +33,7 @@ use super::proxy::{ProxyRun, ProxyTrail, ProxyTuning};
 use super::pty::{Pty, PtyError};
 use super::pump::Pump;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
-use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
+use super::signals::{Escalation, Setup, SignalError, StopSignal, Supervisor, Target, Watch};
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
 use crate::policy::HostRule;
@@ -115,6 +115,9 @@ pub struct RunSpec {
     pub proxy_tuning: Option<ProxyTuning>,
     /// Makes this a `hb warm` run: see [`WarmSpec`].
     pub warm: Option<WarmSpec>,
+    /// A way for another thread to stop the run as SIGTERM would, including during the pre-run
+    /// hooks. Only used with [`SignalMode::Forward`].
+    pub stop: Option<Arc<StopSignal>>,
 }
 
 /// What makes a run a warm run (design 10, hb-ghd.7.3).
@@ -142,7 +145,15 @@ impl RunSpec {
             proxy_summary: true,
             proxy_tuning: None,
             warm: None,
+            stop: None,
         }
+    }
+
+    /// Lets `stop` end the run as SIGTERM would.
+    #[must_use]
+    pub fn stop(mut self, stop: Arc<StopSignal>) -> Self {
+        self.stop = Some(stop);
+        self
     }
 
     /// Makes this a warm run.
@@ -249,6 +260,10 @@ pub enum RunError {
     /// There was no command to run.
     #[snafu(display("there is no command to run"))]
     EmptyCommand,
+
+    /// A stop (INT, TERM, HUP or the supervisor) arrived before the command was started.
+    #[snafu(display("the run was stopped before the command started"))]
+    Stopped,
 
     /// A pre-run hook failed.
     #[snafu(transparent)]
@@ -479,9 +494,26 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     let temp = temp_parent(env)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
+    // Registered before the hooks so that a signal or a stop during them is seen: the hooks can
+    // run for minutes and hold credentials. The thread ends just before the child starts, and
+    // anything that arrives after is left for the thread that supervises the child.
+    let watch = match spec.signals {
+        SignalMode::Off => None,
+        SignalMode::Forward { .. } => Some(Watch::prepare(pty.is_some())?),
+    };
+    if let (Some(watch), Some(stop)) = (&watch, &spec.stop) {
+        stop.attach(watch.trigger());
+    }
+    let setup = watch.as_ref().map(Watch::guard_setup).transpose()?;
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
     // the session directory (with whatever they wrote) goes with it.
-    let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home, None)?;
+    let stop_flag = setup.as_ref().map(Setup::flag);
+    let hook_outputs = run_pre_run(
+        &loaded.policy.hooks,
+        session.path(),
+        &env.home,
+        stop_flag.as_deref(),
+    )?;
     let (launchers, warm_cache) = match (&offline, &spec.warm) {
         (Some(plan), None) => (Some(plan.install(session.path())?), None),
         (Some(plan), Some(_)) => (None, Some(plan.install_cache()?)),
@@ -615,10 +647,6 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let launcher = launcher_words(helper, pty.is_some());
     check_size(&profile, &child_env, &spec.argv, &launcher)?;
-    let watch = match spec.signals {
-        SignalMode::Off => None,
-        SignalMode::Forward { .. } => Some(Watch::prepare(pty.is_some())?),
-    };
 
     let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
     match &pty {
@@ -662,6 +690,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     };
     if let (Some(guardian), Some(log)) = (guardian.as_mut(), &log) {
         guardian.watch(Target::Child(pid_of(log.pid())))?;
+    }
+    // The last point a stop can end the run without a child to clean up after.
+    if setup.is_some_and(Setup::finish) {
+        return StoppedSnafu.fail();
     }
     let mut child = command.spawn().context(SpawnSnafu)?;
     if let Some(guardian) = guardian.as_mut() {

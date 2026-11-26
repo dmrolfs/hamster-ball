@@ -222,6 +222,72 @@ fn a_hook_that_runs_past_its_timeout_aborts_the_run() {
     assert!(!marker(&w).exists());
 }
 
+/// A slow hook that records its process group's survivors; SIGTERM to `hb` must end it at once.
+#[test]
+fn a_signal_to_hb_during_a_slow_hook_kills_the_hook_and_never_starts_the_agent() {
+    sandboxed!();
+    for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
+        let w = World::new(PROJECT);
+        let started = w.base.join("hook-started");
+        let leftover = w.base.join("hook-finished");
+        let hook = tool(
+            &w,
+            "slow",
+            &format!(
+                "touch '{}'; sleep 30 & wait; touch '{}'",
+                started.display(),
+                leftover.display()
+            ),
+        );
+        with_base(
+            &w,
+            &format!(
+                "[fs]\nwrite = [\".\"]\n[hooks.pre_run.slow]\ncommand = [\"{}\"]\ntimeout_secs = 60\n",
+                hook.display()
+            ),
+        );
+        let mut cmd = w.drive(
+            DRIVE,
+            &[
+                "run",
+                "--",
+                "/bin/sh",
+                "-c",
+                &format!("touch '{}'", marker(&w).display()),
+            ],
+        );
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let child = assert_ok!(cmd.spawn());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !started.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(started.exists(), "the hook never started");
+        let sent = Instant::now();
+        assert_ok!(kill(
+            Pid::from_raw(i32::try_from(child.id()).unwrap_or(0)),
+            signal
+        ));
+        let out = assert_ok!(child.wait_with_output());
+        assert!(
+            sent.elapsed() < Duration::from_secs(10),
+            "{signal:?}: the stop took {:?}",
+            sent.elapsed()
+        );
+        assert_ne!(code(&out), 0, "{signal:?}");
+        assert!(
+            stderr(&out).contains("stopped"),
+            "{signal:?}: {}",
+            stderr(&out)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!leftover.exists(), "{signal:?}: the hook ran to its end");
+        assert!(!marker(&w).exists(), "{signal:?}: the agent started");
+    }
+}
+
 const CREDENTIALS: &str = r#"{"Version":1,"AccessKeyId":"AKIAEXAMPLE","SecretAccessKey":"sEcr3t/value+x=","SessionToken":"tok/en+==","Expiration":"2030-01-01T00:00:00Z"}"#;
 
 #[test]
