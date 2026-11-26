@@ -37,7 +37,11 @@ fn fixture() -> Option<Environment> {
 }
 
 fn main() -> ExitCode {
-    let _ = hamster_ball::session::close_inherited_fds();
+    let start = hamster_ball::session::start_up();
+    if let Some(problem) = start.problem {
+        eprintln!("hb-testdrive: the supervisor channel is not usable: {problem}");
+        return ExitCode::from(2);
+    }
     let args: Vec<OsString> = std::env::args_os().collect();
     let grace = var("HB_TD_GRACE_MS")
         .and_then(|v| v.to_str().and_then(|t| t.parse::<u64>().ok()))
@@ -55,11 +59,12 @@ fn main() -> ExitCode {
     } else {
         PtyChoice::Auto
     };
-    hamster_ball::cli::main_with_options(
+    hamster_ball::cli::main_supervised(
         args,
         env.as_ref(),
         &mut stdout(),
         &mut stderr(),
         Supervision { grace, pty },
+        start.channel,
     )
 }

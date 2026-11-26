@@ -146,6 +146,12 @@ impl Shared {
 #[derive(Clone)]
 pub struct Telemetry(Arc<Shared>);
 
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Telemetry(..)")
+    }
+}
+
 impl Telemetry {
     fn push(&self, event: Event, denial: bool) {
         let mut q = self.0.lock();
@@ -173,6 +179,35 @@ impl Telemetry {
     /// Reports one finished proxy connection. Never waits.
     pub fn proxy(&self, audit: &AuditEvent) {
         self.push(Event::proxy(audit), false);
+    }
+}
+
+/// A cheap handle for reporting lifecycle events from other threads.
+#[derive(Clone)]
+pub struct Lifecycle(Arc<Shared>);
+
+impl std::fmt::Debug for Lifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lifecycle(..)")
+    }
+}
+
+impl Lifecycle {
+    /// Reports a lifecycle event. Never waits; if the writer is so far behind that even this
+    /// queue is full, the run is stopped.
+    pub fn send(&self, event: Event) {
+        let mut q = self.0.lock();
+        if q.broken || q.closing {
+            return;
+        }
+        if q.lifecycle.len() >= LIFECYCLE_CAPACITY {
+            drop(q);
+            self.0.break_channel();
+            return;
+        }
+        q.lifecycle.push_back(event);
+        drop(q);
+        self.0.wake.notify_one();
     }
 }
 
@@ -259,21 +294,15 @@ impl Reporter {
         Telemetry(Arc::clone(&self.shared))
     }
 
-    /// Reports a lifecycle event. Never waits; if the writer is so far behind that even this
-    /// queue is full, the run is stopped.
+    /// A handle for reporting lifecycle events from other threads.
+    #[must_use]
+    pub fn lifecycle_handle(&self) -> Lifecycle {
+        Lifecycle(Arc::clone(&self.shared))
+    }
+
+    /// Reports a lifecycle event. See [`Lifecycle::send`].
     pub fn lifecycle(&self, event: Event) {
-        let mut q = self.shared.lock();
-        if q.broken || q.closing {
-            return;
-        }
-        if q.lifecycle.len() >= LIFECYCLE_CAPACITY {
-            drop(q);
-            self.shared.break_channel();
-            return;
-        }
-        q.lifecycle.push_back(event);
-        drop(q);
-        self.shared.wake.notify_one();
+        self.lifecycle_handle().send(event);
     }
 
     /// Sends what is queued, then `exited`, and closes the channel. Waits at most about one write
@@ -514,15 +543,18 @@ mod tests {
         let (reporter, _peer, stop) = connect(Duration::from_millis(300));
         let telemetry = reporter.telemetry();
         let big = "x".repeat(1500);
-        let started = Instant::now();
-        // Far more than the socket buffer and the queue hold.
+        // Far more than the socket buffer and the queue hold. A caller that waited on the peer
+        // would wait out the write timeout (300 ms), so the longest single call is the measure;
+        // the total would also count this machine's scheduling.
+        let mut longest = Duration::ZERO;
         for _ in 0..20_000 {
+            let before = Instant::now();
             telemetry.denial(&big);
+            longest = longest.max(before.elapsed());
         }
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "callers waited {:?}",
-            started.elapsed()
+            longest < Duration::from_millis(250),
+            "a caller waited {longest:?}"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !stop.is_requested() && Instant::now() < deadline {
@@ -540,11 +572,16 @@ mod tests {
         let big = Event::Warning {
             text: "w".repeat(1500),
         };
-        let started = Instant::now();
+        let mut longest = Duration::ZERO;
         for _ in 0..(LIFECYCLE_CAPACITY * 400) {
+            let before = Instant::now();
             reporter.lifecycle(big.clone());
+            longest = longest.max(before.elapsed());
         }
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            longest < Duration::from_millis(250),
+            "a caller waited {longest:?}"
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !stop.is_requested() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));

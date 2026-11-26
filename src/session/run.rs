@@ -32,6 +32,7 @@ use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::proxy::{ProxyRun, ProxyTrail, ProxyTuning};
 use super::pty::{Pty, PtyError};
 use super::pump::Pump;
+use super::reporter::Telemetry;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, Setup, SignalError, StopSignal, Supervisor, Target, Watch};
 use crate::config::Loaded;
@@ -118,6 +119,20 @@ pub struct RunSpec {
     /// A way for another thread to stop the run as SIGTERM would, including during the pre-run
     /// hooks. Only used with [`SignalMode::Forward`].
     pub stop: Option<Arc<StopSignal>>,
+    /// Where each proxy connection is reported as a typed event, for a supervisor.
+    pub telemetry: Option<Telemetry>,
+    /// Called with the agent's process id once it is running under the sandbox.
+    pub on_start: Option<OnStart>,
+}
+
+/// A function called with the agent's process id; a newtype so [`RunSpec`] can stay `Debug`.
+#[derive(Clone)]
+pub struct OnStart(pub Arc<dyn Fn(u32) + Send + Sync>);
+
+impl std::fmt::Debug for OnStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnStart(..)")
+    }
 }
 
 /// What makes a run a warm run (design 10, hb-ghd.7.3).
@@ -146,6 +161,8 @@ impl RunSpec {
             proxy_tuning: None,
             warm: None,
             stop: None,
+            telemetry: None,
+            on_start: None,
         }
     }
 
@@ -559,10 +576,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
 
     // The proxy lives as long as the child: started before the profile (which names its port)
     // and stopped after the child has gone.
-    let trail = Arc::new(ProxyTrail::new(
-        spec.denials.as_ref(),
-        spec.proxy_log.as_ref(),
-    ));
+    let trail = Arc::new(
+        ProxyTrail::new(spec.denials.as_ref(), spec.proxy_log.as_ref())
+            .with_telemetry(spec.telemetry.clone()),
+    );
     let allowlist = spec.warm.as_ref().map_or_else(
         || loaded.policy.run_allowlist(),
         |warm| warm.allowlist.clone(),
@@ -729,6 +746,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
     running.pumps = pumps;
+    if let Some(on_start) = &spec.on_start {
+        (on_start.0)(running.child.id());
+    }
     let waited = running.wait_for_exit(spec.stdio);
     let denials = log.map(LogStream::finish).unwrap_or_default();
     if let Some(ctl) = ctl {

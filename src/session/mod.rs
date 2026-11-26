@@ -33,7 +33,7 @@ pub use child_helper::{HelperError, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
-pub use fds::{claim_channel, close_inherited_fds, close_inherited_fds_except};
+pub use fds::{StartUp, claim_channel, close_inherited_fds, close_inherited_fds_except, start_up};
 pub use guardian::{GuardError, GuardHandle, Guardian, GuardianError, run_guard};
 pub use interactive::InteractiveError;
 pub use preflight::{
@@ -44,8 +44,8 @@ pub use pty::{Pty, PtyError, Winsize};
 pub use pump::Pump;
 pub use relay::Relay;
 pub use run::{
-    DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, WarmSpec,
-    run,
+    DEFAULT_GRACE, ExitKind, OnStart, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode,
+    WarmSpec, run,
 };
 pub use signals::{Escalation, Setup, Step, StopSignal, Trigger, Watch};
 pub use terminal::{RawMode, TerminalError};

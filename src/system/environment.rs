@@ -33,8 +33,15 @@ pub struct ParentVars(BTreeMap<OsString, OsString>);
 
 impl ParentVars {
     /// A snapshot of `pairs`.
+    ///
+    /// The supervisor channel variable is never kept: it names a descriptor only `hb` may use.
     pub fn from_pairs(pairs: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
-        Self(pairs.into_iter().collect())
+        Self(
+            pairs
+                .into_iter()
+                .filter(|(name, _)| name != crate::session::supervised::SUPERVISOR_FD_VAR)
+                .collect(),
+        )
     }
 
     /// The value of `name`, if set.

@@ -32,6 +32,9 @@ use strum::{Display, EnumDiscriminants, EnumString, IntoStaticStr};
 
 use crate::proxy::{AuditEvent, Decision};
 
+/// The variable that names the inherited channel descriptor. `hb` leaves it out of the
+/// environment snapshot every child is built from, so no child ever sees it.
+pub const SUPERVISOR_FD_VAR: &str = "HB_SUPERVISOR_FD";
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The most bytes in one frame, including the newline.

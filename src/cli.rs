@@ -36,6 +36,8 @@ use crate::session::{
 use crate::system::{Environment, StateDir, UserConfigDir};
 use crate::text::Escaped;
 
+mod supervised;
+
 /// Run AI coding agents inside a hamster ball.
 #[derive(Debug, Parser)]
 #[command(
@@ -273,6 +275,10 @@ struct RunArgs {
     #[arg(long)]
     no_proxy_summary: bool,
 
+    /// Report to a supervisor over the channel it inherited. Only `hb-supervise` sets this.
+    #[arg(long, hide = true)]
+    supervised: bool,
+
     /// The command and its arguments (a `--` before it is optional).
     #[arg(
         required = true,
@@ -336,7 +342,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    execute(args, env, out, err, None).code
+    execute(args, env, out, err, None, None).code
 }
 
 /// How a command ended: the exit code, and a signal `hb` must now raise on itself.
@@ -377,6 +383,9 @@ pub enum PtyChoice {
     Off,
 }
 
+/// The channel a supervisor left open for this process, claimed before anything else ran.
+pub type Channel = std::os::unix::net::UnixStream;
+
 /// How [`main_with_options`] supervises a run.
 #[derive(Debug, Clone, Copy)]
 pub struct Supervision {
@@ -407,7 +416,27 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let exit = execute(args, env, out, err, Some(supervision));
+    main_supervised(args, env, out, err, supervision, None)
+}
+
+/// [`main_with_options`] for a process that was started by `hb-supervise`: `channel` is the
+/// descriptor claimed with [`crate::session::claim_channel`], or `None` for an ordinary start.
+///
+/// `hb run --supervised` needs a channel and a channel is used only with `--supervised`; either
+/// without the other ends the run before anything is asked or started.
+pub fn main_supervised<I, T>(
+    args: I,
+    env: Option<&Environment>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    supervision: Supervision,
+    channel: Option<Channel>,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let exit = execute(args, env, out, err, Some(supervision), channel);
     if let Some(signal) = exit.reraise {
         // The default action now runs. KILL cannot be blocked, and for the others the mask is
         // lifted first. If the process is still here, fall back to the shell convention.
@@ -436,13 +465,14 @@ fn execute<I, T>(
     out: &mut dyn Write,
     err: &mut dyn Write,
     supervise: Option<Supervision>,
+    channel: Option<Channel>,
 ) -> CliExit
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     let mut reraise = None;
-    let code = dispatch(args, env, out, err, supervise, &mut reraise);
+    let code = dispatch(args, env, out, err, supervise, channel, &mut reraise);
     CliExit { code, reraise }
 }
 
@@ -452,6 +482,7 @@ fn dispatch<I, T>(
     out: &mut dyn Write,
     err: &mut dyn Write,
     supervise: Option<Supervision>,
+    channel: Option<Channel>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode
 where
@@ -530,7 +561,7 @@ where
         Command::Approve(args) => {
             approve_command(env, &args, terminal_for(supervise).as_mut(), out, err)
         }
-        Command::Run(args) => run_command(env, args, err, supervise, reraise),
+        Command::Run(args) => run_command(env, args, err, supervise, channel, reraise),
         Command::Warm(args) => warm_command(env, &args, out, err, supervise, reraise),
         Command::Child(_) | Command::Guard(_) | Command::Ctl(_) => ExitCode::FAILURE,
         Command::Explain(args) => {
@@ -561,8 +592,31 @@ fn run_command(
     args: RunArgs,
     err: &mut dyn Write,
     supervise: Option<Supervision>,
+    channel: Option<Channel>,
     reraise: &mut Option<Signal>,
 ) -> ExitCode {
+    // Fails closed, before anything is loaded, asked or started: a supervisor that expects a
+    // report must get one, and a stray channel must not be left unused.
+    match (args.supervised, channel, supervise) {
+        (false, None, _) => {}
+        (true, Some(channel), Some(supervision)) => {
+            return supervised::run(env, args, channel, supervision, err, reraise);
+        }
+        (true, ..) => {
+            let _ = writeln!(
+                err,
+                "hb: --supervised needs the channel a supervisor passes down, and the hb binary"
+            );
+            return ExitCode::from(2);
+        }
+        (false, Some(_), _) => {
+            let _ = writeln!(
+                err,
+                "hb: a supervisor channel was passed without --supervised"
+            );
+            return ExitCode::from(2);
+        }
+    }
     let at_terminal = std::io::stderr().is_terminal();
     let logging = RunLogging {
         denials: args.log_denials.then(|| denial_sink(at_terminal)),
@@ -570,6 +624,29 @@ fn run_command(
         proxy_summary: !args.no_proxy_summary,
     };
     run_command_with(env, args.command, logging, err, supervise, reraise)
+}
+
+/// What is worth saying before the command starts: the agent's own error for these is only
+/// "Operation not permitted".
+fn startup_warnings(env: &Environment, discovery: &Discovery, loaded: &Loaded) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(
+        loaded
+            .policy
+            .project_grant_warning(discovery.root.path())
+            .map(str::to_owned),
+    );
+    warnings.extend(crate::session::gitconfig::warning(
+        &loaded.policy,
+        &env.home,
+    ));
+    let warm_store = crate::warm::stamp::WarmStore::new(&StateDir::locate(&env.home));
+    warnings.extend(crate::warm::cold_warnings(
+        &loaded.policy,
+        &warm_store,
+        discovery.root.path(),
+    ));
+    warnings
 }
 
 /// What `hb run` was asked to show about the run.
@@ -660,15 +737,7 @@ fn run_command_with(
     {
         return fail(err, crate::Error::from(RunError::from(error)));
     }
-    // Said before the command starts: the agent's own error for it is only "Operation not permitted".
-    if let Some(warning) = loaded.policy.project_grant_warning(discovery.root.path()) {
-        let _ = writeln!(err, "warning: {warning}");
-    }
-    if let Some(warning) = crate::session::gitconfig::warning(&loaded.policy, &env.home) {
-        let _ = writeln!(err, "warning: {warning}");
-    }
-    let warm_store = crate::warm::stamp::WarmStore::new(&StateDir::locate(&env.home));
-    for warning in crate::warm::cold_warnings(&loaded.policy, &warm_store, discovery.root.path()) {
+    for warning in startup_warnings(env, &discovery, &loaded) {
         let _ = writeln!(err, "warning: {warning}");
     }
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });

@@ -70,6 +70,57 @@ pub fn claim_channel(number: RawFd) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// What [`start_up`] found: the channel, if a supervisor passed one.
+#[derive(Debug)]
+pub struct StartUp {
+    /// The claimed channel.
+    pub channel: Option<UnixStream>,
+    /// Why the variable was present but unusable; the run must then not start.
+    pub problem: Option<io::Error>,
+}
+
+/// What the `hb` binaries do first: claim the supervisor channel named by
+/// [`SUPERVISOR_FD_VAR`](super::supervised::SUPERVISOR_FD_VAR), if any, then close every other
+/// inherited descriptor.
+///
+/// The claim comes first because the sweep closes the original. A variable that does not name a
+/// usable channel is reported in [`StartUp::problem`], never ignored: a supervisor that thinks it
+/// has a channel must not get an unreported session.
+pub fn start_up() -> StartUp {
+    let named = std::env::var_os(super::supervised::SUPERVISOR_FD_VAR);
+    let claimed = named.map(|value| {
+        value
+            .to_str()
+            .and_then(|text| text.parse::<RawFd>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the supervisor descriptor is not a number",
+                )
+            })
+            .and_then(claim_channel)
+    });
+    let keep = claimed
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(raw);
+    let _ = close_inherited_fds_except(keep);
+    match claimed {
+        None => StartUp {
+            channel: None,
+            problem: None,
+        },
+        Some(Ok(channel)) => StartUp {
+            channel: Some(channel),
+            problem: None,
+        },
+        Some(Err(problem)) => StartUp {
+            channel: None,
+            problem: Some(problem),
+        },
+    }
+}
+
 /// The descriptor of `stream`, to spare in the sweep.
 #[must_use]
 pub fn raw(stream: &UnixStream) -> RawFd {
