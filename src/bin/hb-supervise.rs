@@ -7,8 +7,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use hamster_ball::supervise::launch::{LAUNCH_ARG, run_helper};
-// Declared now so the lockfile and MSRV are verified; the view modules use them next.
-use {crossterm as _, ratatui as _, tui_term as _, vt100 as _};
+use hamster_ball::supervise::runtime::Paths;
+use hamster_ball::supervise::ui::{Ended, run};
+// Used by the library; named here so the lockfile and MSRV are checked for this binary too.
+use {tui_term as _, vt100 as _};
 
 /// Start and watch several sandboxed agent sessions from one terminal.
 #[derive(Parser)]
@@ -24,5 +26,29 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     Args::parse();
-    ExitCode::SUCCESS
+    match supervise() {
+        Ok(Ended::Clean) => ExitCode::SUCCESS,
+        Ok(Ended::Unclean) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("hb-supervise: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Finds `hb` next to this program, and runs the UI in the directory it was started from.
+fn supervise() -> std::io::Result<Ended> {
+    let me = std::env::current_exe()?;
+    let hb = me.with_file_name("hb");
+    let cwd = std::env::current_dir()?;
+    // Tests point this at a copy of hb that takes its fixture from variables. A release build
+    // never reads the variable, so the environment cannot choose which `hb` approves a project.
+    #[cfg(feature = "test-support")]
+    let hb = std::env::var_os("HB_SUPERVISE_HB").map_or(hb, std::path::PathBuf::from);
+    let paths = Paths {
+        hb,
+        me,
+        env: Vec::new(),
+    };
+    run(paths, &cwd)
 }
