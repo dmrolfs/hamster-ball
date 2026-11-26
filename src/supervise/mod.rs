@@ -9,4 +9,5 @@ pub mod launch;
 pub mod runtime;
 pub mod session;
 pub mod terminal;
+pub mod terminal_guard;
 pub mod view;
