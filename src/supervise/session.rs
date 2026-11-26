@@ -23,7 +23,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -266,9 +266,10 @@ fn spawn_threads(
         messages,
     )?;
     let inbox = messages.clone();
+    let for_reader = Arc::clone(outbox);
     let channel_thread = thread::Builder::new()
         .name(format!("hb-chan-{}", id.0))
-        .spawn(move || read_channel(id, generation, reader, &inbox))?;
+        .spawn(move || read_channel(id, generation, reader, &inbox, &for_reader))?;
     let _ = kill;
     Ok((vec![pty_thread, writer_thread], channel_thread))
 }
@@ -415,7 +416,10 @@ fn reap(
             reason: snafu::Report::from_error(error).to_string(),
         },
     };
-    let _ = inbox.send(msg);
+    // The last message of a session is not dropped for a full inbox while the app still
+    // listens. It is given up on when the session is abandoned (`kill`), which is what a shutdown
+    // past its deadline and a dropped worker do, so this thread can always be joined.
+    deliver_unless_killed(inbox, stopping.kill, msg);
 }
 
 /// Polls until the process has ended, killing it when asked to or when its stop is overdue.
@@ -541,12 +545,51 @@ impl Worker {
     }
 }
 
+/// How long a send to a full inbox waits before looking at the cancel flag again.
+const SEND_RETRY: Duration = Duration::from_millis(5);
+
+/// Sends `msg` to the app, in order, waiting while the inbox is full, but giving up as soon as
+/// `outbox` is cancelled or the app has gone: a thread blocked here forever would never end, and
+/// the worker that owns it could never be joined. Returns whether it was delivered.
+fn deliver(inbox: &SyncSender<Msg>, outbox: &Outbox, mut msg: Msg) -> bool {
+    loop {
+        match inbox.try_send(msg) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(back)) => {
+                if outbox.is_cancelled() {
+                    return false;
+                }
+                msg = back;
+                thread::sleep(SEND_RETRY);
+            }
+        }
+    }
+}
+
+/// [`deliver`] for a message that must outlive a cancelled outbox: it stops only for `kill`.
+fn deliver_unless_killed(inbox: &SyncSender<Msg>, kill: &AtomicBool, mut msg: Msg) {
+    loop {
+        match inbox.try_send(msg) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(back)) => {
+                if kill.load(Ordering::Acquire) {
+                    return;
+                }
+                msg = back;
+                thread::sleep(SEND_RETRY);
+            }
+        }
+    }
+}
+
 /// Reads frames until the channel ends and sends each to the app, in order.
 fn read_channel(
     id: SessionId,
     generation: Generation,
     stream: UnixStream,
     inbox: &SyncSender<Msg>,
+    outbox: &Outbox,
 ) {
     // Only an `hb` that answers for this launch and generation speaks for this session.
     let expected = Hello::new(u64::from(id.0), generation);
@@ -567,13 +610,13 @@ fn read_channel(
                 seq: frame.seq,
                 event: frame.event,
             };
-            // Blocks when the app is behind: the socket then fills and `hb` drops telemetry.
-            if inbox.send(msg).is_err() {
+            // Waits when the app is behind: the socket then fills and `hb` drops telemetry.
+            if !deliver(inbox, outbox, msg) {
                 return;
             }
         }
     }
-    let _ = inbox.send(Msg::ChannelLost { id, generation });
+    deliver(inbox, outbox, Msg::ChannelLost { id, generation });
 }
 
 #[cfg(test)]
@@ -583,6 +626,7 @@ mod tests {
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
     use std::sync::mpsc::sync_channel;
+    use std::thread;
 
     /// What the app would be sent when `hb` answers the handshake with `ack` and then says
     /// nothing more and closes.
@@ -592,7 +636,7 @@ mod tests {
         let line = assert_ok!(encode_line(ack));
         assert_ok!(theirs.write_all(&line));
         drop(theirs);
-        read_channel(SessionId(7), 3, ours, &tx);
+        read_channel(SessionId(7), 3, ours, &tx, &Outbox::new());
         drop(tx);
         rx.iter().collect()
     }
@@ -633,7 +677,7 @@ mod tests {
             }));
             assert_ok!(theirs.write_all(&frame));
             drop(theirs);
-            read_channel(SessionId(7), 3, ours, &tx);
+            read_channel(SessionId(7), 3, ours, &tx, &Outbox::new());
             drop(tx);
             let got: Vec<Msg> = rx.iter().collect();
             assert_eq!(
@@ -645,5 +689,46 @@ mod tests {
                 "launch {launch} generation {generation}"
             );
         }
+    }
+
+    #[test]
+    fn a_reader_blocked_on_a_full_inbox_ends_when_its_worker_is_cancelled() {
+        let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+        // An inbox of one that nobody reads: the second frame has nowhere to go.
+        let (tx, rx) = sync_channel(1);
+        let outbox = Arc::new(Outbox::new());
+        let ack = HelloAck {
+            v: Hello::new(7, 3).v,
+            launch: 7,
+            generation: 3,
+            pid: 1,
+        };
+        assert_ok!(theirs.write_all(&assert_ok!(encode_line(&ack))));
+        for seq in 1..=3 {
+            let frame = assert_ok!(encode_line(&crate::session::supervised::Frame {
+                seq,
+                event: crate::session::supervised::Event::Starting {},
+            }));
+            assert_ok!(theirs.write_all(&frame));
+        }
+        let reader = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || read_channel(SessionId(7), 3, ours, &tx, &outbox))
+        };
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !reader.is_finished(),
+            "it should be waiting on the full inbox"
+        );
+        outbox.cancel();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !reader.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reader.is_finished(),
+            "a cancelled reader must not stay blocked on the inbox"
+        );
+        drop(rx);
     }
 }
