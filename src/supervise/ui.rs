@@ -304,7 +304,10 @@ fn review(
     drain_events()?;
     flush_input();
     guard.resume()?;
-    screen.clear()?;
+    // `clear` would ask the terminal where the cursor is and wait for the reply, which fails right
+    // after a hand-over; `resize` clears the same area and forgets what was drawn, with no query.
+    let size = screen.size()?;
+    screen.resize(Rect::new(0, 0, size.width, size.height))?;
     *router = Router::new();
     runtime.send(Msg::ApprovalFinished {
         id: approval.id,

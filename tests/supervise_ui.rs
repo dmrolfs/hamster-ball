@@ -48,6 +48,11 @@ struct Owner {
 impl Owner {
     fn start(w: &World, extra: &[(&str, &str)]) -> Self {
         w.approve();
+        Self::start_unapproved(w, extra)
+    }
+
+    /// Like [`Owner::start`] without approving the project's config first.
+    fn start_unapproved(w: &World, extra: &[(&str, &str)]) -> Self {
         let pty = assert_ok!(Pty::open());
         assert_ok!(pty.set_size(Winsize {
             ws_row: 30,
@@ -290,4 +295,81 @@ fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
         assert_restored(&owner);
         assert!(!alive(pid), "{signal:?}: the agent outlived the supervisor");
     }
+}
+
+/// Waits until `path` exists, or `secs` pass.
+fn appears(path: &std::path::Path, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    path.exists()
+}
+
+#[test]
+fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the_agent() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let ran = w.project.join("ran");
+    let script = w.project.join("agent.sh");
+    common::write(&script, &format!("touch '{}'\nsleep 300\n", ran.display()));
+    let mut owner = Owner::start_unapproved(&w, &[]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    owner.wait_for("Approve", 60);
+    assert!(!ran.exists(), "the agent ran without approval");
+    // `a` asks for the review. The `q` typed right behind it is stale by the time the review
+    // ends: if it were applied to the UI afterwards, the supervisor would quit.
+    owner.send(b"aq");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !owner.text().contains("Approve this config?") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        owner.text().contains("Approve this config?"),
+        "{:?}",
+        owner.text()
+    );
+    assert!(
+        owner.text().contains("\x1b[?1049l"),
+        "the review must run on the real screen"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!ran.exists(), "the review was answered by itself");
+    assert_eq!(
+        assert_ok!(owner.child.try_wait()),
+        None,
+        "the supervisor quit on a stale key"
+    );
+    // A fresh answer approves, and the same session starts again.
+    owner.send(b"y\n");
+    assert!(
+        appears(&ran, 20),
+        "approved, but the agent never started; the screen:\n{}\nraw tail: {:?}",
+        owner.screen(),
+        owner
+            .text()
+            .chars()
+            .rev()
+            .take(1500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+    owner.wait_for("Running", 30);
+    // The stale `q` did nothing; the UI is back and takes a fresh one.
+    assert_eq!(
+        assert_ok!(owner.child.try_wait()),
+        None,
+        "a stale key quit the UI"
+    );
+    owner.send(b"q");
+    owner.send(b"y");
+    assert_eq!(owner.exit_code(60), Some(0));
+    assert_restored(&owner);
 }
