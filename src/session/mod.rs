@@ -24,6 +24,7 @@ pub mod relay;
 pub mod run;
 pub mod sanitize;
 pub mod signals;
+pub mod supervised;
 pub mod terminal;
 
 pub use ca_bundle::{CaBundleError, write_bundle};
