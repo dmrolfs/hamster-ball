@@ -98,11 +98,11 @@ pub struct Suspect {
 
 /// The files below `roots` whose names look secret and are not guarded, sorted by path.
 ///
-/// `complete` is false when the walk stopped at `max_entries`.
+/// `complete` is false when the walk stopped at `max_entries` or could not read part of the tree.
 #[must_use]
 pub fn survey(roots: &[CanonicalPath], max_entries: usize) -> (Vec<Suspect>, bool) {
     let mut found = Vec::new();
-    let complete = walk_files(roots, max_entries, |_, dir: &Path, name| {
+    let gaps = walk_files(roots, max_entries, |_, dir: &Path, name| {
         if let Some(reason) = suspicion(name) {
             found.push(Suspect {
                 path: dir.join(name).to_string_lossy().into_owned(),
@@ -112,7 +112,7 @@ pub fn survey(roots: &[CanonicalPath], max_entries: usize) -> (Vec<Suspect>, boo
         true
     });
     found.sort_by(|a, b| a.path.cmp(&b.path));
-    (found, complete)
+    (found, gaps.is_empty())
 }
 
 /// The names in the launchd environment that look like secrets, from `launchctl print gui/<uid>`.
@@ -420,6 +420,26 @@ mod tests {
             ["/config/credentials.json", "/deploy/terraform.tfvars"]
         );
         assert!(!survey(&[root], 2).1);
+    }
+
+    #[test]
+    fn a_survey_that_could_not_read_a_directory_is_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = assert_ok!(tempfile::tempdir());
+        let root = assert_ok!(CanonicalPath::from_canonical(assert_ok!(
+            std::fs::canonicalize(dir.path())
+        )));
+        let sealed = root.as_path().join("sealed");
+        assert_ok!(std::fs::create_dir_all(&sealed));
+        assert_ok!(std::fs::write(sealed.join("credentials.json"), "x"));
+        assert_ok!(std::fs::set_permissions(
+            &sealed,
+            std::fs::Permissions::from_mode(0o000)
+        ));
+        let (found, complete) = survey(std::slice::from_ref(&root), 1000);
+        let _ = std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755));
+        assert!(found.is_empty());
+        assert!(!complete, "an unreadable directory read as a clean survey");
     }
 
     const LAUNCHD: &str = "\

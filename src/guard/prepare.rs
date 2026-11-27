@@ -120,6 +120,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_directory_turns_the_dependency_exemption_off_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = root();
+        let sealed = root.as_path().join("sealed");
+        assert_ok!(std::fs::create_dir_all(&sealed));
+        assert_ok!(std::fs::write(sealed.join("id_rsa"), "k"));
+        assert_ok!(std::fs::set_permissions(
+            &sealed,
+            std::fs::Permissions::from_mode(0o000)
+        ));
+        let prepared = prepare(&[root], Path::new("/nonexistent/git"));
+        // Restore first, so a failing assertion cannot leave an undeletable directory behind.
+        let _ = std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755));
+        assert!(
+            !prepared.inputs.dependency_exemption,
+            "the exemption stayed on over a tree that was not fully scanned"
+        );
+        assert!(prepared.inputs.pins.is_empty());
+        assert!(prepared.notes.contains(&GuardNote::ScanIncomplete));
+    }
+
+    #[test]
     fn a_missing_git_is_a_note_and_nothing_is_tracked() {
         let (_dir, root) = root();
         let prepared = prepare(&[root], Path::new("/nonexistent/git"));

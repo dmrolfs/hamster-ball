@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::patterns::{is_guarded, is_template};
+use crate::diagnostic::{CheckGap, DiagnosticCode, Gaps, SafePath};
 use crate::policy::CanonicalPath;
 
 /// Directories not walked: dependencies and build output. The walk would otherwise cost seconds
@@ -54,47 +55,77 @@ pub struct Scan {
     pub matches: usize,
     /// Whether the walk covered everything. Pins are only trustworthy when it did.
     pub complete: bool,
+    /// Where the walk could not look (an unreadable directory, a name that is not text, the entry
+    /// limit). Empty does not by itself mean complete: running out of pins also ends a scan.
+    pub gaps: Gaps,
+}
+
+fn gap(code: DiagnosticCode, at: &Path) -> CheckGap {
+    CheckGap {
+        code,
+        subject: Some(SafePath::from_path(at)),
+    }
 }
 
 /// Calls `visit(directory, name)` for each regular file below `roots`, skipping the dependency and
-/// build directories and not following symbolic links. `false` when it stopped at `max_entries`
-/// or met a name that is not text, so the visit was not complete.
+/// build directories and not following symbolic links, and returns where it could not look.
+///
+/// A directory or entry that cannot be read is recorded and the walk goes on, so one sealed
+/// directory does not hide the rest. The entry limit and a name that is not text end the walk. A
+/// `visit` that returns `false` also ends it; that reason is the caller's, so it adds no gap here.
+/// The walk saw everything only if the result is empty and `visit` never returned `false`.
 pub(crate) fn walk_files(
     roots: &[CanonicalPath],
     max_entries: usize,
     mut visit: impl FnMut(&CanonicalPath, &Path, &str) -> bool,
-) -> bool {
+) -> Gaps {
+    let mut gaps = Gaps::new();
     let mut entries = 0;
     for root in roots {
         let mut stack = vec![root.as_path().to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let Ok(listing) = fs::read_dir(&dir) else {
-                continue;
+            let listing = match fs::read_dir(&dir) {
+                Ok(listing) => listing,
+                Err(_) => {
+                    gaps.push(gap(DiagnosticCode::DirectoryUnreadable, &dir));
+                    continue;
+                }
             };
-            for entry in listing.flatten() {
+            for entry in listing {
+                let Ok(entry) = entry else {
+                    // The directory's listing broke part way: what is left of it was not seen.
+                    gaps.push(gap(DiagnosticCode::DirectoryUnreadable, &dir));
+                    break;
+                };
                 entries += 1;
                 if entries > max_entries {
-                    return false;
+                    gaps.push(CheckGap {
+                        code: DiagnosticCode::EntryLimitReached,
+                        subject: None,
+                    });
+                    return gaps;
                 }
                 let Ok(kind) = entry.file_type() else {
+                    gaps.push(gap(DiagnosticCode::DirectoryUnreadable, &entry.path()));
                     continue;
                 };
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
                     // A name that is not text cannot be matched here, and could be a secret.
-                    return false;
+                    gaps.push(gap(DiagnosticCode::NameNotUtf8, &dir));
+                    return gaps;
                 };
                 if kind.is_dir() {
                     if !SKIPPED_DIRS.contains(&name) {
                         stack.push(entry.path());
                     }
                 } else if kind.is_file() && !visit(root, &dir, name) {
-                    return false;
+                    return gaps;
                 }
             }
         }
     }
-    true
+    gaps
 }
 
 /// Walks each of `roots` (symbolic links are not followed).
@@ -103,7 +134,7 @@ pub fn scan(roots: &[CanonicalPath], limits: ScanLimits) -> Scan {
     let mut pins: BTreeSet<PathBuf> = BTreeSet::new();
     let mut matches = 0;
     let mut room = true;
-    let walked = walk_files(roots, limits.max_entries, |root, dir, name| {
+    let gaps = walk_files(roots, limits.max_entries, |root, dir, name| {
         if is_guarded(name) && !is_template(name) {
             matches += 1;
             for ancestor in dir.ancestors() {
@@ -122,14 +153,15 @@ pub fn scan(roots: &[CanonicalPath], limits: ScanLimits) -> Scan {
             .filter_map(|path| CanonicalPath::from_canonical(path).ok())
             .collect(),
         matches,
-        complete: walked && room,
+        complete: gaps.is_empty() && room,
+        gaps,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claims::assert_ok;
+    use claims::{assert_ok, assert_some};
     use pretty_assertions::assert_eq;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
@@ -160,6 +192,92 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    /// Takes away a directory's permissions and gives them back when dropped, so a failing
+    /// assertion cannot leave an undeletable directory behind.
+    struct Unreadable(PathBuf);
+
+    impl Unreadable {
+        fn new(path: PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ok!(fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(0o000)
+            ));
+            Self(path)
+        }
+    }
+
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_makes_the_scan_incomplete() {
+        let (_dir, root) = root();
+        touch(&root, "ok/.env");
+        touch(&root, "sealed/id_rsa");
+        let _sealed = Unreadable::new(root.as_path().join("sealed"));
+        let scan = scan(std::slice::from_ref(&root), ScanLimits::default());
+        // The guarded file in `sealed` was not seen, so the pins cannot be trusted.
+        assert!(!scan.complete, "{scan:?}");
+        assert_eq!(scan.gaps.shown().len(), 1, "{:?}", scan.gaps);
+        let only = &scan.gaps.shown()[0];
+        assert_eq!(only.code, DiagnosticCode::DirectoryUnreadable);
+        assert!(
+            assert_some!(&only.subject).to_string().ends_with("/sealed"),
+            "{only:?}"
+        );
+        // What could be read is still reported.
+        assert_eq!(scan.matches, 1);
+    }
+
+    #[test]
+    fn every_unreadable_directory_is_a_gap_and_the_walk_goes_on() {
+        let (_dir, root) = root();
+        touch(&root, "a/x");
+        touch(&root, "b/y");
+        touch(&root, "c/.env");
+        let _a = Unreadable::new(root.as_path().join("a"));
+        let _b = Unreadable::new(root.as_path().join("b"));
+        let scan = scan(std::slice::from_ref(&root), ScanLimits::default());
+        assert_eq!(scan.gaps.shown().len(), 2, "{:?}", scan.gaps);
+        assert_eq!(scan.matches, 1, "the readable sibling was still walked");
+    }
+
+    #[test]
+    fn the_entry_limit_is_a_named_gap() {
+        let (_dir, root) = root();
+        touch(&root, "a.txt");
+        touch(&root, "b.txt");
+        let limited = scan(
+            std::slice::from_ref(&root),
+            ScanLimits {
+                max_entries: 1,
+                max_pins: 256,
+            },
+        );
+        assert_eq!(
+            limited
+                .gaps
+                .shown()
+                .iter()
+                .map(|g| g.code)
+                .collect::<Vec<_>>(),
+            [DiagnosticCode::EntryLimitReached]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_in_a_skipped_tree_does_not_matter() {
+        let (_dir, root) = root();
+        touch(&root, "node_modules/pkg/index.js");
+        let _sealed = Unreadable::new(root.as_path().join("node_modules/pkg"));
+        assert!(scan(std::slice::from_ref(&root), ScanLimits::default()).complete);
     }
 
     #[test]
