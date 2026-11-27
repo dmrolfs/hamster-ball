@@ -382,6 +382,31 @@ fn doctor_lists_a_skipped_dependency_directory_as_not_inspected() {
 }
 
 #[test]
+fn doctor_stops_at_the_repository_query_cap_and_says_which_it_skipped() {
+    let w = World::new(PROJECT);
+    // The project's own repository plus 34 nested ones: more than the 32 queried.
+    repository(&w.project, "");
+    for i in 0..34 {
+        repository(&w.project.join(format!("vendor/r{i:02}")), "");
+    }
+    let (code, out, _) = doctor(&w);
+    assert_eq!(code, ExitCode::SUCCESS);
+    let git = section(&out, "git the floor does not protect");
+    assert!(git.contains("inspection_limit_reached"), "{out}");
+    assert!(git.contains("git inspection: partial"), "{out}");
+    // The 33 repositories asked about (the project's and 32 more) are 32 queries: the first 32 are
+    // answered, the last two are named as skipped, and the 50-line list says how many it cut.
+    assert!(git.contains("vendor/r32"), "{out}");
+    assert!(git.contains("vendor/r33"), "{out}");
+    assert!(
+        !git.contains("inspection_limit_reached: ")
+            || git.matches("inspection_limit_reached").count() == 3,
+        "{out}"
+    );
+    assert!(git.contains("... and "), "{out}");
+}
+
+#[test]
 fn doctor_reports_an_unreadable_subdirectory_as_partial_not_clean() {
     let w = World::new(PROJECT);
     repository(&w.project, "");

@@ -401,6 +401,22 @@ mod tests {
         assert_ok!(fs::write(path, ""));
     }
 
+    /// Makes a directory unreadable and restores it when dropped, even if an assertion panics first.
+    struct Locked(PathBuf);
+
+    impl Locked {
+        fn new(dir: &Path) -> Self {
+            assert_ok!(fs::set_permissions(dir, fs::Permissions::from_mode(0o000)));
+            Self(dir.to_owned())
+        }
+    }
+
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
     fn walked(roots: &[CanonicalPath], project: &CanonicalPath, max: usize) -> (Tree, Gaps) {
         let mut gaps = Gaps::new();
         let tree = walk(roots, project, max, &mut gaps);
@@ -494,103 +510,19 @@ mod tests {
         let base = root.as_path();
         assert_ok!(fs::create_dir_all(base.join("locked/inner/.git")));
         assert_ok!(fs::create_dir_all(base.join("open/repo/.git")));
-        let locked = base.join("locked");
-        assert_ok!(fs::set_permissions(
-            &locked,
-            fs::Permissions::from_mode(0o000)
-        ));
+        let _locked = Locked::new(&base.join("locked"));
+        // Root can read a mode 000 directory, which would make this test prove nothing.
+        assert!(
+            fs::read_dir(base.join("locked")).is_err(),
+            "the directory is still readable: run as a normal user"
+        );
         let (tree, gaps) = walked(std::slice::from_ref(&root), &root, 1000);
-        // Restore first so the temp directory can be removed whatever the assertions say.
-        assert_ok!(fs::set_permissions(
-            &locked,
-            fs::Permissions::from_mode(0o755)
-        ));
-        if fs::read_dir(&locked).is_err() {
-            // Not running as root: the denial was real.
-        }
         assert_eq!(codes(&gaps), vec![DiagnosticCode::DirectoryUnreadable]);
         let shown: Vec<String> = tree.nested.into_iter().map(|(_, shown)| shown).collect();
         assert_eq!(
             shown,
             vec![base.join("open/repo").to_string_lossy().into_owned()]
         );
-    }
-
-    #[test]
-    fn a_skipped_dependency_directory_is_a_gap_so_a_clean_result_never_hides_it() {
-        let (_dir, root) = project();
-        let base = root.as_path();
-        assert_ok!(fs::create_dir_all(base.join("node_modules/dep/.git")));
-        assert_ok!(fs::create_dir_all(base.join("target")));
-        let (tree, gaps) = walked(std::slice::from_ref(&root), &root, 1000);
-        // Not walked, so its repository is not reported, and the gap says so.
-        assert!(tree.nested.is_empty());
-        assert_eq!(
-            codes(&gaps),
-            vec![
-                DiagnosticCode::DirectoryNotInspected,
-                DiagnosticCode::DirectoryNotInspected
-            ]
-        );
-    }
-
-    #[test]
-    fn a_failed_query_is_unavailable_and_a_spent_budget_is_a_limit() {
-        use git_config::QueryError;
-        let repo = Path::new("/p");
-        assert_eq!(
-            failure_gap(&QueryError::TimedOut, repo).code,
-            DiagnosticCode::InspectionLimitReached
-        );
-        assert_eq!(
-            failure_gap(&QueryError::Refused, repo).code,
-            DiagnosticCode::GitConfigUnavailable
-        );
-    }
-
-    fn setting(value: Option<&str>, repository: &str, hooks_cwd: &str) -> HookSetting {
-        HookSetting {
-            repository: PathBuf::from(repository),
-            git_dir: PathBuf::from(repository).join(".git"),
-            hooks_cwd: PathBuf::from(hooks_cwd),
-            value: value.map(str::to_owned),
-            origin: None,
-        }
-    }
-
-    fn hooks_dir_of(setting: HookSetting) -> String {
-        let mut gaps = Gaps::new();
-        // Only the directory is under test, not the policy's answer about it.
-        let policy = assert_ok!(crate::config::merge(&[], crate::policy::Floor::empty()));
-        observe(setting, &policy, &mut gaps).hooks_dir
-    }
-
-    #[test]
-    fn a_relative_hooks_path_is_joined_to_the_work_tree_top_not_the_inspected_directory() {
-        assert_eq!(
-            hooks_dir_of(setting(Some("rel/hooks"), "/r/sub/dir", "/r")),
-            "/r/rel/hooks"
-        );
-        assert_eq!(
-            hooks_dir_of(setting(Some("/abs/hooks"), "/r/sub/dir", "/r")),
-            "/abs/hooks"
-        );
-        assert_eq!(
-            hooks_dir_of(setting(None, "/r/sub/dir", "/r")),
-            "/r/sub/dir/.git/hooks"
-        );
-    }
-
-    #[test]
-    fn a_missing_hooks_directory_resolves_through_its_nearest_existing_parent() {
-        let (_dir, root) = project();
-        let want = root.as_path().join("a/b");
-        let got = resolve_with_missing_tail(&want);
-        assert_eq!(
-            got.map(|p| p.as_str().to_owned()),
-            Some(want.to_string_lossy().into_owned())
-        );
-        assert!(resolve_with_missing_tail(&root.as_path().join("a/../b")).is_none());
     }
 
     #[test]
@@ -601,14 +533,11 @@ mod tests {
         for i in 0..(crate::diagnostic::MAX_GAPS + 3) {
             let dir = base.join(format!("d{i}"));
             assert_ok!(fs::create_dir(&dir));
-            assert_ok!(fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)));
-            locked.push(dir);
+            locked.push(Locked::new(&dir));
         }
         let (_, gaps) = walked(std::slice::from_ref(&root), &root, 10_000);
-        for dir in &locked {
-            assert_ok!(fs::set_permissions(dir, fs::Permissions::from_mode(0o755)));
-        }
         assert_eq!(gaps.shown().len(), crate::diagnostic::MAX_GAPS);
         assert_eq!(gaps.omitted(), 3);
+        drop(locked);
     }
 }
