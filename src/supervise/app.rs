@@ -1083,6 +1083,15 @@ impl App {
     /// Starts the session again as a new generation. A live one is stopped first; its late
     /// messages carry the old generation and are dropped.
     fn restart(&mut self, id: SessionId) -> Vec<Effect> {
+        if self.live_count() >= MAX_SESSIONS
+            && self
+                .sessions
+                .iter()
+                .any(|s| s.id == id && !s.phase.is_live())
+        {
+            self.refuse(&Refusal::TooManySessions);
+            return Vec::new();
+        }
         let Some(session) = self.find(id) else {
             return Vec::new();
         };
@@ -1443,6 +1452,33 @@ mod tests {
         feed(&mut app, vec![Event::Starting {}]);
         app.update(channel(1, 1, 1, Event::Starting {}));
         assert_eq!(only(&app).phase, Phase::Lost);
+    }
+
+    #[test]
+    fn restarting_an_inactive_row_cannot_exceed_live_capacity() {
+        for phase in [Phase::Exited, Phase::Approve] {
+            let mut app = one();
+            app.sessions[0].phase = phase.clone();
+            for n in 0..MAX_SESSIONS {
+                app.update(Msg::Launch(spec(&format!("live-{n}"))));
+            }
+            assert_eq!(app.live_count(), MAX_SESSIONS);
+            let original = app.sessions[0].clone();
+            let effects = if phase == Phase::Approve {
+                app.update(Msg::ApprovalFinished {
+                    id: original.id,
+                    generation: original.generation,
+                    outcome: ApprovalOutcome::Approved,
+                })
+            } else {
+                app.update(Msg::Jump(1));
+                app.update(Msg::AskRestart)
+            };
+            assert!(effects.is_empty(), "over-capacity spawn: {effects:?}");
+            assert_eq!(app.sessions[0], original);
+            assert_eq!(app.live_count(), MAX_SESSIONS);
+            assert!(app.notice.is_some());
+        }
     }
 
     #[test]
