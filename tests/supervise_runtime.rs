@@ -116,7 +116,11 @@ fn several_sessions_run_side_by_side_and_each_reports_its_own_exit() {
         .map(|s| s.exit.as_ref().and_then(|e| e.code))
         .collect();
     assert_eq!(codes, [Some(1), Some(2), Some(0)]);
-    assert!(rt.shut_down(Duration::from_secs(15)));
+    assert!(
+        rt.shut_down(Duration::from_secs(15)),
+        "{rt:?}; {:?}",
+        rt.app
+    );
 }
 
 #[test]

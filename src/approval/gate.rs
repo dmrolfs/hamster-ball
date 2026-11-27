@@ -1,5 +1,5 @@
 // ABOUTME: The approval decision at `hb run` and `hb approve`: check the store, show the summary, ask at a terminal.
-// ABOUTME: Nothing approves without the person at a terminal typing `approve` and a fresh code shown with the question; no flag skips it.
+// ABOUTME: New approval requires a terminal answer containing `approve` and the fresh displayed code; no flag skips it.
 //! Asking the owner (design section 5).
 
 use std::fs::File;
@@ -17,8 +17,7 @@ use crate::text::Escaped;
 const SHOWN_DIGEST_DIGITS: usize = 12;
 
 /// How many random bytes make the code that must be typed to approve (shown as twice as many
-/// hex digits). It is not a secret: it is fresh for each question, so an answer typed or pasted
-/// before the question was shown cannot be the right one.
+/// hex digits). It reduces blind queued-input acceptance, not screen-reading input injection.
 const CODE_BYTES: usize = 3;
 
 /// The most an answer may be: a longer line is not read further and does not approve.

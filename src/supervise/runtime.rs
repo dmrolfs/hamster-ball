@@ -421,7 +421,14 @@ impl Runtime {
     /// Asks the session's worker to stop, and tracks it until it has ended.
     fn retire(&mut self, id: SessionId) {
         if let Some(live) = self.live.remove(&id) {
-            live.worker.stop();
+            // A late Stop can fail against the closed peer and abandon otherwise clean reports.
+            let exited = self
+                .evidence
+                .get(&(id, live.generation))
+                .is_some_and(|e| e.exited && e.settled && !e.invalid && !e.cleanup_failed);
+            if !exited {
+                live.worker.stop();
+            }
             self.retiring.push(Retiring {
                 id,
                 generation: live.generation,
@@ -834,6 +841,90 @@ mod tests {
 
     fn first(runtime: &Runtime) -> &Session {
         assert_some!(runtime.app.sessions().first())
+    }
+
+    #[test]
+    fn retiring_a_cleanly_exited_generation_does_not_send_stop_to_its_closed_channel() {
+        use crate::session::supervised::{
+            Cleanup, Frame, HelloAck, decode_hello, encode_line, read_line,
+        };
+        use crate::supervise::{launch, session};
+        use claims::assert_ok;
+        use std::io::{BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+
+        let mut runtime = Runtime::new(paths());
+        runtime.app.update(Msg::Launch(spec()));
+        let id = SessionId(1);
+        let (channel, mut peer) = assert_ok!(UnixStream::pair());
+        assert_ok!(peer.set_read_timeout(Some(Duration::from_secs(5))));
+        let mut child = assert_ok!(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        );
+        let input = assert_some!(child.stdin.take());
+        let worker = assert_ok!(session::spawn(
+            id,
+            1,
+            launch::Started {
+                child,
+                channel,
+                terminal: assert_ok!(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/null")
+                ),
+            },
+            Shared::new(2, 2),
+            runtime.outbox.clone()
+        ));
+        runtime.evidence.insert((id, 1), Evidence::default());
+        runtime.live.insert(
+            id,
+            Live {
+                generation: 1,
+                worker,
+            },
+        );
+        let hello = assert_ok!(decode_hello(&assert_some!(assert_ok!(read_line(
+            &mut BufReader::new(assert_ok!(peer.try_clone()))
+        )))));
+        assert_ok!(peer.write_all(&assert_ok!(encode_line(&HelloAck {
+            v: hello.v,
+            launch: hello.launch,
+            generation: hello.generation,
+            pid: 1,
+        }))));
+        for (seq, event) in [
+            (1, Event::Starting {}),
+            (
+                2,
+                Event::Exited {
+                    code: Some(0),
+                    signal: None,
+                    cleanup: Cleanup::Complete {},
+                },
+            ),
+        ] {
+            assert_ok!(peer.write_all(&assert_ok!(encode_line(&Frame { seq, event }))));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime.evidence.get(&(id, 1)).is_some_and(|e| e.exited) {
+            assert!(Instant::now() < deadline, "completion never arrived");
+            runtime.step();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(peer);
+        runtime.retire(id);
+        // Stop refuses input synchronously; keeping cat alive prevents reaper cancellation.
+        assert_ok!(runtime.retiring[0].worker.enqueue_input(vec![1]));
+        drop(input);
+        assert!(runtime.shut_down(Duration::from_secs(5)));
     }
 
     #[test]

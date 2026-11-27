@@ -278,48 +278,85 @@ fn a_panic_while_drawing_restores_the_terminal_before_the_message_and_ends_nonze
 }
 
 #[test]
-fn a_session_does_not_outlive_a_supervisor_that_is_killed() {
+fn sessions_do_not_outlive_a_supervisor_that_is_killed() {
     sandboxed!();
     let w = World::new(PROJECT);
-    let marker = w.project.join("agent.pid");
-    // The form splits on spaces and does not quote, so the agent is a script file.
-    let script = w.project.join("agent.sh");
-    common::write(
-        &script,
-        &format!("echo $$ > '{}'\nsleep 300\n", marker.display()),
-    );
     let mut owner = Owner::start(&w, &[]);
     owner.wait_for("Sessions", 30);
-    // Launch through the form: n, the command, Enter.
-    owner.send(b"n");
-    owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
-        owner.send(&[key]);
+
+    // Keep failure cleanup separate from the disappearance assertions it must not satisfy.
+    struct Agents(Vec<(std::path::PathBuf, std::path::PathBuf)>);
+    impl Drop for Agents {
+        fn drop(&mut self) {
+            for (marker, script) in &self.0 {
+                let Some(pid) = std::fs::read_to_string(marker)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .filter(|pid| *pid > 1)
+                else {
+                    continue;
+                };
+                if let Ok(output) = Command::new("/bin/ps")
+                    .args(["-o", "command=", "-p", &pid.to_string()])
+                    .output()
+                    && String::from_utf8_lossy(&output.stdout).trim()
+                        == format!("/bin/sh {}", script.display())
+                {
+                    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                }
+            }
+        }
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !marker.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+    let mut agents = Agents(Vec::new());
+    let mut pids = Vec::new();
+    for index in 0..2 {
+        let marker = w.project.join(format!("agent-{index}.pid"));
+        let script = w.project.join(format!("agent-{index}.sh"));
+        common::write(
+            &script,
+            &format!(
+                "echo $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nsleep 300\n",
+                marker.display()
+            ),
+        );
+        agents.0.push((marker.clone(), script.clone()));
+        owner.send(b"n");
+        owner.wait_for("Launch a session", 10);
+        // Reopening the form retains the previous command; replace it rather than append.
+        if index > 0 {
+            let previous = format!("/bin/sh {}", agents.0[index - 1].1.display());
+            owner.send(&vec![0x7f; previous.len()]);
+        }
+        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+            owner.send(&[key]);
+        }
+        assert!(
+            appears(&marker, 60),
+            "agent {index} never started: {}",
+            owner.screen()
+        );
+        let pid: i32 = assert_ok!(assert_ok!(std::fs::read_to_string(&marker)).trim().parse());
+        assert!(pid > 1);
+        pids.push(pid);
+        owner.wait_for("Running", 10);
     }
+    assert_ne!(pids[0], pids[1]);
     assert!(
-        marker.exists(),
-        "no agent started; the screen was:\n{}",
-        owner.screen()
+        pids.iter().all(|pid| alive(*pid)),
+        "both agents must be alive before SIGKILL"
     );
-    let pid: i32 = assert_some!(
-        std::fs::read_to_string(&marker)
-            .ok()
-            .and_then(|t| t.trim().parse().ok())
-    );
-    assert!(alive(pid));
     assert_ok!(kill(
         Pid::from_raw(owner.child.id() as i32),
         Signal::SIGKILL
     ));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while alive(pid) && Instant::now() < deadline {
+    while pids.iter().any(|pid| alive(*pid)) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!alive(pid), "the agent outlived a killed supervisor");
+    for pid in pids {
+        assert!(!alive(pid), "agent {pid} outlived a killed supervisor");
+    }
+    agents.0.clear();
 }
 
 #[test]

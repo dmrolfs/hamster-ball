@@ -630,6 +630,19 @@ impl App {
 
     /// Applies one message and returns what the caller must now do.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        // Retired workers still report to Runtime, but cannot dismiss this generation's UI notice.
+        if let Msg::Spawned { id, generation }
+        | Msg::SpawnFailed { id, generation, .. }
+        | Msg::Channel { id, generation, .. }
+        | Msg::ChannelLost { id, generation }
+        | Msg::SessionLost { id, generation, .. }
+        | Msg::ProcessExited { id, generation, .. }
+        | Msg::Input { id, generation, .. }
+        | Msg::ApprovalFinished { id, generation, .. } = &msg
+            && self.current(*id, *generation).is_none()
+        {
+            return Vec::new();
+        }
         self.notice = None;
         let effects = self.apply_msg(msg);
         // Keys must never keep going to an agent that is no longer running; leave Interact so the
@@ -1440,6 +1453,7 @@ mod tests {
         assert_eq!(effects.len(), 2, "stop the old, start the new: {effects:?}");
         assert_eq!(only(&app).generation, 2);
         assert_eq!(only(&app).phase, Phase::Starting);
+        app.update(Msg::Notice("current generation warning".into()));
         let before = app.clone();
         // Everything the replaced process can still say.
         for msg in [
@@ -1469,6 +1483,25 @@ mod tests {
                 generation: 1,
                 reason: "old".into(),
             },
+            Msg::Spawned {
+                id: SessionId(1),
+                generation: 1,
+            },
+            Msg::SessionLost {
+                id: SessionId(1),
+                generation: 1,
+                reason: "old".into(),
+            },
+            Msg::Input {
+                id: SessionId(1),
+                generation: 1,
+                bytes: vec![b'y'],
+            },
+            Msg::ApprovalFinished {
+                id: SessionId(1),
+                generation: 1,
+                outcome: ApprovalOutcome::Approved,
+            },
         ] {
             assert_eq!(app.update(msg), vec![]);
             assert_eq!(app, before, "the old generation changed the state");
@@ -1478,6 +1511,7 @@ mod tests {
     #[test]
     fn a_message_for_a_session_that_does_not_exist_is_ignored() {
         let mut app = one();
+        app.update(Msg::Notice("current warning".into()));
         let before = app.clone();
         assert_eq!(app.update(channel(7, 1, 1, Event::Starting {})), vec![]);
         assert_eq!(
