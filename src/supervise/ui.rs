@@ -227,6 +227,15 @@ fn must_kill_before_waiting(outcome: Option<&Waited>) -> bool {
     !matches!(outcome, Some(Waited::Exited(_)))
 }
 
+/// Looks at the review child without waiting: `None` while it runs.
+fn poll_child(child: &mut Child) -> Option<Waited> {
+    match child.try_wait() {
+        Ok(Some(status)) => Some(Waited::Exited(status.success())),
+        Ok(None) => None,
+        Err(error) => Some(Waited::Error(error.to_string())),
+    }
+}
+
 /// What the app is told about a review.
 fn outcome_of(outcome: Option<Waited>) -> ApprovalOutcome {
     match outcome {
@@ -493,10 +502,8 @@ impl Loop<'_> {
     fn wait_for_review(&mut self) -> Option<Waited> {
         loop {
             let child = self.review_child.as_mut()?;
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(Waited::Exited(status.success())),
-                Ok(None) => {}
-                Err(error) => return Some(Waited::Error(error.to_string())),
+            if let Some(done) = poll_child(child) {
+                return Some(done);
             }
             // Other sessions go on being read while the owner answers.
             self.runtime.step();
@@ -535,6 +542,7 @@ fn drain_events() -> Result<(), UiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claims::{assert_matches, assert_ok};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -561,5 +569,25 @@ mod tests {
             outcome_of(Some(Waited::Error("denied".into()))),
             ApprovalOutcome::Failed("denied".into())
         );
+    }
+
+    /// A review child whose exit was collected by someone else, so the next `waitpid` fails with
+    /// ECHILD: the one real way `try_wait` fails.
+    fn reaped_elsewhere() -> Child {
+        use nix::sys::wait::waitpid;
+        let child = assert_ok!(Command::new("/usr/bin/true").spawn());
+        assert_ok!(waitpid(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0)),
+            None
+        ));
+        child
+    }
+
+    #[test]
+    fn a_review_whose_exit_was_taken_by_someone_else_is_a_wait_error_and_not_an_approval() {
+        let mut child = reaped_elsewhere();
+        let seen = poll_child(&mut child);
+        assert!(matches!(seen, Some(Waited::Error(_))), "{seen:?}");
+        assert_matches!(outcome_of(seen), ApprovalOutcome::Failed(_));
     }
 }
