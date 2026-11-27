@@ -54,8 +54,25 @@ impl Router {
         Self::default()
     }
 
+    /// Leaves Interact and forgets literal-escape input when the terminal pane is hidden.
+    pub fn visibility(&mut self, app: &App, layout: Layout) -> Vec<Msg> {
+        if layout != Layout::Tiny {
+            return Vec::new();
+        }
+        self.left = None;
+        if app.mode == Mode::Interact {
+            vec![Msg::LeaveInteract, Msg::TooSmall]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The messages for one key event.
     pub fn route(&mut self, app: &App, key: KeyEvent, ctx: &Context<'_>) -> Vec<Msg> {
+        let hidden = self.visibility(app, ctx.layout);
+        if !hidden.is_empty() {
+            return hidden;
+        }
         // A release changes nothing, and must not cancel a pending `Ctrl-g`: terminals that
         // report releases send the first one between the two presses.
         if key.kind == KeyEventKind::Release {
@@ -84,6 +101,10 @@ impl Router {
 
     /// The messages for pasted text.
     pub fn paste(&mut self, app: &App, text: &str, ctx: &Context<'_>) -> Vec<Msg> {
+        let hidden = self.visibility(app, ctx.layout);
+        if !hidden.is_empty() {
+            return hidden;
+        }
         self.left = None;
         match app.mode {
             Mode::Interact => target(app)
@@ -109,10 +130,6 @@ impl Router {
         let Some((id, generation)) = target(app) else {
             return vec![Msg::LeaveInteract];
         };
-        if ctx.layout == Layout::Tiny {
-            // The terminal pane is not shown, so keys must not go to an agent unseen.
-            return vec![Msg::LeaveInteract, Msg::TooSmall];
-        }
         if is_escape(&key) {
             self.left = Some((id, generation));
             return vec![Msg::LeaveInteract];
@@ -296,6 +313,42 @@ mod tests {
     // ========================================================================
     // Interact: what reaches the agent
     // ========================================================================
+
+    #[test]
+    fn shrinking_blocks_paste_and_clears_a_pending_literal_escape() {
+        let mut router = Router::new();
+        let mut app = interacting();
+        let messages = router.paste(&app, "do something\n", &ctx(Layout::Tiny));
+        assert_eq!(messages, vec![Msg::LeaveInteract, Msg::TooSmall]);
+        assert!(written(&mut app, messages).is_empty());
+        assert_eq!(app.mode, Mode::Overview);
+
+        app.update(Msg::EnterInteract);
+        let first = router.route(&app, ctrl_g(), &ctx(Layout::Wide));
+        assert!(written(&mut app, first).is_empty());
+        assert_eq!(app.mode, Mode::Overview);
+        let second = router.route(&app, ctrl_g(), &ctx(Layout::Tiny));
+        assert!(second.is_empty(), "hidden terminal got {second:?}");
+        let enlarged = router.route(&app, ctrl_g(), &ctx(Layout::Wide));
+        assert!(enlarged.is_empty(), "old escape survived resize");
+    }
+
+    #[test]
+    fn resize_alone_leaves_interact_and_does_not_replay_an_escape_after_enlarging() {
+        let mut router = Router::new();
+        let mut app = interacting();
+        let messages = router.visibility(&app, Layout::Tiny);
+        assert_eq!(messages, vec![Msg::LeaveInteract, Msg::TooSmall]);
+        assert!(written(&mut app, messages).is_empty());
+        assert_eq!(app.mode, Mode::Overview);
+        assert!(app.notice.is_some());
+        app.update(Msg::EnterInteract);
+        let first = router.route(&app, ctrl_g(), &ctx(Layout::Wide));
+        assert!(written(&mut app, first).is_empty());
+        assert!(router.visibility(&app, Layout::Tiny).is_empty());
+        assert!(router.visibility(&app, Layout::Wide).is_empty());
+        assert!(router.route(&app, ctrl_g(), &ctx(Layout::Wide)).is_empty());
+    }
 
     #[test]
     fn every_key_but_ctrl_g_in_interact_goes_to_the_agent_as_the_encoder_makes_it() {

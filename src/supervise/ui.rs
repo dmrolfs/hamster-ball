@@ -483,6 +483,9 @@ impl Loop<'_> {
         let msgs = match event {
             Key::Key(key) => self.router.route(&self.runtime.app, key, &ctx),
             Key::Paste(text) => self.router.paste(&self.runtime.app, &text, &ctx),
+            Key::Resize(width, height) => self
+                .router
+                .visibility(&self.runtime.app, Layout::for_size(width, height)),
             _ => Vec::new(),
         };
         let mut quit = false;
