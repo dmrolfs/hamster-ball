@@ -166,10 +166,15 @@ hb warm --timeout 600 serena    # give a slow server more time
 
 For each server, `hb warm` starts it once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable.
 It waits for the server to answer an MCP `initialize` request.
-If that works, it records a stamp and the cache is ready.
+All the servers are warmed into one workspace.
+Only when every one has answered does `hb warm` seal the result and publish it as a cache generation, then record the stamps.
+If any server fails, nothing is published and the previous generation stays in use.
+`hb warm NAME...` publishes only those servers.
 
-It needs an approved config and refuses to run inside a ball.
-The cache is `~/.cache/hamster-ball/`, kept apart from your own `~/.cache/uv` and `~/.npm`.
+It needs an approved config, takes a lock per project (a second `hb warm` of the same project says it is already running), and refuses to run inside a ball.
+The store is `~/.cache/hamster-ball/`, kept apart from your own `~/.cache/uv` and `~/.npm`.
+The ball cannot read or write it, and each `hb run` works in its own copy.
+An older shared cache in that directory is never used or deleted.
 
 ## `hb ctl`
 

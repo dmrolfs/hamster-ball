@@ -290,11 +290,15 @@ that into two steps.
    bind_ports = [24282, 24283, 24284, 24285, 24286, 24287, 24288, 24289]   # its dashboard listens on the first free one
    ```
 
-2. **Warm** once, outside the ball: `hb warm`. It starts each declared `uvx`/`npx` server in the ball with only the registries open and keeps what it
-   downloaded in `~/.cache/hamster-ball` (hb's own cache, never your `~/.cache/uv` or `~/.npm`). Warm again after you change a server's arguments.
+2. **Warm** once, outside the ball: `hb warm`. It starts each declared `uvx`/`npx` server in the ball with only the registries open, and once every one
+   has answered it publishes the result as a sealed cache generation in `~/.cache/hamster-ball` (hb's own store, never your `~/.cache/uv` or `~/.npm`; the
+   ball cannot read or write it). It also copies your own uv-managed Python into the generation. Warm again after you change a server's arguments or a tool.
+   `hb warm NAME...` publishes only those servers; a run that needs another one stops and tells you to run a full `hb warm`.
 
-After that `hb run` puts `uvx` and `npx` launchers first on the child's `PATH`: each starts the real tool with `--offline` and hb's cache, so a server starts
-from the cache with no network. Only those two names change: `uv sync`, `npm install` and a program called by absolute path behave as before. A remote
+After that each `hb run` copies the generation into its own private directory and puts `uvx` and `npx` launchers first on the child's `PATH`: each starts the
+real tool with `--offline` and that copy, so a server starts from the cache with no network. What a run writes to its copy is gone when it ends and never
+reaches the published generation, another project, or your next run. If there is no generation, or it no longer matches your tools or servers, `hb run` stops before
+the agent starts and says to run `hb warm`. The old shared cache from earlier versions is never used or deleted: warm again, then remove it yourself if you want the space. Only those two names change: `uv sync`, `npm install` and a program called by absolute path behave as before. A remote
 MCP server has no command; give it `[mcp.context7] net = ["mcp.context7.com"]`. A server's own files (serena's `~/.serena`) are ordinary `[fs]` grants.
 `hb explain` shows the launchers, the cache and whether each server is warmed. Measured on the servers above (time, fetch, reddit, ripgrep, browsermap,
 sequential-thinking and a pinned serena): each answers an MCP `initialize` in the ball in 1 to 2 seconds with no proxy connection (`mcp_offline`, see Development).
@@ -557,7 +561,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
 
 - The offline MCP servers are proved against the real tools by an opt-in test that uses your home, your `uvx`, `npx` and `node`, hb's real cache and the network:
   `HB_MCP=1 cargo test --features test-support --test mcp_offline -- --nocapture` (variables in [presets/README.md](presets/README.md)). The first run downloads
-  about 500 MB into `~/.cache/hamster-ball`; later runs take under a minute.
+  about 500 MB into a cache generation under `~/.cache/hamster-ball` (each run then makes its own copy of it, so keep room for that on the same disk); later runs take under a minute.
 - `hb ctl` is proved against real podman and launchd by opt-in tests: `HB_PODMAN=1 cargo test --test podman_e2e -- --nocapture` (needs a running podman machine and
   the `alpine` image; add `HB_PODMAN_DIR=<dir>` for a machine created with `--volume <dir>:<dir>` to run the isolated test) and
   `HB_LAUNCHD=1 cargo test --test launchd_e2e -- --nocapture` (loads and unloads one throwaway job).

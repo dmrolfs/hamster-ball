@@ -183,7 +183,7 @@ Stopping a dedicated virtual machine also stops its guest processes; merely runn
 | Your own presets | `~/.config/hamster-ball/presets/<name>.toml` |
 | Approvals | `~/.local/state/hamster-ball/approvals/` |
 | `hb warm` stamps | `~/.local/state/hamster-ball/warm/` |
-| Offline package cache | `~/.cache/hamster-ball/` |
+| Offline package cache (sealed generations; a run uses its own copy) | `~/.cache/hamster-ball/` |
 | The session directory | A new private directory under your temp directory, removed at exit. It is the agent's `TMPDIR`. |
 
 The floor hides the config and state directories from the agent.
