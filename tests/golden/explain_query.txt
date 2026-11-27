@@ -159,7 +159,8 @@ mcp
 
 offline launchers (uvx and npx start from hb's own cache, with --offline)
   server serena  not warmed
-  cache  ~/.cache/hamster-ball (read and write, not your own caches)
+  cache store  ~/.cache/hamster-ball (no ball can read or write it; each run copies a generation)
+  generation  a run would stop: no cache generation exists for this project; run `hb warm` outside the ball
 
 hooks (run on the host, in order)
   notify: /usr/bin/notify 2 args hidden (30s)  <- [0] hooks.pre_run.notify

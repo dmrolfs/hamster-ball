@@ -335,6 +335,37 @@ fn explain_lists_the_launchers_with_the_real_tool_and_the_cache_root() {
 }
 
 #[test]
+fn explain_says_what_a_run_would_find_in_the_store_and_agrees_with_the_run() {
+    sandboxed!();
+    let w = world(SERVER);
+    let ready = explain_json(&w);
+    let said = ready["offline"]["generation"].as_str().unwrap_or_default();
+    assert!(said.starts_with("ready: "), "{ready}");
+    let run_ok = run(&w, "echo ran");
+    assert!(
+        run_ok.stdout.contains("ran"),
+        "{}{}",
+        run_ok.stdout,
+        run_ok.stderr
+    );
+    // Change a tool: explain must now say the run would stop, and the run does stop.
+    let path = w.base.join("bin/uvx");
+    write(&path, "#!/bin/sh\necho a different, longer uvx\n");
+    assert_ok!(fs::set_permissions(
+        &path,
+        fs::Permissions::from_mode(0o755)
+    ));
+    let stale = explain_json(&w);
+    let said = stale["offline"]["generation"].as_str().unwrap_or_default();
+    assert!(
+        said.starts_with("a run would stop:") && said.contains("stale") && said.contains("tool"),
+        "{stale}"
+    );
+    let (ok, stdout, _) = refused(&w);
+    assert!(!ok && !stdout.contains("ran"));
+}
+
+#[test]
 fn explain_says_off_without_a_declared_server_and_warns_about_a_launcher_it_cannot_make() {
     let off = explain_json(&world(""));
     assert_eq!(off["offline"]["enabled"], false, "{off}");

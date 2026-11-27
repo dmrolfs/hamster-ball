@@ -2724,6 +2724,7 @@
     "enabled": false,
     "launchers": [],
     "cache_root": null,
+    "generation": null,
     "servers": []
   },
   "hooks": [

@@ -101,8 +101,12 @@ pub struct OfflineReport {
     pub enabled: bool,
     /// One per launcher `[env] tools` found.
     pub launchers: Vec<LauncherRow>,
-    /// Where hb's own cache lives, read and write for the ball; `None` when off.
+    /// Where hb's cache store lives (no ball can read or write it; each run gets its own copy);
+    /// `None` when off.
     pub cache_root: Option<String>,
+    /// What a run would find in the store: the generation it would copy, or why it would stop.
+    /// `None` when off.
+    pub generation: Option<String>,
     /// Each server `hb warm` can warm, and whether it has been.
     pub servers: Vec<WarmRow>,
 }
@@ -510,6 +514,20 @@ pub fn build_report(loaded: &Loaded, options: &ReportOptions<'_>) -> Report {
         cache_root: plan
             .as_ref()
             .map(|plan| plan.cache_root().to_string_lossy().into_owned()),
+        generation: plan.as_ref().map(|plan| {
+            // The same selection a run makes, so `explain` cannot say "ready" for a cache a run
+            // would refuse. It reads the store and copies nothing.
+            let root = options.root;
+            match crate::session::cache::expected_inputs(root, policy, &lookup).and_then(
+                |expected| {
+                    crate::session::cache::CacheStore::new(plan.cache_root().to_path_buf())
+                        .select(&expected)
+                },
+            ) {
+                Ok(found) => format!("ready: {}", found.id),
+                Err(error) => format!("a run would stop: {error}"),
+            }
+        }),
         servers: {
             let store = WarmStore::new(&StateDir::locate(options.home));
             crate::warm::servers(policy)

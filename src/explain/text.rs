@@ -217,9 +217,12 @@ fn render(out: &mut String, report: &Report, t: &Tilde<'_>) -> std::fmt::Result 
     if let Some(root) = &report.offline.cache_root {
         writeln!(
             out,
-            "  cache  {} (read and write, not your own caches)",
+            "  cache store  {} (no ball can read or write it; each run copies a generation)",
             t.show(root)
         )?;
+    }
+    if let Some(generation) = &report.offline.generation {
+        writeln!(out, "  generation  {}", t.show(generation))?;
     }
 
     section(

@@ -2493,6 +2493,7 @@
     "enabled": true,
     "launchers": [],
     "cache_root": "<FIX>/home/.cache/hamster-ball",
+    "generation": "a run would stop: no cache generation exists for this project; run `hb warm` outside the ball",
     "servers": [
       {
         "name": "serena",
