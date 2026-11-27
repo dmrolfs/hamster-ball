@@ -56,6 +56,35 @@ struct Retiring {
     worker: Worker,
     since: Instant,
     abandoned: bool,
+    /// The agent's process id as `hb` reported it, if it got that far. Ending `hb` is not ending
+    /// the agent: when `hb` is killed its guardian stops the agent afterwards, after a grace period
+    /// (measured: a stubborn agent lived 2.0 s after `hb` was reaped in 60 ms). A replacement waits
+    /// until this process is gone.
+    agent: Option<u32>,
+}
+
+/// A finished old worker whose agent may still be running. Its replacement waits for it.
+struct Lingering {
+    id: SessionId,
+    agent: u32,
+    since: Instant,
+}
+
+/// How long an agent that outlived its `hb` is waited for before the replacement is refused. The
+/// guardian's grace is 2 s and then SIGKILL; this is several times that.
+const AGENT_LIMIT: Duration = Duration::from_secs(15);
+
+/// Whether a process with this id exists. A process id can be reused, so a "yes" after a long
+/// time could be a stranger: the wait is bounded by [`AGENT_LIMIT`] and ends in a refusal, never
+/// in a start.
+fn process_exists(pid: u32) -> bool {
+    i32::try_from(pid).is_ok_and(|pid| {
+        // Signal 0 only asks whether the process could be signalled; EPERM means it exists.
+        !matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    })
 }
 
 /// A review the owner asked for. The loop that owns the real terminal carries it out and answers
@@ -100,6 +129,7 @@ pub struct Runtime {
     outbox: SyncSender<Msg>,
     live: HashMap<SessionId, Live>,
     retiring: Vec<Retiring>,
+    lingering: Vec<Lingering>,
     /// The newest start asked for while the session's old worker is still ending.
     waiting: HashMap<SessionId, (Generation, LaunchSpec)>,
     screens: HashMap<SessionId, Arc<Shared>>,
@@ -122,6 +152,7 @@ impl Runtime {
             outbox,
             live: HashMap::new(),
             retiring: Vec::new(),
+            lingering: Vec::new(),
             waiting: HashMap::new(),
             screens: HashMap::new(),
             last_frame: None,
@@ -222,29 +253,66 @@ impl Runtime {
     /// Whether any worker is still ending.
     #[must_use]
     pub fn is_retiring(&self) -> bool {
-        !self.retiring.is_empty()
+        !self.retiring.is_empty() || !self.lingering.is_empty()
     }
 
     /// Asks the session's worker to stop, and tracks it until it has ended.
     fn retire(&mut self, id: SessionId) {
         if let Some(live) = self.live.remove(&id) {
             live.worker.stop();
+            let agent = self
+                .app
+                .sessions()
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.agent_pid);
             self.retiring.push(Retiring {
                 id,
                 worker: live.worker,
                 since: Instant::now(),
                 abandoned: false,
+                agent,
             });
         }
     }
 
-    /// Reaps workers that have ended, abandons ones that have not ended in time, and starts the
-    /// replacements that were waiting for an old worker to end.
+    /// Reaps workers that have ended, abandons ones that have not ended in time, waits for the
+    /// agents of workers that ended, and starts the replacements that were waiting.
     fn advance(&mut self, now: Instant) {
+        self.collect_finished(now);
+        self.check_lingering(now);
+        let ready: Vec<SessionId> = self
+            .waiting
+            .keys()
+            .copied()
+            .filter(|id| {
+                !self.retiring.iter().any(|r| r.id == *id)
+                    && !self.lingering.iter().any(|l| l.id == *id)
+            })
+            .collect();
+        for id in ready {
+            if let Some((generation, spec)) = self.waiting.remove(&id) {
+                self.start(id, generation, &spec);
+            }
+        }
+    }
+
+    /// A worker whose threads have all ended is joined. If its `hb` reported an agent that still
+    /// exists, the agent is waited for as well, because the guardian stops it only after `hb` is
+    /// gone and a stubborn agent can outlast `hb` by its whole grace period.
+    fn collect_finished(&mut self, now: Instant) {
         let mut i = 0;
         while i < self.retiring.len() {
             if self.retiring[i].worker.is_finished() {
-                self.retiring.swap_remove(i).worker.join();
+                let done = self.retiring.swap_remove(i);
+                done.worker.join();
+                if let Some(agent) = done.agent.filter(|pid| process_exists(*pid)) {
+                    self.lingering.push(Lingering {
+                        id: done.id,
+                        agent,
+                        since: now,
+                    });
+                }
             } else {
                 let old = &mut self.retiring[i];
                 if !old.abandoned && now.duration_since(old.since) >= RETIRE_LIMIT {
@@ -256,15 +324,21 @@ impl Runtime {
                 i += 1;
             }
         }
-        let ready: Vec<SessionId> = self
-            .waiting
-            .keys()
-            .copied()
-            .filter(|id| !self.retiring.iter().any(|r| r.id == *id))
-            .collect();
-        for id in ready {
-            if let Some((generation, spec)) = self.waiting.remove(&id) {
-                self.start(id, generation, &spec);
+    }
+
+    /// Drops agents that are gone, and refuses the replacement of one that is not after
+    /// [`AGENT_LIMIT`]: two generations of one session must never run together.
+    fn check_lingering(&mut self, now: Instant) {
+        let mut i = 0;
+        while i < self.lingering.len() {
+            let still = &self.lingering[i];
+            if !process_exists(still.agent) {
+                self.lingering.swap_remove(i);
+            } else if now.duration_since(still.since) >= AGENT_LIMIT {
+                let gone = self.lingering.swap_remove(i);
+                self.refuse_replacement(gone.id);
+            } else {
+                i += 1;
             }
         }
     }
@@ -343,7 +417,7 @@ impl Runtime {
         // A restart replaces the worker, but only once the old one has ended: its late messages
         // carry the old generation and the app drops them. Until then the newest start waits.
         self.retire(id);
-        if self.retiring.iter().any(|r| r.id == id) {
+        if self.retiring.iter().any(|r| r.id == id) || self.lingering.iter().any(|l| l.id == id) {
             self.waiting.insert(id, (generation, spec.clone()));
             return;
         }
@@ -583,5 +657,72 @@ mod tests {
             !text.contains("hunter2") && !text.contains("SECRET_TOKEN"),
             "{text}"
         );
+    }
+
+    // ========================================================================
+    // A replacement waits for the old agent, not only for the old hb
+    // ========================================================================
+
+    /// A runtime with a session waiting to be restarted and a lingering agent, as is left when
+    /// `hb` has been reaped but its agent has not yet been stopped by the guardian.
+    fn waiting_behind(agent: u32) -> Runtime {
+        let mut runtime = Runtime::new(paths());
+        runtime.send(Msg::Launch(spec()));
+        let id = first(&runtime).id;
+        runtime.lingering.push(Lingering {
+            id,
+            agent,
+            since: Instant::now(),
+        });
+        // The generation the session is on, as the app's restart would have given it.
+        let generation = first(&runtime).generation;
+        runtime.waiting.insert(id, (generation, spec()));
+        runtime
+    }
+
+    #[test]
+    fn a_replacement_waits_while_the_old_agent_is_alive_and_starts_when_it_is_gone() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        let id = first(&runtime).id;
+        runtime.advance(Instant::now());
+        assert!(
+            runtime.waiting.contains_key(&id),
+            "started beside a live agent"
+        );
+        assert!(runtime.is_retiring());
+        // The agent ends (and is reaped, so its pid is really gone).
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
+        runtime.advance(Instant::now());
+        assert!(
+            !runtime.waiting.contains_key(&id),
+            "never started after the agent ended"
+        );
+        assert!(!runtime.is_retiring());
+    }
+
+    #[test]
+    fn a_replacement_is_refused_not_started_when_the_old_agent_will_not_go() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        let id = first(&runtime).id;
+        // Past the limit: the start is refused and the row says why; no second agent.
+        runtime.advance(Instant::now() + AGENT_LIMIT + Duration::from_secs(1));
+        assert!(!runtime.waiting.contains_key(&id));
+        let session = first(&runtime);
+        assert_eq!(session.phase, Phase::Failed);
+        assert!(
+            session
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("did not end")),
+            "{:?}",
+            session.failure
+        );
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
     }
 }
