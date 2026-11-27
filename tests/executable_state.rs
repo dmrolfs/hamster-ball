@@ -1,5 +1,6 @@
 // ABOUTME: Disposable cross-run canaries in throwaway homes; fake loaders do not prove vendor startup behaviour.
 // ABOUTME: Cache canary crosses projects inside hb; settings and hard-link canaries use a later outside consumer.
+// ABOUTME: Only the opt-in installed_agents test touches the real home and real agents (`--version`).
 //! Evidence for hb-tx4, not a claim that hb-dai/hb-82i isolate production executable state.
 
 #![cfg(target_os = "macos")]
@@ -96,6 +97,7 @@ fn a_planted_tool_in_hbs_cache_runs_in_another_projects_ball() {
     );
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(assert_ok!(fs::read_to_string(&planted)), payload);
+    assert!(!marker.exists(), "the plant itself wrote the marker");
     let consumer = run_at(&w, &b, "uvx canary");
     assert!(consumer.status.success(), "{}", text(&consumer));
     assert_eq!(assert_ok!(fs::read_to_string(marker)), "cache-canary\n");
@@ -176,6 +178,7 @@ fn a_hook_planted_in_claude_settings_runs_in_a_later_outside_loader() {
         ),
     );
     assert!(out.status.success(), "{}", text(&out));
+    assert!(!marker.exists(), "the plant itself wrote the marker");
     let consumer = start_like_claude(&w.home_dir());
     assert!(consumer.status.success(), "{}", text(&consumer));
     assert_eq!(assert_ok!(fs::read_to_string(marker)), "hook-canary\n");
@@ -259,6 +262,7 @@ fn a_write_through_kiros_hard_linked_run_copy_changes_the_program() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(assert_ok!(fs::metadata(&program)).ino(), inode);
     assert_eq!(assert_ok!(fs::metadata(&alias)).ino(), inode);
+    assert!(!marker.exists(), "the plant itself wrote the marker");
     let consumer = assert_ok!(std::process::Command::new(program).env_clear().output());
     assert!(consumer.status.success(), "{}", text(&consumer));
     assert_eq!(assert_ok!(fs::read_to_string(marker)), "linked-canary\n");
@@ -293,8 +297,9 @@ fn a_deny_write_on_kiros_run_directory_keeps_the_linked_program() {
 // ---- Versioned inventory (hb-tx4 criteria 1 and 3). Test-only table; shortcut: move to src/ when hb-82i makes presets consume it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What hb-82i is asked to do with a mixed file; nothing here isolates anything yet.
 enum Disposition {
-    Isolated,
+    RequiresIsolation,
     Unsupported,
 }
 
@@ -319,14 +324,19 @@ struct AgentInventory {
     binary: &'static str,
     /// Version the entries were inventoried against.
     version: &'static str,
-    /// Version named in the preset's own header, which hb-82i must re-measure before it changes.
+    /// Version the preset's own header names.
     preset_version: &'static str,
+    /// Why `preset_version` may differ from `version`; `None` means they must be equal.
+    accepted_drift: Option<&'static str>,
+    /// The reviewed `[fs] write` and `deny_write` sets; a preset edit must update them and the rows.
+    write: &'static [&'static str],
+    deny: &'static [&'static str],
     preset_toml: &'static str,
     entries: &'static [Entry],
 }
 
 use Class::{Executable, Instruction, Mixed, SessionData};
-use Disposition::{Isolated, Unsupported};
+use Disposition::{RequiresIsolation, Unsupported};
 
 const fn e(path: &'static str, class: Class, evidence: &'static str) -> Entry {
     Entry {
@@ -342,16 +352,24 @@ const INVENTORY: &[AgentInventory] = &[
         binary: "claude",
         version: "2.1.328",
         preset_version: "2.1.328",
+        accepted_drift: None,
+        write: &[
+            "~/.claude",
+            "~/.claude.json",
+            "~/.cache/claude",
+            "~/.local/state/claude",
+        ],
+        deny: &[],
         preset_toml: include_str!("../presets/agent/claude.toml"),
         entries: &[
             e(
                 "~/.claude/settings.json",
-                Mixed(Isolated),
+                Mixed(RequiresIsolation),
                 "read: hooks, awsAuthRefresh, otelHeadersHelper, env, enabledPlugins",
             ),
             e(
                 "~/.claude.json",
-                Mixed(Isolated),
+                Mixed(RequiresIsolation),
                 "read keys; whether isolation breaks OAuth refresh is unmeasured",
             ),
             e("~/.claude/hooks", Executable, "read"),
@@ -378,6 +396,9 @@ const INVENTORY: &[AgentInventory] = &[
         binary: "pi",
         version: "1.7.0",
         preset_version: "1.6.0",
+        accepted_drift: Some("hb-82i re-measures the preset against the installed agent"),
+        write: &["~/.pi/agent"],
+        deny: &["~/.pi/agent/bin", "~/.pi/agent/install"],
         preset_toml: include_str!("../presets/agent/pi.toml"),
         entries: &[
             e("~/.pi/agent/extensions", Executable, "read"),
@@ -386,12 +407,12 @@ const INVENTORY: &[AgentInventory] = &[
             e("~/.pi/agent/agents", Executable, "read"),
             e(
                 "~/.pi/agent/settings.json",
-                Mixed(Isolated),
+                Mixed(RequiresIsolation),
                 "read: `packages` lists code to load",
             ),
             e(
                 "~/.pi/agent/models.json",
-                Mixed(Isolated),
+                Mixed(RequiresIsolation),
                 "assumed: provider URLs redirect traffic",
             ),
             e(
@@ -416,6 +437,15 @@ const INVENTORY: &[AgentInventory] = &[
         binary: "kiro-cli",
         version: "3.6.2",
         preset_version: "3.5.0",
+        accepted_drift: Some("hb-82i re-measures the preset against the installed agent"),
+        write: &["~/.kiro", "~/Library/Application Support/kiro-cli"],
+        deny: &[
+            "~/Library/Application Support/kiro-cli/bun",
+            "~/Library/Application Support/kiro-cli/bunfig.toml",
+            "~/Library/Application Support/kiro-cli/kas",
+            "~/Library/Application Support/kiro-cli/node",
+            "~/Library/Application Support/kiro-cli/tui.js",
+        ],
         preset_toml: include_str!("../presets/agent/kiro.toml"),
         entries: &[
             e(
@@ -474,6 +504,18 @@ const INVENTORY: &[AgentInventory] = &[
         binary: "opencode",
         version: "1.2.0",
         preset_version: "1.2.0",
+        accepted_drift: None,
+        write: &[
+            "~/.cache/opencode",
+            "~/.local/share/opencode",
+            "~/.local/state/opencode",
+        ],
+        deny: &[
+            "~/.cache/opencode/bun.lock",
+            "~/.cache/opencode/node_modules",
+            "~/.cache/opencode/package.json",
+            "~/.local/share/opencode/bin",
+        ],
         preset_toml: include_str!("../presets/agent/opencode.toml"),
         entries: &[
             e(
@@ -528,7 +570,9 @@ fn under(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Entries a write grant reaches and no deny covers: what a sandboxed run can change today.
+/// Raw preset inventory only: rows a listed write grant overlaps and no listed deny covers.
+/// It ignores existence, canonicalization, inherited policy and the floor, so it is grant-change
+/// detection, not proof of what a run can write.
 fn exposed(inv: &AgentInventory) -> Vec<&Entry> {
     let (write, deny) = (grants(inv, "write"), grants(inv, "deny_write"));
     inv.entries
@@ -568,21 +612,66 @@ fn every_write_grant_of_a_shipped_preset_has_inventory_rows_and_every_deny_names
     }
 }
 
+/// The version token after `agent/<name>: <binary> ` in a preset's first line.
+fn header_version(header: &str) -> Option<&str> {
+    let rest = header.split_once(": ")?.1;
+    rest.split_whitespace()
+        .nth(1)?
+        .strip_suffix(',')
+        .or_else(|| rest.split_whitespace().nth(1))
+}
+
 #[test]
-fn preset_headers_name_the_version_the_inventory_recorded_for_them() {
+fn preset_headers_match_the_recorded_version_and_drift_is_explicit() {
     for inv in INVENTORY {
         let header = inv.preset_toml.lines().next().unwrap_or_default();
-        assert!(
-            header.contains(&format!(
-                "{} {}",
-                inv.binary.trim_end_matches("-cli"),
-                inv.preset_version
-            )) || header.contains(&format!("{} {}", inv.binary, inv.preset_version)),
-            "{}: preset header `{header}` no longer matches the recorded {}; re-measure and update both",
+        assert_eq!(
+            header_version(header),
+            Some(inv.preset_version),
+            "{}: preset header `{header}` no longer names the recorded version",
+            inv.preset
+        );
+        assert_eq!(
+            inv.preset_version != inv.version,
+            inv.accepted_drift.is_some(),
+            "{}: preset {} vs inventory {}: record or remove accepted_drift",
             inv.preset,
-            inv.preset_version
+            inv.preset_version,
+            inv.version
+        );
+        if let Some(why) = inv.accepted_drift {
+            eprintln!(
+                "DRIFT {}: preset {} vs inventory {}: {why}",
+                inv.preset, inv.preset_version, inv.version
+            );
+        }
+    }
+}
+
+#[test]
+fn the_reviewed_grant_sets_equal_the_shipped_presets_and_cover_every_agent_preset() {
+    for inv in INVENTORY {
+        assert_eq!(
+            grants(inv, "write"),
+            inv.write,
+            "{}: write grants changed; reclassify the rows",
+            inv.preset
+        );
+        assert_eq!(
+            grants(inv, "deny_write"),
+            inv.deny,
+            "{}: deny_write changed; reclassify the rows",
+            inv.preset
         );
     }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("presets/agent");
+    let mut shipped: Vec<String> = assert_ok!(fs::read_dir(dir))
+        .filter_map(|f| f.ok()?.path().file_stem()?.to_str().map(str::to_owned))
+        .collect();
+    shipped.sort();
+    let mut known: Vec<String> = INVENTORY.iter().map(|a| a.preset.to_owned()).collect();
+    known.sort();
+    assert_eq!(shipped, known, "a shipped agent preset has no inventory");
 }
 
 #[test]
@@ -620,30 +709,36 @@ fn shipped_presets_leave_the_attacked_paths_writable_today() {
     );
 }
 
+/// A report, not a gate: run with `-- --nocapture` to list rows no measurement backs yet.
 #[test]
-fn every_mixed_or_assumed_row_is_listed_so_the_unmeasured_count_is_visible() {
-    let mut assumed = 0;
+fn unmeasured_and_mixed_rows_are_reported() {
     for inv in INVENTORY {
         for en in inv.entries {
-            if en.evidence.starts_with("assumed") {
-                assumed += 1;
-                eprintln!("ASSUMED {} {}: {}", inv.preset, en.path, en.evidence);
+            if en.evidence.starts_with("assumed") || en.evidence.contains("unmeasured") {
+                eprintln!("UNMEASURED {} {}: {}", inv.preset, en.path, en.evidence);
             }
             if let Mixed(d) = en.class {
                 eprintln!("MIXED {} {} {d:?}", inv.preset, en.path);
             }
         }
     }
-    assert!(assumed > 0, "update this test once every row is measured");
 }
 
-fn installed_version(binary: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
+/// Why a real-install probe did not yield a version.
+enum Probe {
+    Absent,
+    Failed(String),
+}
+
+fn installed_version(binary: &str) -> Result<(PathBuf, String), Probe> {
+    let path = std::env::var_os("PATH").ok_or(Probe::Absent)?;
     let program = std::env::split_paths(&path)
         .map(|d| d.join(binary))
-        .find(|p| p.is_file())?;
-    let home = std::env::var_os("HOME")?;
-    let mut child = std::process::Command::new(program)
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .ok_or(Probe::Absent)?;
+    let fail = |why: String| Probe::Failed(format!("{}: {why}", program.display()));
+    let home = std::env::var_os("HOME").ok_or_else(|| fail("HOME unset".into()))?;
+    let mut child = std::process::Command::new(&program)
         .arg("--version")
         .env_clear()
         .env("PATH", path)
@@ -651,38 +746,56 @@ fn installed_version(binary: &str) -> Option<String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
+        .map_err(|e| fail(e.to_string()))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while child.try_wait().ok()?.is_none() {
+    // shortcut: --version output is tiny, so the pipe cannot fill before exit; a chatty agent needs a reader thread.
+    while child.try_wait().map_err(|e| fail(e.to_string()))?.is_none() {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
-            return None;
+            let _ = child.wait();
+            return Err(fail("--version timed out".into()));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let out = child.wait_with_output().ok()?;
+    let out = child.wait_with_output().map_err(|e| fail(e.to_string()))?;
+    if !out.status.success() {
+        return Err(fail(format!("--version exited {}", out.status)));
+    }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    regex::Regex::new(r"\d+\.\d+\.\d+")
-        .ok()?
+    let version = regex::Regex::new(r"\b\d+\.\d+\.\d+\b")
+        .map_err(|e| fail(e.to_string()))?
         .find(&text)
         .map(|m| m.as_str().to_owned())
+        .ok_or_else(|| fail(format!("no version in `{}`", text.trim())))?;
+    Ok((program, version))
 }
 
-/// Reads only `--version` of the real install; run with HB_REQUIRE_AGENTS=1 to make a missing agent fail.
+/// Runs the real installed agents (`--version` only, with the real HOME), so it is opt-in:
+/// HB_INSPECT_AGENTS=1 enables it, and HB_REQUIRE_AGENTS=1 additionally fails on a missing agent.
 #[test]
 fn installed_agents_match_the_inventoried_versions() {
+    if std::env::var_os("HB_INSPECT_AGENTS").is_none() {
+        eprintln!("SKIP: installed-agent version check is opt-in (HB_INSPECT_AGENTS=1)");
+        return;
+    }
     let required = std::env::var_os("HB_REQUIRE_AGENTS").is_some();
     for inv in INVENTORY {
         match installed_version(inv.binary) {
-            Some(v) => assert_eq!(
-                v, inv.version,
-                "{}: installed {v} differs from the inventory; re-run the measurements before trusting it",
-                inv.preset
+            Ok((program, v)) => assert_eq!(
+                v,
+                inv.version,
+                "{}: {} reports {v}, the inventory pins {}; re-run the measurements before trusting it",
+                inv.preset,
+                program.display(),
+                inv.version
             ),
-            None => {
+            Err(Probe::Failed(why)) => {
+                assert!(why.is_empty(), "{}: probe failed: {why}", inv.preset);
+            }
+            Err(Probe::Absent) => {
                 assert!(
                     !required,
-                    "HB_REQUIRE_AGENTS is set but {} is not usable",
+                    "HB_REQUIRE_AGENTS is set but {} is not installed",
                     inv.binary
                 );
                 eprintln!(
