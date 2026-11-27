@@ -239,10 +239,10 @@ fn from_label(origins: &[OriginRow]) -> String {
                     .map_or_else(|| path.to_owned(), str::to_owned)
             })
         });
-        if let Some(name) = name {
-            if !names.contains(&name) {
-                names.push(name);
-            }
+        if let Some(name) = name
+            && !names.contains(&name)
+        {
+            names.push(name);
         }
     }
     names.join(", ")

@@ -1098,10 +1098,8 @@ impl Running {
             .into_iter()
             .map(Pump::finish)
             .fold(ClipboardUse::default(), |sum, used| sum + used);
-        if filtered {
-            if let Some(terminal) = output_terminal() {
-                settle(&terminal);
-            }
+        if filtered && let Some(terminal) = output_terminal() {
+            settle(&terminal);
         }
         result
             .map(|(exit, stdout, stderr)| Waited {

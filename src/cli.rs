@@ -679,10 +679,10 @@ fn run_command_with(
     if let Err(code) = ensure_approved(env, &discovery, &loaded, terminal.as_mut(), err) {
         return code;
     }
-    if supervise.is_some() {
-        if let Err(error) = block_supervised() {
-            return fail(err, crate::Error::from(RunError::from(error)));
-        }
+    if supervise.is_some()
+        && let Err(error) = block_supervised()
+    {
+        return fail(err, crate::Error::from(RunError::from(error)));
     }
     // Said before the command starts: the agent's own error for it is only "Operation not permitted".
     if let Some(warning) = loaded.policy.project_grant_warning(discovery.root.path()) {
@@ -778,10 +778,10 @@ fn warm_command(
         }
         return ExitCode::SUCCESS;
     }
-    if supervise.is_some() {
-        if let Err(error) = block_supervised() {
-            return fail(err, crate::Error::from(RunError::from(error)));
-        }
+    if supervise.is_some()
+        && let Err(error) = block_supervised()
+    {
+        return fail(err, crate::Error::from(RunError::from(error)));
     }
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let at_terminal = std::io::stderr().is_terminal();
@@ -826,11 +826,11 @@ fn warm_command(
                 }
             }
         }
-        if supervise.is_some() {
-            if let Some(signal) = reraise_for(outcome.exit) {
-                *reraise = Some(signal);
-                return exit_code(outcome.exit);
-            }
+        if supervise.is_some()
+            && let Some(signal) = reraise_for(outcome.exit)
+        {
+            *reraise = Some(signal);
+            return exit_code(outcome.exit);
         }
     }
     if failed {

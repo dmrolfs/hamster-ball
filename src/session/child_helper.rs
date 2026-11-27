@@ -113,10 +113,10 @@ pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool, gated: bool) 
             return HelperError::ControllingTty { source };
         }
     }
-    if let Some(gate) = gate {
-        if let Err(source) = gate.wait_for_release(std::process::id()) {
-            return HelperError::Gate { source };
-        }
+    if let Some(gate) = gate
+        && let Err(source) = gate.wait_for_release(std::process::id())
+    {
+        return HelperError::Gate { source };
     }
     HelperError::Exec {
         source: Command::new(SANDBOX_EXEC).args(args).exec(),
