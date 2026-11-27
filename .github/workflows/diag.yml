@@ -20,11 +20,19 @@ jobs:
           /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true && echo "sandbox-exec works" || echo "sandbox-exec FAILS"
           /usr/bin/env -i HB_X=1 /bin/sleep 5 & p=$!; sleep 0.5
           echo "ps -E of /bin/sleep shows HB_X: $(ps -E -o command= -p $p | grep -c HB_X)"; kill $p
-      - run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
-      - name: Three tests alone, 5 times, with output
+      - name: Sleep overshoot
         run: |
-          for _ in 1 2 3 4 5; do
-            cargo test --locked --lib -- --nocapture --test-threads=1 session::sweep::tests::a_process_whose_environment_macos_hides session::relay::tests::a_child_that_never_stops session::pump::tests::output_that_arrives_shortly 2>&1 | grep -E "^test |test result|panicked|ms$|ms\b" || true
-          done
-      - name: Relay and pump modules together
-        run: cargo test --locked --lib -- session::relay session::pump session::sweep 2>&1 | grep -E "FAILED|test result|panicked" || true
+          python3 - <<'PY'
+          import time
+          for want in (0.020, 0.050, 0.110):
+              xs=[]
+              for _ in range(100):
+                  t=time.perf_counter(); time.sleep(want); xs.append((time.perf_counter()-t)*1000)
+              xs.sort()
+              print("sleep %3d ms: median %.1f p90 %.1f max %.1f" % (want*1000, xs[50], xs[90], xs[-1]))
+          PY
+      - run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+      - name: Failing assertions in full
+        run: |
+          cargo test --locked --lib -- --test-threads=1 session::sweep::tests::a_process_whose_environment_macos_hides session::relay::tests::a_child_that_never_stops session::pump::tests::output_that_arrives_shortly > /tmp/out.txt 2>&1 || true
+          sed -n '/^failures:/,$p' /tmp/out.txt
