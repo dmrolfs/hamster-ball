@@ -245,7 +245,7 @@ impl OfflinePlan {
 /// The variables that point `uv` and `npm` at the cache under `cache_root`, as `hb warm` sets
 /// them for the server it starts (a run sets them inside the launcher scripts instead).
 ///
-/// `UV_PYTHON_INSTALL_DIR` and the settings in [`PRIVATE_PYTHON`] keep uv on the interpreter
+/// `UV_PYTHON_INSTALL_DIR` and the fixed settings from [`private_python_vars`] keep uv on the interpreter
 /// inside the cache, so no link points at the user's own `~/.local/share/uv/python`.
 #[must_use]
 pub fn cache_vars(cache_root: &CanonicalPath) -> Vec<(EnvName, CanonicalPath)> {
@@ -263,7 +263,7 @@ pub fn cache_vars(cache_root: &CanonicalPath) -> Vec<(EnvName, CanonicalPath)> {
     .collect()
 }
 
-/// The fixed (non-path) variables a warm run sets so uv builds a closed tree: see [`PRIVATE_PYTHON`].
+/// The fixed (non-path) variables a warm run sets so uv builds a closed tree (managed Python only, no download, copied files).
 #[must_use]
 pub fn private_python_vars() -> Vec<(&'static str, &'static str)> {
     PRIVATE_PYTHON.to_vec()

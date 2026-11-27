@@ -197,13 +197,20 @@ pub enum CacheError {
     },
 
     /// A record or manifest could not be read as the supported format.
-    #[snafu(display("{} is not a usable cache record", path.display()))]
+    #[snafu(display(
+        "{} is not a usable cache record ({reason}); run `hb warm` outside the ball to publish a new one",
+        path.display()
+    ))]
     BadRecord {
         /// The file.
         path: PathBuf,
         /// What was wrong with it.
         reason: RecordFault,
     },
+
+    /// There is no per-user temporary directory to build in.
+    #[snafu(display("there is no per-user temporary directory to build the cache in"))]
+    NoTempDir,
 
     /// Another `hb warm` holds the project's lock.
     #[snafu(display("another hb warm is already running for this project"))]
@@ -761,7 +768,7 @@ pub struct CacheGeneration {
     pub manifest: CacheManifest,
 }
 
-/// Where generations live: `<cache root>/generations`, `projects`, `builds`, `staging`.
+/// Where generations live: `<cache root>/generations`, `projects`, `staging`.
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     root: PathBuf,
@@ -992,13 +999,24 @@ fn fresh_id() -> String {
     format!("g{}-{nanos}-{n}", std::process::id())
 }
 
+/// `hb-<pid>-<nanos>-<counter>`: the name shape the session sweep recognises and, once the
+/// process is gone, removes.
+fn fresh_build_name() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("hb-{}-{nanos}-{n}", std::process::id())
+}
+
 impl CacheStore {
     /// Creates the store's directories, private to the owner. Existing ones are left alone.
     ///
     /// # Errors
     /// [`CacheError::Copy`]-free: a [`CacheError::Read`] if a directory cannot be made.
     pub fn ensure_dirs(&self) -> Result<(), CacheError> {
-        for sub in ["", "generations", "projects", "builds", "staging"] {
+        for sub in ["", "generations", "projects", "staging"] {
             let dir = self.root.join(sub);
             DirBuilder::new()
                 .recursive(true)
@@ -1009,13 +1027,16 @@ impl CacheStore {
         Ok(())
     }
 
-    /// A fresh, empty workspace for `hb warm` to build in. It is never selectable.
+    /// A fresh, empty workspace under `parent` (the per-user temporary directory) for `hb warm`
+    /// to build in. It is never selectable, and it is named like a session directory, so the
+    /// stale-directory sweep removes one that an interrupted warm left behind.
+    ///
+    /// The workspace is outside the store on purpose: no ball is ever given a path inside it.
     ///
     /// # Errors
     /// [`CacheError`] if the directory cannot be made.
-    pub fn begin_build(&self) -> Result<PathBuf, CacheError> {
-        self.ensure_dirs()?;
-        let dir = self.root.join("builds").join(fresh_id());
+    pub fn begin_build(&self, parent: &Path) -> Result<PathBuf, CacheError> {
+        let dir = parent.join(fresh_build_name());
         private_dir(&dir).context(ReadSnafu { path: &dir })?;
         Ok(dir)
     }
@@ -1779,6 +1800,14 @@ mod tests {
 
     // ---- store: seal and publish ----
 
+    /// A directory standing in for the per-user temporary directory, removed when the process ends.
+    fn temp_parent() -> PathBuf {
+        let dir = assert_ok!(TempDir::new());
+        let path = assert_ok!(fs::canonicalize(dir.path()));
+        std::mem::forget(dir);
+        path
+    }
+
     fn loose() -> CacheLimits {
         CacheLimits {
             min_free_bytes: 0,
@@ -1787,7 +1816,7 @@ mod tests {
     }
 
     fn workspace(store: &CacheStore, files: &[(&str, &str)]) -> PathBuf {
-        let ws = assert_ok!(store.begin_build());
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
         for (name, text) in files {
             put(&ws.join(name), text);
         }
@@ -1976,7 +2005,7 @@ mod tests {
         assert_eq!(assert_ok!(seed_python(&uv_python, &root, loose())), None);
         put(&uv_python.join("cpython-3.11.1-x/bin/python3.11"), "old");
         put(&uv_python.join("cpython-3.12.9-x/bin/python3.12"), "new");
-        let ws = assert_ok!(store.begin_build());
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
         let seeded = assert_some!(assert_ok!(seed_python(&uv_python, &ws, loose())));
         assert_eq!(seeded, ws.join("python/cpython-3.12.9-x"));
         assert_eq!(
@@ -2001,7 +2030,7 @@ mod tests {
             "/usr/bin/python3",
             uv_python.join("cpython-3.12.9-x/bin/python")
         ));
-        let ws = assert_ok!(store.begin_build());
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
         let got = assert_err!(seed_python(&uv_python, &ws, loose()));
         assert!(
             matches!(

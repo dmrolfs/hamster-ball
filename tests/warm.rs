@@ -107,18 +107,18 @@ fn warming_builds_in_a_private_workspace_then_publishes_one_generation_and_stamp
         seen.contains("args=mcp-server-time\n"),
         "no --offline: {seen}"
     );
-    // The server built inside a workspace under builds/, never the shared cache root.
-    let builds =
-        fs::canonicalize(cache(&w).join("builds")).unwrap_or_else(|_| cache(&w).join("builds"));
+    // The server built inside a workspace in the per-user temp dir, never anywhere in the store.
+    let temp = fs::canonicalize(w.base.join("tmp")).unwrap_or_else(|_| w.base.join("tmp"));
     for var in ["uv_cache", "tool_dir", "npm"] {
         let line = seen
             .lines()
             .find(|l| l.starts_with(var))
             .unwrap_or_default();
         assert!(
-            line.contains(&format!("{}/", builds.display())),
+            line.contains(&format!("{}/hb-", temp.display())),
             "{var}: {seen}"
         );
+        assert!(!line.contains(".cache/hamster-ball"), "{var}: {seen}");
     }
     assert!(
         !cache(&w).join("warmed").exists(),
@@ -129,7 +129,7 @@ fn warming_builds_in_a_private_workspace_then_publishes_one_generation_and_stamp
         .unwrap_or(0);
     assert_eq!(generations, 1);
     assert_eq!(
-        fs::read_dir(cache(&w).join("builds"))
+        fs::read_dir(w.base.join("tmp"))
             .map(|d| d.count())
             .unwrap_or(0),
         0,
@@ -159,7 +159,7 @@ fn a_failed_warm_publishes_nothing_and_leaves_no_workspace() {
             .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| e.path().join("current").exists())))
     );
     assert_eq!(
-        fs::read_dir(cache(&w).join("builds"))
+        fs::read_dir(w.base.join("tmp"))
             .map(|d| d.count())
             .unwrap_or(0),
         0

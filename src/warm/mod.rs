@@ -279,7 +279,16 @@ pub fn begin(
     let store = CacheStore::new(cache_root(&env.home));
     let inputs = expected_inputs_for(root, selected, tools)?;
     let lock = store.lock_warm(&inputs.project_key)?;
-    let workspace = store.begin_build()?;
+    let temp = env
+        .floor
+        .user_temp_dir
+        .as_deref()
+        .ok_or(CacheError::NoTempDir)?;
+    let temp = std::fs::canonicalize(temp).map_err(|source| CacheError::Read {
+        path: temp.to_path_buf(),
+        source,
+    })?;
+    let workspace = store.begin_build(&temp)?;
     let build = WarmBuild {
         store,
         workspace,

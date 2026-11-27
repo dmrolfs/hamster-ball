@@ -237,7 +237,7 @@ impl World {
             &tools
         ));
         let store = CacheStore::new(cache_root(&self.home));
-        let workspace = assert_ok!(store.begin_build());
+        let workspace = assert_ok!(store.begin_build(&self.base.join("tmp")));
         for (name, text) in files {
             write(&workspace.join(name), text);
         }
