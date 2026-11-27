@@ -44,6 +44,47 @@ pub enum SweepError {
 /// compares it with the limit the machine reports, so it fails when that happens.
 const MAX_RANGE: i32 = 1 << 16;
 
+#[test]
+fn fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered() {
+    use claims::assert_ok;
+    use std::os::fd::IntoRawFd;
+    const CHILD: &str = "HB_FD_LOWERED_LIMIT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = assert_ok!(std::process::Command::new(assert_ok!(std::env::current_exe()))
+            .args(["--exact", "session::fds::fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered", "--nocapture"])
+            .env(CHILD, "1").output());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let file = assert_ok!(std::fs::File::open("/dev/null"));
+    let high = assert_ok!(rustix::io::fcntl_dupfd_cloexec(&file, 200)).into_raw_fd();
+    let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    limit.current = Some(64);
+    assert_ok!(rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        limit
+    ));
+    let closed = assert_ok!(sweep(
+        None,
+        || Err(io::Error::other("forced unavailable listing")),
+        |fd| {
+            if fd == high {
+                close(fd)
+            } else {
+                Err(Errno::EBADF)
+            }
+        }
+    ));
+    assert!(
+        closed.contains(&high),
+        "fallback missed inherited fd {high}"
+    );
+}
+
 /// Closes every descriptor above 2 and returns the numbers it closed.
 ///
 /// Call it once, before opening anything, in a program that is only `hb`. Descriptors 0, 1 and 2
@@ -74,11 +115,8 @@ fn list_open() -> io::Result<Vec<String>> {
 /// profile denies reading `/dev/fd`, and `hb ctl` and the helpers run inside it. Closing a number
 /// that is not open finds nothing (`EBADF`), which the sweep allows.
 fn every_possible() -> Vec<String> {
-    let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-    let top = soft.map_or(MAX_RANGE, |n| {
-        i32::try_from(n).unwrap_or(MAX_RANGE).min(MAX_RANGE)
-    });
-    (3..top).map(|fd| fd.to_string()).collect()
+    // Lowering the allocation limit does not close descriptors already open above it.
+    (3..MAX_RANGE).map(|fd| fd.to_string()).collect()
 }
 
 /// The sweep, with the listing and the closing passed in so each case can be tested. A listing
