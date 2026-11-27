@@ -91,6 +91,7 @@ Inside the ball the agent cannot do these things.
 - Data sent to a host you allowed. The proxy passes encrypted (HTTPS) traffic through without opening it, so an allowed host can receive anything the agent can read.
 - Network use by containers you start yourself. Podman on macOS cannot limit that.
 - Secrets with unusual names. The guard matches common names. `hb doctor` lists look-alikes, and you can add patterns.
+- A process the agent hides on purpose. If `hb` is force-killed, its cleanup process ends what it can find, but it cannot promise to catch every process an agent starts and then detaches. See [how it works](02-how-it-works.md).
 - Other operating systems.
 
 The full threat model is section 2 of the [design](https://github.com/dmrolfs/hamster-ball/blob/main/ref/Hamster-Ball-Design.md).

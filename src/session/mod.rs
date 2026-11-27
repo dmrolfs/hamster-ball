@@ -14,6 +14,7 @@ pub mod gitconfig;
 mod guard_channel;
 pub mod guardian;
 pub mod hooks;
+pub mod identity;
 mod interactive;
 pub mod launch;
 pub mod offline;
@@ -26,7 +27,9 @@ pub mod relay;
 pub mod run;
 pub mod sanitize;
 pub mod signals;
+mod sweep;
 pub mod terminal;
+mod tracker;
 
 pub use ca_bundle::{CaBundleError, write_bundle};
 pub use child_helper::{HelperError, exec_gated, exec_sandbox_exec};

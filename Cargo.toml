@@ -32,7 +32,13 @@ test-support = []
 
 [dependencies]
 clap = { version = "4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# Lists a process's children and group members and reads its start time, which the kernel will not report as it forks (hb-caj).
+# Chosen over libproc 0.15: no bindgen, so it builds without clang or a valid SDK; typed io errors; exact-size reads.
+darwin-libproc = "0.2"
 httparse = "1.10"
+# Reads one process's environment as separate entries (hb-caj teardown sweep); `ps` text joins arguments and environment.
+# 0.30, not 0.31: 0.31 needs memchr >= 2.7, which darwin-libproc 0.2 (memchr ~2.3) rules out.
+sysinfo = { version = "0.30", default-features = false }
 nix = { version = "0.32", default-features = false, features = ["event", "signal", "time", "user"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "process", "pty", "termios", "net", "stdio"] }
 serde = { version = "1.0.229", features = ["derive"] }

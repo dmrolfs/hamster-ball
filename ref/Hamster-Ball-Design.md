@@ -669,8 +669,22 @@ it as well (no panic hook is installed).
 **SIGKILL of `hb`** (D66). Nothing in `hb` can run when it is killed, so a second process does. `hb` starts `hb __guard` in a
 session of its own, registers the agent's process (or group) and the `log stream` helper with it, and holds the only write end of a
 pipe to it. A normal end sends `release` and the guard exits. If the pipe closes without one, the guard sends what is still
-running SIGTERM and, after 2 s, SIGKILL. It watches each registered process with a kernel exit notification, so a process that
-has ended is forgotten and its number, which the system may give to an unrelated program, is never signalled. Measured before the
+running SIGTERM and, after 2 s, SIGKILL. It watches each registered process with a kernel exit notification and records each
+process's number with its start time. Before every signal it reads the process again, and a number whose start time differs is
+not signalled, so a number the system has given to an unrelated program is left alone. The check and the signal are two steps,
+so a gap remains that is unlikely and not bounded in time (hb-caj).
+
+**Descendants** (hb-caj). macOS refuses `NOTE_TRACK`, so the kernel does not follow forks. The guard registers `NOTE_FORK` and
+`NOTE_EXIT` on each owned process and, on a fork, lists the children and adopts them; a root that leads its own group has the
+group scanned too, after the leader exits. Each adoption checks that the process is still where it was listed (parent or
+group), is the same user, and started no earlier than the root. This keeps a descendant that calls `setsid` or whose parent
+has exited. Two recovery sweeps then look for what it missed: processes whose environment holds this run's `HB_LAUNCH_TOKEN`
+(candidates from two `ps` listings, each confirmed by reading the process's environment as separate entries) and processes
+using the per-run directory (`lsof`). A sweep finds candidates only and never shows that cleanup is complete. **Residual,
+measured:** a process started in a chain of fork-then-exit generations can win the race against discovery; a process that
+clears its environment is invisible to the token sweep; macOS hides the environment of Apple's own tools (`/bin/sh`, `perl`,
+`sleep`), so such a survivor that has also left the directory and closed its files there is not found; processes of other users
+are out of scope. A VM is the only complete answer. Measured before the
 guard: with no terminal, a killed `hb` left both the agent and the `log stream` running (with a pty the kernel hangs up the agent,
 and `log stream` dies with the session). **The raw terminal cannot be repaired, so the guard says so.** Bash puts the terminal back itself. zsh (the macOS login shell)
 adopts the settings of a job that was killed and applies them to every later command: measured, with a guard that restored the

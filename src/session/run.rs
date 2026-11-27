@@ -36,6 +36,7 @@ use super::pty::{Pty, PtyError};
 use super::pump::Pump;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
+use super::sweep::LaunchToken;
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
 use crate::policy::HostRule;
@@ -406,6 +407,13 @@ pub enum RunError {
         source: GateError,
     },
 
+    /// A random launch token could not be made, so the guard could not be told what to look for.
+    #[snafu(display("a launch token could not be generated"))]
+    Token {
+        /// The underlying error.
+        source: io::Error,
+    },
+
     /// The process that cleans up after a killed hb could not be started or told what to watch.
     #[snafu(transparent)]
     Guardian {
@@ -509,6 +517,17 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         _ => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
     };
     let mut guardian = helper.map(Guardian::start).transpose()?;
+    // The token marks this run's processes so the guard can look for leftovers at teardown. It goes
+    // to the guard first: a child that exists before the guard knows the token would be missed.
+    let launch_token = match guardian.as_mut() {
+        Some(guardian) => {
+            let token = LaunchToken::generate().context(TokenSnafu)?;
+            guardian.token(token.value())?;
+            guardian.session_dir(session.path().as_path())?;
+            Some(token)
+        }
+        None => None,
+    };
     let ctl = match ctl_scope {
         Some(scope) => {
             let hb = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
@@ -620,6 +639,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         proxy: Some(&proxy_url),
         hook_vars: &child_vars,
         ctl_socket: ctl.as_ref().map(|c| &c.socket),
+        launch_token: launch_token.as_ref().map(LaunchToken::value),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let launcher = launcher_words(helper, pty.is_some());
@@ -1309,6 +1329,7 @@ mod tests {
             proxy: None,
             hook_vars: &std::collections::BTreeMap::new(),
             ctl_socket: None,
+            launch_token: None,
         }))
     }
 

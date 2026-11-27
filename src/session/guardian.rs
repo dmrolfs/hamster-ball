@@ -35,7 +35,10 @@ use rustix::termios::{LocalModes, Termios, tcgetattr};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use super::guard_channel::Channel;
+use super::identity::{Identity, IdentityError};
 use super::signals::{SignalError, Target, clear_mask};
+use super::sweep::{LaunchToken, holders_of, holds_entry, listing, owned_by_token};
+use super::tracker::{Tracker, TrackerError};
 
 /// How long the guard lets processes end after SIGTERM before it sends SIGKILL.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(2);
@@ -163,6 +166,10 @@ pub(super) enum GuardCommand {
     AckTerminal(u64, PathBuf),
     /// An acknowledged socket registration.
     AckSocket(u64, PathBuf),
+    /// An acknowledged launch token: what the teardown sweep looks for in processes' environments.
+    AckToken(u64, String),
+    /// An acknowledged session directory: where the teardown sweep looks for processes still using it.
+    AckSessionDir(u64, PathBuf),
     /// `hb` finished normally: exit and touch nothing.
     Release,
     /// The user's terminal, which `hb` is about to put in raw mode.
@@ -206,6 +213,17 @@ pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
             id.parse().map_err(|_| LineError::Unknown)?,
             ctl_socket(path)?,
         )),
+        ["ack", id, "token", value] => {
+            LaunchToken::parse(value).ok_or(LineError::Unknown)?;
+            Ok(GuardCommand::AckToken(
+                id.parse().map_err(|_| LineError::Unknown)?,
+                (*value).to_owned(),
+            ))
+        }
+        ["ack", id, "sessiondir", path] => Ok(GuardCommand::AckSessionDir(
+            id.parse().map_err(|_| LineError::Unknown)?,
+            session_dir(path)?,
+        )),
         ["release"] => Ok(GuardCommand::Release),
         ["tty", path] => terminal_device(path).map(GuardCommand::Terminal),
         ["socket", path] => ctl_socket(path).map(GuardCommand::Socket),
@@ -248,6 +266,21 @@ fn ctl_socket(path: &str) -> Result<PathBuf, LineError> {
     let path = Path::new(path);
     let plain = path.is_absolute()
         && path.file_name().is_some_and(|n| n == CTL_SOCKET_NAME)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if plain {
+        Ok(path.to_path_buf())
+    } else {
+        UnknownSnafu.fail()
+    }
+}
+
+/// A directory the guard will only look in: absolute, no `..`, and not the root of anything big.
+fn session_dir(path: &str) -> Result<PathBuf, LineError> {
+    let path = Path::new(path);
+    let plain = path.is_absolute()
+        && path.components().count() >= 3
         && !path
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir));
@@ -437,6 +470,27 @@ impl Guardian {
         expect_ok(&self.channel.request(&format!("tty {}", path.display()))?)
     }
 
+    /// Tells the guard the token this run's processes carry in their environment, so a teardown can
+    /// look for leftovers the process tracker missed.
+    ///
+    /// # Errors
+    /// [`GuardianError`] if the guard does not acknowledge it.
+    pub fn token(&mut self, token: &str) -> Result<(), GuardianError> {
+        expect_ok(&self.channel.request(&format!("token {token}"))?)
+    }
+
+    /// Tells the guard the per-run directory, so a teardown can look for processes still using it.
+    ///
+    /// # Errors
+    /// [`GuardianError`] if the guard does not acknowledge it.
+    pub fn session_dir(&mut self, path: &Path) -> Result<(), GuardianError> {
+        expect_ok(
+            &self
+                .channel
+                .request(&format!("sessiondir {}", path.display()))?,
+        )
+    }
+
     /// Asks the guard to remove the `hb ctl` socket at `path` if `hb` dies first.
     ///
     /// # Errors
@@ -564,8 +618,8 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
         .context(QueueSnafu)?;
 
     let mut watched = Watched::new();
-    let mut terminal: Option<TerminalWatch> = None;
-    let mut sockets: Vec<PathBuf> = Vec::new();
+    let mut tracker = Tracker::default();
+    let mut registered = Registered::default();
     let mut buffered: Vec<u8> = Vec::new();
     let mut pipe_open = true;
     let mut terminating: Option<Instant> = None;
@@ -581,17 +635,40 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
     loop {
         if !pipe_open && terminating.is_none() {
             // `hb` is gone and did not release: end what is left.
-            for socket in &sockets {
+            for socket in &registered.sockets {
                 remove_socket(socket);
             }
-            if watched.is_empty() {
-                return Ok((Ended::HbGone, terminal));
-            }
-            send_all(&watched, Signal::SIGTERM);
+            // What is already known gets TERM first: the sweeps below run `ps` and `lsof`, which can be
+            // slow, and nothing should wait for them. The grace period starts here, so the sweeps
+            // come out of it rather than extending it.
+            // shortcut: a signalling error is not reported (the guard has no output channel once hb is
+            // gone); a member that cannot be signalled is retried with KILL at the deadline.
+            let _ = tracker.signal(Signal::SIGTERM);
             terminating = Some(Instant::now() + grace);
+            // Leftovers the tracker missed are adopted and get the same TERM and the same deadline.
+            if sweep_for_leftovers(&mut tracker, &queue, &registered) > 0 {
+                let _ = tracker.signal(Signal::SIGTERM);
+            }
         }
-        if terminating.is_some() && watched.is_empty() {
-            return Ok((Ended::HbGone, terminal));
+        if terminating.is_some() && tracker.is_empty() {
+            // Nothing tracked is left, but a leftover can still exist: look once more before
+            // concluding. Anything found is ended under the original deadline.
+            if !registered.final_sweep_done {
+                registered.final_sweep_done = true;
+                if sweep_for_leftovers(&mut tracker, &queue, &registered) > 0 {
+                    let _ = tracker.signal(Signal::SIGTERM);
+                }
+            }
+            if tracker.is_empty() {
+                return Ok((Ended::HbGone, registered.terminal));
+            }
+        }
+        // The deadline is checked on every pass, so a busy stream of fork events cannot defer it.
+        if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
+            // One last look: work that left every tie since the first sweep is still a leftover.
+            let _ = sweep_for_leftovers(&mut tracker, &queue, &registered);
+            let _ = tracker.signal(Signal::SIGKILL);
+            return Ok((Ended::HbGone, registered.terminal));
         }
         let timeout = terminating.map(|deadline| {
             TimeSpec::from_duration(deadline.saturating_duration_since(Instant::now()))
@@ -602,10 +679,6 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             Err(source) => return Err(GuardError::Queue { source }),
         };
         if ready == 0 {
-            if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
-                send_all(&watched, Signal::SIGKILL);
-                return Ok((Ended::HbGone, terminal));
-            }
             continue;
         }
         for event in &events[..ready] {
@@ -616,8 +689,8 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                         &mut replies,
                         &mut buffered,
                         &mut watched,
-                        &mut terminal,
-                        &mut sockets,
+                        &mut tracker,
+                        &mut registered,
                         &queue,
                     )?;
                     pipe_open = open;
@@ -638,8 +711,17 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                     }
                 }
                 Ok(EventFilter::EVFILT_PROC) => {
-                    // The process has ended; its number may be reused from now on.
-                    watched.remove(&i32::try_from(event.ident()).unwrap_or(0));
+                    // shortcut: a discovery error (full registry, kernel refusal) leaves that branch
+                    // untracked and is not reported; the sweep and the documented residual cover it.
+                    let exited = tracker.event(&queue, event).unwrap_or(false);
+                    if exited {
+                        // The root's slot is free again; its descendants stay in the tracker.
+                        watched.remove(&i32::try_from(event.ident()).unwrap_or(0));
+                    }
+                    if terminating.is_some() {
+                        // A process forked during the grace period is ended under the same deadline.
+                        let _ = tracker.signal(Signal::SIGTERM);
+                    }
                 }
                 _ => {}
             }
@@ -651,10 +733,50 @@ fn zero() -> nix::libc::timespec {
     *TimeSpec::from_duration(Duration::ZERO).as_ref()
 }
 
-fn send_all(watched: &Watched, signal: Signal) {
-    for (target, _) in watched.values() {
-        target.send(signal);
+/// Finds leftovers the process tracker missed and adopts them, so they are signalled with the rest.
+///
+/// Two sources, neither of which proves anything: processes whose environment holds the run's
+/// token (found by comparing two `ps` listings, so a token in an argument does not count), and
+/// processes still using the per-run directory. Every candidate is re-read and must be the same
+/// user and no older than the earliest root before it is adopted. A source that cannot be read is
+/// skipped; the tracker stays the primary mechanism. Returns how many leftovers were adopted.
+fn sweep_for_leftovers(tracker: &mut Tracker, queue: &Kqueue, registered: &Registered) -> usize {
+    let own = i32::try_from(std::process::id()).unwrap_or(0);
+    let mut candidates: Vec<i32> = Vec::new();
+    if let Some(token) = &registered.token {
+        if let (Ok(with_env), Ok(plain)) = (listing(true), listing(false)) {
+            let entry = token.entry();
+            // The text only nominates: an argument that shrank between the two reads, or a value
+            // containing a space, reads the same. Only a whole environment entry counts.
+            candidates.extend(
+                owned_by_token(&with_env, &plain, &entry)
+                    .pids
+                    .into_iter()
+                    .filter(|pid| holds_entry(*pid, &entry)),
+            );
+        }
     }
+    if let Some(dir) = &registered.session_dir {
+        if let Ok(holders) = holders_of(dir) {
+            candidates.extend(holders);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|pid| matches!(tracker.adopt_candidate(queue, *pid, own), Ok(true)))
+        .count()
+}
+
+/// What `hb` has told the guard to remember besides the processes: files to remove, the terminal to
+/// check, and where to look for leftovers.
+#[derive(Default)]
+struct Registered {
+    terminal: Option<TerminalWatch>,
+    sockets: Vec<PathBuf>,
+    token: Option<LaunchToken>,
+    session_dir: Option<PathBuf>,
+    /// Whether the look made after the tracked processes ended has been done.
+    final_sweep_done: bool,
 }
 
 /// Reads what is available, runs the complete lines, and reports whether to stop and whether the
@@ -664,8 +786,8 @@ fn read_commands(
     replies: &mut File,
     buffered: &mut Vec<u8>,
     watched: &mut Watched,
-    terminal: &mut Option<TerminalWatch>,
-    sockets: &mut Vec<PathBuf>,
+    tracker: &mut Tracker,
+    registered: &mut Registered,
     queue: &Kqueue,
 ) -> Result<(Next, bool), GuardError> {
     let mut chunk = [0u8; 256];
@@ -692,25 +814,35 @@ fn read_commands(
                 return Ok((Next::Release, true));
             }
             Ok(GuardCommand::Watch(target)) => {
-                let _ = watch(target, WatchRole::Broker, watched, queue);
+                let _ = watch(target, WatchRole::Broker, watched, tracker, queue);
             }
             Ok(GuardCommand::AckWatch { id, role, target }) => {
-                let body = match watch(target, role, watched, queue) {
+                let body = match watch(target, role, watched, tracker, queue) {
                     Ok(WatchOutcome::Armed) => "armed".to_owned(),
                     Ok(WatchOutcome::Gone) => "gone".to_owned(),
                     Err(reason) => format!("refused {reason}"),
                 };
                 reply(replies, id, &body);
             }
-            Ok(GuardCommand::Terminal(path)) => *terminal = TerminalWatch::open(&path),
+            Ok(GuardCommand::Terminal(path)) => registered.terminal = TerminalWatch::open(&path),
             Ok(GuardCommand::AckTerminal(id, path)) => {
-                *terminal = TerminalWatch::open(&path);
+                registered.terminal = TerminalWatch::open(&path);
                 reply(replies, id, "ok");
             }
-            Ok(GuardCommand::Socket(path)) if sockets.len() < MAX_SOCKETS => sockets.push(path),
+            Ok(GuardCommand::Socket(path)) if registered.sockets.len() < MAX_SOCKETS => {
+                registered.sockets.push(path);
+            }
             Ok(GuardCommand::Socket(_)) => {}
-            Ok(GuardCommand::AckSocket(id, path)) if sockets.len() < MAX_SOCKETS => {
-                sockets.push(path);
+            Ok(GuardCommand::AckSocket(id, path)) if registered.sockets.len() < MAX_SOCKETS => {
+                registered.sockets.push(path);
+                reply(replies, id, "ok");
+            }
+            Ok(GuardCommand::AckToken(id, value)) => {
+                registered.token = LaunchToken::parse(&value);
+                reply(replies, id, "ok");
+            }
+            Ok(GuardCommand::AckSessionDir(id, path)) => {
+                registered.session_dir = Some(path);
                 reply(replies, id, "ok");
             }
             Ok(GuardCommand::AckSocket(id, _)) => reply(replies, id, "refused capacity"),
@@ -742,10 +874,14 @@ fn reply_line(replies: &mut File, id: u64, body: &str) {
 type Watched = HashMap<i32, (Target, WatchRole)>;
 
 /// Starts watching `target`, unless it has already ended or there is no capacity.
+///
+/// Root admission (the slots) is counted here; the kernel watch and the descendants it leads to
+/// belong to the [`Tracker`].
 fn watch(
     target: Target,
     role: WatchRole,
     watched: &mut Watched,
+    tracker: &mut Tracker,
     queue: &Kqueue,
 ) -> Result<WatchOutcome, WatchRefusal> {
     let pid = match target {
@@ -767,25 +903,15 @@ fn watch(
     if full {
         return Err(WatchRefusal::Capacity);
     }
-    let exit = KEvent::new(
-        pid.as_raw() as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
-    record(
-        queue.kevent(&[exit], &mut [], Some(zero())),
-        target,
-        role,
-        watched,
-    )
+    // A group target leads its own group, which is scanned after the leader exits. A single
+    // process shares hb's group, which must never be adopted wholesale.
+    let armed = tracker.arm(queue, pid.as_raw(), matches!(target, Target::Group(_)));
+    record(armed, target, role, watched)
 }
 
-/// Turns the kernel's answer into an outcome, keeping only a target the kernel really watches.
+/// Turns the tracker's answer into an outcome, keeping only a root the kernel really watches.
 fn record(
-    installed: nix::Result<usize>,
+    armed: Result<Identity, TrackerError>,
     target: Target,
     role: WatchRole,
     watched: &mut Watched,
@@ -793,12 +919,18 @@ fn record(
     let pid = match target {
         Target::Group(pid) | Target::Child(pid) => pid,
     };
-    match installed {
+    match armed {
         Ok(_) => {
             watched.insert(pid.as_raw(), (target, role));
             Ok(WatchOutcome::Armed)
         }
-        Err(Errno::ESRCH) => Ok(WatchOutcome::Gone),
+        Err(TrackerError::Identity {
+            source: IdentityError::Gone { .. },
+        }) => Ok(WatchOutcome::Gone),
+        Err(TrackerError::Watch {
+            source: Errno::ESRCH,
+        }) => Ok(WatchOutcome::Gone),
+        Err(TrackerError::Capacity) => Err(WatchRefusal::Capacity),
         Err(_) => Err(WatchRefusal::Kernel),
     }
 }
@@ -925,11 +1057,12 @@ mod tests {
     fn broker_watches_get_their_slots_even_after_the_core_slots_are_used() {
         let queue = assert_ok!(Kqueue::new());
         let mut watched = Watched::new();
+        let mut tracker = Tracker::default();
         let mut children: Vec<_> = (0..MAX_WATCHED + 1).map(|_| sleeper()).collect();
         let pid =
             |c: &std::process::Child| Pid::from_raw(i32::try_from(c.id()).unwrap_or(i32::MAX));
-        let arm = |c: &std::process::Child, role, w: &mut Watched| {
-            watch(Target::Child(pid(c)), role, w, &queue)
+        let mut arm = |c: &std::process::Child, role, w: &mut Watched| {
+            watch(Target::Child(pid(c)), role, w, &mut tracker, &queue)
         };
         for child in &children[..RESERVED_CORE] {
             assert_eq!(
@@ -963,6 +1096,7 @@ mod tests {
     fn brokers_cannot_take_the_reserved_core_slots() {
         let queue = assert_ok!(Kqueue::new());
         let mut watched = Watched::new();
+        let mut tracker = Tracker::default();
         let mut children: Vec<_> = (0..MAX_WATCHED).map(|_| sleeper()).collect();
         let pid =
             |c: &std::process::Child| Pid::from_raw(i32::try_from(c.id()).unwrap_or(i32::MAX));
@@ -973,6 +1107,7 @@ mod tests {
                     Target::Group(pid(child)),
                     WatchRole::Broker,
                     &mut watched,
+                    &mut tracker,
                     &queue
                 )),
                 WatchOutcome::Armed
@@ -983,6 +1118,7 @@ mod tests {
                 Target::Group(pid(&children[broker_slots])),
                 WatchRole::Broker,
                 &mut watched,
+                &mut tracker,
                 &queue
             ),
             Err(WatchRefusal::Capacity)
@@ -993,6 +1129,7 @@ mod tests {
                     Target::Child(pid(child)),
                     WatchRole::Core,
                     &mut watched,
+                    &mut tracker,
                     &queue
                 )),
                 WatchOutcome::Armed
@@ -1005,20 +1142,42 @@ mod tests {
     }
 
     #[test]
-    fn a_kernel_refusal_is_reported_and_nothing_is_recorded() {
+    fn a_tracker_refusal_is_reported_and_nothing_is_recorded() {
         let target = Target::Child(Pid::from_raw(4242));
         let mut watched = Watched::new();
+        let gone = || {
+            Err(TrackerError::Identity {
+                source: IdentityError::Gone { pid: 4242 },
+            })
+        };
+        let denied = || {
+            Err(TrackerError::Watch {
+                source: Errno::EPERM,
+            })
+        };
         assert_eq!(
-            record(Err(Errno::EPERM), target, WatchRole::Core, &mut watched),
+            record(denied(), target, WatchRole::Core, &mut watched),
             Err(WatchRefusal::Kernel)
         );
         assert_eq!(
-            record(Err(Errno::ESRCH), target, WatchRole::Core, &mut watched),
+            record(gone(), target, WatchRole::Core, &mut watched),
             Ok(WatchOutcome::Gone)
         );
-        assert!(watched.is_empty());
         assert_eq!(
-            record(Ok(0), target, WatchRole::Broker, &mut watched),
+            record(
+                Err(TrackerError::Capacity),
+                target,
+                WatchRole::Core,
+                &mut watched
+            ),
+            Err(WatchRefusal::Capacity)
+        );
+        assert!(watched.is_empty());
+        let identity = assert_ok!(Identity::of(
+            i32::try_from(std::process::id()).unwrap_or(i32::MAX)
+        ));
+        assert_eq!(
+            record(Ok(identity), target, WatchRole::Broker, &mut watched),
             Ok(WatchOutcome::Armed)
         );
         assert_eq!(watched.get(&4242), Some(&(target, WatchRole::Broker)));
@@ -1028,6 +1187,7 @@ mod tests {
     fn a_duplicate_is_armed_once_a_conflict_is_refused_and_a_gone_target_is_reported() {
         let queue = assert_ok!(Kqueue::new());
         let mut watched = Watched::new();
+        let mut tracker = Tracker::default();
         let mut child = sleeper();
         let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
         assert_eq!(
@@ -1035,6 +1195,7 @@ mod tests {
                 Target::Group(pid),
                 WatchRole::Core,
                 &mut watched,
+                &mut tracker,
                 &queue
             )),
             WatchOutcome::Armed
@@ -1044,13 +1205,20 @@ mod tests {
                 Target::Group(pid),
                 WatchRole::Core,
                 &mut watched,
+                &mut tracker,
                 &queue
             )),
             WatchOutcome::Armed
         );
         assert_eq!(watched.len(), 1);
         assert_eq!(
-            watch(Target::Child(pid), WatchRole::Core, &mut watched, &queue),
+            watch(
+                Target::Child(pid),
+                WatchRole::Core,
+                &mut watched,
+                &mut tracker,
+                &queue
+            ),
             Err(WatchRefusal::Invalid)
         );
         let _ = child.kill();
@@ -1058,11 +1226,13 @@ mod tests {
         // A fresh queue: the first queue still holds the undelivered exit event for this pid.
         let fresh_queue = assert_ok!(Kqueue::new());
         let mut fresh = Watched::new();
+        let mut fresh_tracker = Tracker::default();
         assert_eq!(
             assert_ok!(watch(
                 Target::Child(pid),
                 WatchRole::Core,
                 &mut fresh,
+                &mut fresh_tracker,
                 &fresh_queue
             )),
             WatchOutcome::Gone
