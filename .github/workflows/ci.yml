@@ -44,6 +44,15 @@ jobs:
         run: |
           rustup toolchain install "$LINT_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
           rustup default "$LINT_TOOLCHAIN"
+      # hb's sandbox allows only the Command Line Tools developer directory, which is what it was
+      # built and measured against. The runner selects full Xcode, whose xcrun the ball blocks, so
+      # git and python3 shims fail inside it. Selecting the supported configuration is not a claim
+      # that Xcode-selected machines work (see the hb-je6 notes).
+      - name: Select the Command Line Tools
+        run: |
+          test -d /Library/Developer/CommandLineTools
+          sudo xcode-select -s /Library/Developer/CommandLineTools
+          xcode-select -p
       - name: Format
         run: cargo fmt --check
       - name: Clippy
