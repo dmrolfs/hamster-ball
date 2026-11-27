@@ -332,6 +332,8 @@ fn spawn_pty_reader(
         .name(format!("hb-pty-{}", id.0))
         .spawn(move || {
             let mut buffer = [0u8; super::terminal::READ_SIZE];
+            #[cfg(feature = "test-support")]
+            crash_for_test();
             // Ends on end of output or error, or within a poll of the session being abandoned.
             while !outbox.is_cancelled() {
                 match terminal.read(&mut buffer) {
@@ -353,6 +355,16 @@ fn spawn_pty_reader(
                 }
             }
         })
+}
+
+/// Makes the calling thread panic if a test asked for it, to show that a panic in a worker thread
+/// ends the whole supervisor cleanly. Only in test-support builds.
+#[cfg(feature = "test-support")]
+#[allow(clippy::panic)]
+fn crash_for_test() {
+    if std::env::var_os("HB_SUPERVISE_TEST_WORKER_PANIC").is_some() {
+        panic!("test panic in a worker thread");
+    }
 }
 
 /// The writer thread: sends queued input and Stop. If it fails the session cannot be steered, so

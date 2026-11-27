@@ -503,3 +503,40 @@ fn an_agent_that_never_reads_cannot_freeze_the_ui_and_quit_still_stops_it() {
     }
     assert!(!alive(pid), "the agent outlived quit");
 }
+
+#[test]
+fn a_panic_in_a_session_thread_restores_the_terminal_stops_the_agent_and_ends_nonzero() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.project.join("agent.pid");
+    let script = w.project.join("agent.sh");
+    common::write(
+        &script,
+        &format!("echo $$ > '{}'\nsleep 300\n", marker.display()),
+    );
+    // The variable is set for the supervisor and so for its threads; the sessions it starts are
+    // separate processes and unaffected. Only the first session's reader thread panics.
+    let mut owner = Owner::start(&w, &[("HB_SUPERVISE_TEST_WORKER_PANIC", "1")]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    // The panic happens as the session starts: the supervisor ends, nonzero, terminal restored.
+    assert_eq!(owner.exit_code(60), Some(1), "{}", owner.screen());
+    assert_restored(&owner);
+    let after = assert_some!(owner.after_leaving());
+    assert!(after.contains("test panic in a worker thread"), "{after:?}");
+    // Whatever agent was started is gone.
+    if let Some(pid) = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|t| t.trim().parse::<i32>().ok())
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive(pid), "the agent outlived a worker panic");
+    }
+}
