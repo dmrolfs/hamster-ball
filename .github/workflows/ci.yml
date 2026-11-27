@@ -31,6 +31,28 @@ env:
   MSRV: "1.88"
 
 jobs:
+  baseline:
+    name: unchanged hb-je6 baseline
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 99bc4c29dc4a10cbb3485e9e22e08b263e0dc6aa
+          persist-credentials: false
+      - name: Match validation environment
+        run: |
+          rustup toolchain install "$LINT_TOOLCHAIN" --profile minimal
+          rustup default "$LINT_TOOLCHAIN"
+          sudo xcode-select -s /Library/Developer/CommandLineTools
+          git rev-parse HEAD
+          sw_vers
+          sysctl -n hw.ncpu
+      - name: Baseline full suite
+        env:
+          HB_REQUIRE_SANDBOX: "1"
+        run: cargo test --locked --all-features --no-fail-fast
+
   quality:
     name: quality (fmt, clippy, rustdoc, tests)
     runs-on: macos-15
