@@ -166,11 +166,43 @@ fn alert_text(app: &App) -> Option<String> {
     Some(format!("{name}: {}", alert.text))
 }
 
+/// The project's name for display. It is the agent's to choose, so it is escaped by the same rule
+/// as every other untrusted text in the product (control, escape and direction characters become
+/// visible `\u{..}` forms) and never trusted to look like anything the supervisor says.
 fn session_name(session: &Session) -> String {
-    session.spec.project.file_name().map_or_else(
+    let raw = session.spec.project.file_name().map_or_else(
         || session.spec.project.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
-    )
+    );
+    crate::text::Escaped(&raw).to_string()
+}
+
+/// The part of a row that is the supervisor's: the state words, and the unread count after them.
+fn row_tail(session: &Session) -> String {
+    let mut tail = state_words(session);
+    if session.unread_denials > 0 {
+        tail.push_str(&format!(" ({})", session.unread_denials));
+    }
+    tail
+}
+
+/// One row of the list in `width` columns: the number and the name on the left, cut with `~` if it
+/// does not fit, and the state on the right where a name cannot reach it. The name is the
+/// agent's; the state is the supervisor's, so the state is the one that always stays.
+fn row_text(index: usize, session: &Session, width: usize) -> (String, String) {
+    let tail = row_tail(session);
+    let head = format!("{} {}", index + 1, session_name(session));
+    // One space between the name and the state, and the tail never shrinks.
+    let room = width.saturating_sub(tail.chars().count() + 1);
+    let shown: String = if head.chars().count() > room {
+        let keep = room.saturating_sub(1);
+        let mut cut: String = head.chars().take(keep).collect();
+        cut.push('~');
+        cut
+    } else {
+        head
+    };
+    (format!("{shown} "), tail)
 }
 
 /// The words a row shows for a phase.
@@ -239,12 +271,19 @@ fn draw_sessions(frame: &mut Frame<'_>, rect: Rect, app: &App, look: Look) {
         .iter()
         .enumerate()
         .map(|(i, session)| {
+            // The block's border and the highlight symbol take 4 columns of the list's width.
+            let (head, tail) = row_text(i, session, usize::from(rect.width).saturating_sub(4));
+            let words = state_words(session);
+            let count = tail
+                .strip_prefix(words.as_str())
+                .unwrap_or_default()
+                .to_owned();
             let mut spans = vec![
-                Span::raw(format!("{} {} ", i + 1, session_name(session))),
-                Span::styled(state_words(session), state_style(look, session)),
+                Span::raw(head),
+                Span::styled(words, state_style(look, session)),
             ];
-            if session.unread_denials > 0 {
-                spans.push(Span::raw(format!(" ({})", session.unread_denials)));
+            if !count.is_empty() {
+                spans.push(Span::raw(count));
             }
             ListItem::new(Line::from(spans))
         })
@@ -955,6 +994,84 @@ mod tests {
                 }
                 let _ = render(&scene, cols, rows, COLOR);
             }
+        }
+    }
+
+    // ========================================================================
+    // A project's name is the agent's to choose; the state words are the supervisor's
+    // ========================================================================
+
+    /// The first row of the session list, as the owner sees it at `cols` wide.
+    fn first_row(project: &str, cols: u16) -> String {
+        let mut app = App::new();
+        launch(&mut app, project, "claude");
+        event(&mut app, 1, 1, Event::Starting {});
+        event(
+            &mut app,
+            1,
+            2,
+            Event::ApprovalRequired { root: "/x".into() },
+        );
+        let scene = Scene {
+            app,
+            screens: HashMap::new(),
+        };
+        let text = render(&scene, cols, 24, PLAIN);
+        text.lines()
+            .find(|l| l.contains("Approve") || l.contains("Running"))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_long_name_cannot_push_the_real_state_out_of_the_row() {
+        let name = format!("{}Running", "x".repeat(60));
+        let row = first_row(&name, 80);
+        assert!(
+            row.contains("Approve"),
+            "the real state was pushed off: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_says_running_is_not_mistaken_for_the_state() {
+        let row = first_row("billing Running", 80);
+        // The name is shown as it is, and what the supervisor says comes last and is true.
+        assert!(row.contains("billing Running Approve"), "{row:?}");
+        // The row's last word before the border is the real state, whatever the name says.
+        assert!(
+            row.trim_end_matches(['│', ' ']).ends_with("Approve"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_with_controls_or_format_characters_is_shown_escaped() {
+        for hostile in [
+            "a\u{1b}[2Jb",
+            "a\u{202e}Running",
+            "tab\there",
+            "nl\nRunning",
+        ] {
+            let row = first_row(hostile, 80);
+            assert!(
+                row.trim_end_matches(['│', ' ']).ends_with("Approve"),
+                "{hostile:?} -> {row:?}"
+            );
+            // No raw control or direction character reaches the screen, anywhere on it.
+            let mut app = App::new();
+            launch(&mut app, hostile, "claude");
+            let scene = Scene {
+                app,
+                screens: HashMap::new(),
+            };
+            let screen = render(&scene, 80, 24, PLAIN);
+            assert!(
+                !screen
+                    .chars()
+                    .any(|c| c == '\u{1b}' || c == '\u{202e}' || (c.is_control() && c != '\n')),
+                "{hostile:?} reached the screen: {screen:?}"
+            );
         }
     }
 }
