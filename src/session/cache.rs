@@ -8,8 +8,11 @@
 //! nothing falls back to the old shared cache.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -692,37 +695,84 @@ fn tree_bytes(root: &Path, limits: CacheLimits) -> Result<u64, CacheError> {
     Ok(total)
 }
 
-/// Removes `path` and everything under it without following links; a missing path is fine.
+/// Removes `path` and everything under it without following a link at any point; a missing
+/// path is fine.
+///
+/// Works through held directory descriptors: it opens the root with `O_NOFOLLOW`, and for each
+/// child uses `fstatat`/`unlinkat`/`openat` relative to the parent it already holds. A symlink,
+/// at the root or inside, is unlinked as a link and never entered, so a writer that swaps a
+/// directory for a link while this runs cannot make it remove or `chmod` anything outside. A
+/// directory a run made unreadable is made owner-accessible through its own descriptor first.
 ///
 /// # Errors
 /// [`CacheError::Cleanup`] if something is left behind.
 pub fn remove_tree(path: &Path) -> Result<(), CacheError> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(CacheError::Cleanup {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-        Ok(_) => {}
-    }
-    // A run may have made directories unreadable; make ours writable again before removing.
-    reopen(path);
-    fs::remove_dir_all(path).context(CleanupSnafu { path })
+    let fail = |source: io::Error| CacheError::Cleanup {
+        path: path.to_path_buf(),
+        source,
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(fail(io::Error::from(io::ErrorKind::InvalidInput)));
+    };
+    let parent_fd = match open_dir_nofollow(rustix::fs::CWD, parent.as_os_str()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(fail(e.into())),
+    };
+    remove_entry(&parent_fd, name).map_err(fail)
 }
 
-/// Makes every directory under `dir` (and `dir`) owner-accessible so `remove_dir_all` can enter it.
-fn reopen(dir: &Path) {
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+/// Removes the entry `name` of the directory `parent`: a link or file is unlinked, a directory
+/// is emptied (through its own descriptor) and then removed.
+fn remove_entry(parent: &OwnedFd, name: &OsStr) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            reopen(&entry.path());
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return unlinkat(parent, name, AtFlags::empty()).map_err(Into::into);
+    }
+    // A run may have made the directory unreadable, which would stop us opening it. Make it
+    // owner-accessible by name relative to the parent we hold, but only after `stat` said it is
+    // a real directory; the open below then refuses a link that replaced it in between, and the
+    // descriptor-based `fchmod` fixes whatever we actually opened. `SYMLINK_NOFOLLOW` makes a
+    // link that took its place get chmod-ed as a link (a no-op on its target) instead of followed.
+    if stat.st_mode & 0o700 != 0o700 {
+        let _ = rustix::fs::chmodat(
+            parent,
+            name,
+            rustix::fs::Mode::from_raw_mode(0o700),
+            AtFlags::SYMLINK_NOFOLLOW,
+        );
+    }
+    let dir = open_dir_nofollow(parent, name)?;
+    rustix::fs::fchmod(&dir, rustix::fs::Mode::from_raw_mode(0o700))?;
+    let mut names = Vec::new();
+    let mut entries = rustix::fs::Dir::read_from(&dir)?;
+    while let Some(entry) = entries.read() {
+        let entry = entry?;
+        let child = entry.file_name().to_bytes();
+        if child != b"." && child != b".." {
+            names.push(OsString::from_vec(child.to_vec()));
         }
     }
+    for child in &names {
+        remove_entry(&dir, child)?;
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(Into::into)
+}
+
+/// Opens directory `name` relative to `parent` without following a link in the last component.
+fn open_dir_nofollow(parent: impl AsFd, name: impl rustix::path::Arg) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, openat};
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
 }
 
 /// The manifest format this hb writes and reads.
@@ -2112,6 +2162,63 @@ mod tests {
                 }
             ),
             "{got}"
+        );
+    }
+
+    #[test]
+    fn test_remove_tree_on_a_root_that_was_swapped_for_a_link_removes_the_link_and_touches_nothing_outside()
+     {
+        let (d, _src, sess) = session();
+        let outside = d.path().join("victim");
+        put(&outside.join("sub/f"), "keep");
+        assert_ok!(fs::set_permissions(
+            outside.join("sub"),
+            fs::Permissions::from_mode(0o755)
+        ));
+        let root = sess.join("workspace");
+        assert_ok!(symlink(&outside, &root));
+        assert_ok!(remove_tree(&root));
+        assert!(
+            fs::symlink_metadata(&root).is_err(),
+            "the link itself is gone"
+        );
+        assert_eq!(
+            assert_ok!(fs::read_to_string(outside.join("sub/f"))),
+            "keep"
+        );
+        let mode = assert_ok!(fs::metadata(outside.join("sub")))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "nothing outside was chmod-ed");
+    }
+
+    #[test]
+    fn test_remove_tree_does_not_chmod_through_a_link_inside_the_tree() {
+        let (d, _src, sess) = session();
+        let outside = d.path().join("victim");
+        put(&outside.join("sub/f"), "keep");
+        assert_ok!(fs::set_permissions(
+            outside.join("sub"),
+            fs::Permissions::from_mode(0o755)
+        ));
+        let tree = sess.join("t");
+        put(&tree.join("a/f"), "x");
+        assert_ok!(symlink(&outside, tree.join("a/escape")));
+        assert_ok!(fs::set_permissions(
+            tree.join("a"),
+            fs::Permissions::from_mode(0o000)
+        ));
+        assert_ok!(remove_tree(&tree));
+        assert!(!tree.exists());
+        let mode = assert_ok!(fs::metadata(outside.join("sub")))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "nothing outside was chmod-ed");
+        assert_eq!(
+            assert_ok!(fs::read_to_string(outside.join("sub/f"))),
+            "keep"
         );
     }
 }
