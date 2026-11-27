@@ -21,12 +21,14 @@ pub mod config;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 pub mod ctl;
+pub mod diagnostic;
 pub mod error;
 pub mod explain;
 pub mod guard;
 pub mod origin;
 pub mod policy;
 pub mod proxy;
+pub(crate) mod safe_json;
 pub mod seatbelt;
 pub mod session;
 pub(crate) mod sys;
