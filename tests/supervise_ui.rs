@@ -351,7 +351,7 @@ fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the
         "the supervisor quit on a stale key"
     );
     // A fresh answer approves, and the same session starts again.
-    owner.send(b"y\n");
+    owner.send(format!("approve {}\n", assert_some!(code_shown(&owner))).as_bytes());
     assert!(
         appears(&ran, 20),
         "approved, but the agent never started; the screen:\n{}\nraw tail: {:?}",
@@ -380,6 +380,15 @@ fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the
 }
 
 /// Starts an unapproved session and asks for its review, leaving the prompt on screen unanswered.
+/// The code the review's question shows, read off the terminal bytes: the last one, so an earlier
+/// review's is never taken.
+fn code_shown(owner: &Owner) -> Option<String> {
+    let text = owner.text();
+    let (_, tail) = text.rsplit_once("Type `approve ")?;
+    let code: String = tail.chars().take_while(char::is_ascii_hexdigit).collect();
+    (code.len() == 6).then_some(code)
+}
+
 fn start_review(w: &World) -> Owner {
     let script = w.project.join("agent.sh");
     common::write(&script, "sleep 300\n");

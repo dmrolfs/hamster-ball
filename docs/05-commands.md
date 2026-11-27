@@ -67,11 +67,13 @@ Warnings you may see include `project_not_granted` (no grant covers the project)
 Reviews this project's config and records your approval.
 
 ```
-Approve this config? [y/N]
+Approve this config? Type `approve 3fa9c2` to approve:
 ```
 
 It shows the project root, each file with a short digest, and what the project adds beyond your base.
-It accepts only a typed `y` or `yes`, and only at a terminal.
+It accepts only the words `approve` and the six-digit code shown with that question, typed at a terminal.
+The code is new for every question, and anything typed before the question appeared is discarded, so a pasted or queued answer cannot approve a config you did not read.
+A plain `y` or `yes` does nothing.
 There is no `--yes`.
 
 | Option | Meaning |

@@ -74,7 +74,8 @@ fn at_a_terminal(w: &World, args: &[&str], answer: &str) -> (String, i32) {
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
          set timeout 30\n{guard}spawn {drive} {args}\n\
-         expect -ex {{Approve this config? [y/N] }}\nsend {{{answer}}}\nsend \"\\r\"\n\
+         expect -re {{Type `approve ([0-9a-f]+)` to approve: }}\nset code $expect_out(1,string)\n\
+         send \"{answer}\"\nsend \"\\r\"\n\
          expect eof\ncatch wait result\nputs \"EXIT=[lindex $result 3]\"\n",
         home = w.home_dir().display(),
         cwd = w.project.display(),
@@ -187,10 +188,10 @@ fn hb_approve_without_a_terminal_is_exit_78_and_stores_nothing() {
 }
 
 #[test]
-fn a_yes_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
+fn the_typed_approval_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
     sandboxed!();
     let w = World::new(PROJECT);
-    let (text, exit) = at_a_terminal(&w, &["approve"], "y");
+    let (text, exit) = at_a_terminal(&w, &["approve"], "approve $code");
     if exit == -2 {
         eprintln!("SKIP: no expect to provide a terminal");
         return;
@@ -203,7 +204,7 @@ fn a_yes_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
 }
 
 #[test]
-fn anything_but_yes_at_the_terminal_leaves_the_config_unapproved() {
+fn anything_but_the_typed_approval_at_the_terminal_leaves_the_config_unapproved() {
     sandboxed!();
     let w = World::new(PROJECT);
     let (text, exit) = at_a_terminal(&w, &["approve"], "no");
@@ -216,10 +217,35 @@ fn anything_but_yes_at_the_terminal_leaves_the_config_unapproved() {
 }
 
 #[test]
-fn hb_run_at_a_terminal_asks_then_runs_the_command_on_a_yes() {
+fn a_plain_y_or_yes_or_a_made_up_code_at_the_terminal_no_longer_approves() {
+    sandboxed!();
+    for answer in [
+        "y",
+        "yes",
+        "approve",
+        "approve 000000",
+        "approve $code extra",
+    ] {
+        let w = World::new(PROJECT);
+        let (text, exit) = at_a_terminal(&w, &["approve"], answer);
+        if exit == -2 {
+            eprintln!("SKIP: no expect to provide a terminal");
+            return;
+        }
+        assert_eq!(exit, NOT_APPROVED, "{answer:?}: {text}");
+        assert_eq!(records(&w), 0, "{answer:?}");
+    }
+}
+
+#[test]
+fn hb_run_at_a_terminal_asks_then_runs_the_command_on_the_typed_approval() {
     sandboxed!();
     let w = World::new(PROJECT);
-    let (text, exit) = at_a_terminal(&w, &["run", "/bin/sh", "-c", &marker_script(&w)], "yes");
+    let (text, exit) = at_a_terminal(
+        &w,
+        &["run", "/bin/sh", "-c", &marker_script(&w)],
+        "approve $code",
+    );
     if exit == -2 {
         eprintln!("SKIP: no expect to provide a terminal");
         return;
