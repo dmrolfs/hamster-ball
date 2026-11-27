@@ -29,8 +29,8 @@ use crate::session::reporter::{Lifecycle, Reporter};
 use crate::session::signals::{StopSignal, block_supervised};
 use crate::session::supervised::{Cleanup, Event};
 use crate::session::{
-    DenialSink, ExitKind, OnStart, PtyMode, RunError, RunSpec, SESSION_MARKER, SignalMode,
-    StdioMode, check_nesting,
+    DenialSink, ExitKind, OnStart, OnStopping, PtyMode, RunError, RunSpec, SESSION_MARKER,
+    SignalMode, StdioMode, check_nesting,
 };
 use crate::system::{Environment, StateDir};
 
@@ -189,6 +189,10 @@ fn spec_for(
     }
     spec.proxy_summary = false;
     spec.telemetry = Some(telemetry);
+    let stopping = events.clone();
+    spec.on_stopping = Some(OnStopping(Arc::new(move || {
+        stopping.send(Event::Stopping {})
+    })));
     let running = events.clone();
     spec.on_start = Some(OnStart(Arc::new(move |pid| {
         running.send(Event::Running { agent_pid: pid });

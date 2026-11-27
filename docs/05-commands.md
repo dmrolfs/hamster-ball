@@ -62,6 +62,14 @@ path /Users/you/.ssh/id_rsa
 
 Warnings you may see include `project_not_granted` (no grant covers the project), `grant_shadowed_by_floor` (a grant the floor overrides), `git_config_unreadable` and `not_approved`.
 
+## `hb-supervise`: private channel environment
+
+The launcher passes the private channel descriptor number in `HB_SUPERVISOR_FD`.
+The live `hb` process retains that variable; it is excluded from child environment snapshots.
+Child commands use explicit environments, while descriptor sweeping and close-on-exec independently prevent channel inheritance.
+This is snapshot exclusion, not immediate erasure from the live process environment.
+The descriptor number alone is not access to the channel.
+
 ## `hb-supervise`: restart and cleanup evidence
 
 Restart prevents overlap between the old and new agent leaders.

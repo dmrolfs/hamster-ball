@@ -320,6 +320,19 @@ fn an_unapproved_config_is_reported_not_asked_about_and_nothing_runs() {
     sandboxed!();
     let w = World::new(PROJECT);
     let marker = w.project.join("ran");
+    let hook_marker = w.base.join("hook-ran");
+    let hook = tool(
+        &w,
+        "approval-hook",
+        &format!("touch '{}'", hook_marker.display()),
+    );
+    with_base(
+        &w,
+        &format!(
+            "[fs]\nwrite = [\".\"]\n[hooks.pre_run.check]\ncommand = [\"{}\"]\n",
+            hook.display()
+        ),
+    );
     let session = Session::start(
         &w,
         &[],
@@ -338,10 +351,23 @@ fn an_unapproved_config_is_reported_not_asked_about_and_nothing_runs() {
     );
     assert!(!ended.kinds().iter().any(|k| k == "running"));
     assert!(!marker.exists(), "the agent ran");
+    assert!(!hook_marker.exists(), "host hook ran before approval");
     assert!(
         !ended.stdout.contains("Approve this config"),
         "a prompt was written: {}",
         ended.stdout
+    );
+    let approved = Session::start(
+        &w,
+        &[],
+        &["/bin/sh", "-c", &format!("touch '{}'", marker.display())],
+        true,
+    )
+    .finish(60);
+    assert_eq!(approved.status.code(), Some(0), "{}", approved.stderr);
+    assert!(
+        hook_marker.exists() && marker.exists(),
+        "approved control must execute both"
     );
 }
 
@@ -385,6 +411,51 @@ fn the_agent_cannot_see_or_use_the_channel_and_the_control_shows_the_attack_work
         "{:?}",
         ended.frames
     );
+}
+
+#[test]
+fn stopping_is_reported_before_a_term_trapping_agent_finishes() {
+    sandboxed!();
+    for os_signal in [false, true] {
+        let w = World::new(PROJECT);
+        let ready = w.project.join("ready");
+        let release = w.project.join("release");
+        let script = format!(
+            "trap 'while [ ! -f \"{release}\" ]; do sleep 0.02; done; exit 0' TERM; \
+             echo $$ > '{ready}.tmp'; mv '{ready}.tmp' '{ready}'; while :; do sleep 0.02; done",
+            release = release.display(),
+            ready = ready.display(),
+        );
+        let mut session = Session::start(&w, &[], &["/bin/sh", "-c", &script], true);
+        session.wait_for("running", 60);
+        let pid: i32 = assert_ok!(wait_for_file(&ready, 20).trim().parse());
+        assert!(pid > 1 && alive(pid));
+        if os_signal {
+            assert_ok!(kill(
+                Pid::from_raw(session.child.id() as i32),
+                nix::sys::signal::Signal::SIGTERM
+            ));
+        } else {
+            assert_ok!(session.peer.write_all(b"{\"cmd\":\"stop\"}\n"));
+        }
+        session.wait_for("stopping", 10);
+        let still_alive = alive(pid);
+        // Release even on the old implementation's late report, before checking the observation.
+        write(&release, "done");
+        let ended = session.finish(30);
+        assert!(
+            still_alive,
+            "Stopping arrived only after agent exit (os_signal={os_signal})"
+        );
+        assert_eq!(
+            ended
+                .frames
+                .iter()
+                .filter(|f| matches!(f.event, Event::Stopping {}))
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]

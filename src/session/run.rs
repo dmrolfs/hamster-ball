@@ -35,7 +35,9 @@ use super::pty::{Pty, PtyError};
 use super::pump::Pump;
 use super::reporter::Telemetry;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
-use super::signals::{Escalation, Setup, SignalError, StopSignal, Supervisor, Target, Watch};
+use super::signals::{
+    Escalation, OnStopping, Setup, SignalError, StopSignal, Supervisor, Target, Watch,
+};
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
 use crate::policy::HostRule;
@@ -124,6 +126,8 @@ pub struct RunSpec {
     pub telemetry: Option<Telemetry>,
     /// Called with the agent's process id once it is running under the sandbox.
     pub on_start: Option<OnStart>,
+    /// Called when shutdown begins, before cleanup; must return promptly.
+    pub on_stopping: Option<OnStopping>,
 }
 
 /// A function called with the agent's process id; a newtype so [`RunSpec`] can stay `Debug`.
@@ -164,6 +168,7 @@ impl RunSpec {
             stop: None,
             telemetry: None,
             on_start: None,
+            on_stopping: None,
         }
     }
 
@@ -524,7 +529,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     // anything that arrives after is left for the thread that supervises the child.
     let watch = match spec.signals {
         SignalMode::Off => None,
-        SignalMode::Forward { .. } => Some(Watch::prepare(pty.is_some())?),
+        SignalMode::Forward { .. } => {
+            Some(Watch::prepare(pty.is_some())?.on_stopping(spec.on_stopping.clone()))
+        }
     };
     if let (Some(watch), Some(stop)) = (&watch, &spec.stop) {
         stop.attach(watch.trigger());
@@ -775,7 +782,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     if let Some(on_start) = &spec.on_start {
         (on_start.0)(running.child.id());
     }
-    let waited = running.wait_for_exit(spec.stdio);
+    let waited = running.wait_for_exit(spec.stdio, spec.on_stopping.as_ref());
     let denials = log.map(LogStream::finish).unwrap_or_default();
     if let Some(ctl) = ctl {
         ctl.broker.finish();
@@ -1079,7 +1086,11 @@ fn open_pty(spec: &RunSpec) -> Result<Option<Pty>, RunError> {
 
 impl Running {
     /// Waits for the child, then stops the signal thread, and returns how it ended.
-    fn wait_for_exit(self, stdio: StdioMode) -> Result<Waited, RunError> {
+    fn wait_for_exit(
+        self,
+        stdio: StdioMode,
+        on_stopping: Option<&OnStopping>,
+    ) -> Result<Waited, RunError> {
         let Self {
             child,
             supervisor,
@@ -1092,6 +1103,7 @@ impl Running {
                 Some(pid) => terminal.wait(pid),
                 None => Err(io::Error::other("the child has no valid pid")),
             };
+            OnStopping::notify(on_stopping);
             if let Some(supervisor) = supervisor {
                 supervisor.finish();
             }
@@ -1116,6 +1128,7 @@ impl Running {
                     .map(|status| (ExitKind::from_status(status), Vec::new(), Vec::new()))
             }
         };
+        OnStopping::notify(on_stopping);
         if let Some(supervisor) = supervisor {
             supervisor.finish();
         }

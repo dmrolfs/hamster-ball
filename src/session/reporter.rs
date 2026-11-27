@@ -86,6 +86,7 @@ struct Queues {
     /// The closing event, sent after everything else.
     last: Option<Event>,
     closing: bool,
+    stopping: bool,
     broken: bool,
 }
 
@@ -224,6 +225,12 @@ impl Lifecycle {
         let mut q = self.0.lock();
         if q.broken || q.closing {
             return;
+        }
+        match event {
+            Event::Stopping {} if q.stopping => return,
+            Event::Running { .. } if q.stopping => return,
+            Event::Stopping {} => q.stopping = true,
+            _ => {}
         }
         if q.deadlines.len() >= LIFECYCLE_CAPACITY {
             drop(q);
@@ -561,6 +568,39 @@ mod tests {
             },
             stop,
         )
+    }
+
+    #[test]
+    fn racing_running_and_stopping_never_publish_running_after_stopping() {
+        for _ in 0..32 {
+            let shared = queued();
+            let lifecycle = Lifecycle(Arc::clone(&shared));
+            lifecycle.send(Event::Starting {});
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            thread::scope(|scope| {
+                let ready = Arc::clone(&barrier);
+                let starting = lifecycle.clone();
+                scope.spawn(move || {
+                    ready.wait();
+                    starting.send(Event::Running { agent_pid: 5 });
+                });
+                barrier.wait();
+                lifecycle.send(Event::Stopping {});
+            });
+            lifecycle.send(Event::Stopping {});
+            lifecycle.send(Event::Running { agent_pid: 5 });
+            let q = shared.lock();
+            assert!(matches!(q.lifecycle.front(), Some(Event::Starting {})));
+            assert!(matches!(q.lifecycle.back(), Some(Event::Stopping {})));
+            assert_eq!(
+                q.lifecycle
+                    .iter()
+                    .filter(|e| matches!(e, Event::Stopping {}))
+                    .count(),
+                1
+            );
+            assert_eq!(q.deadlines.len(), q.lifecycle.len());
+        }
     }
 
     #[test]
@@ -929,6 +969,88 @@ mod tests {
             }
             assert!(stop.is_requested(), "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn real_proxy_audit_callbacks_report_exact_split_drops_on_the_wire() {
+        use crate::proxy::{AuditSink, Decision};
+        use crate::session::{DenialSink, proxy::ProxyTrail};
+        let shared = queued();
+        let telemetry = Telemetry(Arc::clone(&shared));
+        let sink = telemetry.clone();
+        let denial = DenialSink::Stream(Arc::new(move |line| sink.denial(line)));
+        let trail = ProxyTrail::new(Some(&denial), None).with_telemetry(Some(telemetry.clone()));
+        let mut event = AuditEvent {
+            host: None,
+            port: None,
+            decision: Decision::Allowed,
+            bytes_up: 1,
+            bytes_down: 2,
+        };
+        trail.record(&event);
+        assert!(matches!(
+            shared.lock().telemetry.front(),
+            Some(Event::Proxy { .. })
+        ));
+        for _ in 1..TELEMETRY_CAPACITY {
+            telemetry.denial("fill");
+        }
+        event.decision = Decision::Refused {
+            code: "not_allowed",
+            reason: "no grant".into(),
+        };
+        for _ in 0..3 {
+            trail.record(&event);
+        }
+        assert_eq!(trail.report().refusals, 3);
+        let (mut stream, peer) = assert_ok!(UnixStream::pair());
+        shared.lock().closing = true;
+        let writer = thread::spawn(move || write_loop(&mut stream, &shared));
+        let mut reader = BufReader::new(peer);
+        let mut dropped = None;
+        while let Some(line) = assert_ok!(read_line(&mut reader)) {
+            if let Event::Dropped { denials, proxy } = assert_ok!(decode_frame(&line)).event {
+                dropped = Some((denials, proxy));
+            }
+        }
+        assert_ok!(writer.join());
+        assert_eq!(dropped, Some((3, 3)));
+    }
+
+    #[test]
+    fn stalled_peer_does_not_block_the_real_proxy_audit_callback() {
+        use crate::proxy::{AuditSink, Decision};
+        use crate::session::{DenialSink, proxy::ProxyTrail};
+        let (reporter, _peer, stop) = connect(Duration::from_millis(300));
+        let telemetry = reporter.telemetry();
+        let sink = telemetry.clone();
+        let denial = DenialSink::Stream(Arc::new(move |line| sink.denial(line)));
+        let trail = ProxyTrail::new(Some(&denial), None).with_telemetry(Some(telemetry));
+        let event = AuditEvent {
+            host: None,
+            port: None,
+            decision: Decision::Refused {
+                code: "not_allowed",
+                reason: "x".repeat(1500),
+            },
+            bytes_up: 0,
+            bytes_down: 0,
+        };
+        let mut longest = Duration::ZERO;
+        for _ in 0..20_000 {
+            let before = Instant::now();
+            trail.record(&event);
+            longest = longest.max(before.elapsed());
+        }
+        assert!(
+            longest < Duration::from_millis(250),
+            "callback waited {longest:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stop.is_requested() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stop.is_requested());
     }
 
     #[test]

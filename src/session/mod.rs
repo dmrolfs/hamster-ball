@@ -51,5 +51,5 @@ pub use run::{
     DEFAULT_GRACE, ExitKind, OnStart, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode,
     WarmSpec, run,
 };
-pub use signals::{Escalation, Setup, Step, StopSignal, Trigger, Watch};
+pub use signals::{Escalation, OnStopping, Setup, Step, StopSignal, Trigger, Watch};
 pub use terminal::{RawMode, TerminalError};

@@ -117,13 +117,29 @@ impl Target {
     }
 }
 
-/// Signals registered with the kernel, before the child exists.
-///
-/// Registering first means a signal that arrives while the child is starting is queued for the
-/// thread, not lost.
+/// Notification that shutdown has begun. Must return promptly; may be called more than once.
+#[derive(Clone)]
+pub struct OnStopping(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for OnStopping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnStopping(..)")
+    }
+}
+
+impl OnStopping {
+    pub(crate) fn notify(callback: Option<&Self>) {
+        if let Some(callback) = callback {
+            (callback.0)();
+        }
+    }
+}
+
+/// Signals registered before the child exists, so startup signals are queued rather than lost.
 #[derive(Debug)]
 pub struct Watch {
     queue: Arc<Kqueue>,
+    on_stopping: Option<OnStopping>,
 }
 
 /// The identifier of the "stop" event.
@@ -172,7 +188,15 @@ impl Watch {
         queue.kevent(&changes, &mut [], None).context(KqueueSnafu)?;
         Ok(Self {
             queue: Arc::new(queue),
+            on_stopping: None,
         })
+    }
+
+    /// Installs a prompt notification before accepted shutdown actions.
+    #[must_use]
+    pub fn on_stopping(mut self, callback: Option<OnStopping>) -> Self {
+        self.on_stopping = callback;
+        self
     }
 
     /// A handle that makes the thread treat a stop as if SIGTERM had arrived.
@@ -196,9 +220,10 @@ impl Watch {
         let queue = Arc::clone(&self.queue);
         let stopped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stopped);
+        let on_stopping = self.on_stopping.clone();
         let handle = thread::Builder::new()
             .name("hb-setup-signals".to_owned())
-            .spawn(move || await_stop(&queue, &flag))
+            .spawn(move || await_stop(&queue, &flag, on_stopping.as_ref()))
             .context(ThreadSnafu)?;
         Ok(Setup {
             queue: Arc::clone(&self.queue),
@@ -219,9 +244,18 @@ impl Watch {
         on_winch: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Supervisor, SignalError> {
         let queue = Arc::clone(&self.queue);
+        let on_stopping = self.on_stopping;
         let handle = thread::Builder::new()
             .name("hb-signals".to_owned())
-            .spawn(move || supervise(&queue, target, rule, on_winch.as_deref()))
+            .spawn(move || {
+                supervise(
+                    &queue,
+                    target,
+                    rule,
+                    on_winch.as_deref(),
+                    on_stopping.as_ref(),
+                )
+            })
             .context(ThreadSnafu)?;
         Ok(Supervisor {
             queue: self.queue,
@@ -343,7 +377,7 @@ impl Drop for Setup {
 }
 
 /// The setup thread's body: any signal or the disconnect event sets `stopped`.
-fn await_stop(queue: &Kqueue, stopped: &AtomicBool) {
+fn await_stop(queue: &Kqueue, stopped: &AtomicBool, on_stopping: Option<&OnStopping>) {
     let blank = KEvent::new(
         0,
         EventFilter::EVFILT_USER,
@@ -364,9 +398,11 @@ fn await_stop(queue: &Kqueue, stopped: &AtomicBool) {
             match (event.filter(), event.ident()) {
                 (Ok(EventFilter::EVFILT_USER), STOP_ID) => ended = true,
                 (Ok(EventFilter::EVFILT_USER), DISCONNECT_ID) => {
+                    OnStopping::notify(on_stopping);
                     stopped.store(true, Ordering::SeqCst)
                 }
                 (Ok(EventFilter::EVFILT_SIGNAL), ident) if ident != WINCH as usize => {
+                    OnStopping::notify(on_stopping);
                     stopped.store(true, Ordering::SeqCst);
                 }
                 _ => {}
@@ -409,6 +445,7 @@ fn supervise(
     target: Target,
     mut rule: Escalation,
     on_winch: Option<&(dyn Fn() + Send + Sync)>,
+    on_stopping: Option<&OnStopping>,
 ) {
     let blank = KEvent::new(
         0,
@@ -429,13 +466,17 @@ fn supervise(
             Err(_) => return,
         };
         if ready == 0 {
-            apply(rule.on_tick(Instant::now()), target);
+            apply(rule.on_tick(Instant::now()), target, on_stopping);
             continue;
         }
         for event in &events[..ready] {
             match event.filter() {
                 Ok(EventFilter::EVFILT_USER) if event.ident() == DISCONNECT_ID => {
-                    apply(rule.on_signal(Signal::SIGTERM, Instant::now()), target);
+                    apply(
+                        rule.on_signal(Signal::SIGTERM, Instant::now()),
+                        target,
+                        on_stopping,
+                    );
                 }
                 Ok(EventFilter::EVFILT_USER) => return,
                 Ok(EventFilter::EVFILT_SIGNAL) => {
@@ -453,7 +494,7 @@ fn supervise(
                     }
                     // Several signals can arrive before the thread looks; two is enough to escalate.
                     for _ in 0..event.data().clamp(1, 2) {
-                        apply(rule.on_signal(signal, Instant::now()), target);
+                        apply(rule.on_signal(signal, Instant::now()), target, on_stopping);
                     }
                 }
                 _ => {}
@@ -462,7 +503,10 @@ fn supervise(
     }
 }
 
-fn apply(step: Step, target: Target) {
+fn apply(step: Step, target: Target, on_stopping: Option<&OnStopping>) {
+    if step != Step::Ignore {
+        OnStopping::notify(on_stopping);
+    }
     match step {
         Step::Ignore => {}
         Step::Forward(signal) => target.send(signal),
@@ -607,6 +651,57 @@ mod tests {
         })
         .join()
         .ok()
+    }
+
+    #[test]
+    fn setup_notifies_before_publishing_cancellation() {
+        let got = blocked(|| {
+            let notified = Arc::new(AtomicBool::new(false));
+            let called = Arc::clone(&notified);
+            let watch = Watch::prepare(false)
+                .ok()?
+                .on_stopping(Some(OnStopping(Arc::new(move || {
+                    called.store(true, Ordering::SeqCst);
+                }))));
+            let setup = watch.guard_setup().ok()?;
+            let flag = setup.flag();
+            watch.trigger().fire();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            let observed = flag.load(Ordering::SeqCst) && notified.load(Ordering::SeqCst);
+            Some(observed && setup.finish())
+        });
+        assert_eq!(got, Some(Some(true)));
+    }
+
+    #[test]
+    fn ignored_shared_terminal_signals_do_not_notify_or_signal_the_child() {
+        use claims::assert_ok;
+        use std::sync::atomic::AtomicUsize;
+        let count = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&count);
+        let callback = OnStopping(Arc::new(move || {
+            called.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut child = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let target = Target::Child(Pid::from_raw(child.id() as i32));
+        let (mut rule, now) = rule(true);
+        for signal in [Signal::SIGINT, Signal::SIGHUP] {
+            apply(rule.on_signal(signal, now), target, Some(&callback));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let alive = assert_ok!(child.try_wait()).is_none();
+        apply(
+            rule.on_signal(Signal::SIGTERM, now),
+            target,
+            Some(&callback),
+        );
+        let _ = child.kill();
+        assert_ok!(child.wait());
+        assert!(alive);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
