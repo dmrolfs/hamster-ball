@@ -10,6 +10,6 @@ pub mod outbox;
 pub mod runtime;
 pub mod session;
 pub mod terminal;
-pub mod terminal_guard;
+mod terminal_guard;
 pub mod ui;
 pub mod view;

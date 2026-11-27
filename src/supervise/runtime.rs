@@ -79,6 +79,18 @@ pub struct Stepped {
     pub quit: bool,
 }
 
+impl std::fmt::Debug for Runtime {
+    /// Without the configured environment, which can hold anything the caller put there.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("sessions", &self.app.sessions().len())
+            .field("live", &self.live.len())
+            .field("retiring", &self.retiring.len())
+            .field("waiting", &self.waiting.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The app, its workers and its inbox.
 pub struct Runtime {
     /// The state the screens draw.
@@ -555,5 +567,21 @@ mod tests {
     fn the_frame_cap_is_thirty_per_second() {
         assert_eq!(MAX_FPS, 30);
         assert!(FRAME >= Duration::from_millis(33) && FRAME <= Duration::from_millis(34));
+    }
+
+    #[test]
+    fn debug_shows_counts_and_never_the_environment() {
+        let mut runtime = Runtime::new(Paths {
+            hb: PathBuf::from("/nonexistent/hb"),
+            me: PathBuf::from("/nonexistent/hb-supervise"),
+            env: vec![("SECRET_TOKEN".into(), "hunter2".into())],
+        });
+        runtime.send(Msg::Launch(spec()));
+        let text = format!("{runtime:?}");
+        assert!(text.contains("sessions: 1"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("SECRET_TOKEN"),
+            "{text}"
+        );
     }
 }

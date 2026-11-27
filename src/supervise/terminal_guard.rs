@@ -104,6 +104,7 @@ impl TerminalGuard {
     }
 
     /// Whether the UI holds the terminal now.
+    #[cfg(test)]
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.active
