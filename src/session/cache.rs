@@ -714,7 +714,7 @@ pub fn remove_tree(path: &Path) -> Result<(), CacheError> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(fail(io::Error::from(io::ErrorKind::InvalidInput)));
     };
-    let parent_fd = match open_dir_nofollow(rustix::fs::CWD, parent.as_os_str()) {
+    let parent_fd = match open_path_nofollow(parent) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(fail(e.into())),
@@ -762,6 +762,28 @@ fn remove_entry(parent: &OwnedFd, name: &OsStr) -> io::Result<()> {
         remove_entry(&dir, child)?;
     }
     unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(Into::into)
+}
+
+/// Opens the absolute directory `path` one component at a time, each relative to the directory
+/// already held and none followed if it is a link. A symlink anywhere in the path, not only at
+/// its end, makes this fail with `ELOOP` instead of redirecting the caller.
+///
+/// An ancestor that is a link by design (macOS's `/var`, `/tmp` and `/etc`) is therefore refused
+/// too; callers pass canonical paths, as every path in this module already is.
+fn open_path_nofollow(path: &Path) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    let mut dir = openat(
+        CWD,
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    for part in path.components() {
+        if let std::path::Component::Normal(name) = part {
+            dir = open_dir_nofollow(&dir, name)?;
+        }
+    }
+    Ok(dir)
 }
 
 /// Opens directory `name` relative to `parent` without following a link in the last component.
@@ -2220,5 +2242,17 @@ mod tests {
             assert_ok!(fs::read_to_string(outside.join("sub/f"))),
             "keep"
         );
+    }
+
+    #[test]
+    fn test_remove_tree_refuses_a_path_whose_parent_component_is_a_link() {
+        let (d, _src, sess) = session();
+        let real = d.path().join("real");
+        put(&real.join("t/f"), "keep");
+        let via = sess.join("via");
+        assert_ok!(symlink(&real, &via));
+        let got = assert_err!(remove_tree(&via.join("t")));
+        assert!(matches!(got, CacheError::Cleanup { .. }), "{got}");
+        assert_eq!(assert_ok!(fs::read_to_string(real.join("t/f"))), "keep");
     }
 }
