@@ -53,7 +53,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       - name: Tests
-        run: cargo test --locked --all-features
+        run: cargo test --locked --all-features --no-fail-fast
 
   msrv:
     name: declared minimum compiler
