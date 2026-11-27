@@ -435,8 +435,21 @@ fn detach_patterns_are_ended_and_the_escape_rates_are_reported() {
     let double = escapes(DAEMON_DOUBLE_FORK, trials);
     let quick = escapes(DAEMON_QUICK_EXIT, trials);
     println!("RATES trials={trials} linger={linger} double_fork={double} quick_exit={quick}");
+    // The tracker alone (no sweep is registered here). The lingering leader is deterministic, so none
+    // may escape. The other two can lose the race by scheduling, so a small share is allowed: at most
+    // 2% of the trials, rounded up. That bound is a choice, not a derived number; the measured rate
+    // is 1 in 300 quiet and 0 in 300 under load (history/hb-caj-analysis-3.md).
+    let allowed = trials / 50 + 1;
     assert_eq!(
         linger, 0,
         "a descendant that left its session while its leader lingered escaped"
+    );
+    assert!(
+        double <= allowed,
+        "double fork: {double} of {trials} escaped, allowed {allowed}"
+    );
+    assert!(
+        quick <= allowed,
+        "quick exit: {quick} of {trials} escaped, allowed {allowed}"
     );
 }
