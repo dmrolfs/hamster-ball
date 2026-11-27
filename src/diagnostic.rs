@@ -14,12 +14,20 @@
 //! A consumer of version 1 follows these rules, all of which fail closed:
 //!
 //! 1. Ignore fields it does not know.
-//! 2. Show a `code` it does not know as written, and treat it as a finding.
+//! 2. Show a `code` it does not know as written (escaped for the terminal), and treat it as a finding.
 //! 3. Treat a `severity` it does not know as `error`.
 //! 4. Treat a `state` it does not know, or a missing `state`, as not complete.
 //! 5. Treat a check `id` it does not know as a check whose `state` still counts toward completeness.
 //! 6. Treat a `remedy` it does not know as `review_manually`.
 //! 7. If `schema_version` is higher than it supports, it cannot attest that the inspection was complete.
+//! 8. If a required field is missing or has the wrong type, it cannot attest completion. Required:
+//!    `schema_version` and `checks` on the report; `id` and `result` on a check; `state` on a result,
+//!    plus `value` for `complete` and `partial`, `gaps` (with `shown` and `omitted`) for `partial`,
+//!    and `gap` for `unavailable`. `subject` is always present; `null` means no subject.
+//!
+//! A report with no checks is complete over the checks it holds and says nothing about which checks
+//! should have run. Whoever builds a report must include an `unavailable` result for every check
+//! it was asked for and could not run.
 //!
 //! A parsed string is the original text: the JSON escapes control and bidirectional characters as
 //! `\uXXXX`, and a parser decodes them again. A consumer that prints a parsed `subject` to a terminal
@@ -331,6 +339,15 @@ mod tests {
         assert_ok!(serde_json::from_str(&assert_ok!(report.to_json())))
     }
 
+    fn diagnostic() -> Diagnostic {
+        Diagnostic {
+            code: DiagnosticCode::DirectoryUnreadable,
+            severity: Severity::Warning,
+            subject: Some(SafePath::new("/p/found")),
+            remedy: Remedy::ReviewManually,
+        }
+    }
+
     #[test]
     fn test_clean_empty_and_unavailable_serialize_differently() {
         let clean = parse(&report(Check::from_parts(Vec::new(), Gaps::new())));
@@ -341,52 +358,119 @@ mod tests {
             clean["checks"][0]["result"],
             json!({"state": "complete", "value": []})
         );
-        assert_eq!(unavailable["checks"][0]["result"]["state"], "unavailable");
-        assert!(unavailable["checks"][0]["result"].get("value").is_none());
+        assert_eq!(
+            unavailable["checks"][0]["result"],
+            json!({
+                "state": "unavailable",
+                "gap": {"code": "inspection_unavailable", "subject": "/usr/sbin/scutil"}
+            })
+        );
     }
 
     #[test]
     fn test_partial_carries_its_gaps_and_the_value() {
         let mut gaps = Gaps::new();
         gaps.push(gap(DiagnosticCode::DirectoryUnreadable, "/p/secret"));
-        let json = parse(&report(Check::from_parts(Vec::new(), gaps)));
-        let result = &json["checks"][0]["result"];
-        assert_eq!(result["state"], "partial");
-        assert_eq!(result["gaps"]["omitted"], 0);
-        assert_eq!(result["gaps"]["shown"][0]["code"], "directory_unreadable");
+        let json = parse(&report(Check::from_parts(vec![diagnostic()], gaps)));
+        assert_eq!(
+            json["checks"][0]["result"],
+            json!({
+                "state": "partial",
+                "value": [{
+                    "code": "directory_unreadable",
+                    "severity": "warning",
+                    "subject": "/p/found",
+                    "remedy": "review_manually"
+                }],
+                "gaps": {
+                    "shown": [{"code": "directory_unreadable", "subject": "/p/secret"}],
+                    "omitted": 0
+                }
+            })
+        );
     }
 
     #[test]
     fn test_gaps_past_the_cap_are_counted_and_keep_the_result_incomplete() {
+        assert_eq!(MAX_GAPS, 32);
+        for pushed in [MAX_GAPS - 1, MAX_GAPS, MAX_GAPS + 1, MAX_GAPS + 5] {
+            let mut gaps = Gaps::new();
+            for _ in 0..pushed {
+                gaps.push(gap(DiagnosticCode::DirectoryUnreadable, "/p"));
+            }
+            assert_eq!(gaps.shown().len(), pushed.min(MAX_GAPS));
+            assert_eq!(gaps.omitted(), pushed.saturating_sub(MAX_GAPS) as u64);
+            assert!(!Check::from_parts((), gaps).is_complete());
+        }
+    }
+
+    #[test]
+    fn test_the_omitted_count_saturates() {
         let mut gaps = Gaps::new();
-        for _ in 0..MAX_GAPS + 5 {
+        for _ in 0..MAX_GAPS {
             gaps.push(gap(DiagnosticCode::DirectoryUnreadable, "/p"));
         }
-        assert_eq!(gaps.shown().len(), MAX_GAPS);
-        assert_eq!(gaps.omitted(), 5);
+        gaps.omitted = u64::MAX;
+        gaps.push(gap(DiagnosticCode::DirectoryUnreadable, "/p"));
+        assert_eq!(gaps.omitted(), u64::MAX);
+    }
+
+    #[test]
+    fn test_gaps_with_only_an_omitted_count_are_not_empty() {
+        let gaps = Gaps {
+            shown: Vec::new(),
+            omitted: 1,
+        };
+        assert!(!gaps.is_empty());
         assert!(!Check::from_parts((), gaps).is_complete());
     }
 
     #[test]
     fn test_control_and_bidi_characters_never_render_raw() {
-        let hostile = "/p/\u{1b}[2J\nx\u{202e}y";
+        // C0, ESC, DEL, C1, a bidi override, a zero-width space and a tag character.
+        let hostile = "/p/\u{1b}[2J\nx\u{7f}\u{85}\u{202e}y\u{200b}\u{e0041}";
+        let raw = [
+            '\u{1b}',
+            '\n',
+            '\u{7f}',
+            '\u{85}',
+            '\u{202e}',
+            '\u{200b}',
+            '\u{e0041}',
+        ];
         let subject = SafePath::new(hostile);
-        for text in [subject.to_string(), format!("{subject:?}")] {
-            assert!(!text.contains('\u{1b}') && !text.contains('\n') && !text.contains('\u{202e}'));
+        let finding = Diagnostic {
+            subject: Some(subject.clone()),
+            ..diagnostic()
+        };
+        for text in [
+            subject.to_string(),
+            format!("{subject:?}"),
+            format!("{finding:?}"),
+        ] {
+            assert!(!text.contains(raw), "{text:?}");
         }
-        let json = report(Check::Unavailable {
-            gap: gap(DiagnosticCode::InspectionUnavailable, hostile),
-        })
-        .to_json();
-        let json = assert_ok!(json);
-        for raw in ['\u{1b}', '\u{202e}'] {
-            assert!(!json.contains(raw), "{json:?}");
+        let mut gaps = Gaps::new();
+        gaps.push(gap(DiagnosticCode::DirectoryUnreadable, hostile));
+        let reports = [
+            report(Check::Unavailable {
+                gap: gap(DiagnosticCode::InspectionUnavailable, hostile),
+            }),
+            report(Check::from_parts(vec![finding.clone()], Gaps::new())),
+            report(Check::from_parts(vec![finding], gaps)),
+        ];
+        for report in &reports {
+            let json = assert_ok!(report.to_json());
+            // Pretty printing adds newlines and indentation between values; none is inside a string.
+            assert!(!json.contains(&raw[2..]), "{json:?}");
+            assert!(!json.contains('\u{1b}'), "{json:?}");
+            assert!(
+                json.contains("\\u001b") && json.contains("\\u202e"),
+                "{json}"
+            );
+            assert!(json.contains("\\n"), "{json}");
         }
-        assert!(
-            json.contains("\\u001b") && json.contains("\\u202e"),
-            "{json}"
-        );
-        assert_eq!(parse_subject(&json), hostile, "the escape is lossless");
+        assert_eq!(parse_subject(&assert_ok!(reports[0].to_json())), hostile);
     }
 
     fn parse_subject(json: &str) -> String {
@@ -396,50 +480,80 @@ mod tests {
     }
 
     #[test]
-    fn test_subject_is_bounded() {
-        let long = "a".repeat(MAX_SUBJECT_CHARS + 100);
-        let subject = SafePath::new(&long).to_string();
-        assert_eq!(subject.chars().count(), MAX_SUBJECT_CHARS + 3);
-        assert!(subject.ends_with("..."));
-        assert_eq!(
-            SafePath::new("é".repeat(MAX_SUBJECT_CHARS).as_str())
-                .0
-                .chars()
-                .count(),
-            MAX_SUBJECT_CHARS
-        );
+    fn test_subject_is_bounded_on_a_character_boundary() {
+        assert_eq!(MAX_SUBJECT_CHARS, 512);
+        let kept = |n: usize, ch: char| SafePath::new(&ch.to_string().repeat(n)).0;
+        for ch in ['a', 'é', '\u{1f600}'] {
+            assert_eq!(kept(511, ch), ch.to_string().repeat(511));
+            assert_eq!(kept(512, ch), ch.to_string().repeat(512));
+            assert_eq!(kept(513, ch), format!("{}...", ch.to_string().repeat(512)));
+        }
     }
 
     #[test]
     fn test_exit_code_is_zero_by_default_and_three_only_when_strict_and_incomplete() {
-        let complete = report(Check::from_parts(Vec::new(), Gaps::new()));
-        let unavailable = report(Check::Unavailable {
+        let unavailable = || Check::Unavailable {
             gap: gap(DiagnosticCode::InspectionUnavailable, "x"),
-        });
-        assert_eq!(complete.exit_code(true), 0);
-        assert_eq!(unavailable.exit_code(false), 0);
-        assert_eq!(unavailable.exit_code(true), EXIT_INCOMPLETE);
-        assert_ne!(EXIT_INCOMPLETE, 78);
+        };
+        let mut gaps = Gaps::new();
+        gaps.push(gap(DiagnosticCode::DirectoryUnreadable, "x"));
+        let partial = Check::from_parts(Vec::new(), gaps);
+        let complete = || Check::from_parts(vec![diagnostic()], Gaps::new());
+        let all = |results: Vec<Check<Vec<Diagnostic>>>| {
+            DoctorReport::new(
+                results
+                    .into_iter()
+                    .map(|result| CheckReport {
+                        id: CheckId::Git,
+                        result,
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(EXIT_INCOMPLETE, 3);
+        // Findings, even errors, are not incompleteness.
+        assert_eq!(all(vec![complete()]).exit_code(true), 0);
+        assert_eq!(all(vec![unavailable()]).exit_code(false), 0);
+        assert_eq!(all(vec![unavailable()]).exit_code(true), 3);
+        assert_eq!(all(vec![partial.clone()]).exit_code(true), 3);
+        assert_eq!(all(vec![partial.clone(), complete()]).exit_code(true), 3);
+        assert_eq!(all(vec![complete(), partial]).exit_code(true), 3);
+        assert_eq!(all(vec![complete(), unavailable()]).exit_code(false), 0);
+        // An empty report is complete over the checks it holds (see the module docs).
+        assert_eq!(all(Vec::new()).exit_code(true), 0);
     }
 
     #[test]
-    fn test_enum_tokens_match_between_serde_and_strum() {
-        fn same<T: Serialize + AsRef<str>>(value: T) {
-            assert_eq!(assert_ok!(serde_json::to_value(&value)), value.as_ref());
+    fn test_enum_tokens_are_the_documented_strings() {
+        fn token<T: Serialize + AsRef<str> + fmt::Display>(value: T, expected: &str) {
+            assert_eq!(assert_ok!(serde_json::to_value(&value)), expected);
+            assert_eq!(value.as_ref(), expected);
+            assert_eq!(value.to_string(), expected);
         }
-        same(DiagnosticCode::DirectoryUnreadable);
-        same(DiagnosticCode::NameNotUtf8);
-        same(DiagnosticCode::EntryLimitReached);
-        same(DiagnosticCode::InspectionUnavailable);
-        same(Severity::Warning);
-        same(Remedy::ReviewManually);
-        same(CheckId::SecretsSurvey);
+        token(DiagnosticCode::DirectoryUnreadable, "directory_unreadable");
+        token(DiagnosticCode::NameNotUtf8, "name_not_utf8");
+        token(DiagnosticCode::EntryLimitReached, "entry_limit_reached");
+        token(
+            DiagnosticCode::InspectionUnavailable,
+            "inspection_unavailable",
+        );
+        token(Severity::Info, "info");
+        token(Severity::Warning, "warning");
+        token(Severity::Error, "error");
+        token(Remedy::None, "none");
+        token(Remedy::ReviewManually, "review_manually");
+        token(CheckId::SecretsSurvey, "secrets_survey");
+        token(CheckId::Git, "git");
+        token(CheckId::Proxy, "proxy");
     }
 
     #[test]
     fn test_schema_version_is_pinned() {
         // A shape change that is not additive must bump this, and the rules in the module docs.
         assert_eq!(SCHEMA_VERSION, 1);
-        assert_eq!(parse(&DoctorReport::new(Vec::new()))["schema_version"], 1);
+        assert_eq!(
+            parse(&DoctorReport::new(Vec::new())),
+            json!({"schema_version": 1, "checks": []})
+        );
     }
 }
