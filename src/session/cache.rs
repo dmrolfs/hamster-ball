@@ -393,10 +393,13 @@ fn make_dir_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
     Ok(open_dir_nofollow(parent, name)?)
 }
 
+/// Test only: runs after an entry was inspected and before it is opened, to swap it.
+#[cfg(test)]
+type BetweenHook = Option<Box<dyn FnMut(&Path)>>;
+
 struct Walk<'a> {
-    /// Test only: runs after an entry was inspected and before it is opened, to swap it.
     #[cfg(test)]
-    between: Option<Box<dyn FnMut(&Path)>>,
+    between: BetweenHook,
     plan: CopyPlan<'a>,
     src_root: &'a Path,
     dst_root: &'a Path,
