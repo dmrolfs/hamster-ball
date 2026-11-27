@@ -237,6 +237,19 @@ impl Reporter {
         stop: Arc<StopSignal>,
         write_timeout: Duration,
     ) -> Result<Self, ChannelError> {
+        Self::connect_spawning(stream, stop, write_timeout, |body| {
+            thread::Builder::new()
+                .name("hb-report-read".to_owned())
+                .spawn(body)
+        })
+    }
+
+    fn connect_spawning(
+        stream: UnixStream,
+        stop: Arc<StopSignal>,
+        write_timeout: Duration,
+        spawn_reader: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self, ChannelError> {
         stream
             .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
             .context(IoSnafu)?;
@@ -274,11 +287,17 @@ impl Reporter {
                 .context(ThreadSnafu)?
         };
         let reader = {
-            let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name("hb-report-read".to_owned())
-                .spawn(move || read_loop(&mut reader, &shared))
-                .context(ThreadSnafu)?
+            let reading_shared = Arc::clone(&shared);
+            match spawn_reader(Box::new(move || read_loop(&mut reader, &reading_shared))) {
+                Ok(reader) => reader,
+                Err(source) => {
+                    shared.lock().broken = true;
+                    shared.wake.notify_all();
+                    let _ = stream.shutdown(Shutdown::Both);
+                    let _ = writer.join();
+                    return Err(ChannelError::Thread { source });
+                }
+            }
         };
         Ok(Self {
             shared,
@@ -430,6 +449,20 @@ mod tests {
             },
             stop,
         )
+    }
+
+    #[test]
+    fn reader_spawn_failure_closes_the_already_started_writer_channel() {
+        let (ours, mut peer) = assert_ok!(UnixStream::pair());
+        assert_ok!(peer.set_read_timeout(Some(Duration::from_millis(200))));
+        assert_ok!(peer.write_all(&assert_ok!(encode_line(&Hello::new(7, 2)))));
+        let result = Reporter::connect_spawning(ours, StopSignal::new(), WRITE_TIMEOUT, |_| {
+            Err(std::io::Error::other("injected reader spawn failure"))
+        });
+        assert!(matches!(result, Err(ChannelError::Thread { .. })));
+        let mut received = Vec::new();
+        assert_ok!(peer.read_to_end(&mut received));
+        assert!(String::from_utf8_lossy(&received).contains("generation"));
     }
 
     #[test]
