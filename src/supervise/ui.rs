@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as Key};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signal::{SigSet, Signal, kill};
 use nix::sys::time::TimeSpec;
+use nix::unistd::Pid;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -126,7 +127,9 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> Result<Ended, UiError> {
 /// instead of killing it where it stands, and once seen they stay seen: a review that consumed
 /// one must not let the supervisor carry on. SIGINT only arrives while the owner's terminal is
 /// cooked, which is during a review (raw mode makes Ctrl-C a key for the agent): it cancels that
-/// review. They are blocked, so their default action never runs, and read from a kernel queue.
+/// review. SIGTSTP requests restoration before the job stops; these signals are blocked and
+/// read from a kernel queue. SIGCONT uses its default resume action; foreground ownership,
+/// not receipt of SIGCONT alone, decides when terminal I/O can resume.
 ///
 /// The queue is the supervisor's only way to see a stop, so a failure to read it is an error,
 /// not "no signal".
@@ -134,16 +137,26 @@ struct StopSignals {
     queue: Kqueue,
     terminate: bool,
     interrupt: bool,
+    suspend: bool,
 }
 
 impl StopSignals {
-    const WATCHED: [Signal; 3] = [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGINT];
+    const WATCHED: [Signal; 4] = [
+        Signal::SIGTERM,
+        Signal::SIGHUP,
+        Signal::SIGINT,
+        Signal::SIGTSTP,
+    ];
 
     fn watch() -> Result<Self, UiError> {
         let mut set = SigSet::empty();
         for signal in Self::WATCHED {
             set.add(signal);
         }
+        // A background approval read sends TTIN to the whole job group. Keep the supervisor
+        // runnable for shutdown; the review helper clears its mask and retains normal job control.
+        set.add(Signal::SIGTTIN);
+        set.add(Signal::SIGTTOU);
         set.thread_block()
             .map_err(io::Error::from)
             .context(SignalsSnafu)?;
@@ -171,6 +184,7 @@ impl StopSignals {
             queue,
             terminate: false,
             interrupt: false,
+            suspend: false,
         })
     }
 
@@ -192,10 +206,11 @@ impl StopSignals {
             .map_err(io::Error::from)
             .context(SignalsSnafu)?;
         for event in &events[..n] {
-            if event.ident() == Signal::SIGINT as usize {
-                self.interrupt = true;
-            } else {
-                self.terminate = true;
+            match Signal::try_from(event.ident() as i32) {
+                Ok(Signal::SIGINT) => self.interrupt = true,
+                Ok(Signal::SIGTSTP) => self.suspend = true,
+                Ok(Signal::SIGTERM | Signal::SIGHUP) => self.terminate = true,
+                _ => {}
             }
         }
         Ok(())
@@ -305,6 +320,13 @@ fn event_loop(
         if ui.stop.terminated() {
             return Ok(());
         }
+        if ui.stop.suspend {
+            if !ui.suspend_job()? {
+                return Ok(());
+            }
+            ui.resume_ui()?;
+            changed = true;
+        }
         fit(ui.screen, ui.runtime, &mut sized)?;
         if ui.runtime.frame_due(changed, Instant::now()) {
             draw(ui.screen, ui.runtime, look)?;
@@ -379,7 +401,68 @@ fn fit(
     Ok(())
 }
 
+/// Whether the shell has given this job the terminal, not merely continued it with `bg`.
+fn foreground() -> Result<bool, UiError> {
+    rustix::termios::tcgetpgrp(io::stdin())
+        .map(|group| group == rustix::process::getpgrp())
+        .map_err(io::Error::from)
+        .context(TerminalSnafu)
+}
+
 impl Loop<'_> {
+    /// Restore before stopping. Sessions keep their own hb supervision while this UI is stopped.
+    fn suspend_job(&mut self) -> Result<bool, UiError> {
+        self.stop.suspend = false;
+        self.guard.suspend().context(TerminalSnafu)?;
+        if let Some(child) = self.review_child.as_ref() {
+            signal_review(child, Signal::SIGSTOP)?;
+        }
+        // TSTP stays blocked in all threads; STOP takes effect after restoration without a
+        // handler or an unblock/default-action race. CONT resumes even when no handler runs.
+        kill(Pid::this(), Signal::SIGSTOP)
+            .map_err(io::Error::from)
+            .context(SignalsSnafu)?;
+        if !self.wait_foreground()? {
+            return Ok(false);
+        }
+        if let Some(child) = self.review_child.as_ref() {
+            signal_review(child, Signal::SIGCONT)?;
+        }
+        Ok(true)
+    }
+
+    /// A backgrounded job must not read shell input or change the shell's terminal modes.
+    fn wait_foreground(&mut self) -> Result<bool, UiError> {
+        loop {
+            self.stop.poll()?;
+            if self.stop.terminated() || fatal() {
+                return Ok(false);
+            }
+            if self.stop.suspend {
+                self.stop.suspend = false;
+                kill(Pid::this(), Signal::SIGSTOP)
+                    .map_err(io::Error::from)
+                    .context(SignalsSnafu)?;
+                continue;
+            }
+            if foreground()? {
+                return Ok(true);
+            }
+            self.runtime.step();
+            std::thread::sleep(FRAME);
+        }
+    }
+
+    fn resume_ui(&mut self) -> Result<(), UiError> {
+        self.guard.resume().context(TerminalSnafu)?;
+        let size = self.screen.size().context(TerminalSnafu)?;
+        self.screen
+            .resize(Rect::new(0, 0, size.width, size.height))
+            .context(TerminalSnafu)?;
+        self.router = Router::new();
+        Ok(())
+    }
+
     /// Applies one terminal event; true when the owner confirmed a quit.
     fn handle(&mut self, event: Key) -> Result<bool, UiError> {
         let size = self.screen.size().context(TerminalSnafu)?;
@@ -439,20 +522,19 @@ impl Loop<'_> {
         if self.stop.poll().is_err() || self.stop.terminated() || fatal() {
             return Ok(false);
         }
+        if self.stop.suspend && !self.suspend_job()? {
+            return Ok(false);
+        }
+        if !self.wait_foreground()? {
+            return Ok(false);
+        }
         drain_events()?;
         // A flush that fails here leaves possible stale keys for the UI; say so, stay in the UI.
         let flushed = flush_input();
         // If the terminal was not fully given back for the review, this does not resume the UI and
         // fails; the run then ends through the normal path rather than carrying on in a terminal
         // that is partly cooked.
-        self.guard.resume().context(TerminalSnafu)?;
-        // `clear` would ask the terminal where the cursor is and wait for the reply, which fails
-        // right after a hand-over; `resize` clears the same area and forgets what was drawn.
-        let size = self.screen.size().context(TerminalSnafu)?;
-        self.screen
-            .resize(Rect::new(0, 0, size.width, size.height))
-            .context(TerminalSnafu)?;
-        self.router = Router::new();
+        self.resume_ui()?;
         self.runtime.send(Msg::ApprovalFinished {
             id: approval.id,
             generation: approval.generation,
@@ -515,8 +597,23 @@ impl Loop<'_> {
             {
                 return None;
             }
+            if self.stop.suspend {
+                match self.suspend_job() {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(error) => return Some(Waited::Error(error.to_string())),
+                }
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+/// The child remains owned and unreaped here, so its PID cannot be reused.
+fn signal_review(child: &Child, signal: Signal) -> Result<(), UiError> {
+    match kill(Pid::from_raw(child.id() as i32), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from(error)).context(SignalsSnafu),
     }
 }
 

@@ -48,6 +48,7 @@ struct Owner {
     bytes: Arc<Mutex<Vec<u8>>>,
     /// What the owner would see: the same bytes through a terminal emulator.
     seen: Arc<Mutex<SessionScreen>>,
+    original_modes: rustix::termios::Termios,
 }
 
 impl Owner {
@@ -66,6 +67,7 @@ impl Owner {
             ws_ypixel: 0
         }));
         let (stdin, stdout, stderr) = assert_ok!(pty.child_stdio());
+        let original_modes = assert_ok!(rustix::termios::tcgetattr(assert_ok!(pty.clone_master())));
         let mut cmd = Command::new("/usr/bin/perl");
         cmd.args(["-e", LAUNCHER, SUPERVISE])
             .env_clear()
@@ -109,6 +111,7 @@ impl Owner {
             master,
             bytes,
             seen,
+            original_modes,
         }
     }
 
@@ -176,6 +179,15 @@ impl Drop for Owner {
 
 /// Every mode the supervisor turned on has been turned off again.
 fn assert_restored(owner: &Owner) {
+    let modes = assert_ok!(rustix::termios::tcgetattr(&owner.master));
+    assert_eq!(modes.input_modes, owner.original_modes.input_modes);
+    assert_eq!(modes.output_modes, owner.original_modes.output_modes);
+    assert_eq!(modes.control_modes, owner.original_modes.control_modes);
+    assert_eq!(modes.local_modes, owner.original_modes.local_modes);
+    assert_eq!(
+        format!("{:?}", modes.special_codes),
+        format!("{:?}", owner.original_modes.special_codes)
+    );
     let text = owner.text();
     for (on, off) in [
         ("\x1b[?1049h", "\x1b[?1049l"),
@@ -194,6 +206,50 @@ fn assert_restored(owner: &Owner) {
 
 fn alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[test]
+fn suspension_restores_termios_before_any_shell_can_repair_it() {
+    let w = World::new(PROJECT);
+    let mut owner = Owner::start_unapproved(&w, &[]);
+    owner.wait_for("Sessions", 30);
+    assert_ok!(kill(
+        Pid::from_raw(owner.child.id() as i32),
+        Signal::SIGTSTP
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = assert_ok!(
+            Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &owner.child.id().to_string()])
+                .output()
+        );
+        if String::from_utf8_lossy(&output.stdout).contains('T') {
+            break;
+        }
+        assert!(Instant::now() < deadline, "supervisor did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    while !owner.text().contains("\x1b[?1049l") {
+        assert!(
+            Instant::now() < deadline,
+            "restoration bytes were not received"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_restored(&owner);
+    assert_ok!(kill(
+        Pid::from_raw(owner.child.id() as i32),
+        Signal::SIGCONT
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner.text().matches("\x1b[?1049h").count() < 2 {
+        assert!(Instant::now() < deadline, "supervisor did not resume");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    owner.send(b"q");
+    assert_eq!(owner.exit_code(10), Some(0));
+    assert_restored(&owner);
 }
 
 #[test]

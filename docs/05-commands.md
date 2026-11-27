@@ -62,6 +62,19 @@ path /Users/you/.ssh/id_rsa
 
 Warnings you may see include `project_not_granted` (no grant covers the project), `grant_shadowed_by_floor` (a grant the floor overrides), `git_config_unreadable` and `not_approved`.
 
+## `hb-supervise`: suspending the terminal UI
+
+SIGTSTP restores the terminal before suspending the supervisor.
+During an approval review, Ctrl-Z suspends the review and supervisor together.
+Use `fg` to resume; `bg` leaves the shell's terminal modes and input alone.
+A pending review remains a review until it finishes or is cancelled.
+
+Agent sessions keep running under their own `hb` supervision while the UI job is stopped.
+The stopped UI does not drain reports; their queues remain bounded.
+After background continuation the supervisor drains reports and handles TERM/HUP,
+but does not read the keyboard or redraw until the shell gives it foreground ownership.
+SIGSTOP and SIGKILL bypass this restoration path and can leave terminal modes unchanged.
+
 ## `hb approve`
 
 Reviews this project's config and records your approval.
