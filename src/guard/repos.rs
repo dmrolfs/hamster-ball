@@ -540,4 +540,81 @@ mod tests {
         assert_eq!(gaps.omitted(), 3);
         drop(locked);
     }
+
+    #[test]
+    fn a_skipped_dependency_directory_is_a_gap_so_a_clean_result_never_hides_it() {
+        let (_dir, root) = project();
+        let base = root.as_path();
+        assert_ok!(fs::create_dir_all(base.join("node_modules/dep/.git")));
+        assert_ok!(fs::create_dir_all(base.join("target")));
+        let (tree, gaps) = walked(std::slice::from_ref(&root), &root, 1000);
+        // Not walked, so its repository is not reported, and the gap says so.
+        assert!(tree.nested.is_empty());
+        assert_eq!(
+            codes(&gaps),
+            vec![
+                DiagnosticCode::DirectoryNotInspected,
+                DiagnosticCode::DirectoryNotInspected
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_query_is_unavailable_and_a_spent_budget_is_a_limit() {
+        use git_config::QueryError;
+        let repo = Path::new("/p");
+        assert_eq!(
+            failure_gap(&QueryError::TimedOut, repo).code,
+            DiagnosticCode::InspectionLimitReached
+        );
+        assert_eq!(
+            failure_gap(&QueryError::Refused, repo).code,
+            DiagnosticCode::GitConfigUnavailable
+        );
+    }
+
+    fn setting(value: Option<&str>, repository: &str, hooks_cwd: &str) -> HookSetting {
+        HookSetting {
+            repository: PathBuf::from(repository),
+            git_dir: PathBuf::from(repository).join(".git"),
+            hooks_cwd: PathBuf::from(hooks_cwd),
+            value: value.map(str::to_owned),
+            origin: None,
+        }
+    }
+
+    fn hooks_dir_of(setting: HookSetting) -> String {
+        let mut gaps = Gaps::new();
+        // Only the directory is under test, not the policy's answer about it.
+        let policy = assert_ok!(crate::config::merge(&[], crate::policy::Floor::empty()));
+        observe(setting, &policy, &mut gaps).hooks_dir
+    }
+
+    #[test]
+    fn a_relative_hooks_path_is_joined_to_the_work_tree_top_not_the_inspected_directory() {
+        assert_eq!(
+            hooks_dir_of(setting(Some("rel/hooks"), "/r/sub/dir", "/r")),
+            "/r/rel/hooks"
+        );
+        assert_eq!(
+            hooks_dir_of(setting(Some("/abs/hooks"), "/r/sub/dir", "/r")),
+            "/abs/hooks"
+        );
+        assert_eq!(
+            hooks_dir_of(setting(None, "/r/sub/dir", "/r")),
+            "/r/sub/dir/.git/hooks"
+        );
+    }
+
+    #[test]
+    fn a_missing_hooks_directory_resolves_through_its_nearest_existing_parent() {
+        let (_dir, root) = project();
+        let want = root.as_path().join("a/b");
+        let got = resolve_with_missing_tail(&want);
+        assert_eq!(
+            got.map(|p| p.as_str().to_owned()),
+            Some(want.to_string_lossy().into_owned())
+        );
+        assert!(resolve_with_missing_tail(&root.as_path().join("a/../b")).is_none());
+    }
 }
