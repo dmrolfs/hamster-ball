@@ -193,11 +193,22 @@ fn row_text(index: usize, session: &Session, width: usize) -> (String, String) {
     let tail = row_tail(session);
     let head = format!("{} {}", index + 1, session_name(session));
     // One space between the name and the state, and the tail never shrinks.
-    let room = width.saturating_sub(tail.chars().count() + 1);
-    let shown: String = if head.chars().count() > room {
-        let keep = room.saturating_sub(1);
-        let mut cut: String = head.chars().take(keep).collect();
-        cut.push('~');
+    let room = width.saturating_sub(Span::raw(&tail).width() + 1);
+    let shown: String = if Span::raw(&head).width() > room {
+        let mut left = room.saturating_sub(1);
+        let span = Span::raw(&head);
+        let mut cut = String::new();
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let cells = Span::raw(grapheme.symbol).width();
+            if cells > left {
+                break;
+            }
+            cut.push_str(grapheme.symbol);
+            left -= cells;
+        }
+        if room > 0 {
+            cut.push('~');
+        }
         cut
     } else {
         head
@@ -1018,9 +1029,47 @@ mod tests {
         };
         let text = render(&scene, cols, 24, PLAIN);
         text.lines()
-            .find(|l| l.contains("Approve") || l.contains("Running"))
+            .find(|l| l.starts_with("│> 1 "))
             .unwrap_or_default()
             .to_owned()
+    }
+
+    #[test]
+    fn wide_unicode_names_cannot_hide_the_trusted_state() {
+        for width in [60, 80, 120] {
+            let row = first_row(&format!("{}Running", "界".repeat(30)), width);
+            assert!(
+                row.contains("Approve"),
+                "trusted state hidden at {width}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_name_truncation_uses_cells_and_preserves_grapheme_prefixes() {
+        for name in ["界".repeat(30), "e\u{301}".repeat(60), "👩‍💻".repeat(30)] {
+            let mut app = App::new();
+            launch(&mut app, &name, "claude");
+            let session = &app.sessions()[0];
+            let original = format!("1 {}", session_name(session));
+            for width in [0, 1, 8, 9, 10, 11, 24, 25, 56] {
+                let (head, tail) = row_text(0, session, width);
+                assert_eq!(tail, row_tail(session));
+                if width > Span::raw(&tail).width() {
+                    assert!(Span::raw(&head).width() + Span::raw(&tail).width() <= width);
+                }
+                let prefix = head.trim_end_matches(' ').trim_end_matches('~');
+                let mut rebuilt = String::new();
+                let span = Span::raw(&original);
+                for g in span.styled_graphemes(Style::default()) {
+                    if rebuilt == prefix {
+                        break;
+                    }
+                    rebuilt.push_str(g.symbol);
+                }
+                assert_eq!(rebuilt, prefix, "truncated inside a grapheme");
+            }
+        }
     }
 
     #[test]
