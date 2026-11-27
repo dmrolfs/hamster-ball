@@ -453,7 +453,7 @@ pub enum Msg {
     /// The owner asked to review approval for the selected session.
     ReviewApproval,
     /// Something the owner should be told that is not about one session: a line in the alert
-    /// area until the next message.
+    /// area until the next owner action.
     Notice(String),
     /// `hb approve` ended for this session and generation.
     ApprovalFinished {
@@ -643,7 +643,17 @@ impl App {
         {
             return Vec::new();
         }
-        self.notice = None;
+        if !matches!(
+            msg,
+            Msg::Spawned { .. }
+                | Msg::SpawnFailed { .. }
+                | Msg::Channel { .. }
+                | Msg::ChannelLost { .. }
+                | Msg::SessionLost { .. }
+                | Msg::ProcessExited { .. }
+        ) {
+            self.notice = None;
+        }
         let effects = self.apply_msg(msg);
         // Keys must never keep going to an agent that is no longer running; leave Interact so the
         // status bar says so.
@@ -1394,14 +1404,16 @@ mod tests {
             Some("8 sessions are already running; stop one first")
         );
         assert_eq!(app.sessions().len(), MAX_SESSIONS);
-        // A message clears the notice, and a slot freed by an ended session can be used again.
+        // Background failure frees a slot, but only the owner's next action dismisses notice.
+        let notice = app.notice.clone();
         app.update(Msg::SpawnFailed {
             id: SessionId(1),
             generation: 1,
             reason: "x".into(),
         });
-        assert_none!(app.notice.as_ref());
+        assert_eq!(app.notice, notice);
         assert_eq!(app.update(Msg::Launch(spec("ninth"))).len(), 1);
+        assert_none!(app.notice.as_ref());
     }
 
     #[test]
@@ -1479,6 +1491,23 @@ mod tests {
             assert_eq!(app.live_count(), MAX_SESSIONS);
             assert!(app.notice.is_some());
         }
+    }
+
+    #[test]
+    fn worker_traffic_does_not_dismiss_an_unread_owner_notice() {
+        let mut app = running();
+        app.update(Msg::Notice("input refused".into()));
+        let notice = app.notice.clone();
+        assert_eq!(notice.as_deref(), Some("input refused"));
+        app.update(channel(1, 1, 3, Event::denial("background denial")));
+        assert_eq!(app.notice, notice);
+        app.update(Msg::Spawned {
+            id: SessionId(1),
+            generation: 1,
+        });
+        assert_eq!(app.notice, notice);
+        app.update(Msg::NextTab);
+        assert!(app.notice.is_none(), "owner action dismisses the notice");
     }
 
     #[test]
@@ -1789,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_is_shown_until_the_next_message_and_changes_nothing_else() {
+    fn a_notice_is_shown_until_the_next_owner_action_and_changes_nothing_else() {
         let mut app = running();
         let before = only(&app).clone();
         assert_eq!(app.update(Msg::Notice("keys dropped".into())), vec![]);
