@@ -25,7 +25,12 @@ const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
 const PROJECT: &str = "[fs]\nwrite = [\".\"]\n";
 
 /// Makes the pty on stdin the controlling terminal, as a terminal emulator does, then execs.
-const LAUNCHER: &str = "use POSIX; POSIX::setsid(); ioctl(STDIN, 0x20007461, 0); \
+///
+/// It also puts INT, QUIT, HUP and TERM back to their defaults: a process started from a background
+/// job or under `nohup` has some of them ignored, an ignored signal stays ignored through exec, and
+/// this test run may itself have been started that way (as `common::drive` also guards against).
+const LAUNCHER: &str = "use POSIX; $SIG{$_}='DEFAULT' for qw(INT QUIT HUP TERM); \
+POSIX::setsid(); ioctl(STDIN, 0x20007461, 0); \
 $ENV{TERM}=q(xterm-256color); exec @ARGV or die qq(exec: $!)";
 
 macro_rules! sandboxed {
