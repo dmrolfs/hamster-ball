@@ -162,9 +162,18 @@ If `hb` is force-killed, that small process ends what the agent started. It does
 - It keeps track of the agent's processes and of the processes they start, including ones that leave the agent's process group or outlive their parent. Each is ended with a polite stop request first, then a forced stop after a short wait. Before it signals any process it checks that the process is still the same one it recorded (same number, same start time), so a number that macOS has handed to an unrelated program is left alone.
 - Right after, it looks once more for leftovers it missed. It looks for processes that carry this run's secret marker in their environment, and for processes still using the run's private directory.
 - It can miss a process that was started in a rapid chain of "start another process, then exit", because that race can be lost. It can miss a process that clears its own environment, and a macOS system tool that has left the private directory and closed its files there. It does not touch processes of other users.
-- There is a tiny gap between checking a process and signalling it. It is very unlikely to matter, but it is not closed.
+- Already-tracked members remain owned after their leader exits.
+  Once the leader has been reaped, its group number alone cannot identify additional members safely, so those need independent token or directory evidence.
+- Recovery retains the process identity captured before reading that evidence, then checks it again before adoption and before signalling.
+  A directory holder born during the identity snapshot may be missed in that pass.
+  An unreadable directory can also hide a holder from `lsof` without a warning.
+- Known processes receive SIGKILL before the last recovery sweep.
+  Deadlines are checked between operations; an individual stalled OS call or scheduler pause can still delay cleanup.
+- The final identity check and signal are separate syscalls.
+  The remaining race is unlikely but unbounded in time, not closed.
+  Cleanup failures are not durably reported after `hb` dies.
 
-For a hard guarantee that nothing survives, run the agent in a virtual machine.
+Stopping a dedicated virtual machine also stops its guest processes; merely running inside one does not guarantee teardown.
 
 ## Where things live
 

@@ -9,9 +9,9 @@
 //! closes without one, `hb` is gone, and the guard sends what is still running SIGTERM and then,
 //! after the grace period, SIGKILL.
 //!
-//! The guard watches every registered process with a kernel exit notification, so a process that
-//! has ended is forgotten at once and its number, which the system may hand to an unrelated
-//! program, is never signalled.
+//! The guard retains process identities and rechecks them before signalling.
+//! This avoids signalling a known replacement, but the final check and signal are separate
+//! syscalls. Cleanup is best effort and never establishes that no descendants remain.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -647,10 +647,20 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             terminating = Some(Instant::now() + grace);
             // Leftovers the tracker missed are adopted and get the same TERM and the same deadline.
             let by = sweep_budget(grace, terminating);
-            if sweep_for_leftovers(&mut tracker, &queue, &registered, by).adopted > 0 {
-                let _ = tracker.signal(Signal::SIGTERM);
+            if sweep_for_leftovers(&mut tracker, &queue, &registered, by).adopted > 0
+                && terminating.is_some_and(|deadline| Instant::now() < deadline)
+            {
+                let _ = tracker.term_until(terminating.unwrap_or_else(Instant::now));
             }
         }
+        // Overdue KILL takes priority over the empty-registry recovery pass.
+        if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
+            kill_then_sweep(&mut tracker, |tracker| {
+                sweep_for_leftovers(tracker, &queue, &registered, Instant::now() + SWEEP_FLOOR)
+            });
+            return Ok((Ended::HbGone, registered.terminal));
+        }
+        tracker.discovery_until(terminating);
         if terminating.is_some() && tracker.is_empty() {
             // Nothing tracked is left, but a leftover can still exist: look once more before
             // concluding. Anything found is ended under the original deadline.
@@ -660,9 +670,11 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                 let swept = sweep_for_leftovers(&mut tracker, &queue, &registered, by);
                 // A sweep that could not finish proves nothing, so it is not final: the guard waits
                 // for the deadline, where the sweep after KILL gets a fresh budget.
-                registered.final_sweep_done = swept.complete;
-                if swept.adopted > 0 {
-                    let _ = tracker.signal(Signal::SIGTERM);
+                registered.final_sweep_done = swept.is_final_empty();
+                if swept.adopted > 0
+                    && terminating.is_some_and(|deadline| Instant::now() < deadline)
+                {
+                    let _ = tracker.term_until(terminating.unwrap_or_else(Instant::now));
                 }
             }
             if tracker.is_empty() && registered.final_sweep_done {
@@ -690,6 +702,9 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             continue;
         }
         for event in &events[..ready] {
+            if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             match event.filter() {
                 Ok(EventFilter::EVFILT_READ) if pipe_open => {
                     let (next, open) = read_commands(
@@ -726,9 +741,9 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                         // The root's slot is free again; its descendants stay in the tracker.
                         watched.remove(&i32::try_from(event.ident()).unwrap_or(0));
                     }
-                    if terminating.is_some() {
+                    if terminating.is_some_and(|deadline| Instant::now() < deadline) {
                         // A process forked during the grace period is ended under the same deadline.
-                        let _ = tracker.signal(Signal::SIGTERM);
+                        let _ = tracker.term_until(terminating.unwrap_or_else(Instant::now));
                     }
                 }
                 _ => {}
@@ -776,49 +791,94 @@ fn sweep_for_leftovers(
     registered: &Registered,
     by: Instant,
 ) -> Swept {
+    tracker.discovery_until(Some(by));
     let own = i32::try_from(std::process::id()).unwrap_or(0);
-    let begun = now_as_start();
-    let mut candidates: Vec<i32> = Vec::new();
+    let mut candidates: Vec<Identity> = Vec::new();
     let mut complete = true;
     if let Some(token) = &registered.token {
-        if let (Ok(with_env), Ok(plain)) = (listing(true, by), listing(false, by)) {
+        let listings = listing(true, by)
+            .and_then(|with_env| listing(false, by).map(|plain| (with_env, plain)));
+        if let Ok((with_env, plain)) = listings {
             let entry = token.entry();
-            // The text only nominates: an argument that shrank between the two reads, or a value
-            // containing a space, reads the same. Only a whole environment entry counts.
-            candidates.extend(
-                owned_by_token(&with_env, &plain, &entry)
-                    .pids
-                    .into_iter()
-                    .filter(|pid| holds_entry(*pid, &entry)),
-            );
+            let found = owned_by_token(&with_env, &plain, &entry);
+            complete &= found.unreadable.is_empty();
+            for pid in found.pids {
+                if Instant::now() >= by {
+                    complete = false;
+                    break;
+                }
+                let identity = match Identity::of(pid) {
+                    Ok(identity) => identity,
+                    Err(IdentityError::Gone { .. }) => continue,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                if holds_entry(pid, &entry) {
+                    // Registration rechecks this same identity after confirmation.
+                    candidates.push(identity);
+                } else {
+                    // sysinfo cannot distinguish a hidden/unreadable environment from no match.
+                    complete = false;
+                }
+            }
         } else {
             complete = false;
         }
     }
     if let Some(dir) = &registered.session_dir {
+        // Capture identities before lsof reads relationships. Its PID-only output can only
+        // nominate an identity from this snapshot, never a replacement read afterward.
+        let (snapshot, readable) = identity_snapshot(by);
+        complete &= readable;
         match holders_of(dir, by) {
             Ok(holders) => {
                 complete &= holders.complete;
-                candidates.extend(holders.pids);
+                for pid in holders.pids {
+                    if let Some(identity) = snapshot.get(&pid) {
+                        candidates.push(*identity);
+                    } else {
+                        complete = false;
+                    }
+                }
             }
             Err(_) => complete = false,
         }
     }
-    let adopted = candidates
-        .into_iter()
-        .filter(|pid| matches!(tracker.adopt_candidate(queue, *pid, own, begun), Ok(true)))
-        .count();
-    Swept { adopted, complete }
+    let mut swept = Swept {
+        adopted: 0,
+        complete,
+    };
+    for identity in candidates {
+        if Instant::now() >= by {
+            swept.complete = false;
+            break;
+        }
+        swept.record(tracker.adopt_candidate(queue, identity, own));
+    }
+    swept.complete &= Instant::now() < by;
+    swept
 }
 
-/// The present moment in the form a process start time is recorded in (seconds, microseconds since
-/// the epoch). If the clock is unreadable the answer is the epoch, so nothing is adopted: a refusal,
-/// not a guess.
-fn now_as_start() -> (u64, u64) {
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    (since.as_secs(), u64::from(since.subsec_micros()))
+/// Capture identities before a PID-only directory listing, bounded between kernel queries.
+fn identity_snapshot(by: Instant) -> (HashMap<i32, Identity>, bool) {
+    let mut snapshot = HashMap::new();
+    if Instant::now() >= by {
+        return (snapshot, false);
+    }
+    let Ok(pids) = super::identity::all_pids() else {
+        return (snapshot, false);
+    };
+    for pid in pids {
+        if Instant::now() >= by {
+            return (snapshot, false);
+        }
+        if let Ok(identity) = Identity::of(pid) {
+            snapshot.insert(pid, identity);
+        }
+    }
+    (snapshot, true)
 }
 
 /// What a sweep found. `complete` is false when a source could not be read in time, so "nothing
@@ -827,6 +887,20 @@ fn now_as_start() -> (u64, u64) {
 struct Swept {
     adopted: usize,
     complete: bool,
+}
+
+impl Swept {
+    fn is_final_empty(&self) -> bool {
+        self.complete && self.adopted == 0
+    }
+
+    fn record(&mut self, adoption: Result<bool, TrackerError>) {
+        match adoption {
+            Ok(true) => self.adopted += 1,
+            Ok(false) => {}
+            Err(_) => self.complete = false,
+        }
+    }
 }
 
 /// What `hb` has told the guard to remember besides the processes: files to remove, the terminal to
@@ -933,7 +1007,7 @@ fn reply_line(replies: &mut File, id: u64, body: &str) {
 }
 
 /// What the guard watches: each target with the capacity pool it came from.
-type Watched = HashMap<i32, (Target, WatchRole)>;
+type Watched = HashMap<i32, (Target, WatchRole, Identity)>;
 
 /// Starts watching `target`, unless it has already ended or there is no capacity.
 ///
@@ -949,24 +1023,29 @@ fn watch(
     let pid = match target {
         Target::Group(pid) | Target::Child(pid) => pid,
     };
-    if let Some((existing, _)) = watched.get(&pid.as_raw()) {
-        return if *existing == target {
-            Ok(WatchOutcome::Armed)
-        } else {
-            Err(WatchRefusal::Invalid)
-        };
+    if let Some((existing, _, identity)) = watched.get(&pid.as_raw()).copied() {
+        let current = identity.is_current().map_err(|_| WatchRefusal::Kernel)?;
+        if current && tracker.contains(identity) {
+            return if existing == target {
+                Ok(WatchOutcome::Armed)
+            } else {
+                Err(WatchRefusal::Invalid)
+            };
+        }
+        // An undelivered EXIT or a removed tracker entry cannot acknowledge a new launch.
+        watched.remove(&pid.as_raw());
     }
     let brokers = watched
         .values()
-        .filter(|(_, r)| *r == WatchRole::Broker)
+        .filter(|(_, r, _)| *r == WatchRole::Broker)
         .count();
     let full = watched.len() >= MAX_WATCHED
         || (role == WatchRole::Broker && brokers >= MAX_WATCHED - RESERVED_CORE);
     if full {
         return Err(WatchRefusal::Capacity);
     }
-    // A group target leads its own group, which is scanned after the leader exits. A single
-    // process shares hb's group, which must never be adopted wholesale.
+    // Group discovery needs the original leader still present (including an unreaped zombie).
+    // Already-owned members remain tracked after it disappears. Shared terminal groups are not scanned.
     let armed = tracker.arm(queue, pid.as_raw(), matches!(target, Target::Group(_)));
     record(armed, target, role, watched)
 }
@@ -982,8 +1061,8 @@ fn record(
         Target::Group(pid) | Target::Child(pid) => pid,
     };
     match armed {
-        Ok(_) => {
-            watched.insert(pid.as_raw(), (target, role));
+        Ok(identity) => {
+            watched.insert(pid.as_raw(), (target, role, identity));
             Ok(WatchOutcome::Armed)
         }
         Err(TrackerError::Identity {
@@ -1174,6 +1253,23 @@ mod tests {
         assert_eq!(swept.adopted, 0);
     }
 
+    #[test]
+    fn failed_adoption_cannot_make_a_final_look_complete() {
+        let mut swept = Swept {
+            adopted: 0,
+            complete: true,
+        };
+        swept.record(Ok(false));
+        assert!(swept.is_final_empty());
+        swept.record(Ok(true));
+        assert_eq!(swept.adopted, 1);
+        assert!(!swept.is_final_empty());
+        swept.record(Err(TrackerError::Capacity));
+        assert!(!swept.complete);
+        swept.record(Ok(false));
+        assert!(!swept.complete);
+    }
+
     /// The budget is part of the grace period, never more than half of it, and never under the floor.
     #[test]
     fn the_sweeps_budget_comes_out_of_the_grace_period() {
@@ -1316,7 +1412,10 @@ mod tests {
             record(Ok(identity), target, WatchRole::Broker, &mut watched),
             Ok(WatchOutcome::Armed)
         );
-        assert_eq!(watched.get(&4242), Some(&(target, WatchRole::Broker)));
+        assert_eq!(
+            watched.get(&4242),
+            Some(&(target, WatchRole::Broker, identity))
+        );
     }
 
     #[test]
@@ -1359,6 +1458,18 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+        // Reuse the admission map before draining the old exit event.
+        assert_eq!(
+            assert_ok!(watch(
+                Target::Group(pid),
+                WatchRole::Core,
+                &mut watched,
+                &mut tracker,
+                &queue
+            )),
+            WatchOutcome::Gone
+        );
+        assert!(watched.is_empty());
         // A fresh queue: the first queue still holds the undelivered exit event for this pid.
         let fresh_queue = assert_ok!(Kqueue::new());
         let mut fresh = Watched::new();
@@ -1374,6 +1485,42 @@ mod tests {
             WatchOutcome::Gone
         );
         assert!(fresh.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_without_a_tracker_registration_is_armed_again() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut watched = Watched::new();
+        let mut tracker = Tracker::default();
+        let mut child = sleeper();
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+        let target = Target::Child(pid);
+        assert_eq!(
+            assert_ok!(watch(
+                target,
+                WatchRole::Core,
+                &mut watched,
+                &mut tracker,
+                &queue
+            )),
+            WatchOutcome::Armed
+        );
+        let identity = watched[&pid.as_raw()].2;
+        // Simulate a tracker entry removed independently of the admission map.
+        tracker = Tracker::default();
+        assert_eq!(
+            assert_ok!(watch(
+                target,
+                WatchRole::Core,
+                &mut watched,
+                &mut tracker,
+                &queue
+            )),
+            WatchOutcome::Armed
+        );
+        assert!(tracker.contains(identity));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

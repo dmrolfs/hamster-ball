@@ -130,12 +130,6 @@ impl Identity {
         self.started() >= other.started()
     }
 
-    /// Whether the process started before `moment` (seconds and microseconds since the epoch).
-    #[must_use]
-    pub fn started_before(&self, moment: (u64, u64)) -> bool {
-        self.started() < moment
-    }
-
     /// Whether this number still names the process that was recorded. A process that is gone is
     /// `false`, not an error: nothing is left to signal.
     ///
@@ -177,6 +171,11 @@ fn listed(list: impl FnOnce() -> io::Result<Vec<i32>>) -> io::Result<Vec<i32>> {
 /// [`ListError`] when the kernel could not list them. A process with no children is an empty list.
 pub fn children_of(pid: i32) -> Result<Vec<i32>, ListError> {
     listed(|| darwin_libproc::ppid_only_pids(pid)).context(ListSnafu)
+}
+
+/// Process numbers available for an identity snapshot before a directory sweep.
+pub(super) fn all_pids() -> Result<Vec<i32>, ListError> {
+    listed(darwin_libproc::all_pids).context(ListSnafu)
 }
 
 /// The members of process group `pgid`.

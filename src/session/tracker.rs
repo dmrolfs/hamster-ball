@@ -4,7 +4,7 @@
 //! discovered while their parent still exists. This is cleanup, not full-tree containment.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
@@ -32,6 +32,8 @@ pub(super) enum TrackerError {
     Signal { pid: i32, source: Errno },
     #[snafu(display("the process changed while its watch was being armed"))]
     Changed,
+    #[snafu(display("the discovery deadline has elapsed"))]
+    Deadline,
 }
 
 /// The relation a process was listed under, which it must still be in when it is read: a number that
@@ -78,7 +80,7 @@ struct Member {
     identity: Identity,
     cookie: isize,
     root: Identity,
-    /// Set on a root that leads its own process group: the group is scanned even after the root exits.
+    /// Set on a root that leads its own group; new members require its live or zombie identity.
     scan_group: bool,
 }
 
@@ -91,11 +93,34 @@ pub(super) struct Tracker {
     /// The earliest root ever armed. It is kept after the root exits, because a sweep matters most
     /// once the roots are gone, and a candidate older than every root cannot be this run's.
     earliest_root: Option<Identity>,
+    discovery_deadline: Option<Instant>,
 }
 
 impl Tracker {
     pub(super) fn is_empty(&self) -> bool {
         self.members.is_empty()
+    }
+
+    pub(super) fn discovery_until(&mut self, by: Option<Instant>) {
+        self.discovery_deadline = by;
+    }
+
+    fn check_discovery_deadline(&self) -> Result<(), TrackerError> {
+        if self
+            .discovery_deadline
+            .is_some_and(|by| Instant::now() >= by)
+        {
+            DeadlineSnafu.fail()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether admission still refers to a watched identity, not just the same process number.
+    pub(super) fn contains(&self, identity: Identity) -> bool {
+        self.members
+            .get(&identity.pid())
+            .is_some_and(|member| member.identity == identity)
     }
 
     /// Called while the root is still at its launch gate. The caller may acknowledge Armed only
@@ -127,6 +152,7 @@ impl Tracker {
         identity: Identity,
         root: Identity,
     ) -> Result<bool, TrackerError> {
+        self.check_discovery_deadline()?;
         if self
             .members
             .get(&identity.pid())
@@ -184,27 +210,29 @@ impl Tracker {
         root: Identity,
         group: bool,
     ) -> Result<(), TrackerError> {
+        self.check_discovery_deadline()?;
         // An old parent's number is not authority to enumerate a new parent's children.
         if !parent.is_current().context(IdentitySnafu)? {
             return Ok(());
         }
-        let mut candidates: VecDeque<(i32, Listed)> = children_of(parent.pid())
+        let mut candidates: VecDeque<(i32, Listed, Identity)> = children_of(parent.pid())
             .context(ListSnafu)?
             .into_iter()
-            .map(|pid| (pid, Listed::ChildOf(parent.pid())))
+            .map(|pid| (pid, Listed::ChildOf(parent.pid()), parent))
             .collect();
         if group {
             candidates.extend(
                 group_members(parent.pid())
                     .context(ListSnafu)?
                     .into_iter()
-                    .map(|pid| (pid, Listed::InGroup(parent.pid()))),
+                    .map(|pid| (pid, Listed::InGroup(parent.pid()), parent)),
             );
         }
         if !parent.is_current().context(IdentitySnafu)? {
             return Ok(());
         }
-        while let Some((pid, listed)) = candidates.pop_front() {
+        while let Some((pid, listed, witness)) = candidates.pop_front() {
+            self.check_discovery_deadline()?;
             if pid <= 1 || self.members.contains_key(&pid) {
                 continue;
             }
@@ -213,14 +241,14 @@ impl Tracker {
                 Err(IdentityError::Gone { .. }) => continue,
                 Err(source) => return Err(TrackerError::Identity { source }),
             };
-            if !may_adopt(listed, &seen, &root) {
+            if !may_adopt(listed, &seen, &root) || !witness.is_current().context(IdentitySnafu)? {
                 continue;
             }
             match self.adopt(queue, seen.identity, root) {
                 Ok(true) => candidates.extend(
                     children_while_current(seen.identity)?
                         .into_iter()
-                        .map(|child| (child, Listed::ChildOf(pid))),
+                        .map(|child| (child, Listed::ChildOf(pid), seen.identity)),
                 ),
                 Ok(false)
                 | Err(TrackerError::Changed)
@@ -233,29 +261,21 @@ impl Tracker {
         Ok(())
     }
 
-    /// Adopts live members of the root's own process group. The group number cannot be reissued
-    /// while a member exists. A member is adopted only when it is still in that group, is the root's
-    /// user and started no earlier than the root. That does not prove the group is the root's: if
-    /// the number was reissued to a new leader that has itself exited, leaving a member, that member
-    /// passes all three. Accepted and documented (hb-caj); it needs a full pid wrap between the
-    /// root's exit and the guard handling it.
+    /// Adopts group members only while the original leader still pins the group number.
+    /// A zombie leader also pins it until reaped. Once the leader is gone, previously tracked
+    /// members remain owned, but the bare group number is no longer ownership evidence.
     fn scan_group(
         &mut self,
         queue: &Kqueue,
         leader: Identity,
         root: Identity,
     ) -> Result<(), TrackerError> {
-        // The leader is usually gone by now. If a different process holds its number, that number was
-        // reissued and the group listed under it is not ours. (A dead root is not kept as a zombie:
-        // launchd reaps an orphan first, measured 0 of 300, so this is not a hold on the number.
-        // It refuses one case, a live replacement. A gone leader is not evidence either way. The
-        // fastest pid advance measured was about 2,650 a second, which is an observation, not a bound.)
-        match Identity::of(leader.pid()) {
-            Ok(now) if now != leader => return Ok(()),
-            Ok(_) | Err(IdentityError::Gone { .. }) => {}
-            Err(source) => return Err(TrackerError::Identity { source }),
+        self.check_discovery_deadline()?;
+        if !leader.is_current().context(IdentitySnafu)? {
+            return Ok(());
         }
         for pid in group_members(leader.pid()).context(ListSnafu)? {
+            self.check_discovery_deadline()?;
             if pid <= 1 || self.members.contains_key(&pid) {
                 continue;
             }
@@ -265,7 +285,9 @@ impl Tracker {
                 Err(source) => return Err(TrackerError::Identity { source }),
             };
             let member = seen.identity;
-            if !may_adopt(Listed::InGroup(leader.pid()), &seen, &root) {
+            if !may_adopt(Listed::InGroup(leader.pid()), &seen, &root)
+                || !leader.is_current().context(IdentitySnafu)?
+            {
                 continue;
             }
             match self.adopt(queue, member, root) {
@@ -286,35 +308,28 @@ impl Tracker {
     /// started no earlier than the earliest root (an older process cannot hold this run's token), and
     /// must not be the guard itself.
     ///
-    /// `begun` is when the sweep started, as (seconds, microseconds) since the epoch. The evidence was
-    /// read after that, while the number belonged to a live process, so the candidate must have
-    /// started before it: a process that started later cannot be the one the evidence was about. That
-    /// is a number reused between the evidence and now. A process forked during the sweep is the
-    /// tracker's to find, not the sweep's.
+    /// The caller captures `candidate` before confirming ownership evidence. Retain that identity
+    /// through registration: a later occupant of the number must never inherit the evidence.
     ///
     /// Returns whether the process was adopted. A process that is gone, foreign or too old is not an
     /// error.
     pub(super) fn adopt_candidate(
         &mut self,
         queue: &Kqueue,
-        pid: i32,
+        candidate: Identity,
         own_pid: i32,
-        begun: (u64, u64),
     ) -> Result<bool, TrackerError> {
-        if pid <= 1 || pid == own_pid || self.members.contains_key(&pid) {
+        self.check_discovery_deadline()?;
+        let pid = candidate.pid();
+        if pid <= 1 || pid == own_pid || self.contains(candidate) {
             return Ok(false);
         }
         let Some(earliest) = self.earliest_root else {
             return Ok(false);
         };
-        let candidate = match Identity::of(pid) {
-            Ok(candidate) => candidate,
-            Err(IdentityError::Gone { .. }) => return Ok(false),
-            Err(source) => return Err(TrackerError::Identity { source }),
-        };
         if candidate.uid() != earliest.uid()
             || !candidate.started_no_earlier_than(&earliest)
-            || !candidate.started_before(begun)
+            || !candidate.is_current().context(IdentitySnafu)?
         {
             return Ok(false);
         }
@@ -345,8 +360,7 @@ impl Tracker {
             discovery = self.discover(queue, member.identity, member.root, false);
         }
         if member.scan_group && discovery.is_ok() {
-            // The root leads its own group, which outlives it while any member lives, so members
-            // forked before the root exited are found even though their parent is already gone.
+            // Group discovery requires the leader to remain identifiable; known members survive it.
             discovery = self.scan_group(queue, member.identity, member.root);
         }
         // The exit is retired whatever discovery did: a failed discovery (a full registry, a kernel
@@ -369,9 +383,25 @@ impl Tracker {
     /// or signalled must not leave the rest running. Members that are gone are forgotten. The first
     /// failure is returned after the pass, so the caller can say cleanup was incomplete.
     pub(super) fn signal(&mut self, signal: Signal) -> Result<(), TrackerError> {
+        self.signal_while(signal, || true)
+    }
+
+    /// Yield an ongoing TERM pass to KILL when the grace expires; KILL itself is never cut short.
+    pub(super) fn term_until(&mut self, by: Instant) -> Result<(), TrackerError> {
+        self.signal_while(Signal::SIGTERM, || Instant::now() < by)
+    }
+
+    fn signal_while(
+        &mut self,
+        signal: Signal,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<(), TrackerError> {
         let mut gone = Vec::new();
         let mut first_failure = None;
         for (pid, member) in &self.members {
+            if !keep_going() {
+                break;
+            }
             match member.identity.is_current() {
                 Ok(true) => {}
                 Ok(false) => {
@@ -410,6 +440,42 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn expired_term_signals_nobody_and_does_not_disable_kill() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut child = assert_ok!(Command::new("/bin/sleep").arg("30").spawn());
+        assert_ok!(tracker.arm(&queue, i32::try_from(child.id()).unwrap_or(i32::MAX), false));
+        assert_ok!(tracker.term_until(Instant::now()));
+        std::thread::sleep(Duration::from_millis(50));
+        let before_kill = assert_ok!(child.try_wait());
+        assert_ok!(tracker.signal(Signal::SIGKILL));
+        let _ = child.wait();
+        assert_eq!(before_kill, None);
+    }
+
+    #[test]
+    fn a_term_pass_yields_between_members_but_kill_still_reaches_every_member() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut children: Vec<_> = (0..3)
+            .map(|_| assert_ok!(Command::new("/bin/sleep").arg("30").spawn()))
+            .collect();
+        for child in &children {
+            assert_ok!(tracker.arm(&queue, i32::try_from(child.id()).unwrap_or(i32::MAX), false));
+        }
+        let mut checks = 0;
+        assert_ok!(tracker.signal_while(Signal::SIGTERM, || {
+            checks += 1;
+            checks == 1
+        }));
+        assert_eq!(checks, 2);
+        assert_ok!(tracker.signal(Signal::SIGKILL));
+        for child in &mut children {
+            assert!(!assert_ok!(child.wait()).success());
+        }
+    }
+
+    #[test]
     fn a_stale_exit_event_cannot_remove_a_new_registration() {
         let queue = assert_ok!(Kqueue::new());
         let mut child = assert_ok!(Command::new("/bin/sleep").arg("30").spawn());
@@ -439,6 +505,26 @@ mod tests {
         assert!(tracker.is_empty());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn expired_discovery_does_not_admit_work_or_prevent_signalling() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut child = assert_ok!(Command::new("/bin/sleep").arg("30").spawn());
+        let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        let mut tracker = Tracker::default();
+        let root = assert_ok!(tracker.arm(&queue, pid, false));
+        tracker.discovery_until(Some(Instant::now()));
+        assert!(matches!(
+            tracker.discover(&queue, root, root, false),
+            Err(TrackerError::Deadline)
+        ));
+        assert!(matches!(
+            tracker.scan_group(&queue, root, root),
+            Err(TrackerError::Deadline)
+        ));
+        assert_ok!(tracker.signal(Signal::SIGKILL));
+        assert!(!assert_ok!(child.wait()).success());
     }
 
     /// A recorded process is replaced by a different one under the same number, which is what a reused
@@ -585,29 +671,33 @@ mod tests {
         let _ = parent.wait();
     }
 
-    /// A sweep begun at the far end of time sees every process as already started.
-    const FOREVER: (u64, u64) = (u64::MAX, 0);
+    fn identity_of(child: &std::process::Child) -> Identity {
+        assert_ok!(Identity::of(i32::try_from(child.id()).unwrap_or(i32::MAX)))
+    }
 
-    /// The reuse counterexample from the review: evidence about a process at number P, then P reused by
-    /// a newer process of the same user. The sweep began before the newer process started, so it
-    /// cannot be the one the evidence was about, and every other check passes for it.
+    /// Evidence belongs to the observed identity, not the next occupant of its number.
+    /// A genuinely new candidate remains admissible when its own identity was confirmed.
     #[test]
-    fn a_process_that_started_after_the_sweep_began_is_never_adopted_from_it() {
+    fn a_sweep_identity_cannot_be_replaced_before_adoption() {
         let queue = assert_ok!(Kqueue::new());
         let mut tracker = Tracker::default();
         let mut root = assert_ok!(Command::new("/bin/sleep").arg("30").spawn());
         let root_pid = i32::try_from(root.id()).unwrap_or(i32::MAX);
         assert_ok!(tracker.arm(&queue, root_pid, false));
-        let begun = assert_ok!(Identity::of(root_pid)).started();
+        let root_identity = assert_ok!(Identity::of(root_pid));
         std::thread::sleep(Duration::from_millis(30));
         let mut later = assert_ok!(Command::new("/bin/sleep").arg("30").spawn());
         let later_pid = i32::try_from(later.id()).unwrap_or(i32::MAX);
-        assert!(!assert_ok!(
-            tracker.adopt_candidate(&queue, later_pid, 0, begun)
-        ));
-        assert!(assert_ok!(
-            tracker.adopt_candidate(&queue, later_pid, 0, FOREVER)
-        ));
+        assert!(!assert_ok!(tracker.adopt_candidate(
+            &queue,
+            root_identity.with_pid(later_pid),
+            0
+        )));
+        assert!(assert_ok!(tracker.adopt_candidate(
+            &queue,
+            identity_of(&later),
+            0
+        )));
         let _ = root.kill();
         let _ = root.wait();
         let _ = later.kill();
@@ -626,47 +716,47 @@ mod tests {
         // With no roots there is nothing to compare against.
         assert!(!assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&newer),
-            0,
-            FOREVER
+            identity_of(&newer),
+            0
         )));
         assert_ok!(tracker.arm(&queue, pid(&root), false));
         assert!(!assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&older),
-            0,
-            FOREVER
+            identity_of(&older),
+            0
         )));
-        assert!(!assert_ok!(tracker.adopt_candidate(&queue, 1, 0, FOREVER)));
         assert!(!assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&newer),
-            pid(&newer),
-            FOREVER
+            identity_of(&root).with_pid(1),
+            0
+        )));
+        assert!(!assert_ok!(tracker.adopt_candidate(
+            &queue,
+            identity_of(&newer),
+            pid(&newer)
         )));
         assert!(assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&newer),
-            0,
-            FOREVER
+            identity_of(&newer),
+            0
         )));
         assert!(!assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&newer),
-            0,
-            FOREVER
+            identity_of(&newer),
+            0
         )));
-        assert!(!assert_ok!(
-            tracker.adopt_candidate(&queue, 999_990, 0, FOREVER)
-        ));
+        assert!(!assert_ok!(tracker.adopt_candidate(
+            &queue,
+            identity_of(&root).with_pid(999_990),
+            0
+        )));
         // The root's exit does not forget it: a sweep after the roots are gone still has a reference.
         let _ = root.kill();
         let _ = root.wait();
         assert!(!assert_ok!(tracker.adopt_candidate(
             &queue,
-            pid(&older),
-            0,
-            FOREVER
+            identity_of(&older),
+            0
         )));
         for child in [&mut older, &mut root, &mut newer] {
             let _ = child.kill();
@@ -821,7 +911,8 @@ mod descendants {
     fn a_member_still_dies_after_its_group_leader_has_exited() {
         let queue = assert_ok!(Kqueue::new());
         let mut tracker = Tracker::default();
-        let mut gated = Gated::start("sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exit 0");
+        let mut gated =
+            Gated::start("sleep 30 </dev/null >/dev/null 2>&1 & echo $!; read exit_now; exit 0");
         assert_ok!(tracker.arm(&queue, gated.pid(), true));
         let child = gated.release();
         drain(&mut tracker, &queue, Duration::from_millis(300));
@@ -830,8 +921,10 @@ mod descendants {
             "{:?}",
             tracker.members.keys()
         );
-        assert_ok!(tracker.signal(Signal::SIGKILL));
+        let _ = gated.go.write_all(b"exit\n");
         let _ = gated.leader.wait();
+        drain(&mut tracker, &queue, Duration::from_millis(50));
+        assert_ok!(tracker.signal(Signal::SIGKILL));
         assert_dies(child);
     }
 
@@ -860,7 +953,7 @@ mod descendants {
     /// The member is started by the test, so it is in the root's group but is nobody's descendant
     /// of the root: parentage cannot find it, only the group scan can.
     #[test]
-    fn a_member_of_the_roots_own_group_is_found_by_the_group_scan_when_the_root_exits() {
+    fn an_owned_group_member_is_retained_when_the_root_exits() {
         let queue = assert_ok!(Kqueue::new());
         let mut tracker = Tracker::default();
         let mut gated = Gated::start("exit 0");
@@ -872,6 +965,8 @@ mod descendants {
                 .spawn()
         );
         let member_pid = i32::try_from(member.id()).unwrap_or(i32::MAX);
+        let root = tracker.members[&gated.pid()].identity;
+        assert_ok!(tracker.scan_group(&queue, root, root));
         let _ = gated.go.write_all(b"go\n");
         drain(&mut tracker, &queue, Duration::from_millis(300));
         assert!(
@@ -882,6 +977,31 @@ mod descendants {
         let _ = gated.leader.wait();
         let _ = member.kill();
         let _ = member.wait();
+    }
+
+    #[test]
+    fn a_gone_leader_is_not_authority_to_adopt_an_unknown_group_member() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut gated = Gated::start("exit 0");
+        let root = assert_ok!(tracker.arm(&queue, gated.pid(), true));
+        let mut stranger = assert_ok!(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(gated.pid())
+                .spawn()
+        );
+        let stranger_pid = i32::try_from(stranger.id()).unwrap_or(i32::MAX);
+        let _ = gated.go.write_all(b"go\n");
+        let _ = gated.leader.wait();
+        assert_ok!(tracker.scan_group(&queue, root, root));
+        let adopted = tracker.members.contains_key(&stranger_pid);
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(
+            !adopted,
+            "a leaderless numeric group was treated as ownership"
+        );
     }
 
     /// The reviewer's counterexample for the group scan. The root's group number is "reused": the root
