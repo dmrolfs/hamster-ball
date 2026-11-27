@@ -196,6 +196,7 @@ fn spawn_reaper(
     channel_reader: JoinHandle<()>,
     stop_asked: &Arc<Mutex<Option<Instant>>>,
 ) -> io::Result<JoinHandle<()>> {
+    fault(Step::Reaper)?;
     let (id, generation) = (wiring.id, wiring.generation);
     let asked = Arc::clone(stop_asked);
     let kill = Arc::clone(wiring.kill);
@@ -225,6 +226,46 @@ fn spawn_reaper(
         })
 }
 
+/// The construction steps, in order, at which a test can make [`spawn`] fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum Step {
+    /// Making the terminal non-blocking and setting the socket's write timeout.
+    Prepare,
+    /// Writing the handshake.
+    Handshake,
+    /// Starting the PTY reader.
+    PtyReader,
+    /// Starting the writer.
+    Writer,
+    /// Starting the channel reader.
+    ChannelReader,
+    /// Starting the reaper.
+    Reaper,
+}
+
+/// Which step is to fail, for tests (an index into [`Step`], or `usize::MAX` for none). Only
+/// read in a test-support build; a release build has no way to ask for a failure.
+pub static FAIL_AT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Fails with an error if a test asked for `step` to fail. Always `Ok` in a release build.
+#[cfg(feature = "test-support")]
+fn fault(step: Step) -> io::Result<()> {
+    use strum::IntoEnumIterator;
+    let wanted = FAIL_AT.load(Ordering::SeqCst);
+    if Step::iter().position(|s| s == step) == Some(wanted) {
+        return Err(io::Error::other(format!("injected failure at {step}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+#[allow(clippy::unnecessary_wraps)]
+const fn fault(_: Step) -> io::Result<()> {
+    Ok(())
+}
+
 /// What the threads of one session share besides their descriptors.
 struct Wiring<'a> {
     id: SessionId,
@@ -250,14 +291,18 @@ fn spawn_threads(
     } = *wiring;
     // The flag is on the open file, so it covers every descriptor duplicated from this one: the
     // PTY reader below must therefore wait with `poll` and treat "would block" as "not yet".
+    fault(Step::Prepare)?;
     outbox::set_nonblocking(terminal)?;
     // A socket that stays full fails a write after this long instead of hanging it. It covers the
     // handshake, and Stop, and applies to writes only.
     channel.set_write_timeout(Some(STALL))?;
     let line = encode_line(&Hello::new(u64::from(id.0), generation)).map_err(io::Error::other)?;
+    fault(Step::Handshake)?;
     channel.try_clone()?.write_all(&line)?;
     let reader = channel.try_clone()?;
+    fault(Step::PtyReader)?;
     let pty_thread = spawn_pty_reader(id, terminal.try_clone()?, shared, outbox)?;
+    fault(Step::Writer)?;
     let writer_thread = spawn_writer(
         id,
         terminal.try_clone()?,
@@ -267,6 +312,7 @@ fn spawn_threads(
     )?;
     let inbox = messages.clone();
     let for_reader = Arc::clone(outbox);
+    fault(Step::ChannelReader)?;
     let channel_thread = thread::Builder::new()
         .name(format!("hb-chan-{}", id.0))
         .spawn(move || read_channel(id, generation, reader, &inbox, &for_reader))?;
@@ -356,6 +402,26 @@ impl Stopping<'_> {
     }
 }
 
+/// What the reaper needs of a process: so a failing one can be put in its place in a test, since
+/// a real child cannot be made to fail `try_wait`.
+trait Process {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl Process for std::process::Child {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        Self::try_wait(self)
+    }
+    fn kill(&mut self) -> io::Result<()> {
+        Self::kill(self)
+    }
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        Self::wait(self)
+    }
+}
+
 /// How a session's process ended, as far as the reaper could tell.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -383,7 +449,7 @@ pub enum ReapError {
 fn reap(
     id: SessionId,
     generation: Generation,
-    child: &mut std::process::Child,
+    child: &mut impl Process,
     channel_reader: JoinHandle<()>,
     stopping: &Stopping<'_>,
     inbox: &SyncSender<Msg>,
@@ -425,7 +491,7 @@ fn reap(
 /// Polls until the process has ended, killing it when asked to or when its stop is overdue.
 /// An error from the operating system is not an exit: the child is killed and the error returned.
 fn wait_for_exit(
-    child: &mut std::process::Child,
+    child: &mut impl Process,
     stopping: &Stopping<'_>,
 ) -> io::Result<std::process::ExitStatus> {
     loop {
@@ -730,5 +796,116 @@ mod tests {
             "a cancelled reader must not stay blocked on the inbox"
         );
         drop(rx);
+    }
+
+    // ========================================================================
+    // The reaper never reports an exit it did not see
+    // ========================================================================
+
+    /// A process whose `try_wait` fails, and which records being killed and waited for.
+    #[derive(Default)]
+    struct Broken {
+        killed: bool,
+        waited: bool,
+    }
+
+    impl Process for Broken {
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        fn kill(&mut self) -> io::Result<()> {
+            self.killed = true;
+            Ok(())
+        }
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            self.waited = true;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    fn reap_with(
+        child: &mut impl Process,
+        reader: JoinHandle<()>,
+    ) -> (Vec<Msg>, Arc<Outbox>, bool) {
+        let (ours, theirs) = assert_ok!(UnixStream::pair());
+        let (tx, rx) = sync_channel(8);
+        let outbox = Arc::new(Outbox::new());
+        let asked = Mutex::new(None);
+        let kill = AtomicBool::new(false);
+        reap(
+            SessionId(4),
+            2,
+            child,
+            reader,
+            &Stopping {
+                asked: &asked,
+                kill: &kill,
+                outbox: &outbox,
+                channel: &ours,
+            },
+            &tx,
+        );
+        drop(tx);
+        // The channel was closed by the reaper: the far end sees the end of the stream.
+        let mut far = theirs;
+        far.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let closed = std::io::Read::read(&mut far, &mut [0u8; 1]).is_ok_and(|n| n == 0);
+        (rx.iter().collect(), outbox, closed)
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_waited_for_is_killed_and_reported_lost_never_exited() {
+        let mut child = Broken::default();
+        let reader = thread::spawn(|| {});
+        let (messages, outbox, channel_closed) = reap_with(&mut child, reader);
+        assert!(child.killed && child.waited, "it must be killed and reaped");
+        assert!(channel_closed, "the channel must be closed so hb stops too");
+        assert!(outbox.is_cancelled());
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        match &messages[0] {
+            Msg::SessionLost {
+                id,
+                generation,
+                reason,
+            } => {
+                assert_eq!((*id, *generation), (SessionId(4), 2));
+                assert!(reason.contains("could not be read"), "{reason}");
+            }
+            other => assert_ok!(Err::<(), String>(format!(
+                "expected SessionLost, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn a_reader_that_panicked_is_reported_lost_even_though_the_process_exited() {
+        let mut child = assert_ok!(std::process::Command::new("/usr/bin/true").spawn());
+        let reader = thread::spawn(|| std::panic::resume_unwind(Box::new("boom")));
+        // The hook would print the panic; this one is expected.
+        let (messages, _, _) = reap_with(&mut child, reader);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            matches!(&messages[0], Msg::SessionLost { reason, .. } if reason.contains("panicked")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn an_exit_that_was_seen_is_reported_with_its_code() {
+        let mut child = assert_ok!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+        );
+        let (messages, _, _) = reap_with(&mut child, thread::spawn(|| {}));
+        assert_eq!(
+            messages,
+            vec![Msg::ProcessExited {
+                id: SessionId(4),
+                generation: 2,
+                code: Some(7),
+                signal: None
+            }]
+        );
     }
 }

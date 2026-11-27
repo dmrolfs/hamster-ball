@@ -14,7 +14,7 @@ use claims::{assert_ok, assert_some};
 use common::{World, sandbox_available};
 use hamster_ball::supervise::app::{App, Effect, LaunchSpec, Msg, Phase, SessionId};
 use hamster_ball::supervise::launch::start_with_env;
-use hamster_ball::supervise::session::{Shared, Worker, spawn};
+use hamster_ball::supervise::session::{FAIL_AT, Shared, Step, Worker, spawn};
 use pretty_assertions::assert_eq;
 
 const SUPERVISE: &str = env!("CARGO_BIN_EXE_hb-supervise");
@@ -288,4 +288,74 @@ fn a_spawn_that_fails_leaves_no_process_behind_and_returns_the_error() {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
         "hb ({pid}) is still there after a failed spawn"
     );
+}
+
+/// Names of this process's threads that belong to session `id`, from the kernel.
+fn session_threads(id: u32) -> Vec<String> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output();
+    let _ = id;
+    out.map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[test]
+fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_started() {
+    use strum::IntoEnumIterator;
+    sandboxed!();
+    for (index, step) in Step::iter().enumerate() {
+        let w = World::new(PROJECT);
+        w.approve();
+        let launch = spec(&w, &["/bin/sh", "-c", "sleep 300"]);
+        let vars: Vec<(&str, std::ffi::OsString)> = vec![
+            ("HB_TD_HOME", w.home_dir().into_os_string()),
+            ("HB_TD_CWD", w.project.clone().into_os_string()),
+            ("HB_TD_PATH", w.base.join("bin").into_os_string()),
+            ("HB_TD_TMP", w.base.join("tmp").into_os_string()),
+        ];
+        let extra: Vec<(&str, &std::ffi::OsStr)> =
+            vars.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+        let started = assert_ok!(start_with_env(
+            &PathBuf::from(DRIVE),
+            &PathBuf::from(SUPERVISE),
+            &launch,
+            30,
+            100,
+            &extra
+        ));
+        let pid = assert_ok!(i32::try_from(started.child.id()));
+        // A full inbox that nobody reads, so a started reader that sends would stay blocked on
+        // it unless cancelling really reaches it.
+        let (tx, rx) = sync_channel(1);
+        let threads_before = session_threads(1).len();
+        FAIL_AT.store(index, std::sync::atomic::Ordering::SeqCst);
+        let result = spawn(SessionId(1), 1, started, Shared::new(30, 100), tx);
+        FAIL_AT.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            result.is_err(),
+            "{step}: spawn went on after the injected failure"
+        );
+        // The process was killed and reaped by spawn itself.
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "{step}: hb ({pid}) is still there"
+        );
+        // Every thread that was started ends, whatever it was doing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session_threads(1).len() > threads_before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            session_threads(1).len().saturating_sub(threads_before),
+            0,
+            "{step}: a thread outlived a failed spawn"
+        );
+        drop(rx);
+    }
 }
