@@ -212,6 +212,31 @@ impl StopSignals {
     }
 }
 
+/// How waiting for the review ended. Only `Exited` means the process is known to be gone.
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    /// It ended, successfully or not.
+    Exited(bool),
+    /// The system could not say whether it ended, so it may still be running.
+    Error(String),
+}
+
+/// Whether the review child has to be killed before it is waited for: always, unless it was seen
+/// to exit. A wait that failed, or a review cut short, leaves it possibly running.
+fn must_kill_before_waiting(outcome: Option<&Waited>) -> bool {
+    !matches!(outcome, Some(Waited::Exited(_)))
+}
+
+/// What the app is told about a review.
+fn outcome_of(outcome: Option<Waited>) -> ApprovalOutcome {
+    match outcome {
+        Some(Waited::Exited(true)) => ApprovalOutcome::Approved,
+        // A review cut short did not approve anything.
+        Some(Waited::Exited(false)) | None => ApprovalOutcome::NotApproved,
+        Some(Waited::Error(error)) => ApprovalOutcome::Failed(error),
+    }
+}
+
 /// How `hb approve` is run.
 struct Reviewer {
     hb: std::path::PathBuf,
@@ -451,25 +476,27 @@ impl Loop<'_> {
             Err(error) => return ApprovalOutcome::Failed(error.to_string()),
         }
         let outcome = self.wait_for_review();
-        // Ended or cancelled, the child is reaped before anything else happens.
+        // The child is reaped before anything else happens, but only an observed exit may be
+        // waited for without end. Anything else (cancelled, or the system could not say) means it
+        // may still be running: it is killed first, so this wait cannot hang on an unanswered
+        // review while no session message is being read.
         if let Some(mut child) = self.review_child.take() {
-            if outcome.is_none() {
+            if must_kill_before_waiting(outcome.as_ref()) {
                 let _ = child.kill();
             }
             let _ = child.wait();
         }
-        outcome.unwrap_or(ApprovalOutcome::NotApproved)
+        outcome_of(outcome)
     }
 
     /// `None` when the review was cut short (a stop or Ctrl-C); the child is then still there.
-    fn wait_for_review(&mut self) -> Option<ApprovalOutcome> {
+    fn wait_for_review(&mut self) -> Option<Waited> {
         loop {
             let child = self.review_child.as_mut()?;
             match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Some(ApprovalOutcome::Approved),
-                Ok(Some(_)) => return Some(ApprovalOutcome::NotApproved),
+                Ok(Some(status)) => return Some(Waited::Exited(status.success())),
                 Ok(None) => {}
-                Err(error) => return Some(ApprovalOutcome::Failed(error.to_string())),
+                Err(error) => return Some(Waited::Error(error.to_string())),
             }
             // Other sessions go on being read while the owner answers.
             self.runtime.step();
@@ -498,4 +525,36 @@ fn drain_events() -> Result<(), UiError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn only_an_observed_exit_may_be_waited_for_without_a_kill() {
+        assert!(!must_kill_before_waiting(Some(&Waited::Exited(true))));
+        assert!(!must_kill_before_waiting(Some(&Waited::Exited(false))));
+        // The system could not say, or the review was cut short: it may still be running.
+        assert!(must_kill_before_waiting(Some(&Waited::Error("x".into()))));
+        assert!(must_kill_before_waiting(None));
+    }
+
+    #[test]
+    fn what_the_app_is_told_follows_what_was_seen() {
+        assert_eq!(
+            outcome_of(Some(Waited::Exited(true))),
+            ApprovalOutcome::Approved
+        );
+        assert_eq!(
+            outcome_of(Some(Waited::Exited(false))),
+            ApprovalOutcome::NotApproved
+        );
+        assert_eq!(outcome_of(None), ApprovalOutcome::NotApproved);
+        assert_eq!(
+            outcome_of(Some(Waited::Error("denied".into()))),
+            ApprovalOutcome::Failed("denied".into())
+        );
+    }
 }

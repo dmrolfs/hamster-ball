@@ -45,6 +45,9 @@ pub enum InputError {
     /// The session is stopping, ended, or its terminal failed.
     #[snafu(display("the session no longer takes input"))]
     Closed,
+    /// There was nothing to send. Refused so that empty items cannot fill the queue for free.
+    #[snafu(display("there is no input to send"))]
+    Empty,
 }
 
 /// Why the writer stopped.
@@ -71,6 +74,8 @@ pub enum WriterError {
 #[derive(Debug, Default)]
 struct State {
     queue: VecDeque<Vec<u8>>,
+    /// Bytes waiting in `queue`, plus the item the writer is sending now until it has been sent:
+    /// the budget bounds everything the outbox holds, not only what has not been picked up yet.
     pending: usize,
     stop: bool,
     /// Input is refused from here on: stopping, ended, or failed.
@@ -103,8 +108,12 @@ impl Outbox {
     /// Queues `bytes` whole, or refuses them. Never blocks.
     ///
     /// # Errors
-    /// [`InputError::Full`] if they do not fit; [`InputError::Closed`] once stopping or ended.
-    pub fn push(&self, bytes: Vec<u8>) -> Result<(), InputError> {
+    /// [`InputError::Full`] if they do not fit; [`InputError::Closed`] once stopping or ended;
+    /// [`InputError::Empty`] for no bytes.
+    pub fn push(&self, mut bytes: Vec<u8>) -> Result<(), InputError> {
+        if bytes.is_empty() {
+            return Err(InputError::Empty);
+        }
         let mut state = self.lock();
         if state.refusing {
             return Err(InputError::Closed);
@@ -114,6 +123,9 @@ impl Outbox {
                 pending: state.pending,
             });
         }
+        // What is held is what is charged: a vector that says it has room for 64 MiB and holds one
+        // byte would otherwise keep 64 MiB for the price of one.
+        bytes.shrink_to_fit();
         state.pending += bytes.len();
         state.queue.push_back(bytes);
         drop(state);
@@ -183,7 +195,7 @@ impl Outbox {
                 if state.stop {
                     Next::Stop
                 } else if let Some(bytes) = state.queue.pop_front() {
-                    state.pending -= bytes.len();
+                    // Still charged: it is held until it has been written (see `finished`).
                     Next::Input(bytes)
                 } else {
                     let _ = self.wake.wait_timeout(state, POLL);
@@ -199,9 +211,19 @@ impl Outbox {
                     // Nothing is sent after Stop: the writer's work is done.
                     return Ok(());
                 }
-                Next::Input(bytes) => self.write_input(terminal, &bytes)?,
+                Next::Input(bytes) => {
+                    let written = self.write_input(terminal, &bytes);
+                    self.finished(bytes.len());
+                    written?;
+                }
             }
         }
+    }
+
+    /// An item is no longer held: written, abandoned for a stop, or failed.
+    fn finished(&self, len: usize) {
+        let mut state = self.lock();
+        state.pending = state.pending.saturating_sub(len);
     }
 
     /// Writes all of `bytes`, or stops early (without error) if a stop or cancel arrives.
@@ -462,5 +484,83 @@ mod tests {
         outbox.request_stop();
         let error = assert_err!(outbox.run(&master, &mut Broken, b"STOP\n"));
         assert!(matches!(error, WriterError::Channel { .. }), "{error:?}");
+    }
+
+    // ========================================================================
+    // The budget is a bound on what the queue holds, not on what the caller says it holds
+    // ========================================================================
+
+    #[test]
+    fn empty_input_is_refused_so_it_cannot_fill_the_queue_for_free() {
+        let outbox = Outbox::new();
+        for _ in 0..10_000 {
+            assert_eq!(outbox.push(Vec::new()), Err(InputError::Empty));
+        }
+        assert_eq!(outbox.lock().queue.len(), 0, "nothing was queued");
+    }
+
+    #[test]
+    fn a_vector_with_a_huge_capacity_is_charged_for_what_it_holds_not_what_it_says() {
+        let outbox = Outbox::new();
+        let mut roomy = Vec::with_capacity(64 << 20);
+        roomy.push(b'x');
+        assert_ok!(outbox.push(roomy));
+        let held = outbox.lock().queue.front().map(Vec::capacity).unwrap_or(0);
+        assert!(
+            held <= 2 * 1024,
+            "the queue kept a {held} byte allocation for one byte of input"
+        );
+        assert_eq!(outbox.lock().pending, 1);
+    }
+
+    #[test]
+    fn the_bytes_in_flight_count_against_the_budget_until_they_are_written() {
+        // One full queue handed to the writer must not leave room for a second one behind it.
+        let (master, _slave) = stalled_terminal();
+        let outbox = Arc::new(Outbox::new());
+        let writer = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || outbox.run(&master, &mut Sink::default(), b"STOP\n"))
+        };
+        assert_ok!(outbox.push(vec![b'x'; MAX_PENDING_BYTES]));
+        // The writer takes it and stalls on the full pty.
+        thread::sleep(Duration::from_millis(300));
+        let refused = outbox.push(vec![b'y'; MAX_PENDING_BYTES]);
+        assert_eq!(
+            refused.map_err(|e| matches!(e, InputError::Full { .. })),
+            Err(true),
+            "a second full budget was accepted behind one still being written"
+        );
+        outbox.cancel();
+        assert_ok!(assert_ok!(writer.join()));
+    }
+
+    #[test]
+    fn what_has_been_written_is_no_longer_charged_so_the_budget_does_not_jam() {
+        let pty = assert_ok!(Pty::open());
+        let master = assert_ok!(pty.clone_master());
+        assert_ok!(set_nonblocking(&master));
+        let mut slave = assert_ok!(File::open(pty.slave_path().as_str()));
+        let outbox = Arc::new(Outbox::new());
+        let writer = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || outbox.run(&master, &mut Sink::default(), b"STOP\n"))
+        };
+        // Far more than the budget in total, one small line at a time, each read back.
+        let mut buffer = [0u8; 256];
+        for n in 0..(MAX_PENDING_BYTES / 16) * 3 {
+            let line = format!("{n:07}\n").into_bytes();
+            assert!(
+                within(5, || outbox.push(line.clone()).is_ok()),
+                "the budget is used up after {n} lines: written input was never uncharged"
+            );
+            let mut got = 0;
+            while got < line.len() {
+                got += assert_ok!(slave.read(&mut buffer));
+            }
+        }
+        assert_eq!(outbox.lock().pending, 0);
+        outbox.cancel();
+        assert_ok!(assert_ok!(writer.join()));
     }
 }
