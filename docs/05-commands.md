@@ -74,6 +74,9 @@ It shows the project root, each file with a short digest, and what the project a
 It accepts only the words `approve` and the six-digit code shown with that question, typed at a terminal.
 The code is new for every question, and anything typed before the question appeared is discarded, so a pasted or queued answer cannot approve a config you did not read.
 A plain `y` or `yes` does nothing.
+The code stops answers that were typed, pasted or queued before the question appeared.
+It does not stop a program that can read your terminal's screen and send it input (for example one that owns the terminal's master side, or one that can drive your terminal emulator or tmux).
+Agents that `hb` runs have their own terminal and cannot do either by default; a program outside the sandbox can.
 There is no `--yes`.
 
 | Option | Meaning |

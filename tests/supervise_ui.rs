@@ -591,3 +591,37 @@ fn hb_approve_started_by_the_supervisor_can_be_ended_by_sigterm_and_sigint_on_it
         );
     }
 }
+
+/// The numbered descriptors `pid` holds, from `lsof`.
+fn numbered_fds(pid: u32) -> Vec<String> {
+    let out = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-p", &pid.to_string(), "-n", "-P", "-F", "f"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    out.lines()
+        .filter_map(|l| l.strip_prefix('f'))
+        .filter(|f| f.parse::<u32>().is_ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_review_holds_only_the_terminal_not_the_supervisors_channels_queues_or_ptys() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let owner = start_review(&w);
+    let review = assert_some!(approve_pid(owner.child.id()));
+    // The method can see descriptors: the supervisor itself holds queues, sockets and a pty master.
+    let supervisor = numbered_fds(owner.child.id());
+    assert!(
+        supervisor.len() > 3,
+        "the census saw no extra descriptors in the supervisor: {supervisor:?}"
+    );
+    let held = numbered_fds(review.unsigned_abs());
+    assert_eq!(
+        held,
+        ["0", "1", "2"],
+        "the review inherited more than stdio"
+    );
+}
