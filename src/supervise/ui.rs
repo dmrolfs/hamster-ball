@@ -514,6 +514,11 @@ impl Loop<'_> {
 }
 
 /// Drops terminal events already read or waiting, without waiting for more.
+///
+/// Known limit: the terminal library keeps a half-received key sequence (`ESC [`, `ESC [ 1`) in a
+/// buffer of its own that has no reset and that it never gives up on a timeout (measured), so
+/// such bytes combine with the next keys and swallow one or two of them. A lone `ESC` is not
+/// affected. Only a partial sequence caught exactly at the hand-over can do this.
 fn drain_events() -> Result<(), UiError> {
     let mut dropped = 0;
     while event::poll(Duration::ZERO).context(TerminalSnafu)? {
