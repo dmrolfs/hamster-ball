@@ -3,6 +3,7 @@
 //! A run: everything between "the policy is loaded" and "the child has exited".
 
 pub mod ca_bundle;
+pub mod cache;
 pub mod child_helper;
 pub mod ctl;
 pub mod denials;
