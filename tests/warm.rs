@@ -91,35 +91,80 @@ fn seen(w: &World) -> String {
 }
 
 #[test]
-fn warming_starts_the_server_online_with_hbs_cache_stamps_it_and_marks_the_cache() {
+fn warming_builds_in_a_private_workspace_then_publishes_one_generation_and_stamps_it() {
     sandboxed!();
     let w = world(PROJECT, true);
     let out = hb(&w, &["warm"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("warmed time"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("published cache generation"),
+        "{}",
+        out.stdout
+    );
     let seen = seen(&w);
-    let root = fs::canonicalize(cache(&w)).unwrap_or_else(|_| cache(&w));
     assert!(
         seen.contains("args=mcp-server-time\n"),
         "no --offline: {seen}"
     );
+    // The server built inside a workspace under builds/, never the shared cache root.
+    let builds =
+        fs::canonicalize(cache(&w).join("builds")).unwrap_or_else(|_| cache(&w).join("builds"));
+    for var in ["uv_cache", "tool_dir", "npm"] {
+        let line = seen
+            .lines()
+            .find(|l| l.starts_with(var))
+            .unwrap_or_default();
+        assert!(
+            line.contains(&format!("{}/", builds.display())),
+            "{var}: {seen}"
+        );
+    }
     assert!(
-        seen.contains(&format!("uv_cache={}/uv\n", root.display())),
-        "{seen}"
+        !cache(&w).join("warmed").exists(),
+        "the hint-only marker is gone"
     );
-    assert!(
-        seen.contains(&format!("tool_dir={}/uv-tools\n", root.display())),
-        "{seen}"
-    );
-    assert!(
-        seen.contains(&format!("npm={}/npm\n", root.display())),
-        "{seen}"
-    );
-    assert!(
-        cache(&w).join("warmed").exists(),
-        "the marker the launchers test"
+    let generations = fs::read_dir(cache(&w).join("generations"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(generations, 1);
+    assert_eq!(
+        fs::read_dir(cache(&w).join("builds"))
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0,
+        "the workspace is removed once published"
     );
     assert_eq!(stamps(&w), 1);
+}
+
+#[test]
+fn a_failed_warm_publishes_nothing_and_leaves_no_workspace() {
+    sandboxed!();
+    let w = world(PROJECT, false);
+    let out = hb(&w, &["warm"]);
+    assert_ne!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("not published"), "{}", out.stdout);
+    assert!(
+        !cache(&w).join("generations").exists()
+            || fs::read_dir(cache(&w).join("generations"))
+                .map(|d| d.count())
+                .unwrap_or(0)
+                == 0
+    );
+    assert!(
+        !cache(&w)
+            .join("projects")
+            .read_dir()
+            .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| e.path().join("current").exists())))
+    );
+    assert_eq!(
+        fs::read_dir(cache(&w).join("builds"))
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(stamps(&w), 0);
 }
 
 #[test]

@@ -786,17 +786,43 @@ fn warm_command(
     let signals = supervise.map_or(SignalMode::Off, |s| SignalMode::Forward { grace: s.grace });
     let at_terminal = std::io::stderr().is_terminal();
     let limit = Duration::from_secs(args.timeout);
+    let tools = match crate::system::find_tools(
+        &loaded
+            .policy
+            .env
+            .tools
+            .iter()
+            .map(|t| t.value.clone())
+            .collect::<Vec<_>>(),
+        env.floor.path_var.as_deref(),
+    ) {
+        Ok(tools) => tools,
+        Err(error) => return fail(err, crate::Error::from(RunError::from(error))),
+    };
+    // One workspace for the whole selection: nothing is published until every server answered,
+    // so a failure or an interrupt leaves the previous generation current.
+    let build = match warm::begin(env, &selection.warm, &tools, discovery.root.path()) {
+        Ok(build) => build,
+        Err(error) => return fail(err, crate::Error::from(error)),
+    };
     let mut failed = false;
     for server in &selection.warm {
         let logging = Logging {
             denials: args.log_denials.then(|| denial_sink(at_terminal)),
             proxy_log: args.log_proxy.then(|| proxy_log_sink(at_terminal)),
         };
-        let (result, outcome) =
-            match warm::warm_server(env, &loaded, server, limit, signals, logging) {
-                Ok(done) => done,
-                Err(error) => return fail(err, crate::Error::from(error)),
-            };
+        let (result, outcome) = match warm::warm_server(
+            env,
+            &loaded,
+            server,
+            build.workspace(),
+            limit,
+            signals,
+            logging,
+        ) {
+            Ok(done) => done,
+            Err(error) => return fail(err, crate::Error::from(error)),
+        };
         for warning in &outcome.warnings {
             let _ = writeln!(err, "warning: {warning}");
         }
@@ -808,15 +834,7 @@ fn warm_command(
         }
         match result {
             Warmed::Answered { took } => {
-                match warm::record_success(env, discovery.root.path(), server) {
-                    Ok(()) => {
-                        let _ = writeln!(out, "warmed {} ({} s)", server.name, took.as_secs());
-                    }
-                    Err(message) => {
-                        failed = true;
-                        let _ = writeln!(out, "FAILED {}: {message}", server.name);
-                    }
-                }
+                let _ = writeln!(out, "warmed {} ({} s)", server.name, took.as_secs());
             }
             Warmed::Failed { why } => {
                 failed = true;
@@ -834,9 +852,18 @@ fn warm_command(
         }
     }
     if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+        let _ = writeln!(
+            out,
+            "not published: a server did not answer; the previous cache is unchanged"
+        );
+        return ExitCode::FAILURE;
+    }
+    match warm::publish(env, build, discovery.root.path(), &selection.warm, &tools) {
+        Ok(made) => {
+            let _ = writeln!(out, "published cache generation {}", made.id);
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(err, crate::Error::from(error)),
     }
 }
 

@@ -12,6 +12,7 @@ pub mod probe;
 pub mod stamp;
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -19,9 +20,13 @@ use snafu::Snafu;
 
 use crate::config::{Loaded, Policy};
 use crate::policy::{CanonicalPath, HostRule};
-use crate::session::offline::{Launcher, cache_root, mark_warmed};
+use crate::session::cache::{
+    CacheError, CacheGeneration, CacheLimits, CacheStore, WarmLock, expected_inputs_for,
+    remove_tree, seed_python,
+};
+use crate::session::offline::{Launcher, cache_root};
 use crate::session::{DenialSink, ExitKind, Outcome, RunError, RunSpec, SignalMode, WarmSpec, run};
-use crate::system::{Environment, StateDir};
+use crate::system::{Environment, StateDir, ToolLookup};
 use stamp::{Standing, WarmStore, digest};
 
 /// One server `hb warm` can warm.
@@ -187,7 +192,10 @@ pub struct StartError {
     pub source: Box<RunError>,
 }
 
-/// Warms `server` once, in the ball `loaded` describes, and records it if it answered.
+/// Warms `server` once, in the ball `loaded` describes, building into `workspace`.
+///
+/// Nothing is recorded here: the generation is published only after every selected server
+/// answered, by [`publish`].
 ///
 /// # Errors
 /// [`StartError`] when the run could not start at all; a server that starts and does not answer
@@ -196,6 +204,7 @@ pub fn warm_server(
     env: &Environment,
     loaded: &Loaded,
     server: &Server,
+    workspace: &Path,
     limit: Duration,
     signals: SignalMode,
     logging: Logging,
@@ -204,6 +213,7 @@ pub fn warm_server(
         .signals(signals)
         .warm(WarmSpec {
             allowlist: server.allowlist.clone(),
+            workspace: workspace.to_path_buf(),
         })
         .proxy_summary(false);
     spec.denials = logging.denials;
@@ -227,20 +237,85 @@ pub fn warm_server(
     Ok((result, outcome))
 }
 
-/// Records a success: the stamp for `server`, and the marker that tells the launchers the cache was warmed.
+/// A warm in progress: the project's lock and the empty workspace the ball builds in.
+///
+/// Dropping it without calling [`publish`] removes the workspace and publishes nothing, so a
+/// failed or interrupted warm leaves the previous generation current and no complete-looking tree.
+#[derive(Debug)]
+pub struct WarmBuild {
+    store: CacheStore,
+    workspace: PathBuf,
+    _lock: WarmLock,
+}
+
+impl WarmBuild {
+    /// The directory the warm ball builds in.
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+}
+
+impl Drop for WarmBuild {
+    fn drop(&mut self) {
+        // Best effort: a published build was already removed by `publish`, and an unpublished
+        // leftover is never selected, whatever happens here.
+        let _ = remove_tree(&self.workspace);
+    }
+}
+
+/// Takes the project's warm lock and makes an empty workspace seeded with the user's own
+/// uv-managed interpreter, so the generation holds its Python.
 ///
 /// # Errors
-/// A message naming what could not be written.
-pub fn record_success(
+/// [`CacheError::WarmBusy`] if another warm of this project is running, or another
+/// [`CacheError`] if the workspace or the interpreter copy fails.
+pub fn begin(
     env: &Environment,
+    selected: &[Server],
+    tools: &ToolLookup,
     root: &CanonicalPath,
-    server: &Server,
-) -> Result<(), String> {
-    let store = WarmStore::new(&StateDir::locate(&env.home));
-    store
-        .record(root, &server.name, &server.digest(), SystemTime::now())
-        .map_err(|e| e.to_string())?;
-    mark_warmed(&cache_root(&env.home)).map_err(|e| format!("could not mark the cache warmed: {e}"))
+) -> Result<WarmBuild, CacheError> {
+    let store = CacheStore::new(cache_root(&env.home));
+    let inputs = expected_inputs_for(root, selected, tools)?;
+    let lock = store.lock_warm(&inputs.project_key)?;
+    let workspace = store.begin_build()?;
+    let build = WarmBuild {
+        store,
+        workspace,
+        _lock: lock,
+    };
+    let uv_python = env.home.path().as_path().join(".local/share/uv/python");
+    seed_python(&uv_python, &build.workspace, CacheLimits::default())?;
+    Ok(build)
+}
+
+/// Seals the finished workspace and publishes it as the project's current generation, then
+/// records the advisory stamps. Called once, after every selected server answered.
+///
+/// # Errors
+/// [`CacheError`] if sealing or publishing fails; the previous generation stays current.
+pub fn publish(
+    env: &Environment,
+    build: WarmBuild,
+    root: &CanonicalPath,
+    selected: &[Server],
+    tools: &ToolLookup,
+) -> Result<CacheGeneration, CacheError> {
+    let inputs = expected_inputs_for(root, selected, tools)?;
+    let old_root = build.workspace.clone();
+    let made = build.store.seal_and_publish(
+        &build.workspace,
+        &inputs,
+        Some(&old_root),
+        CacheLimits::default(),
+    )?;
+    let stamps = WarmStore::new(&StateDir::locate(&env.home));
+    for server in selected {
+        // Advisory display state only; a failed stamp never undoes a committed generation.
+        let _ = stamps.record(root, &server.name, &server.digest(), SystemTime::now());
+    }
+    Ok(made)
 }
 
 #[cfg(test)]

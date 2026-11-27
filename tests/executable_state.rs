@@ -66,59 +66,130 @@ fn assert_cannot_write(w: &World, path: &Path) {
     );
 }
 
-fn cache_fixture(with_server: bool) -> (World, PathBuf, PathBuf, PathBuf) {
-    let w = World::with_base(BASE, if with_server { SERVER } else { "" });
+/// Two projects under one home, each with its own published (benign) generation.
+///
+/// The fake `uvx` runs `$UV_TOOL_DIR/canary/bin/canary` when it exists, so a planted file would
+/// execute if a later run ever saw it. Returns (world, project B, marker in B, the store path
+/// a planter would aim at).
+fn cache_fixture() -> (World, PathBuf, PathBuf, PathBuf) {
+    let w = World::with_base(BASE, SERVER);
     executable(
         &w.base.join("bin/uvx"),
         "#!/bin/sh\nif [ -f \"$UV_TOOL_DIR/canary/bin/canary\" ]; then exec /bin/sh \"$UV_TOOL_DIR/canary/bin/canary\"; else echo no-planted-tool; fi\n",
     );
     let b = w.add_project("other", SERVER);
+    let benign = [("uv-tools/seed", "benign")];
+    w.publish_cache(&benign);
+    w.publish_cache_at(&b, &benign);
     let marker = b.join("marker");
-    let planted = w
-        .home_dir()
-        .join(".cache/hamster-ball/uv-tools/canary/bin/canary");
-    write(&planted, "#!/bin/sh\necho benign\n");
-    (w, b, marker, planted)
+    let store = w.home_dir().join(".cache/hamster-ball");
+    (w, b, marker, store)
+}
+
+fn generations(store: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = assert_ok!(fs::read_dir(store.join("generations")))
+        .flatten()
+        .map(|e| e.path().join("data"))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The bytes of every file under the published generations, to compare before and after.
+fn snapshot(store: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = generations(store);
+    while let Some(dir) = stack.pop() {
+        for entry in assert_ok!(fs::read_dir(&dir)).flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push((path.clone(), assert_ok!(fs::read(&path))));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[test]
-fn a_planted_tool_in_hbs_cache_runs_in_another_projects_ball() {
+fn a_planted_tool_reaches_only_the_planting_runs_private_copy_and_never_another_project() {
     sandboxed!();
-    let (w, b, marker, planted) = cache_fixture(true);
+    let (w, b, marker, store) = cache_fixture();
+    let published = snapshot(&store);
     assert_cannot_write(&w, &marker);
-    let payload = format!("#!/bin/sh\necho cache-canary > {}\n", quote(&marker));
-    let out = run(
+    // The planting run writes the canary where its own uvx would look, and runs it: the plant works
+    // in the run's private copy (the permissive control), but only there.
+    let payload = format!(
+        "#!/bin/sh\necho ran-here > \"$TMPDIR/cache/uv-tools/ran\"\necho cache-canary > {}\n",
+        quote(&marker)
+    );
+    let planted = "$TMPDIR/cache/uv-tools/canary/bin/canary";
+    let plant = run(
         &w,
         &format!(
-            "printf %s {} > {}",
-            quote(Path::new(&payload)),
-            quote(&planted)
+            "mkdir -p \"$TMPDIR/cache/uv-tools/canary/bin\" && printf %s {} > \"{planted}\" && uvx canary",
+            quote(Path::new(&payload))
         ),
     );
-    assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(assert_ok!(fs::read_to_string(&planted)), payload);
-    assert!(!marker.exists(), "the plant itself wrote the marker");
-    let consumer = run_at(&w, &b, "uvx canary");
-    assert!(consumer.status.success(), "{}", text(&consumer));
-    assert_eq!(assert_ok!(fs::read_to_string(marker)), "cache-canary\n");
+    // Permissive control: the planted file really executed inside the planting run (it wrote
+    // `ran` in its own copy), so the attack is meaningful. Its write into project B was refused.
+    let said = text(&plant);
+    assert!(said.contains("canary: line"), "the canary executed: {said}");
+    assert!(
+        said.contains("Operation not permitted"),
+        "and could not cross into B: {said}"
+    );
+    let kept = run(&w, "ls \"$TMPDIR/cache/uv-tools\"");
+    assert!(
+        !text(&kept).contains("ran"),
+        "a later run does not see the plant: {}",
+        text(&kept)
+    );
+    assert!(
+        !marker.exists(),
+        "the marker is in B, which the planting ball cannot write"
+    );
+    assert_eq!(snapshot(&store), published, "no generation changed");
+    // Project B's later run, and a later run of the SAME project, start from the published bytes.
+    for (label, project) in [
+        ("other project", b.clone()),
+        ("same project", w.project.clone()),
+    ] {
+        let later = run_at(&w, &project, "uvx canary");
+        assert!(later.status.success(), "{label}: {}", text(&later));
+        assert!(
+            text(&later).contains("no-planted-tool"),
+            "{label}: {}",
+            text(&later)
+        );
+    }
+    assert!(!marker.exists());
+    assert_eq!(snapshot(&store), published);
 }
 
 #[test]
-fn a_run_that_is_not_granted_hbs_cache_cannot_plant_in_it() {
+fn the_planting_run_cannot_reach_the_published_store_at_all() {
     sandboxed!();
-    let (w, b, marker, planted) = cache_fixture(false);
-    let before = assert_ok!(fs::read(&planted));
-    let out = run(&w, &format!("echo poisoned > {}", quote(&planted)));
-    assert!(!out.status.success(), "{}", text(&out));
-    assert!(
-        text(&out).contains("Operation not permitted"),
-        "{}",
-        text(&out)
+    let (w, _b, marker, store) = cache_fixture();
+    let published = snapshot(&store);
+    let aimed = generations(&store).remove(0).join("uv-tools/canary");
+    let attack = run(
+        &w,
+        &format!(
+            "mkdir -p {a} 2>&1; echo x > {a}/f 2>&1; rm -rf {g} 2>&1; ls {s} 2>&1; true",
+            a = quote(&aimed),
+            g = quote(&generations(&store).remove(0)),
+            s = quote(&store)
+        ),
     );
-    assert_eq!(assert_ok!(fs::read(planted)), before);
-    let consumer = run_at(&w, &b, "uvx canary");
-    assert!(consumer.status.success(), "{}", text(&consumer));
-    assert!(text(&consumer).contains("benign"), "{}", text(&consumer));
+    let said = text(&attack);
+    assert!(
+        said.matches("Operation not permitted").count() >= 3,
+        "every reach into the store is refused: {said}"
+    );
+    assert_eq!(snapshot(&store), published, "unchanged");
     assert!(!marker.exists());
 }
 

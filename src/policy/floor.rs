@@ -327,6 +327,8 @@ const CREDENTIALS: &str = "credentials";
 const BROWSER: &str = "browser profile, cookies and sessions";
 const CONTAINER: &str = "container runtime access is host access";
 const HB_STATE: &str = "hamster-ball's own configuration and approvals";
+const HB_CACHE: &str =
+    "hamster-ball's published cache generations: a run gets its own copy, never these";
 const STARTUP: &str = "runs outside the sandbox at the next shell start";
 const TOOL_CONFIG: &str = "tool configuration that runs code or redirects package sources";
 /// The reason on every rule that protects a directory of programs.
@@ -515,6 +517,7 @@ pub(crate) const TABLE: &[TableRule] = &[
     // hamster-ball itself.
     rw("hb-config", "~/.config/hamster-ball", HB_STATE),
     rw("hb-state", "~/.local/state/hamster-ball", HB_STATE),
+    rw("hb-cache", "~/.cache/hamster-ball", HB_CACHE),
     // Shell startup and login files.
     wr("zshrc", "~/.zshrc", STARTUP),
     wr("zshenv", "~/.zshenv", STARTUP),
@@ -932,6 +935,7 @@ mod tests {
         "connect-podman-data",
         "hb-config",
         "hb-state",
+        "hb-cache",
         "zshrc",
         "zshenv",
         "zprofile",
@@ -1198,6 +1202,7 @@ mod tests {
             "docker-socket",
             "hb-config",
             "hb-state",
+            "hb-cache",
             "zshrc",
             "zshenv",
             "zprofile",

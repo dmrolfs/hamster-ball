@@ -54,10 +54,16 @@ exit($ok ? 0 : 1);
 /// The argument list that runs the probe on `command` and `args` for at most `limit`.
 #[must_use]
 pub fn argv(limit: Duration, command: &str, args: &[String]) -> Vec<OsString> {
+    // uv's fixed settings (see `private_python_vars`) are set inside the probe, before it starts
+    // the server, so the "cannot start" message still names the server's own program.
+    let settings: String = crate::session::offline::private_python_vars()
+        .into_iter()
+        .map(|(k, v)| format!("$ENV{{{k}}} = '{v}';\n"))
+        .collect();
     let mut words: Vec<OsString> = vec![
         PERL.into(),
         "-e".into(),
-        PROBE.into(),
+        format!("{settings}{PROBE}").into(),
         limit.as_secs().to_string().into(),
         command.into(),
     ];
@@ -102,7 +108,11 @@ mod tests {
             .collect();
         assert_eq!(words[0], "/usr/bin/perl");
         assert_eq!(words[1], "-e");
-        assert_eq!(words[2], PROBE);
+        assert!(
+            words[2].ends_with(PROBE),
+            "the probe script is unchanged after its settings"
+        );
+        assert!(words[2].starts_with("$ENV{UV_PYTHON_PREFERENCE} = 'only-managed';"));
         assert_eq!(&words[3..], ["90", "uvx", "--from", "x"]);
     }
 
@@ -110,7 +120,11 @@ mod tests {
     fn the_script_compiles() {
         let out = assert_ok!(
             Command::new("/usr/bin/perl")
-                .args(["-c", "-e", PROBE])
+                .args([
+                    "-c",
+                    "-e",
+                    &argv(Duration::from_secs(1), "x", &[])[2].to_string_lossy()
+                ])
                 .output()
         );
         assert!(out.status.success(), "{}", stderr(&out));
