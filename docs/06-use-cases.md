@@ -177,12 +177,13 @@ Your agent starts MCP servers with `uvx` and `npx`.
    hb run -- "$(command -v kiro-cli)" chat
    ```
 
-`hb warm` starts each server once in a ball where only the package registries are reachable, and keeps what it downloaded in `~/.cache/hamster-ball`.
-`hb run` then puts `uvx` and `npx` launchers first on the agent's `PATH`.
-They add `--offline` and point to that cache, so the server starts with no network.
+`hb warm` starts each server once in a ball where only the package registries are reachable, and publishes what it downloaded as a sealed cache generation in `~/.cache/hamster-ball`.
+`hb run` copies that generation into the run's own private directory and puts `uvx` and `npx` launchers first on the agent's `PATH`.
+They add `--offline` and point to the copy, so the server starts with no network and nothing it writes can reach the next run.
 
 If you change a server's arguments, run `hb warm` again.
-If you did not warm a server, `hb run` says so before it starts: `warning: mcp server X has not been warmed (or its command changed): run hb warm`.
+If there is no cache generation, or it no longer matches your tools or servers, `hb run` stops before the agent starts and says to run `hb warm`.
+If you did not warm a server, `hb run` also says so before it starts: `warning: mcp server X has not been warmed (or its command changed): run hb warm`.
 
 Pin the versions.
 `hb doctor` flags `@latest` and unpinned git sources, because they change on the next `hb warm`.

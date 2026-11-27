@@ -35,7 +35,7 @@ When the command dies of INT, TERM, HUP or KILL, `hb` cleans up and raises the s
 | `~/.config/hamster-ball/presets/<name>.toml` | Your presets. |
 | `~/.local/state/hamster-ball/approvals/` | Approval records (mode 0700). The agent cannot read or write it. |
 | `~/.local/state/hamster-ball/warm/` | Stamps that `hb warm` leaves. The floor hides them from the agent. |
-| `~/.cache/hamster-ball/{uv,uv-tools,npm}` | `hb`'s offline package cache, mode 0700. |
+| `~/.cache/hamster-ball/` | `hb`'s cache store, mode 0700: `generations/` (sealed, immutable), `projects/<key>/current` and `staging/`. The ball cannot read or write it. Each run copies a generation into its own session directory. |
 | `<project>/hamster-ball.toml` | The project config. Read-only inside the ball. |
 | The session directory, under your temp directory | One run's private directory: `TMPDIR`, hook files, the TLS bundle, the `hb` wrapper, the offline launchers and the `hb ctl` socket. Mode 0700. Removed at exit. |
 
