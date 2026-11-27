@@ -177,6 +177,8 @@ pub enum DiagnosticCode {
     InspectionLimitReached,
     /// A directory was left out of the inspection on purpose, for example dependency output.
     DirectoryNotInspected,
+    /// A setting's value failed validation, so it was not reported.
+    ValueRejected,
 }
 
 /// How much a finding matters. It says nothing about completeness.
@@ -549,6 +551,22 @@ mod tests {
             DiagnosticCode::InspectionUnavailable,
             "inspection_unavailable",
         );
+        token(DiagnosticCode::EntryUnavailable, "entry_unavailable");
+        token(
+            DiagnosticCode::GitConfigUnavailable,
+            "git_config_unavailable",
+        );
+        token(DiagnosticCode::WriteAccessUnknown, "write_access_unknown");
+        token(DiagnosticCode::ConfigScopeOmitted, "config_scope_omitted");
+        token(
+            DiagnosticCode::InspectionLimitReached,
+            "inspection_limit_reached",
+        );
+        token(
+            DiagnosticCode::DirectoryNotInspected,
+            "directory_not_inspected",
+        );
+        token(DiagnosticCode::ValueRejected, "value_rejected");
         token(Severity::Info, "info");
         token(Severity::Warning, "warning");
         token(Severity::Error, "error");

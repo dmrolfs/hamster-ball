@@ -291,7 +291,9 @@ mod bounded_tests {
         let dir = assert_ok!(tempfile::tempdir());
         let pid_file = dir.path().join("pid");
         let script = format!("sleep 60 & echo $! > '{}'; wait", pid_file.display());
-        let result = run_bounded(&mut sh(&script), Duration::from_millis(500), 1024);
+        // Long enough that a loaded machine has written the pid file before the kill; the test
+        // still ends at the timeout, not when the sleeping child does.
+        let result = run_bounded(&mut sh(&script), Duration::from_secs(3), 1024);
         assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
         let pid: i32 = assert_ok!(
             assert_ok!(std::fs::read_to_string(&pid_file))

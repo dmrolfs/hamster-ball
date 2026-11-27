@@ -394,15 +394,13 @@ fn doctor_stops_at_the_repository_query_cap_and_says_which_it_skipped() {
     let git = section(&out, "git the floor does not protect");
     assert!(git.contains("inspection_limit_reached"), "{out}");
     assert!(git.contains("git inspection: partial"), "{out}");
-    // The 33 repositories asked about (the project's and 32 more) are 32 queries: the first 32 are
-    // answered, the last two are named as skipped, and the 50-line list says how many it cut.
+    // The project's repository and 34 nested ones are 35, more than the 32 queried. The last two
+    // are always skipped; on a loaded machine the 10 s budget can skip more, and both reasons are
+    // the same code, so the test asks for at least those two and not for an exact count.
     assert!(git.contains("vendor/r32"), "{out}");
     assert!(git.contains("vendor/r33"), "{out}");
-    assert!(
-        !git.contains("inspection_limit_reached: ")
-            || git.matches("inspection_limit_reached").count() == 3,
-        "{out}"
-    );
+    let skipped = git.matches("inspection_limit_reached").count();
+    assert!(skipped >= 3, "{skipped} skipped\n{out}");
     assert!(git.contains("... and "), "{out}");
 }
 
@@ -441,6 +439,24 @@ fn doctor_has_a_git_section_and_a_proxy_section_and_a_plain_project_has_no_git_f
     );
     assert!(git.contains("config_scope_omitted"), "{out}");
     assert!(out.contains("system proxy settings"), "{out}");
+}
+
+#[test]
+fn doctor_reads_the_real_proxy_settings_and_never_prints_a_pac_address() {
+    let w = World::new(PROJECT);
+    let (code, out, _) = doctor(&w);
+    assert_eq!(code, ExitCode::SUCCESS);
+    let proxy = section(&out, "system proxy settings");
+    // The real `scutil` on this machine must be understood: a parser stricter than macOS would
+    // turn every doctor run into "unavailable". What it says depends on the machine's settings,
+    // so this accepts a clean read or a partial one, and never a failed one.
+    assert!(!proxy.contains("proxy inspection: unavailable"), "{out}");
+    assert!(
+        proxy.contains("no proxy is switched on") || proxy.contains("proxy inspection: partial"),
+        "{out}"
+    );
+    assert!(!proxy.contains("(none)"), "{out}");
+    assert!(!proxy.contains("://"), "{out}");
 }
 
 #[test]

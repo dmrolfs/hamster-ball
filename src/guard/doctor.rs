@@ -10,7 +10,7 @@ use super::repos::{RepoFindings, WriteAssessment};
 use super::scan::walk_files;
 use crate::diagnostic::{Check, CheckGap, DiagnosticCode, Gaps};
 use crate::policy::CanonicalPath;
-use crate::system::proxy_settings::ProxySetting;
+use crate::system::proxy_settings::{ProxyKind, ProxySetting};
 use crate::text::Escaped;
 
 /// Most entries of one list shown.
@@ -185,7 +185,7 @@ pub struct Findings {
     /// Git outside the floor's reach: nested repositories and hook managers, and how complete that is.
     pub repos: Check<RepoFindings>,
     /// The proxies the system has switched on, and whether `tls.system_trust` lets the agent read them.
-    pub proxies: Vec<ProxySetting>,
+    pub proxies: Check<Vec<ProxySetting>>,
     /// Whether the agent can read the system proxy settings (`tls.system_trust` is on).
     pub proxies_readable: bool,
 }
@@ -208,7 +208,12 @@ impl Default for Findings {
                     subject: None,
                 },
             },
-            proxies: Vec::new(),
+            proxies: Check::Unavailable {
+                gap: CheckGap {
+                    code: DiagnosticCode::InspectionUnavailable,
+                    subject: None,
+                },
+            },
             proxies_readable: false,
         }
     }
@@ -310,19 +315,22 @@ fn render_git(out: &mut String, check: &Check<RepoFindings>) {
             } else {
                 list(out, TITLE, &lines);
             }
-            render_gaps(out, "partial", gaps);
+            render_gaps(out, "git", "partial", gaps);
         }
         Check::Unavailable { gap } => {
             let _ = writeln!(out, "\n{TITLE}");
             let mut gaps = Gaps::new();
             gaps.push(gap.clone());
-            render_gaps(out, "unavailable", &gaps);
+            render_gaps(out, "git", "unavailable", &gaps);
         }
     }
 }
 
-fn render_gaps(out: &mut String, state: &str, gaps: &Gaps) {
-    let _ = writeln!(out, "  git inspection: {state}; this is not a clean result");
+fn render_gaps(out: &mut String, check: &str, state: &str, gaps: &Gaps) {
+    let _ = writeln!(
+        out,
+        "  {check} inspection: {state}; this is not a clean result"
+    );
     for gap in gaps.shown() {
         match &gap.subject {
             Some(subject) => {
@@ -372,20 +380,39 @@ fn git_lines(repos: &RepoFindings) -> Vec<String> {
     lines
 }
 
-/// The system proxy section.
-fn render_proxies(out: &mut String, proxies: &[ProxySetting], readable: bool) {
-    let lines: Vec<String> = proxies
-        .iter()
-        .map(|p| match &p.target {
-            Some(target) => format!("{}: {}", p.kind, Escaped(target)),
-            None => p.kind.to_owned(),
-        })
-        .collect();
-    list(
-        out,
-        "system proxy settings (`hb` connects directly and does not follow them, so connections may fail)",
-        &lines,
-    );
+/// The system proxy section: three different outcomes read three different ways.
+///
+/// Every line is a constant, a kind label, a validated target or a gap code, so nothing the system
+/// printed reaches the terminal as text.
+fn render_proxies(out: &mut String, check: &Check<Vec<ProxySetting>>, readable: bool) {
+    const TITLE: &str = "system proxy settings (`hb` connects directly and does not follow them, so connections may fail)";
+    let _ = writeln!(out, "\n{TITLE}");
+    match check {
+        Check::Complete { value } if value.is_empty() => {
+            let _ = writeln!(out, "  no proxy is switched on");
+        }
+        Check::Complete { value } => proxy_lines(out, value),
+        Check::Partial { value, gaps } => {
+            if value.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  no proxy is switched on in the settings that were read"
+                );
+            } else {
+                proxy_lines(out, value);
+            }
+            render_gaps(out, "proxy", "partial", gaps);
+        }
+        Check::Unavailable { gap } => {
+            let mut gaps = Gaps::new();
+            gaps.push(gap.clone());
+            render_gaps(out, "proxy", "unavailable", &gaps);
+            let _ = writeln!(
+                out,
+                "  hb could not read the system proxy settings, so it cannot say whether a proxy is switched on"
+            );
+        }
+    }
     let _ = if readable {
         writeln!(
             out,
@@ -399,11 +426,27 @@ fn render_proxies(out: &mut String, proxies: &[ProxySetting], readable: bool) {
     };
 }
 
+fn proxy_lines(out: &mut String, proxies: &[ProxySetting]) {
+    for proxy in proxies.iter().take(SHOWN) {
+        let label = proxy.kind.label();
+        let _ = match (&proxy.target, proxy.kind) {
+            (Some(target), _) => writeln!(out, "  {label}: {target}"),
+            (None, ProxyKind::AutoConfig) => writeln!(out, "  {label} (address not shown)"),
+            (None, ProxyKind::AutoDiscovery) => writeln!(out, "  {label}"),
+            (None, _) => writeln!(
+                out,
+                "  {label} (address not shown: it did not pass validation)"
+            ),
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnostic::SafePath;
     use crate::guard::repos::HookObservation;
+    use crate::system::proxy_settings::parse as proxy_parse;
     use claims::{assert_none, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
 
@@ -646,16 +689,9 @@ gui/501 = {
                     gaps
                 },
             ),
-            proxies: vec![
-                ProxySetting {
-                    kind: "PAC file",
-                    target: Some("http://pac.example/wpad.dat".to_owned()),
-                },
-                ProxySetting {
-                    kind: "HTTPS",
-                    target: Some("proxy.example:8080".to_owned()),
-                },
-            ],
+            proxies: proxy_parse(&scutil(
+                "ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : http://u:pw@pac.example/wpad.dat?token=SECRET\n  HTTPSEnable : 1\n  HTTPSProxy : proxy.example\n  HTTPSPort : 8080",
+            )),
             proxies_readable: true,
         };
         let text = render(&findings);
@@ -674,8 +710,9 @@ gui/501 = {
         );
         assert!(text.contains("git inspection: partial"), "{text}");
         assert!(text.contains("directory_unreadable: /p/"), "{text}");
+        assert!(text.contains("PAC file (address not shown)"), "{text}");
         assert!(
-            text.contains("PAC file: http://pac.example/wpad.dat"),
+            !text.contains("pac.example") && !text.contains("SECRET"),
             "{text}"
         );
         assert!(text.contains("HTTPS: proxy.example:8080"), "{text}");
@@ -702,7 +739,9 @@ gui/501 = {
             survey_complete: true,
             ..clean()
         });
-        assert_eq!(text.matches("(none)").count(), 5);
+        // Four lists say (none); the proxy section says what it read instead.
+        assert_eq!(text.matches("(none)").count(), 4);
+        assert!(text.contains("no proxy is switched on"), "{text}");
         assert!(text.contains("off: those files stay denied"));
         let many = Findings {
             tracked: (0..60).map(|i| format!("/p/{i}.key")).collect(),
@@ -712,12 +751,77 @@ gui/501 = {
         assert!(render(&many).contains("... and 10 more"));
     }
 
-    /// Nothing found and the git check ran to the end: only this may print as clean.
+    /// `scutil --proxy` output with `entries` as the top-level lines after the quiet defaults.
+    fn scutil(entries: &str) -> String {
+        format!("<dictionary> {{\n  {entries}\n}}\n")
+    }
+
+    /// Nothing found and both checks ran to the end: only this may print as clean.
     fn clean() -> Findings {
         Findings {
             repos: Check::from_parts(RepoFindings::default(), Gaps::new()),
+            proxies: proxy_parse(&scutil("HTTPEnable : 0")),
             ..Findings::default()
         }
+    }
+
+    fn proxy_section(findings: &Findings) -> String {
+        let text = render(findings);
+        let from = text.find("system proxy settings").unwrap_or(0);
+        text[from..].to_owned()
+    }
+
+    #[test]
+    fn a_missing_scutil_a_partial_read_and_no_proxy_are_three_different_things() {
+        let none = proxy_section(&clean());
+        assert!(none.contains("no proxy is switched on"), "{none}");
+        assert!(!none.contains("proxy inspection"), "{none}");
+        assert!(!none.contains("could not read"), "{none}");
+
+        let failed = proxy_section(&Findings::default());
+        assert!(failed.contains("proxy inspection: unavailable"), "{failed}");
+        assert!(
+            failed.contains("could not read the system proxy settings"),
+            "{failed}"
+        );
+        assert!(!failed.contains("no proxy is switched on"), "{failed}");
+
+        let partial = proxy_section(&Findings {
+            proxies: proxy_parse(&scutil(
+                "HTTPEnable : 0\n  __SCOPED__ : <dictionary> {\n    en0 : <dictionary> {\n      HTTPEnable : 1\n    }\n  }",
+            )),
+            ..clean()
+        });
+        assert!(partial.contains("proxy inspection: partial"), "{partial}");
+        assert!(
+            partial.contains("config_scope_omitted: __SCOPED__"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("no proxy is switched on in the settings that were read"),
+            "{partial}"
+        );
+        assert!(!partial.contains("could not read"), "{partial}");
+        assert!(!partial.contains("(none)"), "{partial}");
+    }
+
+    #[test]
+    fn an_enabled_proxy_whose_address_failed_validation_is_listed_without_the_address() {
+        let section = proxy_section(&Findings {
+            proxies: proxy_parse(&scutil(
+                "HTTPSEnable : 1\n  HTTPSProxy : user:p@ss@proxy.example/x?SECRET\n  HTTPSPort : 8080",
+            )),
+            ..clean()
+        });
+        assert!(
+            section.contains("HTTPS (address not shown: it did not pass validation)"),
+            "{section}"
+        );
+        assert!(section.contains("value_rejected: HTTPSProxy"), "{section}");
+        assert!(
+            !section.contains("SECRET") && !section.contains("p@ss"),
+            "{section}"
+        );
     }
 
     #[test]
@@ -788,6 +892,7 @@ gui/501 = {
             text.contains("the agent cannot read these settings"),
             "{text}"
         );
-        assert_eq!(text.matches("(none)").count(), 4, "{text}");
+        assert_eq!(text.matches("(none)").count(), 3, "{text}");
+        assert!(text.contains("no proxy is switched on"), "{text}");
     }
 }
