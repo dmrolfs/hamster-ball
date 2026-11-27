@@ -2,7 +2,7 @@
 // ABOUTME: Scripted programs only; the opt-in real-agent checks live in tests/supervise_agents.rs. No sandbox is involved, so these never skip.
 //! The terminal pane against a live pty (hb-skf).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 use std::fs::File;
 use std::io::{Read, Write};

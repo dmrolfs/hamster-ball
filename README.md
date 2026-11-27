@@ -75,6 +75,9 @@ cargo install --path .
 hb --version
 ```
 
+To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
+This installs `hb-supervise` beside the matching `hb`; default builds omit the UI dependencies.
+
 `hb` must live in a directory the agent cannot write. The floor write-denies every directory on your `PATH`, and
 `hb` itself, so `~/.cargo/bin` is fine. `hb` refuses to run as root and refuses to start inside another sandbox
 (macOS does not nest them).
@@ -549,10 +552,11 @@ Do not paste `[env] set` values or hook arguments into one; `hb explain` hides t
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features                       # about 1800 tests; the sandbox ones skip when sandbox-exec is nested
-HB_REQUIRE_SANDBOX=1 cargo test --all-features  # fail instead of skipping when the sandbox is not usable
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
+RUSTUP_TOOLCHAIN=1.88 bash scripts/check-features.sh # default dependency isolation and opt-in supervisor build
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features             # includes the optional supervisor; sandbox tests skip when nested
+HB_REQUIRE_SANDBOX=1 cargo test --locked --all-features # fail instead of skipping when the sandbox is not usable
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --lib --all-features
 ```
 
 - The offline MCP servers are proved against the real tools by an opt-in test that uses your home, your `uvx`, `npx` and `node`, hb's real cache and the network:

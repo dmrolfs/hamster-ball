@@ -1,6 +1,8 @@
 // ABOUTME: Exercises supervisor job control through a real interactive bash on an expect-owned PTY.
 // ABOUTME: Checks terminal restoration before stop, background continuation, foreground redraw, and review cancellation.
 //! Job-control behavior on the owner's terminal.
+#![cfg(feature = "supervise")]
+
 mod common;
 
 use claims::assert_ok;

@@ -2,7 +2,7 @@
 // ABOUTME: Real processes and real threads; every wait has a deadline so a hang fails the test instead of stalling it.
 //! Session workers end to end (hb-mi8).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 mod common;
 

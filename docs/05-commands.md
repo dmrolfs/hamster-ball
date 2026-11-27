@@ -62,6 +62,12 @@ path /Users/you/.ssh/id_rsa
 
 Warnings you may see include `project_not_granted` (no grant covers the project), `grant_shadowed_by_floor` (a grant the floor overrides), `git_config_unreadable` and `not_approved`.
 
+## `hb-supervise`: install
+
+The terminal supervisor is optional: `cargo install --locked --path . --features supervise` installs both `hb` and `hb-supervise`.
+Keep these matching binaries in the same directory; the supervisor launches the `hb` beside itself.
+A default build installs only `hb` and does not compile the UI dependencies.
+
 ## `hb-supervise`: private channel environment
 
 The launcher passes the private channel descriptor number in `HB_SUPERVISOR_FD`.

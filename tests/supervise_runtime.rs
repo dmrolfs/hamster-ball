@@ -2,7 +2,7 @@
 // ABOUTME: Every loop has a deadline, so a hang fails the test instead of stalling it; processes left behind are checked for.
 //! The runtime driving real sessions (hb-mi8).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 mod common;
 

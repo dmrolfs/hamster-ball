@@ -23,6 +23,10 @@ cargo install --path .
 hb --version
 ```
 
+To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
+This installs `hb-supervise` beside the matching `hb`.
+Without this feature, ordinary `hb` builds do not compile the UI dependencies.
+
 Put `hb` in a directory that the agent cannot write.
 The floor blocks writes to every directory on your `PATH` and to `hb` itself.
 `~/.cargo/bin`, where `cargo install` puts it, is fine.

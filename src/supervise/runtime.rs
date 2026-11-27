@@ -390,7 +390,7 @@ impl Runtime {
 
     /// Abandons the session's retiring worker at once, as happens when it has not ended in time:
     /// `hb` is killed at the reaper's next look and its agent is left to the guardian. For tests,
-    /// which need that state without waiting out [`RETIRE_LIMIT`].
+    /// which need that state without waiting out the retirement deadline.
     #[cfg(feature = "test-support")]
     pub fn abandon_for_test(&mut self, id: SessionId) {
         for old in &mut self.retiring {

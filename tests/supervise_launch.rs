@@ -2,7 +2,7 @@
 // ABOUTME: Each claim has a control: a launch with the descriptor passed another way fails, and the unfiltered agent sees what the filtered one does not.
 //! Launching a session (hb-mi8).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 mod common;
 

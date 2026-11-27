@@ -2,7 +2,7 @@
 // ABOUTME: A pty master stands in for the owner; its output is read raw, so the mode resets can be seen as bytes. Every wait has a deadline.
 //! `hb-supervise` end to end (hb-q9o).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 mod common;
 

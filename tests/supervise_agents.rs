@@ -7,7 +7,7 @@
 //! reach it, and that it ends when asked. What each agent showed is printed so a failure can be
 //! read, and the screen is dumped on failure.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "supervise"))]
 
 use std::fs::File;
 use std::io::{Read, Write};

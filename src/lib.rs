@@ -29,6 +29,7 @@ pub mod policy;
 pub mod proxy;
 pub mod seatbelt;
 pub mod session;
+#[cfg(feature = "supervise")]
 pub mod supervise;
 pub(crate) mod sys;
 pub mod system;
