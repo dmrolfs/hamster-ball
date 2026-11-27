@@ -146,8 +146,8 @@ pub(crate) fn run_bounded(
     run_cancellable(command, timeout, max_bytes, None)
 }
 
-/// [`run_bounded`] that also ends, with its process group killed, within about 5 ms of `cancel`
-/// being set.
+/// [`run_bounded`] with cancellation checked during both execution and output draining.
+/// Checks are spaced about 5 ms apart; process reaping is not a hard real-time operation.
 pub(crate) fn run_cancellable(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -178,32 +178,41 @@ pub(crate) fn run_cancellable(
         bytes
     });
     let deadline = Instant::now() + timeout;
+    let mut status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None)
-                if Instant::now() < deadline
-                    && !cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Ok(None) | Err(_) => {
-                let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
-                if let Ok(pid) = i32::try_from(child.id()) {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pid),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+        let wait_failed = if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => {
+                    status = observed;
+                    false
                 }
-                let _ = child.wait();
-                drop(reader);
-                return Err(if cancelled {
-                    BoundedError::Cancelled
-                } else {
-                    BoundedError::TimedOut
-                });
+                Err(_) => true,
             }
+        } else {
+            false
+        };
+        if let Some(status) = status
+            && reader.is_finished()
+        {
+            break status;
         }
+        let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        if cancelled || wait_failed || Instant::now() >= deadline {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.wait();
+            drop(reader);
+            return Err(if cancelled {
+                BoundedError::Cancelled
+            } else {
+                BoundedError::TimedOut
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     };
     let stdout = reader
         .join()
@@ -282,6 +291,65 @@ mod bounded_tests {
             started.elapsed()
         );
         assert_ok!(timer.join());
+    }
+
+    #[test]
+    fn timeout_still_applies_after_the_leader_exits_with_stdout_held_open() {
+        let result = run_bounded(
+            &mut sh("sleep 2 & exit 3"),
+            Duration::from_millis(100),
+            1024,
+        );
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+    }
+
+    #[test]
+    fn cancellation_still_applies_after_the_leader_has_been_reaped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = assert_ok!(tempfile::TempDir::new());
+        let marker = dir.path().join("leader");
+        let flag = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let timer = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(&marker)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .filter(|pid| *pid > 1)
+                        && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                            == Err(nix::errno::Errno::ESRCH)
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "leader was never reaped");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let result = run_cancellable(
+                &mut sh(&format!(
+                    "sleep 2 & echo $$ > '{}'; exit 3",
+                    marker.display()
+                )),
+                Duration::from_secs(10),
+                1024,
+                Some(&flag),
+            );
+            assert_ok!(timer.join());
+            assert!(matches!(result, Err(BoundedError::Cancelled)), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn output_arriving_after_leader_exit_is_preserved_with_its_exit_status() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("(sleep 0.1; printf late) & exit 3"),
+            Duration::from_secs(10),
+            1024,
+        ));
+        assert_eq!(done.status.code(), Some(3));
+        assert_eq!(done.stdout, b"late");
     }
 
     #[test]

@@ -86,6 +86,18 @@ fn launch(w: &World, argv: &[&str], approved: bool) -> (Child, UnixStream) {
     (child, ours)
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.close_channel();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Session {
     /// `hb run --supervised -- words`, with the supervisor handshake already sent.
     fn start(w: &World, extra: &[&str], words: &[&str], approved: bool) -> Self {
@@ -188,7 +200,7 @@ impl Session {
         Ended {
             status,
             took,
-            frames: self.seen,
+            frames: std::mem::take(&mut self.seen),
             stdout: self
                 .out
                 .recv_timeout(Duration::from_secs(5))
@@ -426,48 +438,77 @@ fn the_stop_command_stops_the_agent_and_exited_is_reported() {
 #[test]
 fn closing_the_channel_during_a_slow_hook_kills_the_hook_and_never_starts_the_agent() {
     sandboxed!();
-    let w = World::new(PROJECT);
-    let started = w.base.join("hook-started");
-    let finished = w.base.join("hook-finished");
-    let hook = tool(
-        &w,
-        "slow",
-        &format!(
-            "touch '{}'; sleep 30 & wait; touch '{}'",
-            started.display(),
-            finished.display()
-        ),
-    );
-    with_base(
-        &w,
-        &format!(
-            "[fs]\nwrite = [\".\"]\n[hooks.pre_run.slow]\ncommand = [\"{}\"]\ntimeout_secs = 60\n",
-            hook.display()
-        ),
-    );
-    let marker = w.project.join("ran");
-    let session = Session::start(
-        &w,
-        &[],
-        &["/bin/sh", "-c", &format!("touch '{}'", marker.display())],
-        true,
-    );
-    assert!(
-        !wait_for_file(&started, 30).is_empty() || started.exists(),
-        "the hook never started"
-    );
-    let sent = Instant::now();
-    session.close_channel();
-    let ended = session.finish(30);
-    assert!(
-        sent.elapsed() < Duration::from_secs(15),
-        "{:?}",
-        sent.elapsed()
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(!finished.exists(), "the hook ran to its end");
-    assert!(!marker.exists(), "the agent started");
-    assert!(ended.status.code() != Some(0));
+    for leader_exits in [false, true] {
+        let w = World::new(PROJECT);
+        let started = w.base.join("hook-started");
+        let hook_dir = w.base.join("hook-dir");
+        let finished = w.base.join("hook-finished");
+        let body = if leader_exits {
+            format!(
+                "sleep 30 & echo $! > '{0}.tmp'; mv '{0}.tmp' '{0}'; exit 0",
+                started.display()
+            )
+        } else {
+            format!(
+                "echo $$ > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 30 & wait; touch '{1}'",
+                started.display(),
+                finished.display()
+            )
+        };
+        let hook = tool(
+            &w,
+            "slow",
+            &format!("pwd > '{}'; {body}", hook_dir.display()),
+        );
+        with_base(
+            &w,
+            &format!(
+                "[fs]\nwrite = [\".\"]\n[hooks.pre_run.slow]\ncommand = [\"{}\"]\ntimeout_secs = 60\n",
+                hook.display()
+            ),
+        );
+        let marker = w.project.join("ran");
+        let session = Session::start(
+            &w,
+            &[],
+            &["/bin/sh", "-c", &format!("touch '{}'", marker.display())],
+            true,
+        );
+        let pid: i32 = assert_ok!(wait_for_file(&started, 10).trim().parse());
+        assert!(pid > 1);
+        assert_ok!(kill(Pid::from_raw(pid), None));
+        assert!(!finished.exists(), "hook finished before disconnect");
+        let session_dir = PathBuf::from(wait_for_file(&hook_dir, 10).trim());
+        assert!(session_dir.is_dir());
+        // Without disconnect, the hook or its output-holding child must remain live.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_ok!(kill(Pid::from_raw(pid), None));
+        let sent = Instant::now();
+        session.close_channel();
+        let ended = session.finish(30);
+        assert!(
+            sent.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            sent.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while kill(Pid::from_raw(pid), None).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "hook process {pid} survived (leader_exits={leader_exits}); {}",
+            ended.stderr
+        );
+        assert!(!finished.exists(), "the hook ran to its end");
+        assert!(!marker.exists(), "the agent started");
+        assert!(ended.status.code() != Some(0));
+        assert!(
+            !session_dir.exists(),
+            "session directory survived hook cancellation"
+        );
+    }
 }
 
 #[test]
