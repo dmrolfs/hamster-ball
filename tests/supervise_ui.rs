@@ -540,3 +540,40 @@ fn a_panic_in_a_session_thread_restores_the_terminal_stops_the_agent_and_ends_no
         assert!(!alive(pid), "the agent outlived a worker panic");
     }
 }
+
+/// The pid of the `hb approve` the supervisor started, if there is one.
+fn approve_pid(supervisor: u32) -> Option<i32> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "pid=,ppid=,command=", "-ax"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: i32 = parts.next()?.parse().ok()?;
+            let ppid: u32 = parts.next()?.parse().ok()?;
+            let command: Vec<&str> = parts.collect();
+            (ppid == supervisor && command.contains(&"approve")).then_some(pid)
+        })
+}
+
+#[test]
+fn hb_approve_started_by_the_supervisor_can_be_ended_by_sigterm_and_sigint_on_its_own() {
+    sandboxed!();
+    for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        let w = World::new(PROJECT);
+        let owner = start_review(&w);
+        let pid = assert_some!(approve_pid(owner.child.id()), "no approve process found");
+        // The signal goes to the review alone, as `kill <pid>` from another terminal would.
+        assert_ok!(kill(Pid::from_raw(pid), signal));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !alive(pid),
+            "{signal:?} did not end hb approve: the signal is blocked in it"
+        );
+    }
+}

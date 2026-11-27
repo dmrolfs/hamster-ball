@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use clap::Parser;
-use hamster_ball::supervise::launch::{LAUNCH_ARG, run_helper};
+use hamster_ball::supervise::launch::{LAUNCH_ARG, REVIEW_ARG, run_helper, run_review_helper};
 use hamster_ball::supervise::runtime::Paths;
 use hamster_ball::supervise::ui::{Ended, UiError, run};
 use snafu::{ResultExt, Snafu};
@@ -24,6 +24,11 @@ fn main() -> ExitCode {
     if argv.get(1).is_some_and(|a| a == LAUNCH_ARG) {
         let error = run_helper(&argv[2..]);
         eprintln!("hb-supervise: could not launch: {error}");
+        return ExitCode::from(2);
+    }
+    if argv.get(1).is_some_and(|a| a == REVIEW_ARG) {
+        let error = run_review_helper(&argv[2..]);
+        eprintln!("hb-supervise: could not start the review: {error}");
         return ExitCode::from(2);
     }
     Args::parse();

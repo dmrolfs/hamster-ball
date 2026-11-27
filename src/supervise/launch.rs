@@ -41,6 +41,12 @@ use crate::session::{Pty, PtyError, Winsize};
 /// The hidden argument that makes `hb-supervise` act as the launch helper.
 pub const LAUNCH_ARG: &str = "__launch";
 
+/// The hidden argument that makes `hb-supervise` act as the review helper: it clears the signal
+/// mask and becomes `hb approve`, so a review can be ended by Ctrl-C or `kill` like any program.
+/// The supervisor blocks INT, TERM and HUP in every thread to read them from a queue, and
+/// `std::process::Command` hands that mask to what it starts.
+pub const REVIEW_ARG: &str = "__review";
+
 /// Why a session could not be started.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -174,6 +180,22 @@ pub fn run_helper(argv: &[OsString]) -> io::Error {
         }
         Err(error) => error,
     }
+}
+
+/// What the review helper does, called from `main` when `__review` is the first argument. Returns
+/// only when something failed.
+///
+/// `argv` is the `hb` path, then its arguments (`approve`). Nothing else changes: the terminal,
+/// the working directory and the environment are the supervisor's, and no descriptor is passed.
+pub fn run_review_helper(argv: &[OsString]) -> io::Error {
+    let Some((hb, rest)) = argv.split_first() else {
+        return io::Error::new(io::ErrorKind::InvalidInput, "no program to run");
+    };
+    if let Err(error) = crate::session::signals::clear_mask() {
+        return io::Error::other(format!("the signal mask could not be cleared: {error}"));
+    }
+    let error = Command::new(PathBuf::from(hb)).args(rest).exec();
+    io::Error::new(error.kind(), format!("could not start hb: {error}"))
 }
 
 /// Makes stdin the controlling terminal and keeps a duplicate of the channel open across exec.

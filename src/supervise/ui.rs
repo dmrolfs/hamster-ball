@@ -77,6 +77,7 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> Result<Ended, UiError> {
     // Before any thread exists, so every thread has them blocked and only the loop sees them.
     let mut stop = StopSignals::watch()?;
     let hb = paths.hb.clone();
+    let me = paths.me.clone();
     let env = paths.env.clone();
     let mut runtime = Runtime::new(paths);
     let mut guard = TerminalGuard::enter().context(TerminalSnafu)?;
@@ -92,7 +93,7 @@ pub fn run(paths: Paths, cwd: &std::path::Path) -> Result<Ended, UiError> {
             &mut screen,
             &mut runtime,
             cwd,
-            &Reviewer { hb, env },
+            &Reviewer { hb, me, env },
             &mut stop,
             &mut review_child,
         )
@@ -214,6 +215,8 @@ impl StopSignals {
 /// How `hb approve` is run.
 struct Reviewer {
     hb: std::path::PathBuf,
+    /// This supervisor, started again as the review helper that clears the signal mask.
+    me: std::path::PathBuf,
     env: Vec<(String, std::ffi::OsString)>,
 }
 
@@ -422,8 +425,13 @@ impl Loop<'_> {
     }
 
     fn run_review(&mut self, approval: &Approval) -> ApprovalOutcome {
-        let mut command = Command::new(&self.reviewer.hb);
+        // Through the review helper, which clears the signal mask first: the supervisor blocks
+        // INT, TERM and HUP in every thread and `Command` would hand that to the review, which
+        // could then not be ended by Ctrl-C or `kill`.
+        let mut command = Command::new(&self.reviewer.me);
         command
+            .arg(crate::supervise::launch::REVIEW_ARG)
+            .arg(&self.reviewer.hb)
             .arg("approve")
             .current_dir(&approval.project)
             .envs(self.reviewer.env.iter().map(|(k, v)| (k, v)))
