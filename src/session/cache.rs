@@ -88,7 +88,7 @@ pub enum RecordFault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum Phase {
-    /// Writing the manifest or inventory.
+    /// Writing the manifest.
     Metadata,
     /// Flushing data to disk.
     Sync,
@@ -878,7 +878,8 @@ impl SessionCache {
     }
 }
 
-/// Copies the sealed tree `generation` to `<session>/cache`, all or nothing.
+/// Copies the sealed tree of `generation` to `<session>/cache`, all or nothing, after checking
+/// its bytes against the manifest's `tree_digest`.
 ///
 /// The copy is built in `<session>/cache.partial` and renamed once complete, so a run never starts
 /// on half a cache. If anything fails, the partial tree is removed; if that removal fails too, the
@@ -888,22 +889,32 @@ impl SessionCache {
 /// [`CacheError`]: a bound exceeded, too little free space, a refused entry, an I/O failure, or a
 /// cleanup that could not finish.
 pub fn materialize(
-    generation: &Path,
+    generation: &CacheGeneration,
     session: &Path,
     limits: CacheLimits,
 ) -> Result<SessionCache, CacheError> {
     let partial = session.join("cache.partial");
     let root = session.join("cache");
     let attempt = (|| {
-        check_free_space(generation, session, limits)?;
+        check_free_space(&generation.root, session, limits)?;
         let stats = copy_tree(
-            generation,
+            &generation.root,
             &partial,
             CopyPlan {
                 limits,
                 rewrite_from: None,
             },
         )?;
+        // Verified on the run's own copy, so what is checked is exactly what the run will use:
+        // there is no gap between checking the source and copying it. A payload changed after
+        // publication (the manifest's own hash does not cover it) is refused here.
+        ensure!(
+            tree_digest(&partial)? == generation.manifest.tree_digest,
+            StaleManifestSnafu {
+                id: generation.id.clone(),
+                what: Mismatch::Contents
+            }
+        );
         fs::rename(&partial, &root).context(CopySnafu {
             from: &partial,
             to: &root,
@@ -1131,6 +1142,118 @@ pub fn check_store_path(store: &Path, granted: &[&Path]) -> Result<(), CacheErro
     Ok(())
 }
 
+/// The SHA-256 of the file at `path`, following links (a tool on `PATH` is often a link).
+fn file_sha256(path: &Path) -> Result<String, CacheError> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = fs::File::open(path).context(ReadSnafu { path })?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut DigestWriter(&mut hasher)).context(ReadSnafu { path })?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// A SHA-256 over the whole tree at `root`, in sorted path order: for each entry its relative path,
+/// kind, mode, and either the file's bytes or the link's target. It walks through held descriptors
+/// with no link followed, like [`copy_tree`], so it describes the tree and nothing it points at.
+///
+/// # Errors
+/// [`CacheError`] if an entry cannot be read, or is not a file, directory or link.
+pub fn tree_digest(root: &Path) -> Result<String, CacheError> {
+    use sha2::{Digest as _, Sha256};
+    let real = fs::canonicalize(root).context(ReadSnafu { path: root })?;
+    let top = open_path_nofollow(&real).map_err(|e| CacheError::Read {
+        path: root.to_path_buf(),
+        source: e.into(),
+    })?;
+    let mut hasher = Sha256::new();
+    digest_dir(&top, Path::new(""), &mut hasher, root)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+fn digest_dir(
+    dir: &OwnedFd,
+    rel: &Path,
+    hasher: &mut sha2::Sha256,
+    root: &Path,
+) -> Result<(), CacheError> {
+    use rustix::fs::{AtFlags, FileType, statat};
+    use sha2::Digest as _;
+    let fail = |e: Errno| CacheError::Read {
+        path: root.join(rel),
+        source: e.into(),
+    };
+    let mut names: Vec<OsString> = Vec::new();
+    let mut entries = rustix::fs::Dir::read_from(dir).map_err(fail)?;
+    while let Some(entry) = entries.read() {
+        let name = entry.map_err(fail)?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name));
+        }
+    }
+    names.sort();
+    for name in names {
+        let child = rel.join(&name);
+        let stat = statat(dir, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(fail)?;
+        let kind = FileType::from_raw_mode(stat.st_mode);
+        let record = format!("{}\0{:o}\0", child.display(), stat.st_mode & 0o7777);
+        hasher.update((record.len() as u64).to_be_bytes());
+        hasher.update(record.as_bytes());
+        match kind {
+            FileType::Directory => {
+                hasher.update(b"d");
+                let sub = open_dir_nofollow(dir, &name).map_err(fail)?;
+                digest_dir(&sub, &child, hasher, root)?;
+            }
+            FileType::Symlink => {
+                hasher.update(b"l");
+                let target = rustix::fs::readlinkat(dir, &name, Vec::new()).map_err(fail)?;
+                hasher.update((target.as_bytes().len() as u64).to_be_bytes());
+                hasher.update(target.as_bytes());
+            }
+            FileType::RegularFile => {
+                hasher.update(b"f");
+                let file = open_file_nofollow(dir, &name).map_err(fail)?;
+                let opened = rustix::fs::fstat(&file).map_err(fail)?;
+                hasher.update((opened.st_size as u64).to_be_bytes());
+                let mut input = fs::File::from(file);
+                io::copy(&mut input, &mut DigestWriter(hasher)).context(ReadSnafu {
+                    path: root.join(&child),
+                })?;
+            }
+            _ => {
+                return InvalidEntrySnafu {
+                    path: child,
+                    reason: Rejection::SpecialFile,
+                }
+                .fail();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lets `io::copy` feed a hasher.
+struct DigestWriter<'a>(&'a mut sha2::Sha256);
+
+impl io::Write for DigestWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use sha2::Digest as _;
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The manifest format this hb writes and reads.
 pub const MANIFEST_FORMAT: u32 = 1;
 /// The largest manifest or current record that is read.
@@ -1144,7 +1267,7 @@ const LEGACY_DIRS: [&str; 3] = ["uv", "uv-tools", "npm"];
 pub struct ExpectedInputs {
     /// Hash of the canonical project root; names the project's `current` record.
     pub project_key: String,
-    /// Digest of the resolved uv, npm and node (canonical path, size and modification time).
+    /// Digest of the resolved uv, npm and node (path and content hash).
     pub tool_digest: String,
     /// Each warmed server's name and the digest of its command and arguments. A generation
     /// serves a run when it holds every server the run declares; extra servers are fine.
@@ -1168,6 +1291,9 @@ pub struct CacheManifest {
     pub logical_bytes: u64,
     /// Entries of any kind.
     pub entries: u64,
+    /// SHA-256 over every entry of the sealed tree (path, kind, mode, and the bytes or the link
+    /// target), so a payload changed after publication no longer matches its manifest.
+    pub tree_digest: String,
     /// Seconds since the epoch, for display only.
     pub created_at: u64,
     /// The hb version that built it, for display only.
@@ -1301,8 +1427,8 @@ impl ExpectedInputs {
 /// What the current config and tools say a generation must hold.
 ///
 /// `root` is the project's canonical root. The tool digest covers each found `uv`, `uvx`, `npm`
-/// and `npx`, `node` and so on by canonical path, size and modification time: a replaced
-/// binary changes it, and no tool is run to find out.
+/// and `npx`, `node` and so on by path and a SHA-256 of the file's bytes: a replaced binary
+/// changes it, and no tool is run to find out.
 ///
 /// # Errors
 /// [`CacheError::Read`] if a found tool cannot be examined.
@@ -1336,16 +1462,12 @@ pub fn expected_inputs_for(
     found.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
     for tool in found {
         let path = tool.dir.as_path().join(tool.name.as_str());
-        let meta = fs::metadata(&path).context(ReadSnafu { path: &path })?;
-        let stamp = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-        for word in [
-            path.to_string_lossy().into_owned(),
-            meta.len().to_string(),
-            stamp.map_or_else(String::new, |d| d.as_nanos().to_string()),
-        ] {
+        // The tool's own bytes, through any link, not its path, size and modification time: an
+        // equal-size replacement with a restored timestamp has the same path and a different
+        // digest. No tool is run to find out; hashing even a large binary takes a fraction of a
+        // second.
+        let content = file_sha256(&path)?;
+        for word in [path.to_string_lossy().into_owned(), content] {
             tool_bytes.extend_from_slice(&(word.len() as u64).to_be_bytes());
             tool_bytes.extend_from_slice(word.as_bytes());
         }
@@ -1522,12 +1644,15 @@ impl CacheStore {
                 rewrite_from: old_root,
             },
         )?;
+        // Over the sealed copy, which no warm descendant has a descriptor on.
+        let tree_digest = tree_digest(&data)?;
         let manifest = CacheManifest {
             format: MANIFEST_FORMAT,
             id: id.to_owned(),
             inputs: inputs.clone(),
             logical_bytes: stats.bytes,
             entries: stats.entries,
+            tree_digest,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
@@ -1947,6 +2072,40 @@ mod tests {
         );
     }
 
+    /// `dir` presented as a published generation: its manifest carries the tree's real digest.
+    fn as_generation(dir: &Path) -> CacheGeneration {
+        // A sealed tree has owner-only directories (copy_tree makes them so); a hand-made fixture
+        // gets the same, or its digest could never equal its copy's.
+        fn close(dir: &Path) {
+            assert_ok!(fs::set_permissions(dir, fs::Permissions::from_mode(0o700)));
+            for entry in assert_ok!(fs::read_dir(dir)).flatten() {
+                if assert_ok!(entry.file_type()).is_dir() {
+                    close(&entry.path());
+                }
+            }
+        }
+        close(dir);
+        CacheGeneration {
+            id: "g-test".into(),
+            root: dir.to_path_buf(),
+            manifest: CacheManifest {
+                format: MANIFEST_FORMAT,
+                id: "g-test".into(),
+                inputs: ExpectedInputs {
+                    project_key: "pk".into(),
+                    tool_digest: "t".into(),
+                    servers: BTreeMap::new(),
+                    platform: "p".into(),
+                },
+                logical_bytes: 0,
+                entries: 0,
+                tree_digest: assert_ok!(tree_digest(dir)),
+                created_at: 0,
+                hb_version: "t".into(),
+            },
+        }
+    }
+
     fn session() -> (TempDir, PathBuf, PathBuf) {
         let (d, src, _) = world();
         let sess = d.path().join("sess");
@@ -1960,7 +2119,7 @@ mod tests {
         let (_d, gen_dir, sess) = session();
         put(&gen_dir.join("uv/f"), "trusted");
         let cache = assert_ok!(materialize(
-            &gen_dir,
+            &as_generation(&gen_dir),
             &sess,
             CacheLimits {
                 min_free_bytes: 0,
@@ -1984,10 +2143,10 @@ mod tests {
             min_free_bytes: 0,
             ..CacheLimits::default()
         };
-        let a = assert_ok!(materialize(&gen_dir, &sess, limits));
+        let a = assert_ok!(materialize(&as_generation(&gen_dir), &sess, limits));
         let sess_b = sess.parent().map(|p| p.join("sess_b")).unwrap_or_default();
         assert_ok!(fs::create_dir(&sess_b));
-        let b = assert_ok!(materialize(&gen_dir, &sess_b, limits));
+        let b = assert_ok!(materialize(&as_generation(&gen_dir), &sess_b, limits));
         assert_ok!(fs::write(a.root().join("f"), "a-only"));
         assert_eq!(assert_ok!(fs::read_to_string(b.root().join("f"))), "base");
     }
@@ -2002,7 +2161,7 @@ mod tests {
             ..CacheLimits::default()
         };
         assert!(matches!(
-            assert_err!(materialize(&gen_dir, &sess, limits)),
+            assert_err!(materialize(&as_generation(&gen_dir), &sess, limits)),
             CacheError::BudgetExceeded { .. }
         ));
         assert!(!sess.join("cache").exists() && !sess.join("cache.partial").exists());
@@ -2017,7 +2176,7 @@ mod tests {
             ..CacheLimits::default()
         };
         assert!(matches!(
-            assert_err!(materialize(&gen_dir, &sess, limits)),
+            assert_err!(materialize(&as_generation(&gen_dir), &sess, limits)),
             CacheError::NoSpace { .. }
         ));
         assert!(!sess.join("cache.partial").exists());
@@ -2033,7 +2192,7 @@ mod tests {
             ..CacheLimits::default()
         };
         assert!(matches!(
-            assert_err!(materialize(&gen_dir, &sess, limits)),
+            assert_err!(materialize(&as_generation(&gen_dir), &sess, limits)),
             CacheError::InvalidEntry { .. }
         ));
         assert!(!sess.join("cache").exists() && !sess.join("cache.partial").exists());
@@ -2081,6 +2240,7 @@ mod tests {
             inputs: inputs.clone(),
             logical_bytes: 1,
             entries: 3,
+            tree_digest: String::new(),
             created_at: 0,
             hb_version: "t".into(),
         };
@@ -2922,5 +3082,107 @@ mod tests {
         let path = locked.join("first/second/hamster-ball");
         let got = assert_err!(check_store_path(&path, &[open_dir.as_path()]));
         assert!(matches!(got, CacheError::RedirectableStore { .. }), "{got}");
+    }
+
+    // ---- tree digest (review F8) ----
+
+    #[test]
+    fn test_tree_digest_changes_with_content_mode_names_and_links_and_not_with_time() {
+        let (_d, src, _dst) = world();
+        put(&src.join("a/f"), "one");
+        assert_ok!(symlink("f", src.join("a/l")));
+        let base = assert_ok!(tree_digest(&src));
+        assert_eq!(base, assert_ok!(tree_digest(&src)), "stable");
+        let touch = |path: &Path| {
+            let f = assert_ok!(fs::OpenOptions::new().write(true).open(path));
+            assert_ok!(f.set_modified(std::time::SystemTime::UNIX_EPOCH));
+        };
+        touch(&src.join("a/f"));
+        assert_eq!(
+            base,
+            assert_ok!(tree_digest(&src)),
+            "modification time is not part of it"
+        );
+        assert_ok!(fs::write(src.join("a/f"), "two"));
+        let changed = assert_ok!(tree_digest(&src));
+        assert_ne!(base, changed, "content");
+        assert_ok!(fs::write(src.join("a/f"), "one"));
+        assert_eq!(base, assert_ok!(tree_digest(&src)));
+        assert_ok!(fs::set_permissions(
+            src.join("a/f"),
+            fs::Permissions::from_mode(0o700)
+        ));
+        assert_ne!(base, assert_ok!(tree_digest(&src)), "mode");
+        assert_ok!(fs::set_permissions(
+            src.join("a/f"),
+            fs::Permissions::from_mode(0o600)
+        ));
+        assert_ok!(fs::remove_file(src.join("a/l")));
+        assert_ok!(symlink("elsewhere", src.join("a/l")));
+        assert_ne!(base, assert_ok!(tree_digest(&src)), "link target");
+        assert_ok!(fs::remove_file(src.join("a/l")));
+        assert_ok!(symlink("f", src.join("a/l")));
+        assert_ok!(fs::rename(src.join("a/f"), src.join("a/g")));
+        assert_ne!(base, assert_ok!(tree_digest(&src)), "name");
+    }
+
+    #[test]
+    fn test_materialize_refuses_a_payload_changed_after_publication_and_leaves_nothing() {
+        let (_d, gen_dir, sess) = session();
+        put(&gen_dir.join("uv/f"), "trusted");
+        let generation = as_generation(&gen_dir);
+        // Same manifest, edited payload: the manifest's own hash would still match.
+        assert_ok!(fs::write(gen_dir.join("uv/f"), "tampered"));
+        let got = assert_err!(materialize(&generation, &sess, loose()));
+        assert!(
+            matches!(
+                &got,
+                CacheError::StaleManifest {
+                    what: Mismatch::Contents,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+        assert!(!sess.join("cache").exists() && !sess.join("cache.partial").exists());
+    }
+
+    #[test]
+    fn test_a_published_generation_records_the_digest_of_exactly_what_it_published() {
+        let (_d, _root, store) = store();
+        let ws = workspace(&store, &[("uv/f", "built"), ("npm/g", "pkg")]);
+        let made = assert_ok!(store.seal_and_publish(&ws, &inputs(), None, loose()));
+        assert_eq!(
+            made.manifest.tree_digest,
+            assert_ok!(tree_digest(&made.root))
+        );
+        let sess = assert_ok!(fs::canonicalize(assert_ok!(TempDir::new()).keep()));
+        assert_ok!(materialize(
+            &assert_ok!(store.select(&inputs())),
+            &sess,
+            loose()
+        ));
+        // Tamper after publication, as a same-user process (not a ball) could.
+        assert_ok!(fs::set_permissions(
+            made.root.join("uv/f"),
+            fs::Permissions::from_mode(0o600)
+        ));
+        assert_ok!(fs::write(made.root.join("uv/f"), "swapped"));
+        let again = assert_ok!(fs::canonicalize(assert_ok!(TempDir::new()).keep()));
+        let got = assert_err!(materialize(
+            &assert_ok!(store.select(&inputs())),
+            &again,
+            loose()
+        ));
+        assert!(
+            matches!(
+                &got,
+                CacheError::StaleManifest {
+                    what: Mismatch::Contents,
+                    ..
+                }
+            ),
+            "{got}"
+        );
     }
 }

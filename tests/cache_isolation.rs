@@ -333,6 +333,30 @@ fn tampering_with_a_published_manifest_is_refused_before_the_agent_starts() {
 }
 
 #[test]
+fn a_payload_edited_after_publication_is_refused_even_though_the_manifest_still_matches() {
+    sandboxed!();
+    let w = world();
+    warm(&w);
+    let data = published(&w);
+    // As a same-user process outside any ball could: edit a published file in place. The manifest
+    // and the current record are untouched, so only the content digest can notice.
+    let victim = data.join("uv/archive-v0/aaa/mod.py");
+    assert_ok!(fs::set_permissions(
+        &victim,
+        fs::Permissions::from_mode(0o600)
+    ));
+    assert_ok!(fs::write(&victim, "backdoor\n"));
+    let out = run(&w, "echo agent-started");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("agent-started"), "{}", text(&out));
+    assert!(
+        text(&out).contains("stale") && text(&out).contains("contents"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
 fn a_legacy_cache_next_to_a_new_generation_is_ignored_and_never_deleted() {
     sandboxed!();
     let w = world();

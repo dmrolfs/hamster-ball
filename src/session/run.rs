@@ -1267,7 +1267,7 @@ fn run_cache(
     let expected = expected_inputs(loaded.root.path(), &loaded.policy, tools)?;
     check_cache_store(env, loaded)?;
     let generation = CacheStore::new(cache_root(&env.home)).select(&expected)?;
-    let copy = materialize(&generation.root, session.as_path(), CacheLimits::default())?;
+    let copy = materialize(&generation, session.as_path(), CacheLimits::default())?;
     let resolved = fs::canonicalize(copy.root()).context(TempDirSnafu {
         dir: copy.root().to_string_lossy().into_owned(),
     })?;
