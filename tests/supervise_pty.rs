@@ -213,14 +213,11 @@ fn a_resize_reaches_the_program_and_the_emulator_together() {
 fn bracketed_paste_markers_are_sent_only_after_the_program_asks_and_cannot_be_ended_early() {
     // The program shows each byte it receives as hex, one per line, until it has seen a newline.
     // Reads exactly `count` bytes, so no end of input is needed, and prints them as hex.
-    let show =
-        |count: u32| format!("stty raw -echo; dd bs=1 count={count} 2>/dev/null | od -An -v -tx1");
+    let show = |count: u32| {
+        format!("stty raw -echo && echo ready; dd bs=1 count={count} 2>/dev/null | od -An -v -tx1")
+    };
     // Without the mode on: the text arrives as it is.
-    let mut plain = Live::start(
-        40,
-        20,
-        &["/bin/sh", "-c", &format!("echo ready; {}", show(2))],
-    );
+    let mut plain = Live::start(40, 20, &["/bin/sh", "-c", &show(2)]);
     plain.wait_for("ready", 10);
     plain.paste("a\n");
     plain.wait_for("61 0a", 10);
@@ -236,7 +233,7 @@ fn bracketed_paste_markers_are_sent_only_after_the_program_asks_and_cannot_be_en
         &[
             "/bin/sh",
             "-c",
-            &format!("printf '\\033[?2004h'; echo ready; {}", show(15)),
+            &format!("printf '\\033[?2004h'; {}", show(15)),
         ],
     );
     asked.wait_for("ready", 10);

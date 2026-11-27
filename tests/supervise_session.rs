@@ -290,24 +290,43 @@ fn a_spawn_that_fails_leaves_no_process_behind_and_returns_the_error() {
     );
 }
 
-/// Names of this process's threads that belong to session `id`, from the kernel.
-fn session_threads(id: u32) -> Vec<String> {
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-M", "-p", &std::process::id().to_string()])
-        .output();
-    let _ = id;
-    out.map(|o| {
-        String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    })
-    .unwrap_or_default()
+/// This process's kernel thread census, used only in the isolated failure test.
+fn session_threads() -> Vec<String> {
+    let out = assert_ok!(
+        std::process::Command::new("/bin/ps")
+            .args(["-M", "-p", &std::process::id().to_string()])
+            .output()
+    );
+    assert!(
+        out.status.success(),
+        "thread census failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<_> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(lines.len() > 1, "thread census is empty");
+    lines
 }
 
 #[test]
 fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_started() {
     use strum::IntoEnumIterator;
+    const ISOLATED: &str = "HB_ISOLATED_SPAWN_FAILURE_TEST";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = assert_ok!(std::process::Command::new(assert_ok!(std::env::current_exe()))
+            .args(["--exact", "a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_started", "--nocapture"])
+            .env(ISOLATED, "1").output());
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
     sandboxed!();
     for (index, step) in Step::iter().enumerate() {
         let w = World::new(PROJECT);
@@ -336,7 +355,7 @@ fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_sta
         // Filled now, so that every message a reader tries to deliver has nowhere to go until
         // someone reads; nobody will.
         assert_ok!(tx.send(Msg::Notice("filler".into())));
-        let threads_before = session_threads(1).len();
+        let threads_before = session_threads().len();
         FAIL_AT.store(index, std::sync::atomic::Ordering::SeqCst);
         let result = spawn(SessionId(1), 1, started, Shared::new(30, 100), tx);
         FAIL_AT.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
@@ -351,11 +370,11 @@ fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_sta
         );
         // Every thread that was started ends, whatever it was doing.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while session_threads(1).len() > threads_before && Instant::now() < deadline {
+        while session_threads().len() > threads_before && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(
-            session_threads(1).len().saturating_sub(threads_before),
+            session_threads().len().saturating_sub(threads_before),
             0,
             "{step}: a thread outlived a failed spawn"
         );
