@@ -397,7 +397,12 @@ impl Loop<'_> {
                 ApprovalOutcome::Failed(format!("the terminal could not be given back: {error}"))
             }
         };
-        if self.stop.terminated() || fatal() {
+        // A stop that arrived while the review was ending is seen now, before the UI is resumed or
+        // the result applied. Defence in depth: a restart already waits for the old worker and the
+        // loop polls again before it starts, so no way to start a session after a stop was found;
+        // this keeps that from depending on the order of those two. `poll` fails only if the queue
+        // itself is broken, which is a stop we cannot see and is treated as one.
+        if self.stop.poll().is_err() || self.stop.terminated() || fatal() {
             return Ok(false);
         }
         drain_events()?;

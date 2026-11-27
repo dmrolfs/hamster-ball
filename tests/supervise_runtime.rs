@@ -314,3 +314,28 @@ fn an_agent_that_never_reads_its_input_does_not_freeze_the_loop_and_can_still_be
         assert!(!alive(pid), "agent {pid} outlived shut_down");
     }
 }
+
+#[test]
+fn a_restart_waiting_for_the_old_generation_is_never_started_once_shutdown_begins() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 300"]));
+    assert!(run_until(&mut rt, 60, |r| phase(r, 1) == Phase::Running));
+    let first_screen = assert_some!(rt.screen(SessionId(1))).clone();
+    // The restart is asked for; the old generation is still ending, so the new one waits.
+    rt.send(Msg::AskRestart);
+    rt.send(Msg::Answer(true));
+    assert!(
+        rt.is_retiring(),
+        "the old generation should still be ending"
+    );
+    // Shutdown begins before the old generation has finished.
+    assert!(rt.shut_down(Duration::from_secs(30)));
+    // A started generation would have replaced the session's screen; it was never started.
+    let screen_now = assert_some!(rt.screen(SessionId(1)));
+    assert!(
+        std::sync::Arc::ptr_eq(&first_screen, screen_now),
+        "a new generation was started after shutdown began"
+    );
+}
