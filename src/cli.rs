@@ -31,7 +31,7 @@ use crate::seatbelt::{ProxyEndpoint, RenderInputs, render};
 use crate::session::signals::{block_supervised, unblock_supervised};
 use crate::session::{
     self, DEFAULT_GRACE, DenialSink, Denials, ExitKind, PtyMode, RunError, RunSpec, SESSION_MARKER,
-    SignalMode, StdioMode, check_nesting, exec_sandbox_exec, run_guard,
+    SignalMode, StdioMode, check_nesting, run_guard,
 };
 use crate::system::{Environment, StateDir, UserConfigDir};
 use crate::text::Escaped;
@@ -244,6 +244,12 @@ struct GuardArgs {
 
 #[derive(Debug, Args)]
 struct ChildArgs {
+    /// One-shot authorization socket, never passed to the agent.
+    #[arg(long, requires = "gate_parent")]
+    launch_gate: Option<std::path::PathBuf>,
+    /// Expected parent process for the gate connection.
+    #[arg(long, requires = "launch_gate")]
+    gate_parent: Option<u32>,
     /// Become a session leader and take stdin (the pty slave) as the controlling terminal first.
     #[arg(long)]
     controlling_tty: bool,
@@ -513,7 +519,11 @@ where
     if let Command::Child(child) = &command {
         return fail(
             err,
-            crate::Error::from(exec_sandbox_exec(&child.argv, child.controlling_tty)),
+            crate::Error::from(crate::session::child_helper::exec_gated(
+                &child.argv,
+                child.controlling_tty,
+                child.launch_gate.as_deref().zip(child.gate_parent),
+            )),
         );
     }
 

@@ -16,10 +16,11 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,6 +58,10 @@ pub enum GuardianError {
         /// The underlying error.
         source: io::Error,
     },
+
+    /// The guard rejected a required kernel watch.
+    #[snafu(display("the cleanup guard refused process protection"))]
+    Refused,
 
     /// The guard could not be told about a process, so it would not be cleaned up.
     #[snafu(display("the cleanup guard could not be told about a process"))]
@@ -97,6 +102,8 @@ pub enum GuardError {
 pub(super) enum GuardCommand {
     /// Clean up this target if `hb` dies.
     Watch(Target),
+    /// Register a live launch target and acknowledge kernel acceptance.
+    Protect(Target),
     /// `hb` finished normally: exit and touch nothing.
     Release,
     /// The user's terminal, which `hb` is about to put in raw mode.
@@ -126,17 +133,26 @@ pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
         ["release"] => Ok(GuardCommand::Release),
         ["tty", path] => terminal_device(path).map(GuardCommand::Terminal),
         ["socket", path] => ctl_socket(path).map(GuardCommand::Socket),
-        ["watch", kind @ ("group" | "process"), pid] => {
+        [
+            verb @ ("watch" | "protect"),
+            kind @ ("group" | "process"),
+            pid,
+        ] => {
             let pid: i32 = pid.parse().ok().context(BadPidSnafu)?;
             if pid < FIRST_SIGNALLABLE_PID {
                 return BadPidSnafu.fail();
             }
             let pid = Pid::from_raw(pid);
-            Ok(GuardCommand::Watch(if *kind == "group" {
+            let target = if *kind == "group" {
                 Target::Group(pid)
             } else {
                 Target::Child(pid)
-            }))
+            };
+            Ok(if *verb == "protect" {
+                GuardCommand::Protect(target)
+            } else {
+                GuardCommand::Watch(target)
+            })
         }
         _ => UnknownSnafu.fail(),
     }
@@ -255,23 +271,44 @@ const HINT_DELAY: Duration = Duration::from_millis(300);
 #[derive(Debug)]
 pub struct Guardian {
     process: Child,
-    commands: Arc<Mutex<ChildStdin>>,
+    commands: Arc<Mutex<UnixStream>>,
 }
 
 /// A clone of the guard's command pipe, so other threads (the `hb ctl` broker's runner) can
 /// register the process groups they start. It does not keep the guard alive: `release` ends it.
 #[derive(Debug, Clone)]
 pub struct GuardHandle {
-    commands: Arc<Mutex<ChildStdin>>,
+    commands: Arc<Mutex<UnixStream>>,
 }
 
-fn tell(commands: &Mutex<ChildStdin>, text: &str) -> Result<(), GuardianError> {
+fn tell(commands: &Mutex<UnixStream>, text: &str) -> Result<(), GuardianError> {
     let mut pipe = commands.lock().map_err(|_| GuardianError::Tell {
         source: io::Error::other("the guard's command pipe is poisoned"),
     })?;
     pipe.write_all(text.as_bytes())
         .and_then(|()| pipe.flush())
         .context(TellSnafu)
+}
+
+fn protect(commands: &Mutex<UnixStream>, target: Target) -> Result<(), GuardianError> {
+    let mut pipe = commands.lock().map_err(|_| GuardianError::Tell {
+        source: io::Error::other("the guard's command pipe is poisoned"),
+    })?;
+    let result = (|| {
+        let text = watch_line(target).replacen("watch", "protect", 1);
+        pipe.write_all(text.as_bytes()).context(TellSnafu)?;
+        let mut reply = [0];
+        pipe.read_exact(&mut reply).context(TellSnafu)?;
+        if reply != [1] {
+            return RefusedSnafu.fail();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // A late reply must never authorize a later target after a timed-out transaction.
+        let _ = pipe.shutdown(std::net::Shutdown::Both);
+    }
+    result
 }
 
 impl GuardHandle {
@@ -303,20 +340,21 @@ impl Guardian {
             .arg("__guard")
             .arg("--grace-ms")
             .arg(grace.as_millis().to_string());
-        let mut process = command
+        let (commands, remote) = UnixStream::pair().context(SpawnSnafu)?;
+        commands
+            .set_read_timeout(Some(RELEASE_WAIT))
+            .context(SpawnSnafu)?;
+        commands
+            .set_write_timeout(Some(RELEASE_WAIT))
+            .context(SpawnSnafu)?;
+        let output = remote.try_clone().context(SpawnSnafu)?;
+        let process = command
             .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdin(Stdio::from(OwnedFd::from(remote)))
+            .stdout(Stdio::from(OwnedFd::from(output)))
             .stderr(Stdio::null())
             .spawn()
             .context(SpawnSnafu)?;
-        let Some(commands) = process.stdin.take() else {
-            let _ = process.kill();
-            let _ = process.wait();
-            return Err(GuardianError::Spawn {
-                source: io::Error::other("the guard has no command pipe"),
-            });
-        };
         Ok(Self {
             process,
             commands: Arc::new(Mutex::new(commands)),
@@ -374,6 +412,14 @@ impl Guardian {
     /// [`GuardianError::Tell`] if the guard cannot be written to.
     pub fn watch(&mut self, target: Target) -> Result<(), GuardianError> {
         tell(&self.commands, &watch_line(target))
+    }
+
+    /// Requires a kernel watch before the waiting launch helper may execute its agent.
+    ///
+    /// # Errors
+    /// A timeout, broken channel, or rejected watch prevents launch authorization.
+    pub fn protect(&mut self, target: Target) -> Result<(), GuardianError> {
+        protect(&self.commands, target)
     }
 
     /// Tells the guard `hb` has cleaned up and waits (briefly) for it to exit.
@@ -562,6 +608,10 @@ fn read_commands(
     let n = match commands.read(&mut chunk) {
         Ok(n) => n,
         Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok((Next::Keep, true)),
+        // A socket peer can reset when it dies with an unread acknowledgement.
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+            return Ok((Next::Keep, false));
+        }
         Err(source) => return Err(GuardError::Read { source }),
     };
     buffered.extend_from_slice(&chunk[..n]);
@@ -573,7 +623,20 @@ fn read_commands(
         }
         match parse_line(&text) {
             Ok(GuardCommand::Release) => return Ok((Next::Release, true)),
-            Ok(GuardCommand::Watch(target)) => watch(target, watched, queue),
+            Ok(GuardCommand::Watch(target)) => {
+                let _ = watch(target, watched, queue);
+            }
+            Ok(GuardCommand::Protect(target)) => {
+                let accepted = watch(target, watched, queue);
+                // A broken reply channel means parent loss, not permission to abandon targets.
+                if io::stdout()
+                    .write_all(&[u8::from(accepted)])
+                    .and_then(|()| io::stdout().flush())
+                    .is_err()
+                {
+                    return Ok((Next::Keep, false));
+                }
+            }
             Ok(GuardCommand::Terminal(path)) => *terminal = TerminalWatch::open(&path),
             Ok(GuardCommand::Socket(path)) if sockets.len() < MAX_SOCKETS => sockets.push(path),
             Ok(GuardCommand::Socket(_)) => {}
@@ -588,12 +651,12 @@ fn read_commands(
 }
 
 /// Starts watching `target`, unless it has already ended or there are too many.
-fn watch(target: Target, watched: &mut HashMap<i32, Target>, queue: &Kqueue) {
+fn watch(target: Target, watched: &mut HashMap<i32, Target>, queue: &Kqueue) -> bool {
     let pid = match target {
         Target::Group(pid) | Target::Child(pid) => pid,
     };
     if watched.len() >= MAX_WATCHED {
-        return;
+        return false;
     }
     let exit = KEvent::new(
         pid.as_raw() as usize,
@@ -606,6 +669,78 @@ fn watch(target: Target, watched: &mut HashMap<i32, Target>, queue: &Kqueue) {
     // ESRCH: it ended before it could be watched, so there is nothing to clean up.
     if queue.kevent(&[exit], &mut [], Some(zero())).is_ok() {
         watched.insert(pid.as_raw(), target);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use claims::{assert_err, assert_ok};
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    #[test]
+    fn protection_waits_for_reply_and_serializes_other_writers() {
+        let (local, remote) = assert_ok!(UnixStream::pair());
+        assert_ok!(local.set_read_timeout(Some(Duration::from_secs(2))));
+        let commands = Arc::new(Mutex::new(local));
+        let tx_commands = Arc::clone(&commands);
+        let (done, result) = mpsc::channel();
+        let protect_thread = thread::spawn(move || {
+            let _ = done.send(protect(&tx_commands, Target::Child(Pid::from_raw(4242))));
+        });
+        let mut reader = BufReader::new(remote);
+        assert_ok!(
+            reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(100)))
+        );
+        let mut line = String::new();
+        assert_ok!(reader.read_line(&mut line));
+        assert_eq!(line, "protect process 4242\n");
+        assert!(
+            result.try_recv().is_err(),
+            "protection returned without a reply"
+        );
+        let handle = GuardHandle { commands };
+        let writer = thread::spawn(move || handle.watch(Target::Child(Pid::from_raw(4243))));
+        line.clear();
+        assert_err!(reader.read_line(&mut line));
+        assert_ok!(reader.get_mut().write_all(&[1]));
+        assert_ok!(assert_ok!(result.recv_timeout(Duration::from_secs(2))));
+        assert_ok!(reader.read_line(&mut line));
+        assert_eq!(line, "watch process 4243\n");
+        assert_ok!(protect_thread.join());
+        assert_ok!(assert_ok!(writer.join()));
+    }
+
+    #[test]
+    fn a_full_guardian_refuses_protection_instead_of_acknowledging_it() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut watched = HashMap::new();
+        for pid in 2..(2 + MAX_WATCHED as i32) {
+            watched.insert(pid, Target::Child(Pid::from_raw(pid)));
+        }
+        assert!(!watch(Target::Child(Pid::this()), &mut watched, &queue));
+        assert_eq!(watched.len(), MAX_WATCHED);
+    }
+
+    #[test]
+    fn timeout_or_refusal_prevents_reusing_a_late_reply() {
+        for response in [None, Some(0), Some(2)] {
+            let (local, mut remote) = assert_ok!(UnixStream::pair());
+            assert_ok!(local.set_read_timeout(Some(Duration::from_millis(50))));
+            let commands = Mutex::new(local);
+            if let Some(byte) = response {
+                assert_ok!(remote.write_all(&[byte]));
+            }
+            assert_err!(protect(&commands, Target::Child(Pid::from_raw(4242))));
+            let _ = remote.write_all(&[1]);
+            assert_err!(protect(&commands, Target::Child(Pid::from_raw(4243))));
+        }
     }
 }
 

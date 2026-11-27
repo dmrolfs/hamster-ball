@@ -44,6 +44,13 @@ pub enum HelperError {
         source: rustix::io::Errno,
     },
 
+    /// Guardian registration could not be confirmed.
+    #[snafu(display("agent execution was not authorized"))]
+    Gate {
+        /// The gate failure.
+        source: super::launch_gate::GateError,
+    },
+
     /// `sandbox-exec` could not be started.
     #[snafu(display("{SANDBOX_EXEC} could not be started"))]
     Exec {
@@ -58,6 +65,15 @@ pub enum HelperError {
 /// child's pty slave, as the controlling terminal, so the agent has job control and a `/dev/tty`
 /// of its own. Returns only if something failed.
 pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool) -> HelperError {
+    exec_gated(args, controlling_tty, None)
+}
+
+/// The guarded variant used by hb's launch path.
+pub(crate) fn exec_gated(
+    args: &[OsString],
+    controlling_tty: bool,
+    gate: Option<(&std::path::Path, u32)>,
+) -> HelperError {
     if let Err(source) = clear_mask() {
         return HelperError::Mask { source };
     }
@@ -68,6 +84,11 @@ pub fn exec_sandbox_exec(args: &[OsString], controlling_tty: bool) -> HelperErro
         if let Err(source) = ioctl_tiocsctty(std::io::stdin()) {
             return HelperError::ControllingTty { source };
         }
+    }
+    if let Some((path, parent)) = gate
+        && let Err(source) = super::launch_gate::await_permission(path, parent)
+    {
+        return HelperError::Gate { source };
     }
     HelperError::Exec {
         source: Command::new(SANDBOX_EXEC).args(args).exec(),

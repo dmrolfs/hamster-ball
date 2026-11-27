@@ -26,6 +26,7 @@ use super::fence::settle;
 use super::guardian::{Guardian, GuardianError};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
+use super::launch_gate::{GateError, LaunchGate};
 use super::offline::{OfflineError, OfflinePlan};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
@@ -436,6 +437,13 @@ pub enum RunError {
         source: GuardianError,
     },
 
+    /// The child could not obtain guardian-backed launch authorization.
+    #[snafu(transparent)]
+    LaunchGate {
+        /// The gate error.
+        source: GateError,
+    },
+
     /// The CA bundle for `tls.extra_ca_files` could not be built.
     #[snafu(transparent)]
     CaBundle {
@@ -662,10 +670,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         ctl_socket: ctl.as_ref().map(|c| &c.socket),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
-    let launcher = launcher_words(helper, pty.is_some());
+    let gate = helper.map(|_| LaunchGate::bind()).transpose()?;
+    let launcher = launcher_words(helper, pty.is_some(), gate.as_ref().map(LaunchGate::path));
     check_size(&profile, &child_env, &spec.argv, &launcher)?;
 
-    let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
+    let mut command = command_for(&profile, &child_env, spec, &env.cwd, launcher);
     match &pty {
         Some(pty) => {
             // The helper's setsid makes the child leader of a new session and group, which it
@@ -713,6 +722,15 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         return StoppedSnafu.fail();
     }
     let mut child = command.spawn().context(SpawnSnafu)?;
+    let permit = match gate.as_ref().map(|gate| gate.ready(child.id())).transpose() {
+        Ok(permit) => permit,
+        Err(error) => {
+            abort_child(&mut child);
+            return Err(error.into());
+        }
+    };
+    #[cfg(feature = "test-support")]
+    test_gate_pause("ready", child.id());
     if let Some(guardian) = guardian.as_mut() {
         // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
         let target = if pty.is_some() || !stdin_is_tty {
@@ -720,11 +738,13 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         } else {
             Target::Child(pid_of(child.id()))
         };
-        if let Err(error) = guardian.watch(target) {
+        if let Err(error) = guardian.protect(target) {
             abort_child(&mut child);
             return Err(error.into());
         }
     }
+    #[cfg(feature = "test-support")]
+    test_gate_pause("protected", child.id());
     let clipboard = if loaded.policy.terminal.effective_clipboard_write() {
         ClipboardPolicy::Allow
     } else {
@@ -746,6 +766,12 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
     running.pumps = pumps;
+    if let Some((gate, permit)) = gate.zip(permit)
+        && let Err(error) = gate.authorize(permit)
+    {
+        abort_child(&mut running.child);
+        return Err(error.into());
+    }
     if let Some(on_start) = &spec.on_start {
         (on_start.0)(running.child.id());
     }
@@ -1111,14 +1137,48 @@ impl Running {
     }
 }
 
+/// Pauses a real launch at a named boundary for parent-death and ordering tests.
+#[cfg(feature = "test-support")]
+fn test_gate_pause(stage: &str, pid: u32) {
+    if std::env::var("HB_TEST_GATE_STAGE").unwrap_or_else(|_| "ready".into()) != stage {
+        return;
+    }
+    if let Some(path) = std::env::var_os("HB_TEST_GATE_READY") {
+        let path = std::path::PathBuf::from(path);
+        let pending = path.with_extension("pending");
+        if fs::write(&pending, pid.to_string())
+            .and_then(|()| fs::rename(&pending, &path))
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !path.with_extension("continue").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 /// The words that start the command: `sandbox-exec`, or the helper that execs it.
-fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString> {
+fn launcher_words(
+    helper: Option<&Path>,
+    controlling_tty: bool,
+    gate: Option<&Path>,
+) -> Vec<OsString> {
     match helper {
         None => vec![OsString::from(SANDBOX_EXEC)],
         Some(hb) => {
             let mut words = vec![hb.as_os_str().to_owned(), "__child".into()];
             if controlling_tty {
                 words.push("--controlling-tty".into());
+            }
+            if let Some(gate) = gate {
+                words.extend([
+                    "--launch-gate".into(),
+                    gate.as_os_str().to_owned(),
+                    "--gate-parent".into(),
+                    std::process::id().to_string().into(),
+                ]);
             }
             words.push("--".into());
             words
@@ -1144,10 +1204,9 @@ fn command_for(
     child_env: &ChildEnv,
     spec: &RunSpec,
     cwd: &Path,
-    helper: Option<&Path>,
-    controlling_tty: bool,
+    launcher: Vec<OsString>,
 ) -> Command {
-    let mut words = launcher_words(helper, controlling_tty).into_iter();
+    let mut words = launcher.into_iter();
     let mut command = Command::new(words.next().unwrap_or_default());
     command
         .args(words)
@@ -1449,7 +1508,7 @@ mod tests {
     }
 
     fn launcher() -> Vec<OsString> {
-        launcher_words(None, false)
+        launcher_words(None, false, None)
     }
 
     fn empty_profile() -> Profile {

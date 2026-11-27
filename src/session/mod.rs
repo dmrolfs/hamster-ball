@@ -14,6 +14,7 @@ pub mod gitconfig;
 pub mod guardian;
 pub mod hooks;
 mod interactive;
+pub mod launch_gate;
 pub mod offline;
 pub mod ports;
 pub mod preflight;

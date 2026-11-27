@@ -37,7 +37,7 @@ test-support = []
 [dependencies]
 clap = { version = "4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 httparse = "1.10"
-nix = { version = "0.32", default-features = false, features = ["event", "signal", "time", "user"] }
+nix = { version = "0.32", default-features = false, features = ["event", "signal", "socket", "time", "user"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "process", "pty", "stdio", "termios", "event", "fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
