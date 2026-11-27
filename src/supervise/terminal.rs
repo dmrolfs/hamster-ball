@@ -120,7 +120,7 @@ impl OscCap {
             OscState::Escape => {
                 self.state = match byte {
                     0x5d => OscState::Osc { kept: 0 },
-                    0x1b | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => OscState::Escape,
+                    0x1b | 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => OscState::Escape,
                     _ => OscState::Other,
                 };
                 true
@@ -542,6 +542,24 @@ mod tests {
             }
             // The introducer is 2 bytes; the cap counts bytes after it.
             assert_eq!(forwarded, 2 + MAX_OSC_BYTES, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn ignored_bytes_after_escape_cannot_bypass_the_osc_cap() {
+        for ignored in [0x7f, 0x80, 0xff] {
+            let prefix = [0x1b, ignored, b']', b'5', b'2', b';', b'c', b';'];
+            for split in 0..=prefix.len() {
+                let mut screen = SessionScreen::new(2, 20);
+                screen.process(&prefix[..split]);
+                screen.process(&prefix[split..]);
+                screen.process(&vec![b'a'; MAX_OSC_BYTES * 2]);
+                assert!(
+                    screen.fed <= 3 + MAX_OSC_BYTES,
+                    "OSC cap bypass: ignored={ignored:#x} split={split} fed={}",
+                    screen.fed
+                );
+            }
         }
     }
 
