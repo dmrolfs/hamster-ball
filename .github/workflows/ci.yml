@@ -53,6 +53,24 @@ jobs:
           test -d /Library/Developer/CommandLineTools
           sudo xcode-select -s /Library/Developer/CommandLineTools
           xcode-select -p
+      - name: Runner facts
+        run: |
+          git rev-parse HEAD
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu
+          csrutil status
+          rustc --version
+      - name: Repeat synchronized cleanup tests
+        env:
+          HB_REQUIRE_SANDBOX: "1"
+        run: |
+          for attempt in $(seq 1 10); do
+            echo "cleanup repetition $attempt"
+            cargo test --locked --all-features --lib the_second_sweep_finds_a_holder_created_after_the_first_completed
+            cargo test --locked --all-features --lib a_descendant_that_left_its_session_is_still_owned_and_killed
+          done
+          cargo test --locked --all-features --test descendant_cleanup -- --nocapture
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -63,6 +81,8 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - name: Tests
         run: cargo test --locked --all-features --no-fail-fast
+        env:
+          HB_REQUIRE_SANDBOX: "1"
 
   msrv:
     name: declared minimum compiler
