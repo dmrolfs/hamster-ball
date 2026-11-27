@@ -404,6 +404,50 @@ mod tests {
     const SECOND: Duration = Duration::from_secs(1);
 
     #[test]
+    fn test_a_poisoned_capture_buffer_is_still_drained_to_the_end() {
+        struct Counting {
+            left: usize,
+            read: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Read for Counting {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(out.len()).min(1000);
+                self.left -= n;
+                self.read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        let tail = Arc::new(Mutex::new(Tail {
+            buf: VecDeque::new(),
+            limit: 10,
+            truncated: false,
+            whole: false,
+        }));
+        let poisoner = Arc::clone(&tail);
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.lock();
+            #[allow(clippy::panic)] // a panic while holding the lock is how a mutex is poisoned
+            {
+                panic!("poison the buffer");
+            }
+        })
+        .join();
+        assert!(tail.is_poisoned());
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipe = Counting {
+            left: 50_000,
+            read: Arc::clone(&read),
+        };
+        assert_ok!(
+            reader(pipe, Some(tail))
+                .join()
+                .map_err(|_| "reader panicked")
+        );
+        // A writer on the other end of a real pipe would block, or die of SIGPIPE, if we stopped.
+        assert_eq!(read.load(std::sync::atomic::Ordering::Relaxed), 50_000);
+    }
+
+    #[test]
     fn test_stdout_and_stderr_are_both_kept_and_the_exit_code_is_reported() {
         let done = assert_ok!(sh(
             "echo out; echo err >&2; exit 3",

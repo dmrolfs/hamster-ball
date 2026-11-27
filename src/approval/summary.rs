@@ -247,3 +247,39 @@ fn from_label(origins: &[OriginRow]) -> String {
     }
     names.join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(name: Option<&str>, file: Option<&str>) -> OriginRow {
+        OriginRow {
+            layer: String::new(),
+            file_index: None,
+            name: name.map(str::to_owned),
+            file: file.map(str::to_owned),
+            key: None,
+            floor_rule: None,
+        }
+    }
+
+    #[test]
+    fn from_label_lists_each_distinct_name_once_in_first_seen_order() {
+        let origins = [
+            origin(Some("rust"), None),
+            origin(None, Some("/p/hamster-ball.toml")),
+            origin(Some("rust"), None),
+            origin(Some("node"), Some("/ignored/because/a/name/wins.toml")),
+            // A file whose last component equals an earlier name collides with it.
+            origin(None, Some("/elsewhere/rust")),
+            origin(None, None),
+        ];
+        assert_eq!(from_label(&origins), "rust, hamster-ball.toml, node");
+    }
+
+    #[test]
+    fn from_label_of_nothing_is_empty() {
+        assert_eq!(from_label(&[]), "");
+        assert_eq!(from_label(&[origin(None, None)]), "");
+    }
+}
