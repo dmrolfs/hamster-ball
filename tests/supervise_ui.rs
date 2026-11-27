@@ -430,3 +430,76 @@ fn ctrl_c_during_a_review_cancels_the_review_and_returns_to_the_ui_with_the_row_
     assert_eq!(owner.exit_code(60), Some(0));
     assert_restored(&owner);
 }
+
+#[test]
+fn an_agent_that_never_reads_cannot_freeze_the_ui_and_quit_still_stops_it() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let marker = w.project.join("agent.pid");
+    let script = w.project.join("agent.sh");
+    // Raw mode and no reading: the pty fills instead of discarding what it is sent.
+    common::write(
+        &script,
+        &format!(
+            "echo $$ > '{}'\nstty raw -echo\nsleep 300\n",
+            marker.display()
+        ),
+    );
+    let mut owner = Owner::start(&w, &[]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    assert!(appears(&marker, 60), "no agent; {}", owner.screen());
+    // The file exists as soon as the shell opens it; wait until the pid is in it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pid = None;
+    while pid.is_none() && Instant::now() < deadline {
+        pid = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = assert_some!(pid, "the agent never wrote its pid");
+    owner.wait_for("Running", 30);
+    // Interact, then type far more than a pty holds, as a stream of pastes.
+    owner.send(b"\r");
+    owner.wait_for("INTERACT", 10);
+    // Pastes as a terminal sends them (bracketed paste is on): 64 x 16 KiB. Raw bytes would be one
+    // key press each, which says nothing about writing to the agent.
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend(std::iter::repeat_n(b'x', 16 * 1024));
+    paste.extend_from_slice(b"\x1b[201~");
+    let sending = Instant::now();
+    for _ in 0..64 {
+        owner.send(&paste);
+    }
+    // Sending is the test's own cost; the supervisor must not make it wait on the agent.
+    assert!(
+        sending.elapsed() < Duration::from_secs(10),
+        "sending took {:?}",
+        sending.elapsed()
+    );
+    // Leave Interact. The loop must still answer keys (the status bar changes) within a few
+    // seconds, which it could not if it were stuck writing to the agent.
+    let started = Instant::now();
+    owner.send(&[0x07]);
+    owner.wait_for("OVERVIEW", 5);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the UI stalled for {:?}",
+        started.elapsed()
+    );
+    // Quit confirms and stops the agent although its terminal is full.
+    owner.send(b"q");
+    owner.send(b"y");
+    assert_eq!(owner.exit_code(60), Some(0));
+    assert_restored(&owner);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!alive(pid), "the agent outlived quit");
+}
