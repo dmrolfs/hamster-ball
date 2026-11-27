@@ -647,7 +647,7 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             terminating = Some(Instant::now() + grace);
             // Leftovers the tracker missed are adopted and get the same TERM and the same deadline.
             let by = sweep_budget(grace, terminating);
-            if sweep_for_leftovers(&mut tracker, &queue, &registered, by) > 0 {
+            if sweep_for_leftovers(&mut tracker, &queue, &registered, by).adopted > 0 {
                 let _ = tracker.signal(Signal::SIGTERM);
             }
         }
@@ -655,13 +655,17 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             // Nothing tracked is left, but a leftover can still exist: look once more before
             // concluding. Anything found is ended under the original deadline.
             if !registered.final_sweep_done {
-                registered.final_sweep_done = true;
-                let by = sweep_budget(grace, terminating);
-                if sweep_for_leftovers(&mut tracker, &queue, &registered, by) > 0 {
+                // Its own budget, up to the deadline: the first sweep's is already spent.
+                let by = terminating.unwrap_or_else(Instant::now);
+                let swept = sweep_for_leftovers(&mut tracker, &queue, &registered, by);
+                // A sweep that could not finish proves nothing, so it is not final: the guard waits
+                // for the deadline, where the sweep after KILL gets a fresh budget.
+                registered.final_sweep_done = swept.complete;
+                if swept.adopted > 0 {
                     let _ = tracker.signal(Signal::SIGTERM);
                 }
             }
-            if tracker.is_empty() {
+            if tracker.is_empty() && registered.final_sweep_done {
                 return Ok((Ended::HbGone, registered.terminal));
             }
         }
@@ -739,22 +743,24 @@ fn zero() -> nix::libc::timespec {
 
 /// The deadline step: KILL everything known, and only then look for leftovers, which get KILL too.
 /// The order matters: a sweep can be slow, and must never delay the kill of what is already known.
-fn kill_then_sweep(tracker: &mut Tracker, sweep: impl FnOnce(&mut Tracker) -> usize) {
+/// The second pass always runs: a member that could not be read the first time may be readable now,
+/// whether or not the sweep adopted anything new.
+fn kill_then_sweep(tracker: &mut Tracker, sweep: impl FnOnce(&mut Tracker) -> Swept) {
     let _ = tracker.signal(Signal::SIGKILL);
-    if sweep(tracker) > 0 {
-        let _ = tracker.signal(Signal::SIGKILL);
-    }
+    let _ = sweep(tracker);
+    let _ = tracker.signal(Signal::SIGKILL);
 }
 
-/// The least time the sweeps get, however short the grace period is.
+/// The time the sweep after KILL gets. Known members are already dead by then, so this delays nothing
+/// that was known; it only bounds how long the guard lingers.
 const SWEEP_FLOOR: Duration = Duration::from_secs(1);
 
-/// When the sweeps must finish: half the grace period, never less than [`SWEEP_FLOOR`]. The grace
-/// period started when `terminating` was set, so the sweeps come out of it and the TERM-to-KILL
-/// gap stays what the caller asked for.
+/// When the first sweep must finish: half the grace period, counted from when it began. It comes out
+/// of the grace period, so it never postpones the KILL; with a short grace it may not finish, and the
+/// sweep after KILL is the backstop.
 fn sweep_budget(grace: Duration, terminating: Option<Instant>) -> Instant {
     let start = terminating.map_or_else(Instant::now, |end| end - grace);
-    start + (grace / 2).max(SWEEP_FLOOR)
+    start + grace / 2
 }
 
 /// Finds leftovers the process tracker missed and adopts them, so they are signalled with the rest.
@@ -769,9 +775,11 @@ fn sweep_for_leftovers(
     queue: &Kqueue,
     registered: &Registered,
     by: Instant,
-) -> usize {
+) -> Swept {
     let own = i32::try_from(std::process::id()).unwrap_or(0);
+    let begun = now_as_start();
     let mut candidates: Vec<i32> = Vec::new();
+    let mut complete = true;
     if let Some(token) = &registered.token {
         if let (Ok(with_env), Ok(plain)) = (listing(true, by), listing(false, by)) {
             let entry = token.entry();
@@ -783,17 +791,42 @@ fn sweep_for_leftovers(
                     .into_iter()
                     .filter(|pid| holds_entry(*pid, &entry)),
             );
+        } else {
+            complete = false;
         }
     }
     if let Some(dir) = &registered.session_dir {
-        if let Ok(holders) = holders_of(dir, by) {
-            candidates.extend(holders);
+        match holders_of(dir, by) {
+            Ok(holders) => {
+                complete &= holders.complete;
+                candidates.extend(holders.pids);
+            }
+            Err(_) => complete = false,
         }
     }
-    candidates
+    let adopted = candidates
         .into_iter()
-        .filter(|pid| matches!(tracker.adopt_candidate(queue, *pid, own), Ok(true)))
-        .count()
+        .filter(|pid| matches!(tracker.adopt_candidate(queue, *pid, own, begun), Ok(true)))
+        .count();
+    Swept { adopted, complete }
+}
+
+/// The present moment in the form a process start time is recorded in (seconds, microseconds since
+/// the epoch). If the clock is unreadable the answer is the epoch, so nothing is adopted: a refusal,
+/// not a guess.
+fn now_as_start() -> (u64, u64) {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (since.as_secs(), u64::from(since.subsec_micros()))
+}
+
+/// What a sweep found. `complete` is false when a source could not be read in time, so "nothing
+/// adopted" must not be taken for "nothing there".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Swept {
+    adopted: usize,
+    complete: bool,
 }
 
 /// What `hb` has told the guard to remember besides the processes: files to remove, the terminal to
@@ -1095,9 +1128,50 @@ mod tests {
         kill_then_sweep(&mut tracker, |_| {
             // Reaping here is the only way to see the kill: a killed child is a zombie until waited on.
             dead_when_swept = Some(matches!(child.wait(), Ok(status) if !status.success()));
-            0
+            Swept {
+                adopted: 0,
+                complete: true,
+            }
         });
         assert_eq!(dead_when_swept, Some(true));
+    }
+
+    /// A member that could not be signalled before the sweep gets its second chance after it, even
+    /// when the sweep adopts nothing: here the stand-in sweep spawns the process the first pass could
+    /// not have known about, adopts it itself, and reports zero new adoptions.
+    #[test]
+    fn the_second_kill_pass_runs_even_when_the_sweep_adopts_nothing() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut late = sleeper();
+        let late_pid = i32::try_from(late.id()).unwrap_or(i32::MAX);
+        let mut early = sleeper();
+        assert_ok!(tracker.arm(&queue, i32::try_from(early.id()).unwrap_or(i32::MAX), false));
+        kill_then_sweep(&mut tracker, |tracker| {
+            // Joined during the sweep, but not counted as a new adoption.
+            let _ = tracker.arm(&queue, late_pid, false);
+            Swept {
+                adopted: 0,
+                complete: true,
+            }
+        });
+        assert!(matches!(late.wait(), Ok(status) if !status.success()));
+        let _ = early.wait();
+    }
+
+    /// A sweep that ran out of time says so, so the guard does not take "nothing adopted" for "nothing
+    /// there" and conclude.
+    #[test]
+    fn a_sweep_that_ran_out_of_time_says_it_is_incomplete() {
+        let tracker_queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let registered = Registered {
+            session_dir: Some(std::env::temp_dir()),
+            ..Registered::default()
+        };
+        let swept = sweep_for_leftovers(&mut tracker, &tracker_queue, &registered, Instant::now());
+        assert!(!swept.complete, "{swept:?}");
+        assert_eq!(swept.adopted, 0);
     }
 
     /// The budget is part of the grace period, never more than half of it, and never under the floor.
@@ -1107,11 +1181,12 @@ mod tests {
         let grace = Duration::from_secs(10);
         let by = sweep_budget(grace, Some(now + grace));
         assert!(by >= now + Duration::from_millis(4990) && by <= now + Duration::from_millis(5100));
+        // A short grace gets a short budget: the sweep never pushes the KILL past its deadline.
         let short = sweep_budget(
             Duration::from_millis(100),
             Some(now + Duration::from_millis(100)),
         );
-        assert!(short >= now + Duration::from_millis(990));
+        assert!(short <= now + Duration::from_millis(60));
     }
 
     #[test]

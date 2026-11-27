@@ -249,12 +249,16 @@ pub(super) fn listing(with_env: bool, by: Instant) -> Result<String, SweepError>
 ///
 /// # Errors
 /// [`SweepError`] for every way the answer can be incomplete.
-pub(super) fn holders_of(dir: &std::path::Path, by: Instant) -> Result<Vec<i32>, SweepError> {
+pub(super) fn holders_of(dir: &std::path::Path, by: Instant) -> Result<Holders, SweepError> {
     // `lsof` answers a missing directory exactly like an empty one, so a directory that has
     // vanished would read as "nothing left". Say so instead.
     std::fs::metadata(dir).context(DirectorySnafu)?;
     let dir = dir.to_string_lossy();
-    let ran = run_bounded(LSOF, &["-t", "+D", &dir], by)?;
+    read_holders(&run_bounded(LSOF, &["-t", "+D", &dir], by)?)
+}
+
+/// Reads what `lsof` printed; separate from running it so the odd cases can be tested.
+fn read_holders(ran: &Ran) -> Result<Holders, SweepError> {
     if !matches!(ran.code, Some(0 | 1)) {
         return IncompleteSnafu { program: LSOF }.fail();
     }
@@ -264,10 +268,22 @@ pub(super) fn holders_of(dir: &std::path::Path, by: Instant) -> Result<Vec<i32>,
         .map(|line| line.trim().parse::<i32>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SweepError::Malformed { program: LSOF })?;
-    if pids.is_empty() && !ran.stderr.trim().is_empty() {
+    let complained = !ran.stderr.trim().is_empty();
+    if pids.is_empty() && complained {
         return IncompleteSnafu { program: LSOF }.fail();
     }
-    Ok(pids)
+    Ok(Holders {
+        pids,
+        complete: !complained,
+    })
+}
+
+/// What `lsof` found under a directory. `complete` is false when it also complained, so its list is
+/// still worth acting on but is not the whole answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Holders {
+    pub(super) pids: Vec<i32>,
+    pub(super) complete: bool,
 }
 
 /// Nominates the processes whose environment may hold `token`, from two `ps` listings.
@@ -393,12 +409,40 @@ mod tests {
         assert!(!format!("{first:?}").contains(first.value()));
     }
 
+    fn ran(code: i32, stdout: &str, stderr: &str) -> Ran {
+        Ran {
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// A list printed beside a complaint is still used, but it is not the whole answer.
+    #[test]
+    fn lsof_output_beside_a_complaint_is_kept_and_marked_incomplete() {
+        let held = assert_ok!(read_holders(&ran(
+            1,
+            "41\n42\n",
+            "lsof: WARNING: can't stat() x\n"
+        )));
+        assert_eq!(held.pids, vec![41, 42]);
+        assert!(!held.complete);
+        let clean = assert_ok!(read_holders(&ran(0, "41\n", "")));
+        assert!(clean.complete);
+        assert!(read_holders(&ran(1, "", "lsof: no\n")).is_err());
+        assert!(read_holders(&ran(2, "41\n", "")).is_err());
+        assert!(read_holders(&ran(0, "4x\n", "")).is_err());
+    }
+
     #[test]
     fn holders_of_a_directory_are_found_and_an_empty_one_has_none() {
         use std::os::unix::process::CommandExt;
         let dir = assert_ok!(tempfile::tempdir());
         let real = assert_ok!(dir.path().canonicalize());
-        assert_eq!(assert_ok!(holders_of(&real, soon())), Vec::<i32>::new());
+        assert_eq!(
+            assert_ok!(holders_of(&real, soon())).pids,
+            Vec::<i32>::new()
+        );
         let mut holder = assert_ok!(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
@@ -407,10 +451,13 @@ mod tests {
                 .spawn()
         );
         let pid = i32::try_from(holder.id()).unwrap_or(i32::MAX);
-        assert!(assert_ok!(holders_of(&real, soon())).contains(&pid));
+        assert!(assert_ok!(holders_of(&real, soon())).pids.contains(&pid));
         let _ = holder.kill();
         let _ = holder.wait();
-        assert_eq!(assert_ok!(holders_of(&real, soon())), Vec::<i32>::new());
+        assert_eq!(
+            assert_ok!(holders_of(&real, soon())).pids,
+            Vec::<i32>::new()
+        );
     }
 
     /// Names the program that failed, where it used to say `ps` for everything.

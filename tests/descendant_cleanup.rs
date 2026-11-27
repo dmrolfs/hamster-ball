@@ -405,12 +405,11 @@ fn escapes(script: &str, trials: usize) -> usize {
         let _ = gated.leader.wait();
         // Zero grace is not needed: the guardian's own 500 ms grace covers a polite stop.
         drop(guardian);
-        let survivor = pids.first().copied();
-        if let Some(pid) = survivor {
-            if !within(Duration::from_secs(4), || !alive(pid)) {
-                escaped += 1;
-                let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
-            }
+        // No pid printed means the pattern did not run, which is a broken trial, not a clean one.
+        let pid = claims::assert_some!(pids.first().copied());
+        if !within(Duration::from_secs(4), || !alive(pid)) {
+            escaped += 1;
+            let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
         }
     }
     escaped
@@ -439,7 +438,8 @@ fn detach_patterns_are_ended_and_the_escape_rates_are_reported() {
     // may escape. The other two can lose the race by scheduling, so a small share is allowed: at most
     // 2% of the trials, rounded up. That bound is a choice, not a derived number; the measured rate
     // is 1 in 300 quiet and 0 in 300 under load (history/hb-caj-analysis-3.md).
-    let allowed = trials / 50 + 1;
+    assert!(trials >= 1, "HB_CAJ_TRIALS must be at least 1");
+    let allowed = trials.div_ceil(50);
     assert_eq!(
         linger, 0,
         "a descendant that left its session while its leader lingered escaped"

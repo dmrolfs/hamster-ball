@@ -130,6 +130,12 @@ impl Identity {
         self.started() >= other.started()
     }
 
+    /// Whether the process started before `moment` (seconds and microseconds since the epoch).
+    #[must_use]
+    pub fn started_before(&self, moment: (u64, u64)) -> bool {
+        self.started() < moment
+    }
+
     /// Whether this number still names the process that was recorded. A process that is gone is
     /// `false`, not an error: nothing is left to signal.
     ///
