@@ -8,7 +8,7 @@
 //! helpers, which `hb` starts without them, so those cases need no variables.
 
 use std::ffi::OsString;
-use std::io::{stderr, stdout};
+use std::io::{BufRead, Write, stderr, stdout};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -31,14 +31,65 @@ fn fixture() -> Option<Environment> {
     env.floor = FloorEnvironment::new()
         .with_path_var(var("HB_TD_PATH")?)
         .with_user_temp_dir(PathBuf::from(var("HB_TD_TMP")?))
-        .with_hb_exe(std::env::current_exe().ok()?);
+        // HB_TD_EXE lets a test put a wrapper in hb's place, to stand in for the guard process while
+        // the gated helper stays the real one.
+        .with_hb_exe(
+            var("HB_TD_EXE")
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_exe().ok())?,
+        );
     env.vars = ParentVars::from_pairs(std::env::vars_os());
     Some(env)
+}
+
+/// A compiled guardian stand-in selected only by the test executable's special symlink name.
+/// Configuration lives beside the symlink because the real launch clears the environment.
+fn fake_guard(args: &[OsString]) -> Option<ExitCode> {
+    let path = PathBuf::from(args.first()?);
+    if path.file_name()? != "hb-fake-guard" || args.get(1)? != "__guard" {
+        return None;
+    }
+    let result = (|| -> std::io::Result<()> {
+        let _ = rustix::process::setsid();
+        let reply = std::fs::read_to_string(path.with_extension("reply"))?;
+        let mut output = stdout().lock();
+        for line in std::io::stdin().lock().lines() {
+            let line = line?;
+            let mut parts = line.splitn(3, ' ');
+            if parts.next() != Some("ack") {
+                continue;
+            }
+            let (Some(id), Some(command)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let answer = if command.starts_with("watch ") {
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.with_extension("watched"))?;
+                writeln!(log, "{command}")?;
+                reply.trim()
+            } else {
+                "ok"
+            };
+            writeln!(output, "{id} {answer}")?;
+            output.flush()?;
+        }
+        Ok(())
+    })();
+    Some(if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn main() -> ExitCode {
     let _ = hamster_ball::session::close_inherited_fds();
     let args: Vec<OsString> = std::env::args_os().collect();
+    if let Some(status) = fake_guard(&args) {
+        return status;
+    }
     let grace = var("HB_TD_GRACE_MS")
         .and_then(|v| v.to_str().and_then(|t| t.parse::<u64>().ok()))
         .map_or(hamster_ball::session::DEFAULT_GRACE, Duration::from_millis);

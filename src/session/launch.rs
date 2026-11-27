@@ -137,8 +137,13 @@ impl HelperGate {
             &mut control,
             RecvFlags::empty(),
         )
-        .map_err(io::Error::from)
-        .context(IoSnafu)?;
+        // The read timeout reports as EAGAIN; say it was the deadline, not a failed socket.
+        .map_err(|errno| match errno {
+            rustix::io::Errno::AGAIN => GateError::Deadline,
+            other => GateError::Io {
+                source: io::Error::from(other),
+            },
+        })?;
         if &bytes[..received.bytes] != b"stdin\n" {
             return Err(GateError::Protocol);
         }
@@ -223,5 +228,113 @@ mod tests {
         assert_eq!(assert_ok!(parent.prepare(&null)), 4242);
         assert_ok!(parent.release());
         assert_ok!(assert_ok!(helper.join().map_err(|_| "helper panicked")));
+    }
+
+    fn gate_pair() -> (UnixStream, HelperGate) {
+        let (ours, theirs) = assert_ok!(UnixStream::pair());
+        (ours, HelperGate { socket: theirs })
+    }
+
+    /// Sends `bytes` with `fds` attached, as a misbehaving parent might.
+    fn send_raw(socket: &UnixStream, bytes: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) {
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if !fds.is_empty() {
+            assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
+        }
+        assert_ok!(sendmsg(
+            socket,
+            &[IoSlice::new(bytes)],
+            &mut control,
+            SendFlags::empty()
+        ));
+    }
+
+    #[test]
+    fn test_receive_stdin_takes_exactly_one_descriptor_and_marks_it_close_on_exec() {
+        let (ours, gate) = gate_pair();
+        let null = assert_ok!(std::fs::File::open("/dev/null"));
+        send_raw(&ours, b"stdin\n", &[null.as_fd()]);
+        let fd = assert_ok!(gate.receive_stdin());
+        let flags = assert_ok!(rustix::io::fcntl_getfd(&fd));
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn test_receive_stdin_refuses_no_descriptor_two_descriptors_and_other_bytes() {
+        let null = assert_ok!(std::fs::File::open("/dev/null"));
+        let (ours, gate) = gate_pair();
+        send_raw(&ours, b"stdin\n", &[]);
+        assert!(matches!(gate.receive_stdin(), Err(GateError::NoStdin)));
+        let (ours, gate) = gate_pair();
+        send_raw(&ours, b"stdin\n", &[null.as_fd(), null.as_fd()]);
+        assert!(matches!(gate.receive_stdin(), Err(GateError::NoStdin)));
+        let (ours, gate) = gate_pair();
+        send_raw(&ours, b"other\n", &[null.as_fd()]);
+        assert!(matches!(gate.receive_stdin(), Err(GateError::Protocol)));
+    }
+
+    #[test]
+    fn test_prepare_accepts_only_a_well_formed_prepared_line() {
+        let null = assert_ok!(std::fs::File::open("/dev/null"));
+        for reply in [
+            "prepared\n",
+            "prepared x\n",
+            "prepared  12\n",
+            "prepared 1\n",
+            "ready 123\n",
+            "prepared 12 extra\n",
+        ] {
+            let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+            assert_ok!(theirs.write_all(reply.as_bytes()));
+            let mut parent = ParentGate::new(ours);
+            assert!(
+                matches!(parent.prepare(&null), Err(GateError::Protocol)),
+                "{reply:?}"
+            );
+        }
+        // Sending stdin to a closed peer fails immediately, not at the response deadline.
+        let (ours, theirs) = assert_ok!(UnixStream::pair());
+        drop(theirs);
+        let mut parent = ParentGate::new(ours);
+        let started = Instant::now();
+        assert!(matches!(parent.prepare(&null), Err(GateError::Io { .. })));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_wait_for_release_accepts_only_the_exact_release_line() {
+        for reply in [&b"releasex\n"[..], b"RELEASE\n", b"\xff\xfe\n", &[b'a'; 65]] {
+            let (mut ours, gate) = gate_pair();
+            assert_ok!(ours.write_all(reply));
+            assert_ok!(ours.write_all(b"\n"));
+            assert!(
+                matches!(gate.wait_for_release(7), Err(GateError::Protocol)),
+                "{reply:?}"
+            );
+        }
+        let (mut ours, gate) = gate_pair();
+        assert_ok!(ours.write_all(b"release\n"));
+        assert_ok!(gate.wait_for_release(7));
+    }
+
+    #[test]
+    fn test_read_line_gives_up_at_its_deadline_and_not_before() {
+        let (mut ours, _theirs) = assert_ok!(UnixStream::pair());
+        let started = Instant::now();
+        let result = read_line(&mut ours, Instant::now() + Duration::from_millis(60));
+        assert!(matches!(result, Err(GateError::Deadline)));
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_release_after_the_helper_closed_its_end_is_an_error() {
+        let (ours, theirs) = assert_ok!(UnixStream::pair());
+        drop(theirs);
+        assert!(matches!(
+            ParentGate::new(ours).release(),
+            Err(GateError::Io { .. })
+        ));
     }
 }

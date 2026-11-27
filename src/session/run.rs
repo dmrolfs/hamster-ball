@@ -1133,7 +1133,11 @@ fn gated_spawn(
 ) -> Result<Child, RunError> {
     let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
     command.stdin(Stdio::from(OwnedFd::from(theirs)));
-    let mut child = command.spawn().context(SpawnSnafu)?;
+    let spawned = command.spawn();
+    // The Command keeps its Stdio after spawning; drop our copy of the helper's end so a helper
+    // that dies sends the gate end of input instead of leaving it to wait out the deadline.
+    command.stdin(Stdio::null());
+    let mut child = spawned.context(SpawnSnafu)?;
     let mut gate = ParentGate::new(ours);
     let prepared = gate
         .prepare(&stdin)

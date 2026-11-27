@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use claims::assert_ok;
 use common::{World, sandbox_available};
 use hamster_ball::ctl::runner::{Cancel, Capture, Execute, Finished, Host, RunError};
+use hamster_ball::session::launch::GateError;
 use hamster_ball::session::pty::Pty;
 use hamster_ball::session::{Guardian, GuardianError, WatchRefusal};
 use nix::errno::Errno;
@@ -132,13 +133,16 @@ fn a_parent_that_dies_before_release_leaves_nothing_run() {
     drop(gate);
     let out = assert_ok!(child.wait_with_output());
     assert!(!out.status.success());
+    // End of input is seen at once; a helper that ignored it would wait out the 5 s deadline.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );
     assert!(!marker.exists(), "the target ran without a release");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("launch gate"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unexpected message"), "{stderr}");
+    assert!(!stderr.contains("timed out"), "{stderr}");
 }
 
 #[test]
@@ -152,6 +156,11 @@ fn a_silent_parent_times_out_and_nothing_runs() {
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(8), "{waited:?}");
     assert!(!marker.exists());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("timed out"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Lists every open descriptor up to the process limit, with whether it is a socket.
@@ -226,6 +235,11 @@ fn a_silent_parent_after_prepared_times_out_and_nothing_runs() {
     assert!(!out.status.success());
     assert!(waited < Duration::from_secs(8), "{waited:?}");
     assert!(!marker.exists(), "the target ran without a release");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("timed out"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     drop(gate);
 }
 
@@ -308,34 +322,17 @@ fn the_exec_helper_inside_the_ball_adds_no_access() {
 /// asked to watch. The transport is the real one; only the answer is fixed, which is the one way
 /// to get a deterministic `gone` for a helper that is parked at the gate.
 fn fake_guardian(dir: &Path, reply: &str) -> (Guardian, PathBuf) {
-    let log = dir.join("watched");
-    let script = dir.join("fake-guard");
-    let text = format!(
-        r#"#!/usr/bin/python3
-import os, sys
-while True:
-    line = sys.stdin.buffer.readline()
-    if not line:
-        break
-    words = line.decode().split()
-    if len(words) < 3 or words[0] != "ack":
-        continue
-    if words[2] == "watch":
-        with open("{log}", "a") as f:
-            f.write(words[-1] + "\n")
-        out = "{reply}"
-    else:
-        out = "ok"
-    os.write(1, (words[1] + " " + out + "\n").encode())
-"#,
-        log = log.display(),
-    );
-    common::write(&script, &text);
-    assert_ok!(std::fs::set_permissions(
-        &script,
-        std::fs::Permissions::from_mode(0o755)
-    ));
+    let (script, log) = fake_guard_script(dir, reply);
     (assert_ok!(Guardian::start(&script)), log)
+}
+
+/// A one-exec compiled guard fixture. Sidecar configuration survives the real env-clear launch.
+fn fake_guard_script(dir: &Path, reply: &str) -> (PathBuf, PathBuf) {
+    let helper = dir.join("hb-fake-guard");
+    assert_ok!(std::os::unix::fs::symlink(DRIVE, &helper));
+    common::write(&helper.with_extension("reply"), reply);
+    let log = helper.with_extension("watched");
+    (helper, log)
 }
 
 /// Runs `touch marker` as a broker command through the gate, guarded by `guard`.
@@ -351,11 +348,25 @@ fn touch_through_gate(guard: &Guardian, marker: &Path) -> Result<Finished, RunEr
         )
 }
 
-/// The pid of the helper the guardian was asked to watch.
-fn watched_pid(log: &Path) -> i32 {
-    let text = assert_ok!(std::fs::read_to_string(log));
-    let last = text.lines().last().unwrap_or("");
-    assert_ok!(last.parse::<i32>())
+/// The last watch the guardian was asked for whose line starts with `prefix`, as
+/// `watch <role> <group|process> <pid>`. The role is in the prefix because a run's broker may
+/// ask for watches of its own.
+fn watched_line(log: &Path, prefix: &str) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// The pid on the last watch line that starts with `prefix`.
+fn watched_pid(log: &Path, prefix: &str) -> i32 {
+    let line = watched_line(log, prefix);
+    assert_ok!(
+        line.rsplit(' ').next().unwrap_or("").parse::<i32>(),
+        "no watch line starting {prefix:?} in the log"
+    )
 }
 
 fn assert_helper_reaped(pid: i32) {
@@ -363,35 +374,45 @@ fn assert_helper_reaped(pid: i32) {
     assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
 }
 
+/// Runs a broker command whose guard answers `reply`, and checks it is refused with `reason`:
+/// quickly (not by the helper timing out), never run, and its helper killed and reaped.
+fn assert_broker_refusal(reply: &str, reason: WatchRefusal) {
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let (guard, log) = fake_guardian(dir.path(), reply);
+    let started = Instant::now();
+    let result = touch_through_gate(&guard, &marker);
+    // The request must be refused before the helper's five-second deadline.
+    // EOF or SIGKILL may end the refused helper; either way it must be reaped below.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(RunError::Guard { source: GuardianError::Refused { reason: got } }) if *got == reason
+        ),
+        "{reply}: {result:?}"
+    );
+    assert!(
+        !watched_line(&log, "watch broker group ").is_empty(),
+        "no broker group watch was asked for"
+    );
+    assert_helper_reaped(watched_pid(&log, "watch broker group "));
+    assert!(!marker.exists(), "{reply}: the refused command ran");
+}
+
 #[test]
-fn a_command_the_guard_refuses_or_reports_gone_never_runs_and_its_helper_is_reaped() {
-    let cases = [
-        (
-            "refused kernel",
-            GuardianError::Refused {
-                reason: WatchRefusal::Kernel,
-            },
-        ),
-        (
-            "gone",
-            // The helper is parked at the gate, so a gone answer is turned into a refusal.
-            GuardianError::Refused {
-                reason: WatchRefusal::Invalid,
-            },
-        ),
-    ];
-    for (reply, expected) in cases {
-        let dir = assert_ok!(tempfile::tempdir());
-        let marker = dir.path().join("ran");
-        let (guard, log) = fake_guardian(dir.path(), reply);
-        let result = touch_through_gate(&guard, &marker);
-        assert!(
-            matches!(&result, Err(RunError::Guard { source }) if format!("{source:?}") == format!("{expected:?}")),
-            "{reply}: {result:?}"
-        );
-        assert_helper_reaped(watched_pid(&log));
-        assert!(!marker.exists(), "{reply}: the refused command ran");
-    }
+fn a_command_the_guard_refuses_never_runs_and_its_helper_is_reaped() {
+    assert_broker_refusal("refused kernel", WatchRefusal::Kernel);
+}
+
+#[test]
+fn a_command_the_guard_reports_gone_never_runs_and_its_helper_is_reaped() {
+    // The helper is parked at the gate, so a gone answer cannot be a fast exit: it is a refusal.
+    assert_broker_refusal("gone", WatchRefusal::Invalid);
 }
 
 #[test]
@@ -402,8 +423,9 @@ fn the_same_command_runs_when_the_guard_arms_it() {
     let done = assert_ok!(touch_through_gate(&guard, &marker));
     assert!(done.success);
     assert!(marker.exists(), "the armed command did not run");
-    // The reported process is the one that ran, and it has been reaped by now.
-    assert_helper_reaped(watched_pid(&log));
+    // A broker command is watched as a whole group, and the process that ran has been reaped.
+    assert!(!watched_line(&log, "watch broker group ").is_empty());
+    assert_helper_reaped(watched_pid(&log, "watch broker group "));
 }
 
 /// What the target prints on the pty: its terminal, its group and the foreground group.
@@ -489,4 +511,263 @@ fn a_pty_agent_leads_its_session_and_owns_the_terminal_before_prepared_and_in_th
     assert!(text.contains(&format!("pid={pid} ")), "{text}");
     assert!(text.contains(&format!("tty=/dev/{slave_name} ")), "{text}");
     assert!(text.contains("ctty=1 leader=1 fg=1"), "{text}");
+}
+
+/// An executable script `body` written under `dir`.
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    common::write(&path, body);
+    assert_ok!(std::fs::set_permissions(
+        &path,
+        std::fs::Permissions::from_mode(0o755)
+    ));
+    path
+}
+
+/// Non-guard commands through the same symlink still use the real testdrive entry point.
+fn hb_with_fake_guard(dir: &Path, reply: &str) -> (PathBuf, PathBuf) {
+    fake_guard_script(dir, reply)
+}
+
+/// What a run through the stand-in guard left behind. It owns the world, because dropping it
+/// deletes the project directory, and a missing marker must mean the agent did not run.
+struct AgentRun {
+    out: std::process::Output,
+    log: PathBuf,
+    marker: PathBuf,
+    elapsed: Duration,
+    _guard_dir: tempfile::TempDir,
+    _world: World,
+}
+
+/// Runs `hb run -- touch ran` with the stand-in guard answering `reply`.
+fn run_agent_with_guard(reply: &str) -> AgentRun {
+    let w = world();
+    let dir = assert_ok!(tempfile::tempdir());
+    let (wrapper, log) = hb_with_fake_guard(dir.path(), reply);
+    let marker = w.project.join("ran");
+    let mut command = w.drive(DRIVE, &["run", "--", "/usr/bin/touch", "ran"]);
+    command.env("HB_TD_EXE", &wrapper).stdin(Stdio::null());
+    let started = Instant::now();
+    let out = assert_ok!(command.output());
+    AgentRun {
+        out,
+        log,
+        marker,
+        elapsed: started.elapsed(),
+        _guard_dir: dir,
+        _world: w,
+    }
+}
+
+#[test]
+fn an_agent_the_guard_refuses_never_runs_and_its_helper_is_reaped() {
+    sandboxed!();
+    let run = run_agent_with_guard("refused kernel");
+    let stderr = String::from_utf8_lossy(&run.out.stderr);
+    assert!(!run.out.status.success(), "{stderr}");
+    assert!(stderr.contains("kernel"), "{stderr}");
+    assert!(run.elapsed < Duration::from_secs(4), "{:?}", run.elapsed);
+    assert!(!run.marker.exists(), "the refused agent ran");
+    assert!(
+        !watched_line(&run.log, "watch core group ").is_empty(),
+        "{stderr}"
+    );
+    assert_helper_reaped(watched_pid(&run.log, "watch core group "));
+}
+
+#[test]
+fn an_agent_the_guard_reports_gone_never_runs_and_its_helper_is_reaped() {
+    sandboxed!();
+    let run = run_agent_with_guard("gone");
+    let stderr = String::from_utf8_lossy(&run.out.stderr);
+    // The helper is parked, so gone cannot mean a fast exit.
+    assert!(!run.out.status.success(), "{stderr}");
+    assert!(stderr.contains("invalid"), "{stderr}");
+    assert!(run.elapsed < Duration::from_secs(4), "{:?}", run.elapsed);
+    assert!(!run.marker.exists(), "the agent ran after a gone answer");
+    assert_helper_reaped(watched_pid(&run.log, "watch core group "));
+}
+
+#[test]
+fn an_agent_the_guard_arms_runs_and_is_watched_as_a_group() {
+    sandboxed!();
+    let run = run_agent_with_guard("armed");
+    let stderr = String::from_utf8_lossy(&run.out.stderr);
+    assert!(run.out.status.success(), "{stderr}");
+    assert!(run.marker.exists(), "the armed agent did not run: {stderr}");
+    // Stdin is not a terminal, so the agent leads its own group and the whole group is watched.
+    assert!(!watched_line(&run.log, "watch core group ").is_empty());
+}
+
+/// A stand-in `__exec` helper that answers the gate with `reply` instead of its real pid, then
+/// waits so the test can see it killed. `PID1` in `reply` stands for its own pid plus one. It
+/// never reads the descriptor `prepare` sends (it waits in the socket's buffer) and answers on
+/// fd 0, which is the gate socket.
+fn lying_helper(dir: &Path, reply: &str) -> (PathBuf, PathBuf) {
+    let pidfile = dir.join("helper-pid");
+    let reply = reply.replace("PID1", "$(($$ + 1))");
+    let path = script(
+        dir,
+        "lying-helper",
+        &format!(
+            "#!/bin/sh\necho $$ > '{}'\n/bin/ps -o pgid= -p $$ > '{}.pgid'\nprintf '%s\\n' \"{reply}\" >&0\nexec /bin/sleep 30\n",
+            pidfile.display(),
+            pidfile.display()
+        ),
+    );
+    (path, pidfile)
+}
+
+#[test]
+fn a_helper_that_reports_the_wrong_pid_or_a_bad_line_is_killed_and_never_watched() {
+    for reply in [
+        "prepared 1",
+        "prepared PID1",
+        "prepared",
+        "ready 123",
+        "prepared -5",
+    ] {
+        let dir = assert_ok!(tempfile::tempdir());
+        let (guard, log) = fake_guardian(dir.path(), "armed");
+        let (helper, pidfile) = lying_helper(dir.path(), reply);
+        let marker = dir.path().join("ran");
+        let started = Instant::now();
+        let result = Host::new("/usr/bin:/bin", |_| None)
+            .with_guard(guard.handle(), helper)
+            .run(
+                Path::new("/usr/bin/touch"),
+                &[marker.as_os_str().to_owned()],
+                Capture::Tail(1024),
+                Duration::from_secs(10),
+                &Cancel::default(),
+            );
+        assert!(
+            matches!(
+                &result,
+                Err(RunError::Gate {
+                    source: GateError::Protocol
+                })
+            ),
+            "{reply}: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3), "{reply}");
+        assert!(
+            !log.exists(),
+            "{reply}: a watch was asked for a pid nobody vouched for"
+        );
+        let pid = assert_ok!(
+            assert_ok!(std::fs::read_to_string(&pidfile))
+                .trim()
+                .parse::<i32>()
+        );
+        assert_helper_reaped(pid);
+        let group = assert_ok!(std::fs::read_to_string(pidfile.with_extension("pgid")));
+        assert_eq!(assert_ok!(group.trim().parse::<i32>()), pid);
+        assert!(!marker.exists());
+    }
+}
+
+#[test]
+fn an_agent_helper_that_dies_before_prepared_reports_eof_without_waiting_for_deadline() {
+    sandboxed!();
+    let w = world();
+    let dir = assert_ok!(tempfile::tempdir());
+    let helper = script(
+        dir.path(),
+        "dies-agent",
+        &format!("#!/bin/bash\nif [ \"$1\" = __child ]; then exit 3; fi\nexec '{DRIVE}' \"$@\"\n"),
+    );
+    let out = assert_ok!(
+        w.drive(DRIVE, &["run", "--", "/usr/bin/touch", "ran"])
+            .env("HB_TD_EXE", helper)
+            .stdin(Stdio::null())
+            .output()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("launch gate"), "{stderr}");
+    assert!(!stderr.contains("timed out"), "{stderr}");
+    // Assert the gate's error, not total run time (which includes unrelated setup).
+    assert!(!w.project.join("ran").exists());
+}
+
+#[test]
+fn a_helper_that_dies_before_prepared_is_reported_at_once_not_after_the_deadline() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let (guard, log) = fake_guardian(dir.path(), "armed");
+    let helper = script(dir.path(), "dies", "#!/bin/sh\nexit 3\n");
+    let started = Instant::now();
+    let result = Host::new("/usr/bin:/bin", |_| None)
+        .with_guard(guard.handle(), helper)
+        .run(
+            Path::new("/usr/bin/touch"),
+            &[dir.path().join("ran").into_os_string()],
+            Capture::Tail(1024),
+            Duration::from_secs(10),
+            &Cancel::default(),
+        );
+    // hb must not keep the helper's end of the gate open, or this waits out the 5 s deadline.
+    assert!(matches!(&result, Err(RunError::Gate { .. })), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!log.exists());
+}
+
+/// A parent that starts `__exec`, sends stdin, waits for `prepared`, prints the helper's pid and
+/// then idles: a process the test can SIGKILL while the helper is parked.
+fn parked_parent(hb: &str, marker: &Path) -> String {
+    format!(
+        r#"import os, socket, subprocess, array, sys, time
+a, b = socket.socketpair()
+p = subprocess.Popen(["{hb}", "__exec", "/usr/bin/touch", "{marker}"], stdin=b.fileno(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+b.close()
+null = os.open("/dev/null", os.O_RDONLY)
+a.sendmsg([b"stdin\n"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [null]))])
+line = b""
+while not line.endswith(b"\n"):
+    line += a.recv(1)
+print(line.decode().split()[1], flush=True)
+time.sleep(60)
+"#,
+        marker = marker.display()
+    )
+}
+
+#[test]
+fn a_parent_killed_with_sigkill_while_the_helper_is_parked_leaves_nothing_run() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let mut parent = assert_ok!(
+        Command::new("/usr/bin/python3")
+            .args(["-c", &parked_parent(DRIVE, &marker)])
+            .stdout(Stdio::piped())
+            .spawn()
+    );
+    let mut line = String::new();
+    if let Some(out) = parent.stdout.as_mut() {
+        let mut byte = [0u8; 1];
+        while assert_ok!(out.read(&mut byte)) == 1 && byte[0] != b'\n' {
+            line.push(char::from(byte[0]));
+        }
+    }
+    let helper = assert_ok!(line.trim().parse::<i32>());
+    // The helper is parked: alive, and the target has not run.
+    assert_eq!(kill(Pid::from_raw(helper), None), Ok(()));
+    assert!(!marker.exists());
+    assert_ok!(parent.kill());
+    let _ = parent.wait();
+    // The kernel closed the parent's end of the gate; the helper sees end of input and exits.
+    let end = Instant::now() + Duration::from_secs(3);
+    while kill(Pid::from_raw(helper), None) != Err(Errno::ESRCH) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(kill(Pid::from_raw(helper), None), Err(Errno::ESRCH));
+    assert!(
+        !marker.exists(),
+        "the target ran after its parent was killed"
+    );
 }

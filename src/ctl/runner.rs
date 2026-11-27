@@ -255,11 +255,14 @@ impl Execute for Host {
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Its own group from the first instruction, so a Ctrl-C aimed at hb's foreground group
+            // cannot kill a helper that is still parked at the gate.
+            .process_group(0);
         let mut child = match gated {
             Some((guard, _)) => gated_start(&mut command, guard, program)?,
             None => {
-                command.stdin(Stdio::null()).process_group(0);
+                command.stdin(Stdio::null());
                 command.spawn().context(SpawnSnafu { program })?
             }
         };
@@ -309,7 +312,11 @@ fn gated_start(
     let null = File::open("/dev/null").map_err(spawn_error)?;
     let (ours, theirs) = UnixStream::pair().map_err(spawn_error)?;
     command.stdin(Stdio::from(OwnedFd::from(theirs)));
-    let mut child = command.spawn().map_err(spawn_error)?;
+    let spawned = command.spawn();
+    // The Command keeps its Stdio after spawning; drop our copy of the helper's end so a helper
+    // that dies sends the gate end of input instead of leaving it to wait out the deadline.
+    command.stdin(Stdio::null());
+    let mut child = spawned.map_err(spawn_error)?;
     let mut gate = ParentGate::new(ours);
     let armed = gate
         .prepare(&null)
