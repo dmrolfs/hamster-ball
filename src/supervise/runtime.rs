@@ -53,30 +53,62 @@ const RETIRE_LIMIT: Duration = Duration::from_secs(15);
 /// drained, until every thread has finished; nothing waits on it with the inbox unread.
 struct Retiring {
     id: SessionId,
+    generation: Generation,
     worker: Worker,
     since: Instant,
     abandoned: bool,
-    /// The agent's process id as `hb` reported it, if it got that far. Ending `hb` is not ending
-    /// the agent: when `hb` is killed its guardian stops the agent afterwards, after a grace period
-    /// (measured: a stubborn agent lived 2.0 s after `hb` was reaped in 60 ms). A replacement waits
-    /// until this process is gone.
+}
+
+/// What a generation's `hb` has reported, kept by the runtime itself. The session row cannot be
+/// the source: a restart replaces the row before the old worker is retired, and the late reports of
+/// an old generation are dropped by the app.
+#[derive(Debug, Default, Clone, Copy)]
+struct Evidence {
+    /// The agent's process id, as reported by `Running`. Never 0, 1 or out of range.
     agent: Option<u32>,
+    /// `hb` said its run ended and everything it started is gone.
+    settled: bool,
 }
 
-/// A finished old worker whose agent may still be running. Its replacement waits for it.
-struct Lingering {
-    id: SessionId,
-    agent: u32,
-    since: Instant,
+/// Why a session's next run may not start yet. Ending `hb` is not ending its agent: when `hb` is
+/// killed its guardian stops the agent afterwards, after a grace period (measured: a stubborn
+/// agent lived 2.0 s after `hb` was reaped in 60 ms).
+#[derive(Debug, Clone, Copy)]
+enum Blocker {
+    /// This agent may still be running. Waited for, and re-checked for as long as it exists.
+    Agent { pid: u32, since: Instant },
+    /// `hb` ended without reporting an agent or a clean finish, so whether one was started is not
+    /// known. Nothing in the supervisor can find out, so this one never clears.
+    Unknown,
 }
 
-/// How long an agent that outlived its `hb` is waited for before the replacement is refused. The
+impl Blocker {
+    /// Whether waiting any longer is pointless: the replacement is refused, not queued.
+    fn expired(self, now: Instant) -> bool {
+        match self {
+            Self::Agent { since, .. } => now.duration_since(since) >= AGENT_LIMIT,
+            Self::Unknown => true,
+        }
+    }
+
+    fn reason(self) -> String {
+        match self {
+            Self::Agent { pid, .. } => format!(
+                "the previous run's agent (process {pid}) is still running, so this run was not started"
+            ),
+            Self::Unknown => "whether the previous run's agent ended could not be confirmed, so this run was not started"
+                .to_owned(),
+        }
+    }
+}
+
+/// How long an agent that outlived its `hb` is waited for before a replacement is refused. The
 /// guardian's grace is 2 s and then SIGKILL; this is several times that.
 const AGENT_LIMIT: Duration = Duration::from_secs(15);
 
 /// Whether a process with this id exists. A process id can be reused, so a "yes" after a long
-/// time could be a stranger: the wait is bounded by [`AGENT_LIMIT`] and ends in a refusal, never
-/// in a start.
+/// time could be a stranger: the wait ends in a refusal, never in a start, and nothing is ever
+/// signalled with a stored id.
 fn process_exists(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|pid| {
         // Signal 0 only asks whether the process could be signalled; EPERM means it exists.
@@ -85,6 +117,11 @@ fn process_exists(pid: u32) -> bool {
             Err(nix::errno::Errno::ESRCH)
         )
     })
+}
+
+/// An agent id that can be asked about: 0 means "my own process group" to `kill` and 1 is init.
+fn usable_pid(pid: u32) -> bool {
+    pid > 1 && i32::try_from(pid).is_ok()
 }
 
 /// A review the owner asked for. The loop that owns the real terminal carries it out and answers
@@ -129,7 +166,10 @@ pub struct Runtime {
     outbox: SyncSender<Msg>,
     live: HashMap<SessionId, Live>,
     retiring: Vec<Retiring>,
-    lingering: Vec<Lingering>,
+    /// What each started generation has reported, until its worker has been dealt with.
+    evidence: HashMap<(SessionId, Generation), Evidence>,
+    /// Sessions whose previous agent may still exist.
+    blocked: HashMap<SessionId, Blocker>,
     /// The newest start asked for while the session's old worker is still ending.
     waiting: HashMap<SessionId, (Generation, LaunchSpec)>,
     screens: HashMap<SessionId, Arc<Shared>>,
@@ -152,7 +192,8 @@ impl Runtime {
             outbox,
             live: HashMap::new(),
             retiring: Vec::new(),
-            lingering: Vec::new(),
+            evidence: HashMap::new(),
+            blocked: HashMap::new(),
             waiting: HashMap::new(),
             screens: HashMap::new(),
             last_frame: None,
@@ -174,8 +215,34 @@ impl Runtime {
 
     /// Applies a message from the keyboard side, then carries out its effects.
     pub fn send(&mut self, msg: Msg) -> bool {
+        self.observe(&msg);
         let effects = self.app.update(msg);
         self.run(effects)
+    }
+
+    /// Lifecycle reports belong to their generation even after the app has replaced its row.
+    fn observe(&mut self, msg: &Msg) {
+        use crate::session::supervised::{Cleanup, Event};
+        if let Msg::Channel {
+            id,
+            generation,
+            event,
+            ..
+        } = msg
+            && let Some(evidence) = self.evidence.get_mut(&(*id, *generation))
+        {
+            match event {
+                Event::Running { agent_pid } if usable_pid(*agent_pid) => {
+                    evidence.agent = Some(*agent_pid);
+                }
+                Event::Exited {
+                    cleanup: Cleanup::Complete {},
+                    ..
+                }
+                | Event::ApprovalRequired { .. } => evidence.settled = true,
+                _ => {}
+            }
+        }
     }
 
     /// One turn: apply what workers sent, carry out the effects, and report.
@@ -187,8 +254,7 @@ impl Runtime {
                 break;
             };
             applied += 1;
-            let effects = self.app.update(msg);
-            quit |= self.run(effects);
+            quit |= self.send(msg);
         }
         self.advance(Instant::now());
         Stepped { applied, quit }
@@ -226,8 +292,13 @@ impl Runtime {
         let deadline = Instant::now() + limit;
         loop {
             self.step();
-            if self.retiring.is_empty() {
-                return true;
+            let agents_pending = self
+                .blocked
+                .values()
+                .any(|b| matches!(b, Blocker::Agent { pid, .. } if process_exists(*pid)));
+            if self.retiring.is_empty() && !agents_pending {
+                // An agent that could not be confirmed gone is not a clean end.
+                return self.blocked.is_empty();
             }
             if Instant::now() >= deadline {
                 for old in &mut self.retiring {
@@ -236,6 +307,19 @@ impl Runtime {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Abandons the session's retiring worker at once, as happens when it has not ended in time:
+    /// `hb` is killed at the reaper's next look and its agent is left to the guardian. For tests,
+    /// which need that state without waiting out [`RETIRE_LIMIT`].
+    #[cfg(feature = "test-support")]
+    pub fn abandon_for_test(&mut self, id: SessionId) {
+        for old in &mut self.retiring {
+            if old.id == id {
+                old.abandoned = true;
+                old.worker.abandon();
+            }
         }
     }
 
@@ -253,25 +337,19 @@ impl Runtime {
     /// Whether any worker is still ending.
     #[must_use]
     pub fn is_retiring(&self) -> bool {
-        !self.retiring.is_empty() || !self.lingering.is_empty()
+        !self.retiring.is_empty() || !self.blocked.is_empty()
     }
 
     /// Asks the session's worker to stop, and tracks it until it has ended.
     fn retire(&mut self, id: SessionId) {
         if let Some(live) = self.live.remove(&id) {
             live.worker.stop();
-            let agent = self
-                .app
-                .sessions()
-                .iter()
-                .find(|s| s.id == id)
-                .and_then(|s| s.agent_pid);
             self.retiring.push(Retiring {
                 id,
+                generation: live.generation,
                 worker: live.worker,
                 since: Instant::now(),
                 abandoned: false,
-                agent,
             });
         }
     }
@@ -280,14 +358,13 @@ impl Runtime {
     /// agents of workers that ended, and starts the replacements that were waiting.
     fn advance(&mut self, now: Instant) {
         self.collect_finished(now);
-        self.check_lingering(now);
+        self.check_blocked(now);
         let ready: Vec<SessionId> = self
             .waiting
             .keys()
             .copied()
             .filter(|id| {
-                !self.retiring.iter().any(|r| r.id == *id)
-                    && !self.lingering.iter().any(|l| l.id == *id)
+                !self.retiring.iter().any(|r| r.id == *id) && !self.blocked.contains_key(id)
             })
             .collect();
         for id in ready {
@@ -301,17 +378,36 @@ impl Runtime {
     /// exists, the agent is waited for as well, because the guardian stops it only after `hb` is
     /// gone and a stubborn agent can outlast `hb` by its whole grace period.
     fn collect_finished(&mut self, now: Instant) {
+        // A worker that has finished has already queued every report it will make, so they are
+        // applied before judging what it left behind.
+        if self.retiring.iter().any(|r| r.worker.is_finished()) {
+            for _ in 0..INBOX * 2 {
+                let Ok(msg) = self.inbox.try_recv() else {
+                    break;
+                };
+                self.send(msg);
+            }
+        }
         let mut i = 0;
         while i < self.retiring.len() {
             if self.retiring[i].worker.is_finished() {
                 let done = self.retiring.swap_remove(i);
                 done.worker.join();
-                if let Some(agent) = done.agent.filter(|pid| process_exists(*pid)) {
-                    self.lingering.push(Lingering {
-                        id: done.id,
-                        agent,
-                        since: now,
-                    });
+                let evidence = self
+                    .evidence
+                    .remove(&(done.id, done.generation))
+                    .unwrap_or_default();
+                if !evidence.settled {
+                    match evidence.agent {
+                        Some(pid) if process_exists(pid) => {
+                            self.blocked
+                                .insert(done.id, Blocker::Agent { pid, since: now });
+                        }
+                        None => {
+                            self.blocked.insert(done.id, Blocker::Unknown);
+                        }
+                        Some(_) => {}
+                    }
                 }
             } else {
                 let old = &mut self.retiring[i];
@@ -326,20 +422,35 @@ impl Runtime {
         }
     }
 
-    /// Drops agents that are gone, and refuses the replacement of one that is not after
-    /// [`AGENT_LIMIT`]: two generations of one session must never run together.
-    fn check_lingering(&mut self, now: Instant) {
-        let mut i = 0;
-        while i < self.lingering.len() {
-            let still = &self.lingering[i];
-            if !process_exists(still.agent) {
-                self.lingering.swap_remove(i);
-            } else if now.duration_since(still.since) >= AGENT_LIMIT {
-                let gone = self.lingering.swap_remove(i);
-                self.refuse_replacement(gone.id);
-            } else {
-                i += 1;
+    /// A start still waiting behind the old run is dropped when the owner stops it, and its row says
+    /// so: nothing else would ever move a row that never got a worker.
+    fn cancel_waiting(&mut self, id: SessionId, generation: Generation) {
+        if self.waiting.get(&id).is_some_and(|(g, _)| *g == generation) {
+            self.waiting.remove(&id);
+            let effects = self.app.update(Msg::SpawnFailed {
+                id,
+                generation,
+                reason: "stopped before it started".to_owned(),
+            });
+            if !effects.is_empty() {
+                let _ = self.run(effects);
             }
+        }
+    }
+
+    /// Refusing a launch does not prove the old agent gone. Keep its exclusion across retries.
+    fn check_blocked(&mut self, now: Instant) {
+        self.blocked.retain(
+            |_, blocker| !matches!(*blocker, Blocker::Agent { pid, .. } if !process_exists(pid)),
+        );
+        let refused: Vec<_> = self
+            .blocked
+            .iter()
+            .filter(|(_, blocker)| blocker.expired(now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in refused {
+            self.refuse_replacement(id);
         }
     }
 
@@ -349,8 +460,13 @@ impl Runtime {
             let effects = self.app.update(Msg::SpawnFailed {
                 id,
                 generation,
-                reason: "the previous run did not end in time, so this one was not started"
-                    .to_owned(),
+                reason: self.blocked.get(&id).map_or_else(
+                    || {
+                        "the previous run did not end in time, so this one was not started"
+                            .to_owned()
+                    },
+                    |blocker| blocker.reason(),
+                ),
             });
             if !effects.is_empty() {
                 let _ = self.run(effects);
@@ -370,6 +486,7 @@ impl Runtime {
                     spec,
                 } => self.spawn(id, generation, &spec),
                 Effect::Stop { id, generation } => {
+                    self.cancel_waiting(id, generation);
                     if let Some(live) = self.live.get_mut(&id)
                         && live.generation == generation
                     {
@@ -417,7 +534,7 @@ impl Runtime {
         // A restart replaces the worker, but only once the old one has ended: its late messages
         // carry the old generation and the app drops them. Until then the newest start waits.
         self.retire(id);
-        if self.retiring.iter().any(|r| r.id == id) || self.lingering.iter().any(|l| l.id == id) {
+        if self.retiring.iter().any(|r| r.id == id) || self.blocked.contains_key(&id) {
             self.waiting.insert(id, (generation, spec.clone()));
             return;
         }
@@ -449,6 +566,7 @@ impl Runtime {
         let msg = match outcome {
             Ok(worker) => {
                 self.screens.insert(id, shared);
+                self.evidence.insert((id, generation), Evidence::default());
                 self.live.insert(id, Live { generation, worker });
                 Msg::Spawned { id, generation }
             }
@@ -669,11 +787,13 @@ mod tests {
         let mut runtime = Runtime::new(paths());
         runtime.send(Msg::Launch(spec()));
         let id = first(&runtime).id;
-        runtime.lingering.push(Lingering {
+        runtime.blocked.insert(
             id,
-            agent,
-            since: Instant::now(),
-        });
+            Blocker::Agent {
+                pid: agent,
+                since: Instant::now(),
+            },
+        );
         // The generation the session is on, as the app's restart would have given it.
         let generation = first(&runtime).generation;
         runtime.waiting.insert(id, (generation, spec()));
@@ -718,11 +838,134 @@ mod tests {
             session
                 .failure
                 .as_deref()
-                .is_some_and(|f| f.contains("did not end")),
+                .is_some_and(|f| f.contains("still running")),
             "{:?}",
             session.failure
         );
         assert_ok!(sleeper.kill());
         assert_ok!(sleeper.wait());
+    }
+
+    #[test]
+    fn a_refused_restart_does_not_free_the_next_one_while_the_old_agent_still_runs() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        let id = first(&runtime).id;
+        runtime.advance(Instant::now() + AGENT_LIMIT + Duration::from_secs(1));
+        assert_eq!(first(&runtime).phase, Phase::Failed);
+        // The owner tries again at once: the old agent is still there, so the answer is the same.
+        let generation = first(&runtime).generation + 1;
+        runtime.spawn(id, generation, &spec());
+        assert!(
+            runtime.waiting.contains_key(&id) || first(&runtime).phase == Phase::Failed,
+            "started beside a live agent: {:?}",
+            first(&runtime).phase
+        );
+        assert!(
+            runtime.blocked.contains_key(&id),
+            "the exclusion was forgotten"
+        );
+        assert!(runtime.live.is_empty(), "a worker was started");
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
+    }
+
+    #[test]
+    fn an_unknown_agent_blocks_every_start_and_says_so() {
+        let mut runtime = Runtime::new(paths());
+        runtime.send(Msg::Launch(spec()));
+        let id = first(&runtime).id;
+        runtime.blocked.insert(id, Blocker::Unknown);
+        let generation = first(&runtime).generation;
+        runtime.waiting.insert(id, (generation, spec()));
+        runtime.advance(Instant::now());
+        assert!(runtime.live.is_empty());
+        assert!(
+            runtime.blocked.contains_key(&id),
+            "an unknown agent was cleared by waiting"
+        );
+        assert!(
+            first(&runtime)
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("could not be confirmed")),
+            "{:?}",
+            first(&runtime).failure
+        );
+    }
+
+    #[test]
+    fn stopping_a_start_that_is_waiting_cancels_it() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        let id = first(&runtime).id;
+        let generation = first(&runtime).generation;
+        runtime.run(vec![Effect::Stop { id, generation }]);
+        assert!(
+            !runtime.waiting.contains_key(&id),
+            "the queued start survived Stop"
+        );
+        assert_eq!(first(&runtime).phase, Phase::Failed);
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
+        runtime.advance(Instant::now());
+        assert!(
+            runtime.live.is_empty(),
+            "a stopped start ran after the old agent ended"
+        );
+    }
+
+    #[test]
+    fn a_stop_for_an_older_generation_does_not_cancel_the_newer_start() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        let id = first(&runtime).id;
+        let generation = first(&runtime).generation;
+        runtime.run(vec![Effect::Stop {
+            id,
+            generation: generation - 1,
+        }]);
+        assert!(runtime.waiting.contains_key(&id));
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
+    }
+
+    #[test]
+    fn shutting_down_is_not_clean_while_an_agent_cannot_be_confirmed_gone() {
+        use claims::assert_ok;
+        let mut sleeper = assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn());
+        let mut runtime = waiting_behind(sleeper.id());
+        assert!(
+            !runtime.shut_down(Duration::from_millis(100)),
+            "reported clean beside a live agent"
+        );
+        assert_ok!(sleeper.kill());
+        assert_ok!(sleeper.wait());
+        let mut gone = waiting_behind(0);
+        gone.blocked.clear();
+        assert!(gone.shut_down(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn shutting_down_is_not_clean_when_whether_the_agent_ended_is_unknown() {
+        let mut runtime = Runtime::new(paths());
+        runtime.send(Msg::Launch(spec()));
+        let id = first(&runtime).id;
+        runtime.blocked.insert(id, Blocker::Unknown);
+        assert!(!runtime.shut_down(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn pids_that_mean_something_else_are_not_evidence() {
+        assert!(
+            !usable_pid(0),
+            "0 is the caller's own process group to kill()"
+        );
+        assert!(!usable_pid(1));
+        assert!(!usable_pid(u32::MAX));
+        assert!(usable_pid(4242));
     }
 }

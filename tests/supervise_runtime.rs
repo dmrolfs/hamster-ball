@@ -339,3 +339,91 @@ fn a_restart_waiting_for_the_old_generation_is_never_started_once_shutdown_begin
         "a new generation was started after shutdown began"
     );
 }
+
+/// Starts `rt` with a guardian grace of `grace_ms`, so a stubborn agent outlives its `hb` that long.
+fn runtime_with_grace(w: &World, grace_ms: &str) -> Runtime {
+    w.approve();
+    Runtime::new(Paths {
+        hb: PathBuf::from(DRIVE),
+        me: PathBuf::from(SUPERVISE),
+        env: vec![
+            ("HB_TD_HOME".into(), w.home_dir().into_os_string()),
+            ("HB_TD_CWD".into(), w.project.clone().into_os_string()),
+            ("HB_TD_PATH".into(), w.base.join("bin").into_os_string()),
+            ("HB_TD_TMP".into(), w.base.join("tmp").into_os_string()),
+            ("HB_TD_GRACE_MS".into(), grace_ms.into()),
+        ],
+    })
+}
+
+/// An agent that ignores TERM, HUP and INT, and on start records its own pid and whether the
+/// previous agent in the log is still alive: that is the overlap, seen from inside the new agent.
+fn stubborn_agent(w: &World) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = w.project.join("agents.log");
+    let script = w.project.join("agent.sh");
+    common::write(
+        &script,
+        &format!(
+            "trap '' TERM HUP INT\n\
+             echo \"$$\" >> '{log}'\n\
+             while :; do sleep 1; done\n",
+            log = log.display()
+        ),
+    );
+    (script, log)
+}
+
+fn log_lines(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn kill_logged(log: &std::path::Path) {
+    for line in log_lines(log) {
+        if let Some(pid) = line.split(' ').next().and_then(|p| p.parse::<i32>().ok()) {
+            let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn a_restart_does_not_start_the_new_agent_while_the_old_one_that_ignores_stop_still_runs() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    // The guardian waits 8 s before it kills what ignores TERM, far longer than a start takes.
+    let mut rt = runtime_with_grace(&w, "8000");
+    let (script, log) = stubborn_agent(&w);
+    rt.send(launch(&w, &["/bin/sh", &script.to_string_lossy()]));
+    assert!(run_until(&mut rt, 60, |r| phase(r, 1) == Phase::Running));
+    // Running is reported when the agent is started, not when its script has run.
+    assert!(run_until(&mut rt, 30, |_| log_lines(&log).len() == 1));
+    // The old generation's hb is killed, not asked: its agent is left to the guardian's grace.
+    rt.send(Msg::AskRestart);
+    rt.send(Msg::Answer(true));
+    rt.abandon_for_test(SessionId(1));
+    assert!(
+        run_until(&mut rt, 90, |_| log_lines(&log).len() >= 2),
+        "the new agent never started: {:?}; row: {:?} {:?}; blocked/retiring: {rt:?}",
+        log_lines(&log),
+        phase(&rt, 1),
+        rt.app.sessions().first().and_then(|s| s.failure.clone())
+    );
+    // Checked from here, not from inside the sandbox, which may not signal other processes.
+    let first_pid: i32 = assert_some!(
+        log_lines(&log)
+            .first()
+            .and_then(|l| l.split(' ').next())
+            .and_then(|p| p.parse().ok())
+    );
+    let overlapped = alive(first_pid);
+    let lines = log_lines(&log);
+    kill_logged(&log);
+    assert!(
+        !overlapped,
+        "the new agent started while the old one ({first_pid}) was still running: {lines:?}"
+    );
+    rt.shut_down(Duration::from_secs(30));
+}
