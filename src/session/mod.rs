@@ -11,9 +11,12 @@ pub mod env;
 pub mod fds;
 mod fence;
 pub mod gitconfig;
+mod guard_channel;
 pub mod guardian;
 pub mod hooks;
+pub mod identity;
 mod interactive;
+pub mod launch;
 pub mod offline;
 pub mod ports;
 pub mod preflight;
@@ -24,15 +27,19 @@ pub mod relay;
 pub mod run;
 pub mod sanitize;
 pub mod signals;
+mod sweep;
 pub mod terminal;
+mod tracker;
 
 pub use ca_bundle::{CaBundleError, write_bundle};
-pub use child_helper::{HelperError, exec_sandbox_exec};
+pub use child_helper::{HelperError, exec_gated, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 pub use fds::close_inherited_fds;
-pub use guardian::{GuardError, GuardHandle, Guardian, GuardianError, run_guard};
+pub use guardian::{
+    GuardError, GuardHandle, Guardian, GuardianError, WatchOutcome, WatchRefusal, run_guard,
+};
 pub use interactive::InteractiveError;
 pub use preflight::{
     PreflightError, ProbeOutcome, SANDBOX_EXEC, check_nesting, classify, is_nested,

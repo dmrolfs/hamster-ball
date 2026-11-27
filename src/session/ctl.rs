@@ -145,8 +145,8 @@ pub fn start(
         None => HOST_SYSTEM_PATH.to_owned(),
     };
     let mut host = Host::new(&path, |name| env.vars.get(name).map(ToOwned::to_owned));
-    if let Some(guard) = guard {
-        host = host.with_guard(guard);
+    if let (Some(guard), Some(hb)) = (guard, env.floor.hb_exe.as_ref()) {
+        host = host.with_guard(guard, hb.clone());
     }
     let service = service::start(Inputs {
         scope,

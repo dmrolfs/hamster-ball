@@ -64,7 +64,7 @@ Opt-in tests prove the parts that need real tools: agent presets (`HB_CONFORMANC
 ### Requirements
 
 - macOS (15 tested) on Apple silicon. `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
-- Rust 1.85 or newer to build it.
+- Rust 1.88 or newer to build it.
 - An agent you already use and can run outside the ball (log in to it there first).
 
 ### Install
@@ -511,7 +511,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | Symptom | Cause and fix |
 |---|---|
 | `hb: this project's config has not been approved` (exit 78) | Run `hb approve` in a terminal. Any edit to the project file, or a `git pull` that changes it, asks again. |
-| `no hamster-ball.toml found in ... or any parent directory` | Create one in the project root. `hb` never uses the current directory by default. |
+| `no hamster-ball.toml found in ... or any parent directory` | `hb` requires a project file by design, so it does not make an arbitrary current folder writable by accident. Create one in the project root. |
 | `` `claude` was not found on the PATH the program will have `` | The ball's `PATH` is short. Use the full path (`hb run -- ~/.local/bin/claude`) or add the program to `[env] tools`. |
 | `warning: the project directory is not granted`, or `Can't read the current directory (EPERM)` | No grant covers the project. Add `[fs] write = ["."]` to your base (a base made by an older `hb init` lacks it) or to the project file. A grant of a directory inside the project does not count. |
 | `` `~/.cache/claude` was not granted: missing `` | An allow rule for a path that does not exist is skipped. Create the directory, or start the agent once outside the ball. |

@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-use super::relay::{BUFFER, DRAIN_MAX, DRAIN_QUIET, TICK_MS, end_of_output};
+use super::relay::{BUFFER, Drain, TICK_MS, end_of_output};
 use super::sanitize::{ClipboardPolicy, ClipboardUse, Sanitizer};
 
 /// A running copy of one stream to the terminal. Call [`Pump::finish`] after the agent has ended.
@@ -45,11 +45,28 @@ impl Pump {
         sink: OwnedFd,
         clipboard: ClipboardPolicy,
     ) -> io::Result<Self> {
+        Self::spawn(source, sink, clipboard, Drain::default())
+    }
+
+    fn spawn(
+        source: OwnedFd,
+        sink: OwnedFd,
+        clipboard: ClipboardPolicy,
+        drain: Drain,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("hb-pump".to_owned())
-            .spawn(move || run(File::from(source), File::from(sink), &flag, clipboard))?;
+            .spawn(move || {
+                run(
+                    File::from(source),
+                    File::from(sink),
+                    &flag,
+                    clipboard,
+                    drain,
+                )
+            })?;
         Ok(Self { stop, handle })
     }
 
@@ -67,13 +84,17 @@ fn run(
     mut sink: File,
     stop: &AtomicBool,
     clipboard: ClipboardPolicy,
+    drain: Drain,
 ) -> ClipboardUse {
     let mut filter = Sanitizer::with_clipboard(clipboard);
     let mut draining_since: Option<Instant> = None;
+    // Silence is measured from the last output, as in the relay.
+    let mut last_output = Instant::now();
     let mut buffer = [0u8; BUFFER];
     loop {
         if stop.load(Ordering::Relaxed) && draining_since.is_none() {
             draining_since = Some(Instant::now());
+            last_output = Instant::now();
         }
         let mut fds = [PollFd::new(source.as_fd(), PollFlags::POLLIN)];
         let ready = match poll(&mut fds, PollTimeout::from(TICK_MS)) {
@@ -83,6 +104,7 @@ fn run(
             Err(_) => false,
         };
         if ready {
+            last_output = Instant::now();
             match source.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -94,10 +116,10 @@ fn run(
                 }
             }
         }
-        if let Some(since) = draining_since {
-            if !ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX {
-                break;
-            }
+        if let Some(since) = draining_since
+            && (last_output.elapsed() >= drain.quiet || since.elapsed() >= drain.max)
+        {
+            break;
         }
     }
     end_of_output(&mut filter, &mut sink);
@@ -106,6 +128,7 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::relay::DRAIN_MAX;
     use super::*;
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
@@ -120,10 +143,20 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_draining(None)
+    }
+
+    /// A rig whose pump drains for `drain`, or for the production limits when `None`.
+    fn rig_draining(drain: Option<Drain>) -> Rig {
         let (agent, theirs) = assert_ok!(UnixStream::pair());
         let (screen, sink) = assert_ok!(UnixStream::pair());
         assert_ok!(screen.set_read_timeout(Some(Duration::from_millis(300))));
-        let pump = assert_ok!(Pump::start(OwnedFd::from(theirs), OwnedFd::from(sink)));
+        let pump = assert_ok!(Pump::spawn(
+            OwnedFd::from(theirs),
+            OwnedFd::from(sink),
+            ClipboardPolicy::default(),
+            drain.unwrap_or_default(),
+        ));
         Rig {
             agent,
             screen,
@@ -186,22 +219,64 @@ mod tests {
         assert_eq!(rig.pump.finish().allowed, 1);
     }
 
+    /// Limits far above this test's own sleeps: a hosted runner's `sleep(110 ms)` took 153 ms
+    /// at the median and 187 ms at worst, which is past the production 150 ms quiet window.
+    const SLOW_RUNNER: Drain = Drain {
+        quiet: Duration::from_millis(900),
+        max: Duration::from_millis(1500),
+    };
+
     #[test]
     fn output_that_arrives_shortly_after_the_agent_ended_is_still_copied() {
-        let mut rig = rig();
+        let mut rig = rig_draining(Some(SLOW_RUNNER));
         let mut agent = assert_ok!(rig.agent.try_clone());
         let writer = thread::spawn(move || {
-            // After the pump's first idle poll of the drain (50 ms) and inside its quiet window (150 ms).
-            thread::sleep(Duration::from_millis(110));
+            // After several idle polls of the drain (50 ms each) and well inside the quiet window.
+            thread::sleep(Duration::from_millis(250));
             let _ = agent.write_all(b"just in time");
         });
-        assert_ok!(
-            rig.screen
-                .set_read_timeout(Some(Duration::from_millis(600)))
-        );
+        assert_ok!(rig.screen.set_read_timeout(Some(Duration::from_secs(2))));
         rig.pump.finish();
         assert_ok!(writer.join().map_err(|_| "writer panicked"));
         assert_eq!(read_all(&mut rig.screen), b"just in time");
+    }
+
+    #[test]
+    fn a_stream_that_keeps_writing_is_not_cut_off_at_the_quiet_deadline() {
+        let rig = rig_draining(Some(SLOW_RUNNER));
+        let mut agent = assert_ok!(rig.agent.try_clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let writer = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                if agent.write_all(b"noise").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut screen = assert_ok!(rig.screen.try_clone());
+        assert_ok!(screen.set_read_timeout(Some(Duration::from_millis(20))));
+        let reader = thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(4);
+            let mut buffer = [0u8; 256];
+            while Instant::now() < end {
+                let _ = screen.read(&mut buffer);
+            }
+        });
+        let started = Instant::now();
+        rig.pump.finish();
+        let took = started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        let _ = writer.join();
+        let _ = reader.join();
+        // Output never went quiet, so only the maximum may end the drain; the quiet deadline
+        // (900 ms) may not. The slack is for a runner that is slow to wake the pump.
+        assert!(
+            took >= SLOW_RUNNER.max - Duration::from_millis(200),
+            "{took:?}"
+        );
+        assert!(took < SLOW_RUNNER.max + Duration::from_secs(1), "{took:?}");
     }
 
     #[test]

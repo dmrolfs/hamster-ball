@@ -112,6 +112,14 @@ impl Pty {
         ))
     }
 
+    /// A duplicate of the slave, sent to the gated helper as the target's stdin.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the descriptor cannot be duplicated.
+    pub fn slave_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        Ok(std::os::fd::OwnedFd::from(self.slave.try_clone()?))
+    }
+
     /// Closes `hb`'s own copy of the slave. Call it once the child has been started: the master
     /// then reports end of input when the child's last descriptor closes.
     #[must_use]

@@ -22,6 +22,9 @@ pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Set in the child so a nested `hb` can say it is inside one (design 7.4). It proves nothing:
 /// other sandboxes leave no marker, and the preflight is what decides.
 pub const SESSION_MARKER: &str = "HB_SESSION";
+
+/// The variable that carries a run's launch token, which the guard's teardown sweep looks for.
+pub const LAUNCH_TOKEN_VAR: &str = "HB_LAUNCH_TOKEN";
 /// `TERM` when stdin is not a terminal, or the parent has none.
 pub const DUMB_TERM: &str = "dumb";
 
@@ -92,6 +95,9 @@ pub struct EnvInputs<'a> {
     pub hook_vars: &'a BTreeMap<EnvName, CanonicalPath>,
     /// The `hb ctl` broker socket, when this run has one. Set last, so nothing can override it.
     pub ctl_socket: Option<&'a CanonicalPath>,
+    /// The value of `HB_LAUNCH_TOKEN`, when the run has a guard that sweeps for leftovers.
+    /// `HB_` names are reserved, so configuration cannot set or pass it.
+    pub launch_token: Option<&'a str>,
 }
 
 /// What `[env] set` values may contain to name this run's private directory.
@@ -136,6 +142,9 @@ impl ChildEnv {
             vars.insert(OsString::from(name.as_str()), OsString::from(path.as_str()));
         }
         vars.insert(SESSION_MARKER.into(), "1".into());
+        if let Some(token) = inputs.launch_token {
+            vars.insert(LAUNCH_TOKEN_VAR.into(), token.into());
+        }
         if let Some(socket) = inputs.ctl_socket {
             vars.insert(
                 crate::ctl::client::SOCKET_VAR.into(),
@@ -295,6 +304,7 @@ mod tests {
         proxy: Option<ProxyUrl>,
         hook_vars: BTreeMap<EnvName, CanonicalPath>,
         ctl_socket: Option<CanonicalPath>,
+        token: Option<String>,
     }
 
     impl Case {
@@ -312,6 +322,7 @@ mod tests {
                 proxy: None,
                 hook_vars: BTreeMap::new(),
                 ctl_socket: None,
+                token: None,
             }
         }
 
@@ -331,6 +342,7 @@ mod tests {
                 proxy: self.proxy.as_ref(),
                 hook_vars: &self.hook_vars,
                 ctl_socket: self.ctl_socket.as_ref(),
+                launch_token: self.token.as_deref(),
             })
         }
 

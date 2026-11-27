@@ -85,7 +85,7 @@ When the command dies of INT, TERM, HUP or KILL, `hb` cleans up and raises the s
 | `[mcp.<name>]` | `command`, `args` | string, list | any file |
 | `[mcp.<name>]` | `net`, `warm_net` | list of hosts | any file |
 | `[mcp.<name>]` | `bind_ports` | list of ports | any file |
-| `[hooks.pre_run.<name>]` | `command`, `format`, `profile`, `timeout_secs`, `outputs` | see [Configuration](04-configuration.md#hookspre_runname-host-side-hooks) | your own files only |
+| `[hooks.pre_run.<name>]` | `command`, `format`, `profile`, `timeout_secs`, `outputs` | see [Configuration](04-configuration.md#hookspre_runname-prepare-files-before-the-agent-starts) | your own files only |
 | `[guard]` | `exceptions` | list of absolute or `~/` patterns | your own files only |
 
 A key that `hb` does not know is an error that names the file and the key.
@@ -178,7 +178,7 @@ Start with `hb explain` (what is granted) and `hb run --log-denials --log-proxy`
 | Symptom | Cause and fix |
 |---|---|
 | `hb: this project's config has not been approved` (exit 78) | Run `hb approve` in a terminal. Any edit to the project file, or a `git pull` that changes it, asks again. |
-| `no hamster-ball.toml found in ... or any parent directory` | Create one in the project root. `hb` never uses the current directory by default. |
+| `no hamster-ball.toml found in ... or any parent directory` | `hb` requires a project file by design, so it does not make an arbitrary current folder writable by accident. Create one in the project root. |
 | `` `claude` was not found on the PATH the program will have `` | The ball's `PATH` is short. Use the full path or add the program to `[env] tools`. |
 | `warning: the project directory is not granted`, or `Can't read the current directory (EPERM)` | No grant covers the project. Add `[fs] write = ["."]` to your base or the project file. A grant of a directory inside the project does not count. |
 | `` `~/.cache/claude` was not granted: missing `` | A grant for a path that does not exist is skipped. Create the directory, or start the agent once outside the ball. |

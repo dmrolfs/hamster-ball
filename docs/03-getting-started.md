@@ -8,7 +8,7 @@
 These steps assume you use a terminal and have built a Rust program before.
 
 - A Mac with Apple silicon. `hb` was built and measured on macOS 15.7.
-- Rust 1.85 or newer, to build `hb`. If you do not have it, install it with [rustup](https://rustup.rs).
+- Rust 1.88 or newer, to build `hb`. If you do not have it, install it with [rustup](https://rustup.rs).
 - An agent you already use. Log in to it outside the ball first, because the ball has no browser and cannot open one.
 
 `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
@@ -153,16 +153,19 @@ If it uses a private certificate authority, add `[tls] extra_ca_files = ["~/path
 
 ### claude on Bedrock
 
-claude needs AWS credentials, and the ball cannot reach `~/.aws` or your credential tool.
-A hook in your base config runs the tool on the host and hands the agent a short-lived file.
+claude needs AWS credentials, and the ball cannot reach `~/.aws` or your AWS command-line tool.
+A hook in your base config runs the AWS CLI on your Mac and gives the agent temporary credentials for one profile.
 
 ```toml
 # ~/.config/hamster-ball/base.toml
 [hooks.pre_run.bedrock]
-command = ["~/ai-coding/credential-process", "--profile", "my-profile"]
+command = ["/opt/homebrew/bin/aws", "configure", "export-credentials", "--profile", "bedrock-dev", "--format", "process"]
 format  = "aws_credential_process"
-profile = "my-profile"
+profile = "bedrock-dev"
 ```
+
+Replace `bedrock-dev` with your AWS profile name and the AWS CLI path with the output of `command -v aws`.
+See [Hooks](04-configuration.md#hookspre_runname-prepare-files-before-the-agent-starts) for what this does.
 
 Then add `extends = ["agent/claude"]` to the project and run `hb run -- ~/.local/bin/claude`.
 Measured on one machine, claude took about 20 seconds longer to start.

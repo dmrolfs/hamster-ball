@@ -1,0 +1,34 @@
+# hamster-ball.toml: run pi in a ball, with the HERE LLM Gateway (dev-aws) as its model provider.
+extends = ["agent/pi"]
+
+[net]
+# The gateway, and Okta for token refresh. Sign in once outside the ball (`pi`, then `/login here`):
+# the login callback listens on a loopback port, which the ball does not allow. The token lands in
+# ~/.pi/agent/auth.json, which the ball can write.
+# crates.io, index.crates.io and static.crates.io serve cargo. Git dependencies would also need github.com.
+allow = ["dev.ai-gateway.in.here.com", "here.oktapreview.com", "crates.io", "index.crates.io", "static.crates.io"]
+
+[tls]
+# dev-aws presents a temporary self-signed certificate (expires 2027-01-14); see the
+# llm-gateway-clients INSTALL.md, step 4. hb sets NODE_EXTRA_CA_CERTS from this.
+extra_ca_files = ["~/.config/here-llm-gateway/dev-aws-temporary-selfsigned-ca.pem"]
+
+[env]
+# Lets `hb run -- pi` work: pi lives in ~/.pi/agent/bin, which is not on the ball's short PATH.
+tools = ["pi", "bd", "git", "rtk", "cargo", "rustc", "sccache"]
+set = { PI_CLIPBOARD_OSC52 = "1" }
+
+[fs]
+# ~/.agents/skills holds your user skills (claiming-beads-tasks, raising-gaps-and-decisions, ...); read-only.
+# lean-ctx wraps verbose commands; its config stays read-only.
+# bd reads its own settings, machine id and dolt's global config from the home directory.
+# rg, fd and lean-ctx are reached through links in ~/.pi/agent/bin to /opt/homebrew/bin/<name> (create them
+# with `ln -s`; they survive brew upgrades). The /opt/homebrew/opt/<name> grants below are resolved by hb to
+# the current Cellar version each run, so upgrades need no edit. Do not put rg or fd in [env] tools:
+# /opt/homebrew/bin would then shadow your nvm node with Homebrew's.
+# rtk is linked against this nix libiconv; a nix rebuild changes the hash and needs this updated.
+read = ["/opt/homebrew/opt/lean-ctx", "~/.rustup", "~/.cargo/config.toml", "~/.agents/skills", "/nix/store/0iavzb323r97k7sps762r5kj1f2bny0b-libiconv-115.100.1", "/opt/homebrew/opt/ripgrep", "/opt/homebrew/opt/fd", "~/.config/bd", "~/.beads/machine-id", "~/.beads/eventsData", "~/.dolt/config_global.json"]
+# cargo downloads crates here. credentials.toml (registry token) is deliberately not granted.
+write = ["~/.lean-ctx", "~/Library/Caches/Mozilla.sccache", "~/.cargo/registry", "~/.cargo/git", "~/.cargo/.package-cache", "~/.cargo/.global-cache", "~/Library/Application Support/rtk"]
+# rtk's own settings and filters stay read-only, so the agent cannot change how its output is rewritten.
+deny_write = ["~/.lean-ctx/config.toml", "~/Library/Application Support/rtk/config.toml", "~/Library/Application Support/rtk/filters.toml"]

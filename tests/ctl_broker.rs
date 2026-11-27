@@ -12,6 +12,7 @@ use std::path::Path;
 
 use claims::assert_ok;
 use common::{World, sandbox_available, write};
+use pretty_assertions::assert_eq;
 use serde_json::json;
 
 const DRIVE: &str = env!("CARGO_BIN_EXE_hb-testdrive");
@@ -215,6 +216,199 @@ fn mount_sources_are_pinned_in_the_running_profile_but_the_agent_can_still_edit_
     );
 }
 
+/// Sends raw bytes, bypassing clap and Request serialization, from inside the sandbox.
+fn raw_request(w: &World, payload: &[u8]) -> hamster_ball::ctl::op::Response {
+    let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+    let script = format!(
+        r#"/usr/bin/perl -MIO::Socket::UNIX -e '
+            alarm 15;
+            my $s = IO::Socket::UNIX->new(Peer => $ENV{{HB_CTL_SOCKET}}, Type => SOCK_STREAM)
+                or die "connect: $!";
+            print $s pack("H*", "{hex}") or die "write: $!";
+            shutdown($s, 1) or die "shutdown: $!";
+            my $reply = <$s>; defined($reply) or die "missing reply";
+            print $reply;
+        '"#
+    );
+    let (out, err, ok) = run(w, &script);
+    assert!(ok, "raw client failed, not a refusal: {out}{err}");
+    assert_ok!(serde_json::from_str(&out))
+}
+
+#[test]
+fn raw_broker_requests_are_validated_before_any_host_mutation() {
+    sandboxed!();
+    let w = world("[ctl]\ncontainers = [\"db\"]\n");
+    let valid = b"{\"target\":\"container\",\"op\":\"restart\",\"name\":\"db\"}\n";
+    let control = raw_request(&w, valid);
+    assert!(control.ok && control.out.contains(ID), "{control:?}");
+    let mutations = || {
+        calls(&w)
+            .lines()
+            .filter(|l| l.starts_with("restart "))
+            .count()
+    };
+    assert_eq!(mutations(), 1, "raw control must reach the actual runner");
+    let bad = [
+        (
+            b"{\"target\":\"container\",\"op\":\"restart\",\"name\":\"db\",\"argv\":[\"sh\"]}\n"
+                .to_vec(),
+            "not understood",
+        ),
+        (
+            b"{\"target\":\"container\",\"op\":\"exec\",\"name\":\"db\"}\n".to_vec(),
+            "not understood",
+        ),
+        (
+            b"{\"target\":\"container\",\"op\":\"restart\",\"name\":\"--all\"}\n".to_vec(),
+            "invalid container name",
+        ),
+        (
+            b"{\"target\":\"container\",\"op\":\"restart\",\"name\":\"other\"}\n".to_vec(),
+            "but other was requested",
+        ),
+        (b"\xff\n".to_vec(), "not text"),
+        ([vec![b' '; 4096], valid.to_vec()].concat(), "too long"),
+    ];
+    for (payload, expected) in bad {
+        let reply = raw_request(&w, &payload);
+        assert!(
+            !reply.ok && reply.err.contains(expected),
+            "expected {expected}, got: {reply:?}"
+        );
+        assert_eq!(mutations(), 1, "host mutation escaped validation");
+    }
+    assert!(
+        raw_request(&w, valid).ok,
+        "rejections must not break the broker"
+    );
+    assert_eq!(mutations(), 2);
+}
+
+#[test]
+fn raw_broker_admission_and_incomplete_requests_are_bounded() {
+    sandboxed!();
+    let w = world("[ctl]\ncontainers = [\"db\"]\n");
+    let script = r#"/usr/bin/perl -MIO::Socket::UNIX -e '
+        alarm 20;
+        my @s;
+        for (1..5) {
+            push @s, IO::Socket::UNIX->new(Peer => $ENV{HB_CTL_SOCKET}, Type => SOCK_STREAM)
+                or die "connect: $!";
+        }
+        print {$s[0]} qq({"target":) or die "partial write: $!";
+        my $busy = readline($s[4]); defined($busy) or die "missing busy reply";
+        print $busy;
+        for my $s (@s[0..3]) {
+            my $reply = <$s>; defined($reply) or die "missing timeout reply";
+            print $reply;
+        }
+        close $_ for @s;
+    ' && hb ctl ps"#;
+    let (out, err, ok) = run(&w, script);
+    assert!(ok, "client failed, not a bounded refusal: {out}{err}");
+    let replies: Vec<hamster_ball::ctl::op::Response> = out
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| assert_ok!(serde_json::from_str(line)))
+        .collect();
+    assert_eq!(replies.len(), 5, "{out}{err}");
+    assert!(
+        !replies[0].ok && replies[0].err.contains("busy"),
+        "{out}{err}"
+    );
+    for reply in &replies[1..] {
+        assert!(!reply.ok && reply.err.contains("too slow"), "{reply:?}");
+    }
+    assert!(
+        out.contains("db\trunning"),
+        "valid request after saturation: {out}{err}"
+    );
+}
+
+/// Covers launcher FD 3 reaching testdrive's host-side tool, not broker-internal descriptors.
+#[test]
+fn inherited_secret_descriptor_does_not_reach_the_host_broker_command() {
+    sandboxed!();
+    let w = world("[ctl]\ncontainers = [\"db\"]\n");
+    let canary = w.base.join("fd-canary");
+    write(&canary, "BROKER-FD-SECRET");
+    let tool = w.base.join("bin/podman");
+    let original = assert_ok!(fs::read_to_string(&tool));
+    let probe =
+        "/usr/bin/perl -e 'print qq(FD-PROBE:); print <F> if open(F, \"<&=3\"); print qq(\\n)'";
+    write(
+        &tool,
+        &original.replace(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\nif [ \"$1\" = logs ]; then {probe}; exit; fi\n"),
+        ),
+    );
+    let control = assert_ok!(
+        std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "exec 3<{}; exec {} logs",
+                    common::quote(&canary),
+                    common::quote(&tool)
+                )
+            ])
+            .output()
+    );
+    assert!(control.status.success(), "{control:?}");
+    assert_eq!(control.stdout, b"FD-PROBE:BROKER-FD-SECRET\n");
+    w.approve();
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args([
+        "-c",
+        &format!(
+            "exec 3<{}; exec '{}' run -- /bin/sh -c 'hb ctl logs db'",
+            common::quote(&canary),
+            DRIVE
+        ),
+    ]);
+    w.drive_env_unapproved(&mut command);
+    let denied = assert_ok!(command.output());
+    assert!(denied.status.success(), "{denied:?}");
+    assert_eq!(
+        denied.stdout, b"FD-PROBE:\n",
+        "descriptor reached host-side command"
+    );
+}
+
+#[test]
+fn the_hidden_child_helper_cannot_replace_the_outer_sandbox() {
+    sandboxed!();
+    let w = world("[ctl]\ncontainers = [\"db\"]\n");
+    let canary = w.base.join("outside-canary");
+    write(&canary, "HELPER-ESCAPE-CANARY");
+    let outside = assert_ok!(
+        std::process::Command::new(DRIVE)
+            .args([
+                "__child",
+                "--",
+                "-p",
+                "(version 1)(allow default)",
+                "/bin/cat"
+            ])
+            .arg(&canary)
+            .output()
+    );
+    assert!(outside.status.success(), "{outside:?}");
+    assert_eq!(outside.stdout, b"HELPER-ESCAPE-CANARY");
+    let (out, err, ok) = run(
+        &w,
+        &format!(
+            "command -v hb >/dev/null || exit 90; hb __child -- -p '(version 1)(allow default)' /bin/cat '{}'; rc=$?; test $rc -eq 71 && echo nested-refused",
+            canary.display()
+        ),
+    );
+    assert!(ok && out.contains("nested-refused"), "{out}{err}");
+    assert!(!out.contains("HELPER-ESCAPE-CANARY"), "{out}{err}");
+    assert!(!err.contains("HELPER-ESCAPE-CANARY"), "{out}{err}");
+}
+
 // ====================================================================================
 // A run killed with SIGKILL
 // ====================================================================================
@@ -403,8 +597,7 @@ fn a_podman_command_still_running_when_the_agent_exits_is_stopped_with_the_run()
 fn the_podman_machine_key_and_container_directories_are_unreadable_inside_the_ball() {
     sandboxed!();
     let w = world("[ctl]\nlabel = \"proj=x\"\n");
-    // The real floor names these under the world's home: make each one exist, grant the whole home
-    // for reading, and show that only the floor stops the read (a sibling file is readable).
+    // Prove the covering grant works outside the floor and the denied fixtures exist.
     let home = w.home_dir();
     for (dir, file) in [
         (".local/share/containers/podman/machine", "machine"),
@@ -412,7 +605,15 @@ fn the_podman_machine_key_and_container_directories_are_unreadable_inside_the_ba
         (".local/share/containers", "storage.conf"),
     ] {
         write(&home.join(dir).join(file), "secret\n");
+        assert_eq!(
+            assert_ok!(fs::read_to_string(home.join(dir).join(file))),
+            "secret\n"
+        );
     }
+    write(
+        &home.join(".local/share/plain.txt"),
+        "covering-grant-control\n",
+    );
     write(&home.join("sibling.txt"), "plain\n");
     // Grants that cover the three directories (the whole home is too broad to grant, so name them).
     w.set_base("[fs]\nwrite = [\".\"]\nread = [\"~/.local/share\", \"~/.config/containers\", \"~/sibling.txt\"]\n[ctl]\nlabel = \"proj=x\"\n");
@@ -420,7 +621,7 @@ fn the_podman_machine_key_and_container_directories_are_unreadable_inside_the_ba
         &w,
         "for f in .local/share/containers/podman/machine/machine .config/containers/containers.conf .local/share/containers/storage.conf; do \
            cat \"$HOME/$f\" >/dev/null 2>&1 && echo \"READABLE:$f\" || echo \"denied:$f\"; done; \
-         cat \"$HOME/sibling.txt\" && echo sibling-readable",
+         cat \"$HOME/.local/share/plain.txt\"; cat \"$HOME/sibling.txt\" && echo sibling-readable",
     );
     assert!(ok, "{out}{err}");
     assert!(
@@ -429,7 +630,7 @@ fn the_podman_machine_key_and_container_directories_are_unreadable_inside_the_ba
     );
     assert_eq!(out.matches("denied:").count(), 3, "{out}{err}");
     assert!(
-        out.contains("sibling-readable"),
-        "control: the home itself is readable: {out}{err}"
+        out.contains("sibling-readable") && out.contains("covering-grant-control"),
+        "control: both explicit and covering grants work: {out}{err}"
     );
 }

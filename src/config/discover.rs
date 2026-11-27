@@ -100,8 +100,10 @@ pub enum DiscoverError {
 
     /// No `hamster-ball.toml` exists in `from` or any of its ancestors, up to `/`.
     #[snafu(display(
-        "no {CONFIG_FILE_NAME} found in {} or any parent directory up to /; create one in your \
-         project's root directory, or run hb from inside a project that already has one.",
+        "no {CONFIG_FILE_NAME} found in {} or any parent directory up to /. hb requires one by \
+         design: it marks the exact project directory you approved, so hb does not make an \
+         arbitrary folder writable by accident. Create one in your project's root directory, \
+         or run hb from inside a project that already has one.",
         path_preview(from.as_path())
     ))]
     NoProjectConfig {
@@ -351,7 +353,9 @@ mod tests {
         let tree = Tree::new();
         let project = tree.outside("proj");
         let shown = assert_err!(discover_in(&tree, &project)).to_string();
-        assert!(shown.contains("create one"), "{shown:?}");
+        assert!(shown.contains("Create one"), "{shown:?}");
+        assert!(shown.contains("requires one by design"), "{shown:?}");
+        assert!(shown.contains("arbitrary folder writable"), "{shown:?}");
     }
 
     #[test]

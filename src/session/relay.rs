@@ -24,11 +24,11 @@ pub(super) const BUFFER: usize = 8192;
 
 /// How long a relay keeps draining after the child has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Drain {
+pub(super) struct Drain {
     /// How long the master may stay silent before the relay stops.
-    quiet: Duration,
+    pub(super) quiet: Duration,
     /// The most time spent draining.
-    max: Duration,
+    pub(super) max: Duration,
 }
 
 impl Default for Drain {
@@ -218,11 +218,15 @@ fn run(
 ) {
     let mut input_open = true;
     let mut draining_since: Option<Instant> = None;
+    // `quiet` is silence, so it is measured from the last output (or the start of the drain), not
+    // from the start of the drain: a child writing every 60 ms is not silent.
+    let mut last_output = Instant::now();
     loop {
         hold_while_paused(shared);
         let stopping = shared.stop.load(Ordering::Relaxed);
         if stopping && draining_since.is_none() {
             draining_since = Some(Instant::now());
+            last_output = Instant::now();
         }
         let (master_ready, input_ready) = {
             let mut fds = vec![PollFd::new(master.as_fd(), PollFlags::POLLIN)];
@@ -239,6 +243,9 @@ fn run(
             };
             (ready(&fds[0]), fds.get(1).is_some_and(ready))
         };
+        if master_ready {
+            last_output = Instant::now();
+        }
         if master_ready && !copy_chunk(&mut master, &mut output, Some(filter)) {
             // End of the child's output: nothing more can come.
             end_of_output(filter, &mut output);
@@ -247,11 +254,11 @@ fn run(
         if input_ready && !copy_chunk(&mut input, &mut master, None) {
             input_open = false;
         }
-        if let Some(since) = draining_since {
-            if !master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max {
-                end_of_output(filter, &mut output);
-                return;
-            }
+        if let Some(since) = draining_since
+            && (last_output.elapsed() >= drain.quiet || since.elapsed() >= drain.max)
+        {
+            end_of_output(filter, &mut output);
+            return;
         }
     }
 }
@@ -605,6 +612,44 @@ mod tests {
         let _ = reader.join();
         assert!(took >= drain.max - Duration::from_millis(200), "{took:?}");
         assert!(took < drain.max + Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn a_child_that_writes_slower_than_a_poll_is_not_silent_and_is_drained_to_the_maximum() {
+        // Writes every 100 ms, two polls apart (TICK_MS is 50), so some polls see nothing. The
+        // child is never silent for the 400 ms `quiet`, so only `max` may end the drain.
+        let drain = Drain {
+            quiet: Duration::from_millis(400),
+            max: Duration::from_millis(1500),
+        };
+        let rig = rig_draining(drain);
+        let mut child = assert_ok!(rig.child.try_clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let writer = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                let _ = child.write_all(b"tick");
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let mut user = assert_ok!(rig._outer.clone_master());
+        let reader = thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            let end = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < end {
+                let mut fds = [PollFd::new(user.as_fd(), PollFlags::POLLIN)];
+                if poll(&mut fds, PollTimeout::from(50u8)).is_ok_and(|n| n > 0) {
+                    let _ = user.read(&mut buffer);
+                }
+            }
+        });
+        let started = Instant::now();
+        rig.relay.finish();
+        let took = started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        let _ = writer.join();
+        let _ = reader.join();
+        assert!(took >= drain.max - Duration::from_millis(200), "{took:?}");
     }
 
     #[test]

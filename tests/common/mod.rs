@@ -283,8 +283,9 @@ pub fn hb_text(outcome: &Outcome) -> String {
 pub fn sandbox_available() -> bool {
     let nested = hamster_ball::session::is_nested();
     if nested {
-        // CI sets HB_REQUIRE_SANDBOX so an environment that cannot sandbox fails loudly instead
-        // of turning every Seatbelt test into a silent pass.
+        // A job that claims sandbox coverage sets HB_REQUIRE_SANDBOX so an environment that cannot
+        // sandbox fails loudly instead of turning every Seatbelt test into a silent pass. The
+        // `quality` job in ci.yml does not set it: hosted runners are sandboxed (hb-btp).
         assert!(
             std::env::var_os("HB_REQUIRE_SANDBOX").is_none(),
             "HB_REQUIRE_SANDBOX is set but sandbox-exec is unavailable"

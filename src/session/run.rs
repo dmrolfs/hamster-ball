@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -23,9 +24,10 @@ use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag}
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
 use super::fence::settle;
-use super::guardian::{Guardian, GuardianError};
+use super::guardian::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
+use super::launch::{GateError, ParentGate};
 use super::offline::{OfflineError, OfflinePlan};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
@@ -34,6 +36,7 @@ use super::pty::{Pty, PtyError};
 use super::pump::Pump;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
 use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
+use super::sweep::LaunchToken;
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
 use crate::policy::HostRule;
@@ -397,6 +400,20 @@ pub enum RunError {
     ))]
     PtyUnavailable,
 
+    /// The launch gate did not open; the helper was killed before running anything.
+    #[snafu(display("the launch gate did not open"))]
+    Gate {
+        /// The underlying error.
+        source: GateError,
+    },
+
+    /// A random launch token could not be made, so the guard could not be told what to look for.
+    #[snafu(display("a launch token could not be generated"))]
+    Token {
+        /// The underlying error.
+        source: io::Error,
+    },
+
     /// The process that cleans up after a killed hb could not be started or told what to watch.
     #[snafu(transparent)]
     Guardian {
@@ -500,6 +517,17 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         _ => Some(env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?),
     };
     let mut guardian = helper.map(Guardian::start).transpose()?;
+    // The token marks this run's processes so the guard can look for leftovers at teardown. It goes
+    // to the guard first: a child that exists before the guard knows the token would be missed.
+    let launch_token = match guardian.as_mut() {
+        Some(guardian) => {
+            let token = LaunchToken::generate().context(TokenSnafu)?;
+            guardian.token(token.value())?;
+            guardian.session_dir(session.path().as_path())?;
+            Some(token)
+        }
+        None => None,
+    };
     let ctl = match ctl_scope {
         Some(scope) => {
             let hb = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
@@ -611,6 +639,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         proxy: Some(&proxy_url),
         hook_vars: &child_vars,
         ctl_socket: ctl.as_ref().map(|c| &c.socket),
+        launch_token: launch_token.as_ref().map(LaunchToken::value),
     })?;
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let launcher = launcher_words(helper, pty.is_some());
@@ -621,6 +650,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     };
 
     let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
+    // With a guardian the helper is gated: its stdin becomes the gate socket, and the target's
+    // real stdin is sent across it, so nothing runs before the guard has armed its watch.
+    let mut gated_stdin: Option<OwnedFd> = None;
     match &pty {
         Some(pty) => {
             // The helper's setsid makes the child leader of a new session and group, which it
@@ -628,12 +660,16 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
             pty.copy_size_from(io::stdin());
             let (stdin, stdout, stderr) = pty.child_stdio().context(SpawnSnafu)?;
             command.stdin(stdin).stdout(stdout).stderr(stderr);
+            gated_stdin = Some(pty.slave_fd().context(SpawnSnafu)?);
         }
         None => {
             // A child in its own group is a background group to a terminal and cannot read it,
             // so without a pty it gets one only when stdin is not a tty (hb-ghd.2.3 decision 1).
             if !stdin_is_tty {
                 command.process_group(0);
+            }
+            if guardian.is_some() {
+                gated_stdin = Some(target_stdin(spec.stdio).context(SpawnSnafu)?);
             }
             if spec.stdio == StdioMode::Capture {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -660,22 +696,39 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
         _ => None,
     };
-    if let (Some(guardian), Some(log)) = (guardian.as_mut(), &log) {
-        guardian.watch(Target::Child(pid_of(log.pid())))?;
-    }
-    let mut child = command.spawn().context(SpawnSnafu)?;
-    if let Some(guardian) = guardian.as_mut() {
-        // With a pty or no terminal the child leads its own group; otherwise it shares hb's.
-        let target = if pty.is_some() || !stdin_is_tty {
-            Target::Group(pid_of(child.id()))
-        } else {
-            Target::Child(pid_of(child.id()))
-        };
-        if let Err(error) = guardian.watch(target) {
-            abort_child(&mut child);
-            return Err(error.into());
+    let log = match (guardian.as_mut(), log) {
+        (Some(guardian), Some(log)) => match guardian.watch(Target::Child(pid_of(log.pid()))) {
+            Ok(WatchOutcome::Armed) => Some(log),
+            // The log stream never exits by itself, so Gone or a refusal means it is unprotected.
+            Ok(WatchOutcome::Gone) => {
+                let _ = log.finish();
+                return Err(RunError::from(GuardianError::Refused {
+                    reason: WatchRefusal::Invalid,
+                }));
+            }
+            Err(error) => {
+                let _ = log.finish();
+                return Err(error.into());
+            }
+        },
+        (_, log) => log,
+    };
+    let launched = match (guardian.as_mut(), gated_stdin) {
+        (Some(guardian), Some(stdin)) => {
+            let group = pty.is_some() || !stdin_is_tty;
+            gated_spawn(&mut command, stdin, guardian, group)
         }
-    }
+        _ => command.spawn().context(SpawnSnafu),
+    };
+    let mut child = match launched {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(log) = log {
+                let _ = log.finish();
+            }
+            return Err(error);
+        }
+    };
     let clipboard = if loaded.policy.terminal.effective_clipboard_write() {
         ClipboardPolicy::Allow
     } else {
@@ -1045,10 +1098,8 @@ impl Running {
             .into_iter()
             .map(Pump::finish)
             .fold(ClipboardUse::default(), |sum, used| sum + used);
-        if filtered {
-            if let Some(terminal) = output_terminal() {
-                settle(&terminal);
-            }
+        if filtered && let Some(terminal) = output_terminal() {
+            settle(&terminal);
         }
         result
             .map(|(exit, stdout, stderr)| Waited {
@@ -1061,12 +1112,67 @@ impl Running {
     }
 }
 
+/// The descriptor the target should read: `/dev/null` when output is captured, hb's own stdin
+/// otherwise.
+fn target_stdin(stdio: StdioMode) -> io::Result<OwnedFd> {
+    match stdio {
+        StdioMode::Capture => Ok(OwnedFd::from(fs::File::open("/dev/null")?)),
+        StdioMode::Inherit => io::stdin().as_fd().try_clone_to_owned(),
+    }
+}
+
+/// Starts the gated helper, waits for Prepared, arms the guard on the reported process, and only
+/// then releases it. Any failure kills and reaps the helper before it has run the target.
+fn gated_spawn(
+    command: &mut Command,
+    stdin: OwnedFd,
+    guardian: &mut Guardian,
+    group: bool,
+) -> Result<Child, RunError> {
+    let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
+    command.stdin(Stdio::from(OwnedFd::from(theirs)));
+    let mut child = command.spawn().context(SpawnSnafu)?;
+    let mut gate = ParentGate::new(ours);
+    let prepared = gate
+        .prepare(&stdin)
+        .map_err(|source| RunError::Gate { source });
+    drop(stdin);
+    let outcome = prepared.and_then(|pid| {
+        if u32::try_from(pid).ok() != Some(child.id()) {
+            return Err(RunError::Gate {
+                source: GateError::Protocol,
+            });
+        }
+        let pid = Pid::from_raw(pid);
+        let target = if group {
+            Target::Group(pid)
+        } else {
+            Target::Child(pid)
+        };
+        match guardian.watch(target)? {
+            WatchOutcome::Armed => Ok(()),
+            // The helper is still blocked on the gate, so a gone answer is never acceptable here.
+            WatchOutcome::Gone => Err(GuardianError::Refused {
+                reason: WatchRefusal::Invalid,
+            }
+            .into()),
+        }
+    });
+    let released =
+        outcome.and_then(|()| gate.release().map_err(|source| RunError::Gate { source }));
+    if let Err(error) = released {
+        abort_child(&mut child);
+        return Err(error);
+    }
+    Ok(child)
+}
+
 /// The words that start the command: `sandbox-exec`, or the helper that execs it.
 fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString> {
     match helper {
         None => vec![OsString::from(SANDBOX_EXEC)],
         Some(hb) => {
-            let mut words = vec![hb.as_os_str().to_owned(), "__child".into()];
+            let mut words = vec![hb.as_os_str().to_owned(), "__child".into(), "--gate".into()];
             if controlling_tty {
                 words.push("--controlling-tty".into());
             }
@@ -1221,6 +1327,7 @@ mod tests {
             proxy: None,
             hook_vars: &std::collections::BTreeMap::new(),
             ctl_socket: None,
+            launch_token: None,
         }))
     }
 

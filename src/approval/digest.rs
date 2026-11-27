@@ -33,7 +33,7 @@ impl Digest {
             return None;
         }
         let mut out = [0u8; 32];
-        for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        for (byte, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
             let pair = std::str::from_utf8(pair).ok()?;
             *byte = u8::from_str_radix(pair, 16).ok()?;
         }
@@ -227,7 +227,27 @@ mod tests {
     fn hex_round_trips_and_bad_hex_is_refused() {
         let digest = Digest::of(b"abc");
         assert_eq!(assert_some!(Digest::from_hex(&digest.to_string())), digest);
-        assert_some!(Digest::from_hex(&digest.to_string().to_uppercase()));
+        assert_eq!(
+            assert_some!(Digest::from_hex(&digest.to_string().to_uppercase())),
+            digest
+        );
+        let mixed: String = digest
+            .to_string()
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        assert_eq!(assert_some!(Digest::from_hex(&mixed)), digest);
+        assert_none!(Digest::from_hex(&"0".repeat(63)));
+        assert_none!(Digest::from_hex(&"0".repeat(65)));
+        // A bad digit in the last pair, which an incomplete chunking would not look at.
+        assert_none!(Digest::from_hex(&format!("{}zz", "0".repeat(62))));
         assert_none!(Digest::from_hex("abc"));
         assert_none!(Digest::from_hex(&"g".repeat(64)));
         assert_none!(Digest::from_hex(&format!("é{}", "0".repeat(62))));

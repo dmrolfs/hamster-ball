@@ -157,6 +157,15 @@ After that, `hb run` puts launchers for `uvx` and `npx` first on the agent's `PA
 6. Supervise. It forwards signals, filters the terminal output, and writes denial and proxy logs if you asked for them.
 7. Clean up. When the agent ends, `hb` stops the proxy and broker, removes the session directory and exits with the agent's exit code. A separate small process also cleans up if `hb` itself is force-killed (SIGKILL, a signal that a program cannot catch).
 
+If `hb` is force-killed, that small process ends what the agent started. It does its best, and does not promise to find everything:
+
+- It keeps track of the agent's processes and of the processes they start, including ones that leave the agent's process group or outlive their parent. Each is ended with a polite stop request first, then a forced stop after a short wait. Before it signals any process it checks that the process is still the same one it recorded (same number, same start time), so a number that macOS has handed to an unrelated program is left alone.
+- Right after, it looks once more for leftovers it missed. It looks for processes that carry this run's secret marker in their environment, and for processes still using the run's private directory.
+- It can miss a process that was started in a rapid chain of "start another process, then exit", because that race can be lost. It can miss a process that clears its own environment, and a macOS system tool that has left the private directory and closed its files there. It does not touch processes of other users.
+- There is a tiny gap between checking a process and signalling it. It is very unlikely to matter, but it is not closed.
+
+For a hard guarantee that nothing survives, run the agent in a virtual machine.
+
 ## Where things live
 
 | What | Where |

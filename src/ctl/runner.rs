@@ -4,7 +4,10 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::Read;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -18,6 +21,8 @@ use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu};
 
 use crate::session::GuardHandle;
+use crate::session::guardian::{GuardianError, WatchOutcome, WatchRefusal};
+use crate::session::launch::{GateError, ParentGate};
 use crate::session::signals::Target;
 
 /// How the output of a command is kept.
@@ -53,6 +58,18 @@ pub enum RunError {
         program: PathBuf,
         /// The OS error.
         source: std::io::Error,
+    },
+    /// The cleanup guard did not protect the command, so it was killed before its result was used.
+    #[snafu(display("the cleanup guard did not protect the command"))]
+    Guard {
+        /// Why the guard did not arm.
+        source: GuardianError,
+    },
+    /// The launch gate did not open, so the command never ran.
+    #[snafu(display("the launch gate did not open"))]
+    Gate {
+        /// Why.
+        source: GateError,
     },
     /// The deadline passed; the process group was killed. The command may still have taken effect.
     #[snafu(display("timed out after {} s", limit.as_secs()))]
@@ -115,6 +132,8 @@ pub trait Execute: Send + Sync {
 pub struct Host {
     env: Vec<(OsString, OsString)>,
     guard: Option<GuardHandle>,
+    /// `hb` itself, which runs `__exec` so the command waits at the gate until it is protected.
+    helper: Option<PathBuf>,
 }
 
 /// Variables from `hb`'s own environment that host commands may see: where the user's podman
@@ -136,18 +155,21 @@ impl Host {
             .filter_map(|k| vars(k).map(|v| (OsString::from(*k), v)))
             .collect();
         env.push(("PATH".into(), path.into()));
-        Self { env, guard: None }
+        Self {
+            env,
+            guard: None,
+            helper: None,
+        }
     }
 
     /// Registers every command's process group with the cleanup guard, so a killed `hb` does not
-    /// leave one running.
-    ///
-    /// shortcut: the group is registered just after it starts, not before; an `hb` killed in those
-    /// microseconds leaves that one command to finish or time out by itself. Upgrade to a launch
-    /// gate (child waits on a pipe until the guard has acknowledged) if that is ever seen.
+    /// leave one running. The command starts as `helper __exec`, waits at the launch gate until the
+    /// guard has armed its group, and only then execs, so no host command runs unprotected. A
+    /// command the guard does not arm never runs and is reported as [`RunError::Guard`].
     #[must_use]
-    pub fn with_guard(mut self, guard: GuardHandle) -> Self {
+    pub fn with_guard(mut self, guard: GuardHandle, helper: PathBuf) -> Self {
         self.guard = Some(guard);
+        self.helper = Some(helper);
         self
     }
 }
@@ -189,10 +211,10 @@ fn reader(mut pipe: impl Read + Send + 'static, tail: Option<Arc<Mutex<Tail>>>) 
             match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
-                    if let Some(tail) = &tail {
-                        if let Ok(mut t) = tail.lock() {
-                            t.push(&chunk[..n]);
-                        }
+                    if let Some(tail) = &tail
+                        && let Ok(mut t) = tail.lock()
+                    {
+                        t.push(&chunk[..n]);
                     }
                 }
             }
@@ -219,34 +241,28 @@ impl Execute for Host {
             Capture::Tail(n) => (n, false),
             Capture::Whole(n) => (n, true),
         };
-        let mut command = Command::new(program);
+        let gated = self.guard.as_ref().zip(self.helper.as_ref());
+        let mut command = match gated {
+            Some((_, helper)) => {
+                let mut command = Command::new(helper);
+                command.arg("__exec").arg(program);
+                command
+            }
+            None => Command::new(program),
+        };
         command
             .args(argv)
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = command.spawn().context(SpawnSnafu { program })?;
-        if let Some(guard) = &self.guard {
-            let registered = i32::try_from(child.id()).map_err(|_| ()).and_then(|pid| {
-                guard
-                    .watch(Target::Group(Pid::from_raw(pid)))
-                    .map_err(|_| ())
-            });
-            if registered.is_err() {
-                // Unregistered means unprotected: do not run it.
-                kill_group(&child);
-                let _ = child.wait();
-                return Err(RunError::Spawn {
-                    program: program.to_path_buf(),
-                    source: std::io::Error::other(
-                        "the cleanup guard could not be told about the command",
-                    ),
-                });
+            .stderr(Stdio::piped());
+        let mut child = match gated {
+            Some((guard, _)) => gated_start(&mut command, guard, program)?,
+            None => {
+                command.stdin(Stdio::null()).process_group(0);
+                command.spawn().context(SpawnSnafu { program })?
             }
-        }
+        };
         let tail = Arc::new(Mutex::new(Tail {
             buf: VecDeque::new(),
             limit,
@@ -275,6 +291,53 @@ impl Execute for Host {
         }
         Ok(finished(status, &tail))
     }
+}
+
+/// Starts `hb __exec` with the gate on stdin, sends it `/dev/null` as the command's stdin, arms
+/// the guard on the group it reports, then releases it. On any failure the helper is killed while
+/// it is still waiting, so the command never ran.
+fn gated_start(
+    command: &mut Command,
+    guard: &GuardHandle,
+    program: &Path,
+) -> Result<Child, RunError> {
+    let spawn_error = |source| RunError::Spawn {
+        program: program.to_path_buf(),
+        source,
+    };
+    // Everything fallible is acquired before spawning, so a failure never leaves a helper unreaped.
+    let null = File::open("/dev/null").map_err(spawn_error)?;
+    let (ours, theirs) = UnixStream::pair().map_err(spawn_error)?;
+    command.stdin(Stdio::from(OwnedFd::from(theirs)));
+    let mut child = command.spawn().map_err(spawn_error)?;
+    let mut gate = ParentGate::new(ours);
+    let armed = gate
+        .prepare(&null)
+        .map_err(|source| RunError::Gate { source })
+        .and_then(|pid| {
+            if u32::try_from(pid).ok() != Some(child.id()) {
+                return Err(RunError::Gate {
+                    source: GateError::Protocol,
+                });
+            }
+            match guard.watch(Target::Group(Pid::from_raw(pid))) {
+                Ok(WatchOutcome::Armed) => Ok(()),
+                // The helper is blocked at the gate, so gone is never a valid answer here.
+                Ok(WatchOutcome::Gone) => Err(RunError::Guard {
+                    source: GuardianError::Refused {
+                        reason: WatchRefusal::Invalid,
+                    },
+                }),
+                Err(source) => Err(RunError::Guard { source }),
+            }
+        })
+        .and_then(|()| gate.release().map_err(|source| RunError::Gate { source }));
+    if let Err(error) = armed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
 }
 
 fn finished(status: ExitStatus, tail: &Tail) -> Finished {
@@ -339,6 +402,50 @@ mod tests {
     }
 
     const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn test_a_poisoned_capture_buffer_is_still_drained_to_the_end() {
+        struct Counting {
+            left: usize,
+            read: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Read for Counting {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(out.len()).min(1000);
+                self.left -= n;
+                self.read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        let tail = Arc::new(Mutex::new(Tail {
+            buf: VecDeque::new(),
+            limit: 10,
+            truncated: false,
+            whole: false,
+        }));
+        let poisoner = Arc::clone(&tail);
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.lock();
+            #[allow(clippy::panic)] // a panic while holding the lock is how a mutex is poisoned
+            {
+                panic!("poison the buffer");
+            }
+        })
+        .join();
+        assert!(tail.is_poisoned());
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipe = Counting {
+            left: 50_000,
+            read: Arc::clone(&read),
+        };
+        assert_ok!(
+            reader(pipe, Some(tail))
+                .join()
+                .map_err(|_| "reader panicked")
+        );
+        // A writer on the other end of a real pipe would block, or die of SIGPIPE, if we stopped.
+        assert_eq!(read.load(std::sync::atomic::Ordering::Relaxed), 50_000);
+    }
 
     #[test]
     fn test_stdout_and_stderr_are_both_kept_and_the_exit_code_is_reported() {

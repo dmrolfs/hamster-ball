@@ -298,12 +298,12 @@ On the default machine, from a project narrower than the share, `restart` was re
 ```toml
 # your base config only
 [ctl]
-launchd = ["com.example.postgres"]
+launchd = ["homebrew.mxcl.postgresql@16"]
 ```
 
 ```sh
-hb ctl launchd status com.example.postgres
-hb ctl launchd restart com.example.postgres
+hb ctl launchd status homebrew.mxcl.postgresql@16
+hb ctl launchd restart homebrew.mxcl.postgresql@16
 ```
 
 `status` shows the state, the process number, the run count and the last exit code, and nothing else.

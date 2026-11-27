@@ -132,10 +132,10 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     collect(&path, base, found);
-                } else if path.extension().is_some_and(|ext| ext == "toml") {
-                    if let Ok(relative) = path.strip_prefix(base) {
-                        found.push(relative.with_extension("").to_string_lossy().into_owned());
-                    }
+                } else if path.extension().is_some_and(|ext| ext == "toml")
+                    && let Ok(relative) = path.strip_prefix(base)
+                {
+                    found.push(relative.with_extension("").to_string_lossy().into_owned());
                 }
             }
         }

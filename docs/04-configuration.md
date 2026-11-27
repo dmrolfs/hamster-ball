@@ -111,7 +111,7 @@ Everything else you ask for.
 `HOME`, `PATH`, `TMPDIR`, `TERM`, `HB_*`, `DYLD_*`, `LD_*` and the proxy and TLS names cannot be set or passed.
 `set` wins over `pass`, and a hook's variable wins over `set`.
 `hb explain` never prints a `set` value.
-Static cloud keys are never passed on purpose. Use a hook; see [Hooks](#hookspre_runname-host-side-hooks) and [Getting started](03-getting-started.md#claude-on-bedrock).
+Static cloud keys are never passed on purpose. Use a hook; see [Hooks](#hookspre_runname-prepare-files-before-the-agent-starts) and [Getting started](03-getting-started.md#claude-on-bedrock).
 
 ### `[tls]`: certificates
 
@@ -139,22 +139,80 @@ Python and `uv` read their own variables, which you can set with `[env] set`.
 Turning `launchctl` on lets the agent start, unload and disable launchd jobs that are not running, and read your launchd service list. It cannot create jobs, and it cannot restart or unload a job that is running.
 Prefer `[ctl] launchd`, which allows named jobs only.
 
-### `[ctl]`: containers and launchd jobs
+### `[ctl]`: services the agent may check or restart
+
+Use `[ctl]` when the agent needs a local service while it works, but must not get full control of your computer.
+
+For example, a web app uses a Postgres database in a container.
+When its tests fail because the database is down, the agent can run:
+
+```sh
+hb ctl ps
+hb ctl logs app-db --tail 100
+hb ctl restart app-db
+```
+
+It cannot run arbitrary `podman` commands, open a shell in the container, create containers or delete them.
+`hb` checks each request against your config and runs only a fixed operation.
+
+#### Containers
+
+A **container** is a service, such as a database, running in its own isolated environment.
+These settings select which containers the agent may manage:
+
+```toml
+# your-project/hamster-ball.toml
+[ctl]
+containers = ["app-db", "app-redis"]
+```
+
+This names two containers exactly, as shown by `podman ps -a`.
+The agent can view their status and logs, and start, stop or restart them.
+
+If your project uses Compose, it often labels all of its containers with the project name:
 
 ```toml
 [ctl]
-label      = "com.docker.compose.project=myapp"   # every container with this label
-containers = ["app-db"]                       # and these, by exact name
-launchd    = ["com.example.postgres"]                # your own files only
+label = "com.docker.compose.project=shopfront"
 ```
 
-This tells `hb ctl` what the agent may look at and restart.
-The label must be `key=value`, and it must be the same in every file that sets it, so a project cannot widen the scope your base gave.
-Container names are those that `podman ps -a` shows.
-The `launchd` list is for launchd job labels. Only your own files can set it.
+This allows every container whose label is `com.docker.compose.project=shopfront`.
+To see a container's labels, run `podman inspect app-db --format '{{json .Config.Labels}}'` outside the ball.
+You can use `label` and `containers` together.
 
-To use `hb ctl restart`, you also need a podman machine that shares only the project.
-See [Use cases](06-use-cases.md#let-the-agent-restart-a-container).
+Viewing status and logs works with podman's normal machine.
+Starting or restarting a container requires a podman machine that shares only this project, as explained in [Use cases](06-use-cases.md#let-the-agent-restart-a-container).
+That requirement prevents code in a container from reaching other host files.
+
+#### launchd jobs
+
+On macOS, **launchd** starts background services, such as a database installed with Homebrew.
+Each service has a label.
+For Homebrew Postgres 16, the label is commonly `homebrew.mxcl.postgresql@16`.
+
+```toml
+# ~/.config/hamster-ball/base.toml
+[ctl]
+launchd = ["homebrew.mxcl.postgresql@16"]
+```
+
+The agent can then run:
+
+```sh
+hb ctl launchd status homebrew.mxcl.postgresql@16
+hb ctl launchd restart homebrew.mxcl.postgresql@16
+```
+
+Find your exact label with `brew services list` or `launchctl list | grep postgresql` outside the ball.
+Only your own base config or presets can list launchd jobs.
+A project file cannot, because restarting a job runs code on your machine outside the ball.
+`status` shows its state, process number, run count and last exit code, never its environment variables.
+
+Rules:
+
+- Container names must match exactly; a name prefix or container ID is not accepted.
+- A label must be one `key=value` pair. If more than one config file sets it, every file must use the same value.
+- `[ctl]` does not grant network access to a service. If the agent should connect to Postgres on port 5432, also set `[net] loopback_ports = [5432]`.
 
 ### `[mcp.<name>]`: MCP servers
 
@@ -188,35 +246,193 @@ Pin versions.
 `pkg@1.2.3` is fine.
 A `git+` source needs a full revision, such as `@<40 hex>`.
 
-### `[hooks.pre_run.<name>]`: host-side hooks
+### `[hooks.pre_run.<name>]`: prepare files before the agent starts
+
+A **hook** is a small program you choose.
+`hb` runs it on your Mac, outside the ball, immediately before every agent session.
+Its job is to prepare something the agent needs, then exit.
+The agent does not run the hook, and the hook does not keep running during the session.
+
+Hooks are not Git hooks.
+A Git hook runs when you use Git; a hamster-ball hook runs when you start `hb run`.
+
+Use a hook when the agent needs a narrow result, but must not access the source used to create it.
+For example, the agent may need a temporary token, but not your password manager, cloud login cache or credential tool.
+
+```text
+your Mac, outside the ball
+  hook program -> private file in this session
+                         |
+                         v
+agent inside the ball reads only that file through an environment variable
+```
+
+When to use one:
+
+| Use a hook to... | Prefer something else when... |
+|---|---|
+| Create a short-lived credential for one session. | The value is not secret: use `[env] set`. |
+| Turn your local credentials into a narrower file. | The agent only needs an existing readable file: use `[fs] read`. |
+| Prepare a generated config file. | The work belongs to the agent and is safe inside the ball. |
+| Check that a required local setting exists before starting. | It should run repeatedly during the session. Hooks run only once at startup. |
+
+#### How a hook passes results to the agent
+
+Most hooks write files to `HB_HOOK_DIR`, a private directory created for that hook.
+`outputs` maps an environment variable to one of those files:
+
+```toml
+outputs = { API_TOKEN_FILE = "token" }
+```
+
+If the hook writes `$HB_HOOK_DIR/token`, the agent receives `API_TOKEN_FILE=/private/.../token`.
+The variable contains the file's path, not the file's contents.
+The agent's program must know how to read that file.
+
+A hook can also stop the session.
+If it exits with an error or exceeds its time limit, the agent does not start.
+
+#### Example 1: create a short-lived service token file
+
+Suppose a company tool creates a staging-only deployment token that expires after one hour.
+You want the agent to call a staging API, but not to see your company login or run that tool.
+
+```sh
+#!/bin/sh
+# ~/bin/hb-staging-token
+set -eu
+umask 077
+/opt/company/bin/mint-token \
+  --service staging-api \
+  --scope deploy:read \
+  --ttl 1h > "$HB_HOOK_DIR/staging-token"
+```
 
 ```toml
 # ~/.config/hamster-ball/base.toml
-[hooks.pre_run.bedrock]
-command      = ["~/ai-coding/credential-process", "--profile", "my-profile"]
-format       = "aws_credential_process"
-profile      = "my-profile"
-timeout_secs = 30                         # 1 to 300
+[hooks.pre_run.staging]
+command = ["~/bin/hb-staging-token"]
+outputs = { STAGING_TOKEN_FILE = "staging-token" }
+timeout_secs = 20
+
+[net]
+allow = ["staging-api.example.com"]
 ```
 
-A hook runs a program of yours on your machine, outside the ball, before the agent starts.
-Only your base config and your presets can define one.
+A program in the ball can use `$STAGING_TOKEN_FILE`.
+The proxy still decides which hosts it can contact.
 
-| Key | Meaning |
+#### Example 2: give GitHub CLI a limited token file
+
+Some tools read a token from a variable, not from a file path.
+For those, prefer a project script that reads the file only for the command that needs it.
+
+```sh
+#!/bin/sh
+# ~/bin/hb-github-token
+set -eu
+umask 077
+/opt/homebrew/bin/gh auth token > "$HB_HOOK_DIR/github-token"
+```
+
+```toml
+# ~/.config/hamster-ball/base.toml
+[hooks.pre_run.github]
+command = ["~/bin/hb-github-token"]
+outputs = { GITHUB_TOKEN_FILE = "github-token" }
+```
+
+Inside the ball, a command can use it only when needed:
+
+```sh
+GH_TOKEN="$(cat "$GITHUB_TOKEN_FILE")" gh pr view 123
+```
+
+This example uses your current GitHub CLI login token, which may have broad access.
+Use a fine-grained, short-lived token when your workflow supports one.
+GitHub CLI also needs `api.github.com` in `[net] allow`.
+
+#### Example 3: create a generated config file
+
+A local tool needs a config containing the current Git commit and an environment name.
+The tool does not need a secret; the hook simply prepares the file.
+
+```sh
+#!/bin/sh
+# ~/bin/hb-tool-config
+set -eu
+umask 077
+commit=$(/usr/bin/git -C "$HOME/work/shopfront" rev-parse HEAD)
+cat > "$HB_HOOK_DIR/tool.toml" <<EOF
+environment = "local"
+commit = "$commit"
+EOF
+```
+
+```toml
+[hooks.pre_run.tool_config]
+command = ["~/bin/hb-tool-config"]
+outputs = { TOOL_CONFIG = "tool.toml" }
+```
+
+The hook runs Git outside the ball.
+Review a project's Git configuration and hooks before using a hook like this in a repository the agent can edit.
+
+#### Example 4: stop if a required local service is down
+
+A project's tests need a local database.
+This hook succeeds only if Postgres answers, so the agent does not start against a broken environment.
+
+```toml
+[hooks.pre_run.database_ready]
+command = ["/opt/homebrew/bin/pg_isready", "-h", "127.0.0.1", "-p", "5432"]
+timeout_secs = 5
+```
+
+This hook creates no files, so it has no `outputs`.
+It only allows or blocks the start of the session.
+
+#### Example 5: use AWS temporary credentials
+
+`command` and `format` do different jobs:
+
+- `command` says which program to run.
+- `format` says what `hb` should do with what that program prints.
+
+Without `format`, `hb` does not use printed output; use `outputs` for files the hook writes.
+The only built-in `format` is `aws_credential_process`.
+It expects AWS's standard temporary-credential JSON, such as the output of `aws configure export-credentials`:
+
+```toml
+# ~/.config/hamster-ball/base.toml
+[hooks.pre_run.aws_dev]
+command = ["/opt/homebrew/bin/aws", "configure", "export-credentials", "--profile", "dev-sso", "--format", "process"]
+format  = "aws_credential_process"
+profile = "dev-sso"
+```
+
+`hb` writes private AWS `config` and `credentials` files for profile `dev-sso`.
+It sets `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`.
+The agent does not get `~/.aws`, your SSO cache or permission to run the AWS CLI.
+
+#### Settings
+
+| Key | What it means |
 |---|---|
-| `command` | The program and its arguments, as a list. No shell. The program is an absolute path or starts with `~/`. |
-| `format` | `aws_credential_process` makes `hb` turn the tool's JSON into AWS config files. Leave it out to use `outputs`. |
-| `profile` | The AWS profile name that the agent selects. Used with `format = "aws_credential_process"`. |
-| `timeout_secs` | 1 to 300. The default is 30. |
-| `outputs` | A table of variable name to file name. `hb` makes each file mode 0600 and sets the variable to its path. |
-`command` runs with a scrubbed environment and a time limit that kills its process group.
-A hook that fails stops the run before the agent starts.
+| `command` | Program and arguments to run, as a list. Use an absolute path or `~/`; `hb` does not search `PATH` or use a shell. |
+| `outputs` | Variables for the agent. Each points to a file the hook wrote in `HB_HOOK_DIR`. |
+| `format` | Optional built-in converter for the program's output. Today only `aws_credential_process`. |
+| `profile` | AWS profile name; required with `aws_credential_process`, and not allowed otherwise. |
+| `timeout_secs` | Maximum run time, from 1 to 300 seconds. The default is 30. |
 
-- With `format = "aws_credential_process"`, `hb` reads the tool's JSON output itself and writes an AWS `config` and `credentials` pair, mode 0600, into the session directory. It sets `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`. No converter program runs.
-- Without a format, list `outputs = { VAR = "file" }`. `hb` makes each file mode 0600, sets `VAR` to its path and removes it at the end.
+#### Safety rules
 
-A project that extends one of your presets runs that preset's hooks.
-`hb approve` lists them.
+- Only your base config and presets can define hooks. A project file cannot, because hooks run with your normal access.
+- Hooks receive only `HOME`, a system `PATH`, `TMPDIR` and `HB_HOOK_DIR`; no input is provided.
+- `hb` never displays what a hook prints, and failure messages do not include its output.
+- `hb` makes output files private and deletes the whole session directory when the run ends.
+- Keep hooks small. Do not have a hook run untrusted project code.
+- `hb approve` lists hooks inherited from presets.
 
 ### `[guard]`
 
