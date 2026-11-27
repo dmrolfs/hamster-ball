@@ -216,6 +216,18 @@ pub enum CacheError {
         reason: RecordFault,
     },
 
+    /// A link on the way to the store can be rewritten by a granted path.
+    #[snafu(display(
+        "{} is a link on the way to hb's cache store, and the grant {} lets a run rewrite it (the store could be redirected to forged data); remove the grant or move the link out of it, then run `hb warm` again",
+        link.display(), grant.display()
+    ))]
+    RedirectableStore {
+        /// The link.
+        link: PathBuf,
+        /// The grant that covers the directory holding it.
+        grant: PathBuf,
+    },
+
     /// There is no per-user temporary directory to build in.
     #[snafu(display("there is no per-user temporary directory to build the cache in"))]
     NoTempDir,
@@ -1068,6 +1080,55 @@ fn open_dir_nofollow(parent: impl AsFd, name: impl rustix::path::Arg) -> Result<
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
+}
+
+/// Refuses a store whose path passes through a symbolic link that a granted path contains.
+///
+/// `~/.cache/hamster-ball` is a lexical path. If a component of it (say `~/.cache`) is a link, the
+/// floor protects where the link points today, but a ball that can write the link's own directory
+/// can repoint it, and the host then reads and publishes through the new target. A link nothing
+/// grant-covered can change is harmless and allowed (a dotfile manager's `~/.cache`).
+///
+/// `granted` are the canonical `fs.read` and `fs.write` grants.
+///
+/// # Errors
+/// [`CacheError::RedirectableStore`] naming the first link a grant can rewrite.
+pub fn check_store_path(store: &Path, granted: &[&Path]) -> Result<(), CacheError> {
+    let mut so_far = PathBuf::new();
+    for part in store.components() {
+        so_far.push(part);
+        let Ok(meta) = fs::symlink_metadata(&so_far) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        // The link is rewritten by anything that can write the directory that holds it.
+        let holder = so_far.parent().unwrap_or(Path::new("/"));
+        let holder = fs::canonicalize(holder).unwrap_or_else(|_| holder.to_path_buf());
+        if let Some(grant) = granted.iter().find(|g| holder.starts_with(g)) {
+            return RedirectableStoreSnafu {
+                link: so_far.clone(),
+                grant: grant.to_path_buf(),
+            }
+            .fail();
+        }
+        // A link the ball cannot rewrite may itself point through another link; follow it so a
+        // second hop is judged the same way.
+        if let Ok(target) = fs::read_link(&so_far) {
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                holder.join(target)
+            };
+            let rest: PathBuf = store
+                .strip_prefix(&so_far)
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            return check_store_path(&resolved.join(rest), granted);
+        }
+    }
+    Ok(())
 }
 
 /// The manifest format this hb writes and reads.
@@ -2819,5 +2880,47 @@ mod tests {
             !dst.join("a/g").exists(),
             "the stand-in's contents were not copied"
         );
+    }
+
+    // ---- store path through links (review F6) ----
+
+    #[test]
+    fn test_a_store_path_through_a_link_in_a_granted_directory_is_refused_and_one_outside_is_not() {
+        let (d, root, _store) = store();
+        let granted = root.join("granted");
+        let real = root.join("real");
+        assert_ok!(fs::create_dir_all(&granted));
+        assert_ok!(fs::create_dir_all(real.join("hamster-ball")));
+        assert_ok!(symlink(&real, granted.join("cache")));
+        let via = granted.join("cache/hamster-ball");
+        let got = assert_err!(check_store_path(&via, &[granted.as_path()]));
+        assert!(matches!(got, CacheError::RedirectableStore { .. }), "{got}");
+        // The same link with no grant covering its directory: nothing can rewrite it.
+        assert_ok!(check_store_path(&via, &[]));
+        assert_ok!(check_store_path(
+            &via,
+            &[d.path().join("elsewhere").as_path()]
+        ));
+        // No link at all: nothing to refuse.
+        assert_ok!(check_store_path(
+            &real.join("hamster-ball"),
+            &[granted.as_path()]
+        ));
+    }
+
+    #[test]
+    fn test_a_second_hop_behind_an_unwritable_link_is_judged_too() {
+        let (_d, root, _store) = store();
+        let (open_dir, locked, real) = (root.join("open"), root.join("locked"), root.join("real"));
+        for dir in [&open_dir, &locked, &real] {
+            assert_ok!(fs::create_dir_all(dir));
+        }
+        assert_ok!(symlink(&open_dir, locked.join("first")));
+        assert_ok!(symlink(&real, open_dir.join("second")));
+        // locked/first -> open ; open/second -> real. The first link sits in a directory nothing
+        // can write; the second sits in `open`, which a grant covers.
+        let path = locked.join("first/second/hamster-ball");
+        let got = assert_err!(check_store_path(&path, &[open_dir.as_path()]));
+        assert!(matches!(got, CacheError::RedirectableStore { .. }), "{got}");
     }
 }

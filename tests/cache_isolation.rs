@@ -385,3 +385,149 @@ fn a_warm_that_answers_but_builds_something_unsealable_publishes_nothing_and_cle
         0
     );
 }
+
+/// F7 probe: a project that is granted write access to the per-user temp directory (the parent
+/// of every session directory) can reach another run's private copy and a warm workspace.
+fn grant_temp_world() -> World {
+    let w = World::with_base(BASE, PROJECT);
+    fake_uvx(&w);
+    let temp = fs::canonicalize(w.base.join("tmp")).unwrap_or_else(|_| w.base.join("tmp"));
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\", \"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        temp.display()
+    ));
+    w
+}
+
+#[test]
+fn a_grant_that_covers_the_shared_temp_directory_is_refused_before_anything_starts() {
+    sandboxed!();
+    let w = grant_temp_world();
+    warm_expect_refusal(&w);
+    let out = run(&w, "echo agent-started");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("agent-started"), "{}", text(&out));
+    assert!(
+        text(&out).contains("where every run keeps its private directory"),
+        "{}",
+        text(&out)
+    );
+}
+
+fn warm_expect_refusal(w: &World) {
+    let out = hb(w, &["warm"]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("where every run keeps its private directory"),
+        "warm is refused too: {}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_read_grant_over_the_shared_temp_directory_is_refused_too_because_it_exposes_credentials() {
+    sandboxed!();
+    let w = World::with_base(BASE, PROJECT);
+    fake_uvx(&w);
+    let temp = fs::canonicalize(w.base.join("tmp")).unwrap_or_else(|_| w.base.join("tmp"));
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\"]\nread = [\"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        temp.display()
+    ));
+    let out = hb(&w, &["warm"]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(text(&out).contains("covers"), "{}", text(&out));
+}
+
+#[test]
+fn a_project_grant_inside_the_project_and_one_beside_the_temp_directory_still_work() {
+    sandboxed!();
+    let w = World::with_base(BASE, PROJECT);
+    fake_uvx(&w);
+    let sibling = w.base.join("tmp-not-the-temp-dir");
+    assert_ok!(fs::create_dir_all(&sibling));
+    let sibling = fs::canonicalize(&sibling).unwrap_or(sibling);
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\", \"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        sibling.display()
+    ));
+    warm(&w);
+    let out = run(&w, "echo ok");
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+/// `~/.cache` is a link to `~/redirect/current`, which is a link to a real directory; `redirect`
+/// is in a write grant, so the agent can repoint `current`. Returns the world and the paths.
+fn redirected_store(granted: bool) -> (World, PathBuf, PathBuf) {
+    let w = World::with_base(BASE, PROJECT);
+    fake_uvx(&w);
+    let home = w.home_dir();
+    let (redirect, real) = (home.join("redirect"), home.join("real-cache"));
+    assert_ok!(fs::create_dir_all(&redirect));
+    assert_ok!(fs::create_dir_all(&real));
+    assert_ok!(std::os::unix::fs::symlink(&real, redirect.join("current")));
+    assert_ok!(std::os::unix::fs::symlink(
+        redirect.join("current"),
+        home.join(".cache")
+    ));
+    let grant = if granted { ", \"~/redirect\"" } else { "" };
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\"{grant}]\n[env]\ntools = [\"uvx\"]\n"
+    ));
+    (w, redirect, real)
+}
+
+#[test]
+fn a_store_reached_through_a_link_the_ball_can_rewrite_is_refused() {
+    sandboxed!();
+    let (w, _redirect, real) = redirected_store(true);
+    let out = hb(&w, &["warm"]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("lets a run rewrite it") && text(&out).contains("redirect/current"),
+        "names the link: {}",
+        text(&out)
+    );
+    assert!(
+        !real.join("hamster-ball").exists(),
+        "nothing was written through the writable link"
+    );
+}
+
+#[test]
+fn a_run_also_refuses_a_store_a_grant_can_redirect_even_when_a_generation_already_exists() {
+    sandboxed!();
+    // Warm while nothing can rewrite the link, then widen the grant: the run must notice.
+    let (w, _redirect, _real) = redirected_store(false);
+    warm(&w);
+    let home = w.home_dir();
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\", \"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        home.join("redirect").display()
+    ));
+    let out = run(&w, "echo agent-started");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("agent-started"), "{}", text(&out));
+    assert!(
+        text(&out).contains("lets a run rewrite it"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_store_reached_through_a_link_nothing_can_write_works_and_stays_protected() {
+    sandboxed!();
+    let (w, _redirect, real) = redirected_store(false);
+    warm(&w);
+    assert!(real.join("hamster-ball/generations").exists());
+    let out = run(
+        &w,
+        &format!("ls {} 2>&1; true", quote(&real.join("hamster-ball"))),
+    );
+    assert!(
+        text(&out).contains("Operation not permitted"),
+        "{}",
+        text(&out)
+    );
+}

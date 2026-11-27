@@ -272,10 +272,18 @@ impl Drop for WarmBuild {
 /// [`CacheError`] if the workspace or the interpreter copy fails.
 pub fn begin(
     env: &Environment,
+    loaded: &Loaded,
     selected: &[Server],
     tools: &ToolLookup,
     root: &CanonicalPath,
 ) -> Result<WarmBuild, CacheError> {
+    crate::session::run::check_cache_store(env, loaded).map_err(|e| match e {
+        RunError::Cache { source } => source,
+        other => CacheError::Read {
+            path: cache_root(&env.home),
+            source: std::io::Error::other(other.to_string()),
+        },
+    })?;
     let store = CacheStore::new(cache_root(&env.home));
     let inputs = expected_inputs_for(root, selected, tools)?;
     let lock = store.lock_warm(&inputs.project_key)?;

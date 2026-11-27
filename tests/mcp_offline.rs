@@ -349,7 +349,7 @@ fn measured_mcp_servers_start_offline_after_hb_warm() {
         env.floor.path_var.as_deref()
     ));
     let mut warmed: Vec<String> = Vec::new();
-    let build = assert_ok!(warm::begin(&env, &to_warm, &tools, &root));
+    let build = assert_ok!(warm::begin(&env, &loaded, &to_warm, &tools, &root));
     for server in &to_warm {
         let started = Instant::now();
         match warm::warm_server(

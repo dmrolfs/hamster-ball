@@ -801,7 +801,7 @@ fn warm_command(
     };
     // One workspace for the whole selection: nothing is published until every server answered,
     // so a failure or an interrupt leaves the previous generation current.
-    let build = match warm::begin(env, &selection.warm, &tools, discovery.root.path()) {
+    let build = match warm::begin(env, &loaded, &selection.warm, &tools, discovery.root.path()) {
         Ok(build) => build,
         Err(error) => return fail(err, crate::Error::from(error)),
     };

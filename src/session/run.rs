@@ -269,6 +269,18 @@ pub enum RunError {
         source: OfflineError,
     },
 
+    /// A read or write grant covers the per-user temporary directory, which holds every run's
+    /// private directory (its cache copy, hook credentials and sockets).
+    #[snafu(display(
+        "the grant {grant} covers {temp}, where every run keeps its private directory, so this run could read or change another run's cache and credentials; narrow it to a project directory"
+    ))]
+    SharedTempGrant {
+        /// The offending grant.
+        grant: String,
+        /// The per-user temporary directory.
+        temp: String,
+    },
+
     /// No usable cache generation, or it could not be copied for this run.
     #[snafu(transparent)]
     Cache {
@@ -503,6 +515,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     }
 
     let temp = temp_parent(env)?;
+    refuse_grants_over_shared_temp(loaded, &temp)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
@@ -1200,6 +1213,46 @@ fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString>
     }
 }
 
+/// Refuses a policy whose `fs.read` or `fs.write` contains the per-user temporary directory.
+///
+/// Every run's session directory is a child of it. The directory's 0700 mode does not separate two
+/// balls of the same user, so such a grant lets one ball read another's credentials or change its
+/// private cache copy. A grant inside one session directory cannot happen (the name is random).
+fn refuse_grants_over_shared_temp(loaded: &Loaded, temp: &CanonicalPath) -> Result<(), RunError> {
+    let grants = loaded
+        .policy
+        .fs
+        .read
+        .iter()
+        .chain(loaded.policy.fs.write.iter());
+    for grant in grants {
+        if grant.value.is_same_or_ancestor_of(temp) {
+            return Err(RunError::SharedTempGrant {
+                grant: grant.value.as_str().to_owned(),
+                temp: temp.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a cache store reached through a link that a grant lets the ball rewrite (review F6).
+///
+/// # Errors
+/// [`RunError::Cache`] with [`super::cache::CacheError::RedirectableStore`].
+pub fn check_cache_store(env: &Environment, loaded: &Loaded) -> Result<(), RunError> {
+    let grants: Vec<&Path> = loaded
+        .policy
+        .fs
+        .read
+        .iter()
+        .chain(loaded.policy.fs.write.iter())
+        .map(|g| g.value.as_path())
+        .collect();
+    super::cache::check_store_path(&super::offline::cache_root(&env.home), &grants)?;
+    Ok(())
+}
+
 /// This run's own copy of the project's cache generation, inside the session directory.
 ///
 /// A missing, stale or legacy-only cache stops the run here, before any agent or launcher exists.
@@ -1212,6 +1265,7 @@ fn run_cache(
     use super::cache::{CacheLimits, CacheStore, expected_inputs, materialize};
     use super::offline::cache_root;
     let expected = expected_inputs(loaded.root.path(), &loaded.policy, tools)?;
+    check_cache_store(env, loaded)?;
     let generation = CacheStore::new(cache_root(&env.home)).select(&expected)?;
     let copy = materialize(&generation.root, session.as_path(), CacheLimits::default())?;
     let resolved = fs::canonicalize(copy.root()).context(TempDirSnafu {
