@@ -331,33 +331,53 @@ fn measured_mcp_servers_start_offline_after_hb_warm() {
         ));
     }
 
-    // 2. hb warm, for every server but the cold sample.
+    // 2. hb warm, for every server but the cold sample: one workspace, one publication.
     let selected = warm::servers(&loaded.policy);
+    let to_warm: Vec<_> = selected
+        .iter()
+        .filter(|s| s.name != COLD.0)
+        .cloned()
+        .collect();
+    let tools = assert_ok!(hamster_ball::system::find_tools(
+        &loaded
+            .policy
+            .env
+            .tools
+            .iter()
+            .map(|t| t.value.clone())
+            .collect::<Vec<_>>(),
+        env.floor.path_var.as_deref()
+    ));
     let mut warmed: Vec<String> = Vec::new();
-    for server in selected.iter().filter(|s| s.name != COLD.0) {
+    let build = assert_ok!(warm::begin(&env, &to_warm, &tools, &root));
+    for server in &to_warm {
         let started = Instant::now();
         match warm::warm_server(
             &env,
             &loaded,
             server,
+            build.workspace(),
             settings.limit,
             SignalMode::Off,
             Logging::default(),
         ) {
-            Ok((Warmed::Answered { .. }, _)) => match warm::record_success(&env, &root, server) {
-                Ok(()) => {
-                    warmed.push(server.name.clone());
-                    line(
-                        &format!("warm {}", server.name),
-                        &format!("answered in {} s", started.elapsed().as_secs()),
-                    );
-                }
-                Err(message) => problems.push(format!("warm {}: {message}", server.name)),
-            },
+            Ok((Warmed::Answered { .. }, _)) => {
+                warmed.push(server.name.clone());
+                line(
+                    &format!("warm {}", server.name),
+                    &format!("answered in {} s", started.elapsed().as_secs()),
+                );
+            }
             Ok((Warmed::Failed { why }, _)) => {
                 problems.push(format!("warm {} failed:\n{why}", server.name))
             }
             Err(error) => problems.push(format!("warm {}: {error}", server.name)),
+        }
+    }
+    if problems.is_empty() {
+        match warm::publish(&env, build, &root, &to_warm, &tools) {
+            Ok(made) => line("published", &made.id),
+            Err(error) => problems.push(format!("publish: {error}")),
         }
     }
 

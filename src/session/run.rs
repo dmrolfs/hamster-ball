@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +43,7 @@ use crate::policy::HostRule;
 use crate::policy::{CanonicalPath, PathError, ToolName};
 use crate::proxy::ProxyError;
 use crate::seatbelt::{Profile, RenderError, RenderInputs, render};
-use crate::system::{Environment, ToolsError, find_tools};
+use crate::system::{Environment, ToolLookup, ToolsError, find_tools};
 use crate::text::Escaped;
 
 /// What the kernel accepts for `argv` plus `envp` on macOS (`kern.argmax`).
@@ -129,6 +129,8 @@ pub struct RunSpec {
 pub struct WarmSpec {
     /// The only hosts the proxy allows.
     pub allowlist: Vec<HostRule>,
+    /// The empty workspace the warm ball builds in: the only cache directory it can write.
+    pub workspace: PathBuf,
 }
 
 impl RunSpec {
@@ -265,6 +267,13 @@ pub enum RunError {
     Offline {
         /// The underlying error.
         source: OfflineError,
+    },
+
+    /// No usable cache generation, or it could not be copied for this run.
+    #[snafu(transparent)]
+    Cache {
+        /// The underlying error.
+        source: super::cache::CacheError,
     },
 
     /// The proxy could not start.
@@ -500,8 +509,11 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     // the session directory (with whatever they wrote) goes with it.
     let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
     let (launchers, warm_cache) = match (&offline, &spec.warm) {
-        (Some(plan), None) => (Some(plan.install(session.path())?), None),
-        (Some(plan), Some(_)) => (None, Some(plan.install_cache()?)),
+        (Some(plan), None) => {
+            let cache = run_cache(env, loaded, &tools, session.path())?;
+            (Some(plan.install(session.path(), &cache)?), None)
+        }
+        (Some(_), Some(warm)) => (None, Some(warm_workspace(&warm.workspace)?)),
         (None, _) => (None, None),
     };
     // `hb ctl` (design 9.3). A warm run starts no agent, so it gets none. The guardian is started
@@ -1186,6 +1198,34 @@ fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString>
             words
         }
     }
+}
+
+/// This run's own copy of the project's cache generation, inside the session directory.
+///
+/// A missing, stale or legacy-only cache stops the run here, before any agent or launcher exists.
+fn run_cache(
+    env: &Environment,
+    loaded: &Loaded,
+    tools: &ToolLookup,
+    session: &CanonicalPath,
+) -> Result<CanonicalPath, RunError> {
+    use super::cache::{CacheLimits, CacheStore, expected_inputs, materialize};
+    use super::offline::cache_root;
+    let expected = expected_inputs(loaded.root.path(), &loaded.policy, tools)?;
+    let generation = CacheStore::new(cache_root(&env.home)).select(&expected)?;
+    let copy = materialize(&generation.root, session.as_path(), CacheLimits::default())?;
+    let resolved = fs::canonicalize(copy.root()).context(TempDirSnafu {
+        dir: copy.root().to_string_lossy().into_owned(),
+    })?;
+    CanonicalPath::from_canonical(resolved).context(TempDirPathSnafu)
+}
+
+/// The workspace a warm run builds in, resolved so Seatbelt can match it.
+fn warm_workspace(workspace: &Path) -> Result<CanonicalPath, RunError> {
+    let resolved = fs::canonicalize(workspace).context(TempDirSnafu {
+        dir: workspace.to_string_lossy().into_owned(),
+    })?;
+    CanonicalPath::from_canonical(resolved).context(TempDirPathSnafu)
 }
 
 /// The canonical per-user temporary directory, where session directories live.

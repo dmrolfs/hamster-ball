@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use super::git_config::list_tracked;
 use super::patterns::{is_guarded, is_template};
 use crate::policy::CanonicalPath;
 use crate::sys::{BoundedError, run_bounded};
@@ -103,6 +104,26 @@ fn tracked_guarded_within(
 
 /// `git ls-files -z`, run so that nothing in the repository can make it run a program.
 fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, Listing> {
+    // The system git runs confined (see `git_config::list_tracked`). Any other program is a test
+    // double that no repository config can reach, so it runs as given.
+    let result = if git == Path::new(SYSTEM_GIT) {
+        list_tracked(root.as_path(), timeout, MAX_OUTPUT_BYTES)
+    } else {
+        run_plain(root, git, timeout)
+    };
+    match result {
+        Ok(done) if done.status.success() && !done.truncated => Ok(done.stdout),
+        Ok(_) => Err(Listing::NotARepository),
+        Err(BoundedError::TimedOut) => Err(Listing::TimedOut),
+        Err(BoundedError::Spawn(_)) => Err(Listing::Unavailable),
+    }
+}
+
+fn run_plain(
+    root: &CanonicalPath,
+    git: &Path,
+    timeout: Duration,
+) -> Result<crate::sys::Finished, BoundedError> {
     let mut command = Command::new(git);
     command
         .arg("-C")
@@ -129,12 +150,7 @@ fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, 
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         command.env("TMPDIR", tmp);
     }
-    match run_bounded(&mut command, timeout, MAX_OUTPUT_BYTES) {
-        Ok(done) if done.status.success() => Ok(done.stdout),
-        Ok(_) => Err(Listing::NotARepository),
-        Err(BoundedError::TimedOut) => Err(Listing::TimedOut),
-        Err(BoundedError::Spawn(_)) => Err(Listing::Unavailable),
-    }
+    run_bounded(&mut command, timeout, MAX_OUTPUT_BYTES)
 }
 
 #[cfg(test)]
@@ -350,5 +366,108 @@ mod tests {
             !marker.exists(),
             "a program from the repository's config ran"
         );
+    }
+
+    fn repository(dir: &TempDir) -> (CanonicalPath, std::path::PathBuf) {
+        let root = assert_ok!(CanonicalPath::from_canonical(assert_ok!(
+            std::fs::canonicalize(dir.path())
+        )));
+        let git = root.as_path().join(".git");
+        for sub in ["refs", "objects", "hooks"] {
+            assert_ok!(std::fs::create_dir_all(git.join(sub)));
+        }
+        assert_ok!(std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n"));
+        (root, git)
+    }
+
+    fn mkfifo(path: &Path) {
+        assert!(assert_ok!(Command::new("/usr/bin/mkfifo").arg(path).status()).success());
+    }
+
+    /// Tracked-file listing of a repository whose config is hostile must return promptly, list
+    /// nothing, and never read the sentinel the config points at.
+    fn assert_refused(root: &CanonicalPath) {
+        let started = Instant::now();
+        let tracked = tracked_guarded(root, Path::new(SYSTEM_GIT), 10);
+        assert!(tracked.files.is_empty());
+        assert_ne!(tracked.listing, Listing::Listed);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_fifo_or_symlinked_git_config_is_refused_promptly() {
+        if !git_available() {
+            return;
+        }
+        for make_link in [false, true] {
+            let dir = assert_ok!(TempDir::new());
+            let (root, git) = repository(&dir);
+            let config = git.join("config");
+            if make_link {
+                assert_ok!(std::os::unix::fs::symlink("/etc/hosts", &config));
+            } else {
+                mkfifo(&config);
+            }
+            assert_refused(&root);
+        }
+    }
+
+    #[test]
+    fn a_fifo_include_in_a_regular_config_is_refused_promptly() {
+        if !git_available() {
+            return;
+        }
+        let dir = assert_ok!(TempDir::new());
+        let (root, git) = repository(&dir);
+        let fifo = git.join("fifo.cfg");
+        mkfifo(&fifo);
+        assert_ok!(std::fs::write(
+            git.join("config"),
+            format!("[include]\n\tpath = {}\n", fifo.display())
+        ));
+        assert_refused(&root);
+    }
+
+    #[test]
+    fn an_include_that_leaves_the_repository_is_not_read_and_a_good_repository_still_lists() {
+        if !git_available() {
+            return;
+        }
+        let dir = assert_ok!(TempDir::new());
+        let (root, git) = repository(&dir);
+        let outside = dir.path().join("../outside-hb-9ox.cfg");
+        let outside = dir
+            .path()
+            .parent()
+            .map_or(outside.clone(), |p| p.join("outside-hb-9ox.cfg"));
+        assert_ok!(std::fs::write(&outside, "[core]\n\tignorecase = true\n"));
+        assert_ok!(std::fs::write(
+            git.join("config"),
+            format!("[include]\n\tpath = {}\n", outside.display())
+        ));
+        assert_refused(&root);
+        assert_ok!(std::fs::remove_file(&outside));
+        // The control: the same repository without the hostile include lists its tracked file.
+        assert_ok!(std::fs::write(git.join("config"), ""));
+        assert_ok!(std::fs::write(root.as_path().join(".env"), "x"));
+        assert!(
+            assert_ok!(
+                Command::new(SYSTEM_GIT)
+                    .args(["-C"])
+                    .arg(root.as_path())
+                    .args(["add", ".env"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .status()
+            )
+            .success()
+        );
+        let tracked = tracked_guarded(&root, Path::new(SYSTEM_GIT), 10);
+        assert_eq!(tracked.listing, Listing::Listed);
+        assert_eq!(tracked.files.len(), 1);
     }
 }

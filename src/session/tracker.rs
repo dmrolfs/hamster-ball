@@ -852,12 +852,16 @@ mod descendants {
         !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
     }
 
-    fn assert_dies(pid: i32) {
+    fn within_exit(pid: i32) -> bool {
         let end = Instant::now() + Duration::from_secs(2);
         while alive(pid) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!alive(pid), "process {pid} survived");
+        !alive(pid)
+    }
+
+    fn assert_dies(pid: i32) {
+        assert!(within_exit(pid), "process {pid} survived");
     }
 
     /// An exit and a fork arrive together while the registry is full, so discovery fails. The exit must
@@ -928,26 +932,59 @@ mod descendants {
         assert_dies(child);
     }
 
-    /// The leader lingers (`sleep 1`) so the fork event is handled while it still exists. A leader that
-    /// forks and exits at once can win the race against discovery; that is a measured rate, not a gate.
+    /// Keep the forking parent parked until discovery is explicitly observed, not for a guessed delay.
     #[test]
     fn a_descendant_that_left_its_session_is_still_owned_and_killed() {
         let queue = assert_ok!(Kqueue::new());
         let mut tracker = Tracker::default();
         let mut gated = Gated::start(
-            "/usr/bin/perl -e 'use POSIX; if (fork == 0) { setsid; print \"$$\\n\"; close STDOUT; sleep 30; exit } sleep 1; exit 0'",
+            "exec /usr/bin/perl -e 'use POSIX; $|=1; if (fork == 0) { setsid; print \"$$\\n\"; close STDOUT; sleep 30; exit } <STDIN>; exit 0'",
         );
         assert_ok!(tracker.arm(&queue, gated.pid(), true));
+        let root = tracker.members[&gated.pid()];
         let child = gated.release();
-        drain(&mut tracker, &queue, Duration::from_millis(300));
-        assert!(
-            tracker.members.contains_key(&child),
-            "{:?}",
-            tracker.members.keys()
+        // The child reports only after setsid. Wait for the real fork notification while the
+        // parent remains parked, then observe adoption before allowing cleanup.
+        let blank = KEvent::new(
+            0,
+            EventFilter::EVFILT_PROC,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
         );
-        assert_ok!(tracker.signal(Signal::SIGKILL));
+        let mut events = [blank; 8];
+        let timeout = TimeSpec::from_duration(Duration::from_secs(20));
+        let received = queue.kevent(&[], &mut events, Some(*timeout.as_ref()));
+        let mut saw_fork = false;
+        let mut discovery = Ok(false);
+        if let Ok(count) = received {
+            for event in &events[..count] {
+                if event.ident() == gated.pid() as usize
+                    && event.udata() == root.cookie
+                    && event.fflags().contains(FilterFlag::NOTE_FORK)
+                {
+                    saw_fork = true;
+                    discovery = tracker.event(&queue, event);
+                }
+            }
+        }
+        let adopted = tracker.members.contains_key(&child);
+        let _ = tracker.signal(Signal::SIGKILL);
+        let _ = gated.leader.kill();
         let _ = gated.leader.wait();
-        assert_dies(child);
+        let ended = within_exit(child);
+        if !ended {
+            let _ = kill(Pid::from_raw(child), Signal::SIGKILL);
+        }
+        assert_ok!(received);
+        assert!(
+            saw_fork,
+            "the kernel did not report the parked parent's fork"
+        );
+        assert_ok!(discovery);
+        assert!(adopted, "the detached child was not adopted");
+        assert!(ended, "the owned detached child survived");
     }
 
     /// The member is started by the test, so it is in the root's group but is nobody's descendant

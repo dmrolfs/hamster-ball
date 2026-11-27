@@ -209,6 +209,52 @@ impl World {
         cmd
     }
 
+    /// Publishes a cache generation holding `files` for the project at `project`, through the real
+    /// seal-and-publish path, so a run that needs a cache can start. Returns the generation id.
+    pub fn publish_cache_at(&self, project: &Path, files: &[(&str, &str)]) -> String {
+        use hamster_ball::session::cache::{CacheLimits, CacheStore, expected_inputs};
+        use hamster_ball::session::offline::cache_root;
+        let discovery = assert_ok!(discover(project, &self.home));
+        let user = UserConfigDir::locate(&self.home);
+        let loaded = assert_ok!(load(
+            &LoadRequest::new(&self.home, &discovery, &user, &self.env.floor)
+                .with_builtins(&EmbeddedPresets)
+        ));
+        let names: Vec<_> = loaded
+            .policy
+            .env
+            .tools
+            .iter()
+            .map(|t| t.value.clone())
+            .collect();
+        let tools = assert_ok!(hamster_ball::system::find_tools(
+            &names,
+            self.env.floor.path_var.as_deref()
+        ));
+        let inputs = assert_ok!(expected_inputs(
+            discovery.root.path(),
+            &loaded.policy,
+            &tools
+        ));
+        let store = CacheStore::new(cache_root(&self.home));
+        let workspace = assert_ok!(store.begin_build(&self.base.join("tmp")));
+        for (name, text) in files {
+            write(&workspace.join(name), text);
+        }
+        let limits = CacheLimits {
+            min_free_bytes: 0,
+            ..CacheLimits::default()
+        };
+        let made = assert_ok!(store.seal_and_publish(&workspace, &inputs, None, limits));
+        let _ = fs::remove_dir_all(&workspace);
+        made.id
+    }
+
+    /// [`World::publish_cache_at`] for this world's own project.
+    pub fn publish_cache(&self, files: &[(&str, &str)]) -> String {
+        self.publish_cache_at(&self.project, files)
+    }
+
     /// Like [`World::drive`], without approving the config first.
     pub fn drive_unapproved(&self, testdrive: &str, args: &[&str]) -> Command {
         // A process started from a background job or under `nohup` has INT, QUIT or HUP ignored,

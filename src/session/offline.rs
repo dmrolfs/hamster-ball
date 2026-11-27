@@ -11,7 +11,7 @@
 //!
 //! Only these two names are affected. `uv sync`, `npm install` and a call by absolute path are not.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -25,12 +25,11 @@ use crate::system::ToolLookup;
 
 /// The directory under the home that holds hb's own caches.
 const CACHE_DIR: &str = ".cache/hamster-ball";
-/// The file `hb warm` writes in the cache root once it has filled the cache.
-pub const WARMED_MARKER: &str = "warmed";
-/// The cache's subdirectories, each created private.
-const CACHE_SUBDIRS: [&str; 3] = ["uv", "uv-tools", "npm"];
+/// The cache's subdirectories.
+pub const CACHE_SUBDIRS: [&str; 4] = ["uv", "uv-tools", "npm", "python"];
 
-/// Where hb's own cache lives: `~/.cache/hamster-ball`.
+/// Where hb's cache store lives: `~/.cache/hamster-ball`. A run never reads or writes it; it
+/// holds the sealed generations that each run copies from.
 #[must_use]
 pub fn cache_root(home: &HomeDir) -> PathBuf {
     home.path().as_path().join(CACHE_DIR)
@@ -210,27 +209,16 @@ impl OfflinePlan {
         &self.warnings
     }
 
-    /// Creates the cache directories and returns the resolved cache root.
-    ///
-    /// # Errors
-    /// [`OfflineError`] when a directory cannot be made or resolved.
-    pub fn install_cache(&self) -> Result<CanonicalPath, OfflineError> {
-        private_dir(&self.cache_root)?;
-        for sub in CACHE_SUBDIRS {
-            private_dir(&self.cache_root.join(sub))?;
-        }
-        let resolved = fs::canonicalize(&self.cache_root).context(ResolveSnafu {
-            path: self.cache_root.clone(),
-        })?;
-        CanonicalPath::from_canonical(&resolved).context(NotCanonicalSnafu { path: resolved })
-    }
-
-    /// Creates the cache directories and writes the scripts under `session`.
+    /// Writes the scripts under `session`, pointing at the run's own `cache` (already copied
+    /// there from a published generation).
     ///
     /// # Errors
     /// [`OfflineError`] when a directory or a script cannot be made.
-    pub fn install(&self, session: &CanonicalPath) -> Result<Installed, OfflineError> {
-        let cache_root = self.install_cache()?;
+    pub fn install(
+        &self,
+        session: &CanonicalPath,
+        cache: &CanonicalPath,
+    ) -> Result<Installed, OfflineError> {
         let bin = session.as_path().join("bin");
         private_dir(&bin)?;
         for launcher in &self.launchers {
@@ -238,7 +226,7 @@ impl OfflinePlan {
             let text = script(
                 launcher.kind,
                 &launcher.real.to_string_lossy(),
-                cache_root.as_str(),
+                cache.as_str(),
             );
             write_script(&path, &text).context(WriteLauncherSnafu {
                 kind: launcher.kind,
@@ -249,7 +237,7 @@ impl OfflinePlan {
             CanonicalPath::from_canonical(&bin).context(NotCanonicalSnafu { path: bin })?;
         Ok(Installed {
             bin_dir,
-            cache_root,
+            cache_root: cache.clone(),
         })
     }
 }
@@ -257,14 +245,15 @@ impl OfflinePlan {
 /// The variables that point `uv` and `npm` at the cache under `cache_root`, as `hb warm` sets
 /// them for the server it starts (a run sets them inside the launcher scripts instead).
 ///
-/// # Panics
-/// Never: the names are fixed and valid.
+/// `UV_PYTHON_INSTALL_DIR` and the fixed settings from [`private_python_vars`] keep uv on the interpreter
+/// inside the cache, so no link points at the user's own `~/.local/share/uv/python`.
 #[must_use]
 pub fn cache_vars(cache_root: &CanonicalPath) -> Vec<(EnvName, CanonicalPath)> {
     [
         ("UV_CACHE_DIR", "uv"),
         ("UV_TOOL_DIR", "uv-tools"),
         ("npm_config_cache", "npm"),
+        ("UV_PYTHON_INSTALL_DIR", "python"),
     ]
     .into_iter()
     .filter_map(|(name, sub)| {
@@ -274,18 +263,10 @@ pub fn cache_vars(cache_root: &CanonicalPath) -> Vec<(EnvName, CanonicalPath)> {
     .collect()
 }
 
-/// Says the cache under `cache_root` has been warmed: the launcher scripts stop printing their hint.
-///
-/// # Errors
-/// The I/O error if the marker cannot be written.
-pub fn mark_warmed(cache_root: &Path) -> io::Result<()> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(cache_root.join(WARMED_MARKER))
-        .map(drop)
+/// The fixed (non-path) variables a warm run sets so uv builds a closed tree (managed Python only, no download, copied files).
+#[must_use]
+pub fn private_python_vars() -> Vec<(&'static str, &'static str)> {
+    PRIVATE_PYTHON.to_vec()
 }
 
 /// Creates `path` (and missing parents) private to the user; an existing directory is left alone.
@@ -311,18 +292,38 @@ fn quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// The script for `kind`, which runs `real` from the cache under `cache_root`.
+/// The uv settings that keep it on the interpreter inside the run's cache: managed Python only,
+/// no download, and copied (not linked) files, so nothing resolves outside the cache.
+const PRIVATE_PYTHON: [(&str, &str); 3] = [
+    ("UV_PYTHON_PREFERENCE", "only-managed"),
+    ("UV_PYTHON_DOWNLOADS", "never"),
+    ("UV_LINK_MODE", "copy"),
+];
+
+/// The script for `kind`, which runs `real` from the run's own cache under `cache_root`.
 ///
-/// The hint comes first and goes to stderr: stdout belongs to an MCP server's protocol.
+/// There is no "not warmed" hint: a run with no usable cache generation never starts (it stops
+/// before any launcher exists), so a launcher that runs always has a cache to read.
 #[must_use]
 pub fn script(kind: Launcher, real: &str, cache_root: &str) -> String {
     let cache = |sub: &str| quoted(&format!("{cache_root}/{sub}"));
     let env = match kind {
-        Launcher::Uvx => format!(
-            "UV_CACHE_DIR={}\nUV_TOOL_DIR={}\nexport UV_CACHE_DIR UV_TOOL_DIR\n",
-            cache("uv"),
-            cache("uv-tools")
-        ),
+        Launcher::Uvx => {
+            let fixed: String = PRIVATE_PYTHON
+                .iter()
+                .map(|(k, v)| format!("{k}={}\n", quoted(v)))
+                .collect();
+            let names: String = PRIVATE_PYTHON
+                .iter()
+                .map(|(k, _)| format!(" {k}"))
+                .collect();
+            format!(
+                "UV_CACHE_DIR={}\nUV_TOOL_DIR={}\nUV_PYTHON_INSTALL_DIR={}\n{fixed}export UV_CACHE_DIR UV_TOOL_DIR UV_PYTHON_INSTALL_DIR{names}\n",
+                cache("uv"),
+                cache("uv-tools"),
+                cache("python")
+            )
+        }
         Launcher::Npx => format!(
             "npm_config_cache={}\nexport npm_config_cache\n",
             cache("npm")
@@ -330,11 +331,9 @@ pub fn script(kind: Launcher, real: &str, cache_root: &str) -> String {
     };
     format!(
         "#!/bin/sh\n\
-         # Written by hb for this run: starts {kind} from hb's offline cache, with no registry.\n\
-         [ -e {} ] || echo 'hb: hb has not warmed its offline cache; run `hb warm` outside the ball' >&2\n\
+         # Written by hb for this run: starts {kind} from this run's own copy of hb's offline cache, with no registry.\n\
          {env}\
          exec {} --offline \"$@\"\n",
-        cache(WARMED_MARKER),
         quoted(real)
     )
 }
@@ -458,31 +457,26 @@ mod tests {
 
     #[test]
     fn the_uvx_script_sets_the_uv_cache_variables_for_the_call_and_execs_offline() {
-        let text = script(Launcher::Uvx, "/opt/uv/uvx", "/home/u/.cache/hamster-ball");
+        let text = script(Launcher::Uvx, "/opt/uv/uvx", "/run/cache");
         assert!(text.starts_with("#!/bin/sh\n"), "{text}");
-        assert!(
-            text.contains("UV_CACHE_DIR='/home/u/.cache/hamster-ball/uv'"),
-            "{text}"
-        );
-        assert!(
-            text.contains("UV_TOOL_DIR='/home/u/.cache/hamster-ball/uv-tools'"),
-            "{text}"
-        );
+        for line in [
+            "UV_CACHE_DIR='/run/cache/uv'",
+            "UV_TOOL_DIR='/run/cache/uv-tools'",
+            "UV_PYTHON_INSTALL_DIR='/run/cache/python'",
+            "UV_PYTHON_PREFERENCE='only-managed'",
+            "UV_PYTHON_DOWNLOADS='never'",
+            "UV_LINK_MODE='copy'",
+        ] {
+            assert!(text.contains(line), "{line} missing: {text}");
+        }
         assert!(!text.contains("npm_config_cache"), "{text}");
         assert!(
             text.ends_with("exec '/opt/uv/uvx' --offline \"$@\"\n"),
             "{text}"
         );
         assert!(
-            text.contains("[ -e '/home/u/.cache/hamster-ball/warmed' ] ||")
-                && text.contains("hb warm"),
-            "the hint comes before the exec and names hb warm: {text}"
-        );
-        assert!(
-            text.find("hb warm")
-                .map(|h| h < text.find("exec").unwrap_or(0))
-                .unwrap_or(false),
-            "{text}"
+            !text.contains("hb warm") && !text.contains("warmed"),
+            "a launcher only exists when a generation was copied, so there is no hint: {text}"
         );
     }
 
@@ -504,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn installing_writes_private_executable_scripts_and_creates_the_cache_directories() {
+    fn installing_writes_private_executable_scripts_pointing_at_the_given_cache() {
         let tmp = assert_ok!(tempfile::tempdir());
         let base = canon(tmp.path());
         let home_dir = base.as_path().join("home");
@@ -520,22 +514,25 @@ mod tests {
             &found(&canon(&tools_dir), &["uvx", "npx"]),
             &home
         ));
-        let installed = assert_ok!(plan.install(&canon(&session)));
+        let cache = base.as_path().join("cache");
+        for sub in CACHE_SUBDIRS {
+            assert_ok!(fs::create_dir_all(cache.join(sub)));
+        }
+        let installed = assert_ok!(plan.install(&canon(&session), &canon(&cache)));
         let bin = installed.bin_dir().as_path().to_owned();
         assert_eq!(bin, canon(&session).as_path().join("bin"));
         for tool in ["uvx", "npx"] {
             let meta = assert_ok!(fs::metadata(bin.join(tool)));
             assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{tool}");
         }
-        let root = installed.cache_root().as_path().to_owned();
-        for sub in ["uv", "uv-tools", "npm"] {
-            let meta = assert_ok!(fs::metadata(root.join(sub)));
-            assert!(meta.is_dir(), "{sub}");
-            assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{sub}");
-        }
+        assert_eq!(installed.cache_root().as_path(), canon(&cache).as_path());
         let uvx = assert_ok!(fs::read_to_string(bin.join("uvx")));
         assert!(
             uvx.contains(&format!("exec '{}/uvx' --offline", tools_dir.display())),
+            "{uvx}"
+        );
+        assert!(
+            uvx.contains(&format!("UV_CACHE_DIR='{}/uv'", canon(&cache).as_str())),
             "{uvx}"
         );
     }

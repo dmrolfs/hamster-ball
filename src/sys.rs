@@ -129,13 +129,17 @@ pub(crate) struct Finished {
     pub(crate) status: std::process::ExitStatus,
     /// What it wrote to standard output, up to the limit.
     pub(crate) stdout: Vec<u8>,
+    /// Whether it wrote more than the limit, so `stdout` is a prefix.
+    pub(crate) truncated: bool,
 }
 
 /// Runs `command` with no input, its standard output captured (up to `max_bytes`) and its
 /// standard error dropped, in a process group of its own that is killed at `timeout`.
 ///
 /// The reader of the output is not waited for after a timeout: a program that escaped the group
-/// could still hold the pipe, and the reader ends by itself when the pipe closes.
+/// could still hold the pipe, and the reader ends by itself when the pipe closes. After the program
+/// ends on its own the reader gets the rest of the deadline, and a descendant that still holds the
+/// pipe past it is killed with the group and reported as a timeout.
 pub(crate) fn run_bounded(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
@@ -158,12 +162,25 @@ pub(crate) fn run_bounded(
             "no pipe for standard output",
         )));
     };
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(max_bytes).read_to_end(&mut bytes);
-        bytes
+        // One byte more than allowed tells a full read from a cut one.
+        let _ = stdout
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
     });
     let deadline = Instant::now() + timeout;
+    let kill_group = |child: &mut std::process::Child| {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = child.wait();
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -171,22 +188,31 @@ pub(crate) fn run_bounded(
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Ok(None) | Err(_) => {
-                if let Ok(pid) = i32::try_from(child.id()) {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pid),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                }
-                let _ = child.wait();
-                drop(reader);
+                kill_group(&mut child);
                 return Err(BoundedError::TimedOut);
             }
         }
     };
-    let stdout = reader
-        .join()
-        .map_err(|_| BoundedError::Spawn(io::Error::other("the output reader failed")))?;
-    Ok(Finished { status, stdout })
+    let mut stdout = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(bytes) => bytes,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_group(&mut child);
+            return Err(BoundedError::TimedOut);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(BoundedError::Spawn(io::Error::other(
+                "the output reader failed",
+            )));
+        }
+    };
+    let truncated = u64::try_from(stdout.len()).is_ok_and(|len| len > max_bytes);
+    stdout.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    Ok(Finished {
+        status,
+        stdout,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -222,6 +248,30 @@ mod bounded_tests {
             100
         ));
         assert_eq!(done.stdout.len(), 100);
+        assert!(done.truncated);
+    }
+
+    #[test]
+    fn output_of_exactly_the_limit_is_not_truncated() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("printf abcd"),
+            Duration::from_secs(10),
+            4
+        ));
+        assert_eq!(done.stdout, b"abcd");
+        assert!(!done.truncated);
+    }
+
+    #[test]
+    fn a_descendant_that_holds_the_pipe_after_the_program_ends_is_a_timeout_not_a_hang() {
+        let started = Instant::now();
+        let result = run_bounded(
+            &mut sh("sleep 20 & exit 0"),
+            Duration::from_millis(300),
+            1024,
+        );
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -234,6 +284,30 @@ mod bounded_tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_descendants_not_only_the_leader() {
+        let dir = assert_ok!(tempfile::tempdir());
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 60 & echo $! > '{}'; wait", pid_file.display());
+        let result = run_bounded(&mut sh(&script), Duration::from_millis(500), 1024);
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+        let pid: i32 = assert_ok!(
+            assert_ok!(std::fs::read_to_string(&pid_file))
+                .trim()
+                .parse()
+        );
+        let pid = nix::unistd::Pid::from_raw(pid);
+        // The kill is delivered before run_bounded returns; allow the kernel a moment to reap it.
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            nix::sys::signal::kill(pid, None).is_err()
+        });
+        if !gone {
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(gone, "the descendant outlived the timeout");
     }
 
     #[test]

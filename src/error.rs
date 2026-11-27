@@ -41,6 +41,13 @@ pub enum Error {
         source: crate::warm::StartError,
     },
 
+    /// The cache generation could not be built, sealed or published.
+    #[snafu(transparent)]
+    Cache {
+        /// The underlying error.
+        source: crate::session::cache::CacheError,
+    },
+
     /// Asking for approval of a project's config failed.
     #[snafu(transparent)]
     Gate {

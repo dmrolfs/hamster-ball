@@ -7,7 +7,7 @@
 //! generation into its own session directory. Nothing here follows a symlink out of a tree, and
 //! nothing falls back to the old shared cache.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -20,6 +20,10 @@ use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use strum::{AsRefStr, Display};
 
 use crate::approval::Digest;
+use crate::policy::CanonicalPath;
+use crate::system::ToolLookup;
+use crate::warm::stamp::digest as invocation_digest;
+use crate::warm::{Server, servers};
 
 /// Which bounded resource a copy or seal ran out of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, AsRefStr)]
@@ -95,11 +99,9 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum Mismatch {
-    /// The project's config or location changed.
-    Project,
     /// A tool (uv, npm, node) changed.
     Tool,
-    /// The declared servers or their arguments changed.
+    /// A declared server was not warmed, or was warmed with other arguments.
     Server,
     /// Built for another OS or architecture.
     Platform,
@@ -195,13 +197,20 @@ pub enum CacheError {
     },
 
     /// A record or manifest could not be read as the supported format.
-    #[snafu(display("{} is not a usable cache record", path.display()))]
+    #[snafu(display(
+        "{} is not a usable cache record ({reason}); run `hb warm` outside the ball to publish a new one",
+        path.display()
+    ))]
     BadRecord {
         /// The file.
         path: PathBuf,
         /// What was wrong with it.
         reason: RecordFault,
     },
+
+    /// There is no per-user temporary directory to build in.
+    #[snafu(display("there is no per-user temporary directory to build the cache in"))]
+    NoTempDir,
 
     /// Another `hb warm` holds the project's lock.
     #[snafu(display("another hb warm is already running for this project"))]
@@ -709,12 +718,11 @@ const LEGACY_DIRS: [&str; 3] = ["uv", "uv-tools", "npm"];
 pub struct ExpectedInputs {
     /// Hash of the canonical project root; names the project's `current` record.
     pub project_key: String,
-    /// Digest of the approved config and cache-affecting settings.
-    pub project_digest: String,
-    /// Digest of the resolved uv, npm and node (path and bytes).
+    /// Digest of the resolved uv, npm and node (canonical path, size and modification time).
     pub tool_digest: String,
-    /// Digest of the warmed servers' names, commands and arguments.
-    pub server_digest: String,
+    /// Each warmed server's name and the digest of its command and arguments. A generation
+    /// serves a run when it holds every server the run declares; extra servers are fine.
+    pub servers: BTreeMap<String, String>,
     /// `<os>-<arch>`.
     pub platform: String,
 }
@@ -760,7 +768,7 @@ pub struct CacheGeneration {
     pub manifest: CacheManifest,
 }
 
-/// Where generations live: `<cache root>/generations`, `projects`, `builds`, `staging`.
+/// Where generations live: `<cache root>/generations`, `projects`, `staging`.
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     root: PathBuf,
@@ -843,19 +851,16 @@ impl CacheStore {
 }
 
 impl ExpectedInputs {
-    /// Names the first input that differs, platform first.
+    /// Checks that this (published) set can serve `expected`, naming the first input that differs.
     fn check(&self, id: &str, expected: &Self) -> Result<(), CacheError> {
+        let served = expected
+            .servers
+            .iter()
+            .all(|(name, digest)| self.servers.get(name) == Some(digest));
         let what = [
             (self.platform != expected.platform, Mismatch::Platform),
-            (
-                self.project_digest != expected.project_digest,
-                Mismatch::Project,
-            ),
             (self.tool_digest != expected.tool_digest, Mismatch::Tool),
-            (
-                self.server_digest != expected.server_digest,
-                Mismatch::Server,
-            ),
+            (!served, Mismatch::Server),
         ]
         .into_iter()
         .find_map(|(differs, what)| differs.then_some(what));
@@ -864,6 +869,124 @@ impl ExpectedInputs {
             None => Ok(()),
         }
     }
+}
+
+/// What the current config and tools say a generation must hold.
+///
+/// `root` is the project's canonical root. The tool digest covers each found `uv`, `uvx`, `npm`
+/// and `npx`, `node` and so on by canonical path, size and modification time: a replaced
+/// binary changes it, and no tool is run to find out.
+///
+/// # Errors
+/// [`CacheError::Read`] if a found tool cannot be examined.
+pub fn expected_inputs(
+    root: &CanonicalPath,
+    policy: &crate::config::Policy,
+    tools: &ToolLookup,
+) -> Result<ExpectedInputs, CacheError> {
+    let selected: Vec<Server> = servers(policy);
+    expected_inputs_for(root, &selected, tools)
+}
+
+/// [`expected_inputs`] for an explicit server list (what `hb warm NAME...` publishes).
+///
+/// # Errors
+/// [`CacheError::Read`] if a found tool cannot be examined.
+pub fn expected_inputs_for(
+    root: &CanonicalPath,
+    selected: &[Server],
+    tools: &ToolLookup,
+) -> Result<ExpectedInputs, CacheError> {
+    let servers = selected
+        .iter()
+        .map(|s| {
+            let args: Vec<&str> = s.args.iter().map(String::as_str).collect();
+            (s.name.clone(), invocation_digest(&s.command, &args))
+        })
+        .collect();
+    let mut tool_bytes = Vec::new();
+    let mut found: Vec<_> = tools.found.iter().collect();
+    found.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    for tool in found {
+        let path = tool.dir.as_path().join(tool.name.as_str());
+        let meta = fs::metadata(&path).context(ReadSnafu { path: &path })?;
+        let stamp = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        for word in [
+            path.to_string_lossy().into_owned(),
+            meta.len().to_string(),
+            stamp.map_or_else(String::new, |d| d.as_nanos().to_string()),
+        ] {
+            tool_bytes.extend_from_slice(&(word.len() as u64).to_be_bytes());
+            tool_bytes.extend_from_slice(word.as_bytes());
+        }
+    }
+    Ok(ExpectedInputs {
+        project_key: Digest::of(root.as_str().as_bytes()).to_string(),
+        tool_digest: Digest::of(&tool_bytes).to_string(),
+        servers,
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+/// Copies the user's own uv-managed interpreter into `workspace/python`, so the warm ball builds
+/// against a Python inside the generation and no link names `~/.local/share/uv/python`.
+///
+/// The interpreter is copied by this process on the host, before the warm ball starts, from a tree
+/// uv itself installed. It is refused like any other tree if it holds a link that leaves it.
+/// `None` means the user has no managed interpreter; a warm without one is refused by uv itself
+/// (downloads are off), with uv's own message.
+///
+/// # Errors
+/// [`CacheError`] if the interpreter tree is refused or cannot be copied.
+pub fn seed_python(
+    uv_python_dir: &Path,
+    workspace: &Path,
+    limits: CacheLimits,
+) -> Result<Option<PathBuf>, CacheError> {
+    let Some(newest) = newest_interpreter(uv_python_dir)? else {
+        return Ok(None);
+    };
+    let python = workspace.join("python");
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&python)
+        .context(ReadSnafu { path: &python })?;
+    let name = newest.file_name().unwrap_or_default();
+    let dest = python.join(name);
+    copy_tree(
+        &newest,
+        &dest,
+        CopyPlan {
+            limits,
+            rewrite_from: None,
+        },
+    )?;
+    Ok(Some(dest))
+}
+
+/// The highest-named `cpython-*` directory under `dir`, a plain directory (never a link).
+fn newest_interpreter(dir: &Path) -> Result<Option<PathBuf>, CacheError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CacheError::Read {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("cpython-"))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    Ok(found.pop())
 }
 
 /// A unique name for a build or generation: process id, nanoseconds and a counter.
@@ -876,13 +999,24 @@ fn fresh_id() -> String {
     format!("g{}-{nanos}-{n}", std::process::id())
 }
 
+/// `hb-<pid>-<nanos>-<counter>`: the name shape the session sweep recognises and, once the
+/// process is gone, removes.
+fn fresh_build_name() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("hb-{}-{nanos}-{n}", std::process::id())
+}
+
 impl CacheStore {
     /// Creates the store's directories, private to the owner. Existing ones are left alone.
     ///
     /// # Errors
     /// [`CacheError::Copy`]-free: a [`CacheError::Read`] if a directory cannot be made.
     pub fn ensure_dirs(&self) -> Result<(), CacheError> {
-        for sub in ["", "generations", "projects", "builds", "staging"] {
+        for sub in ["", "generations", "projects", "staging"] {
             let dir = self.root.join(sub);
             DirBuilder::new()
                 .recursive(true)
@@ -893,13 +1027,16 @@ impl CacheStore {
         Ok(())
     }
 
-    /// A fresh, empty workspace for `hb warm` to build in. It is never selectable.
+    /// A fresh, empty workspace under `parent` (the per-user temporary directory) for `hb warm`
+    /// to build in. It is never selectable, and it is named like a session directory, so the
+    /// stale-directory sweep removes one that an interrupted warm left behind.
+    ///
+    /// The workspace is outside the store on purpose: no ball is ever given a path inside it.
     ///
     /// # Errors
     /// [`CacheError`] if the directory cannot be made.
-    pub fn begin_build(&self) -> Result<PathBuf, CacheError> {
-        self.ensure_dirs()?;
-        let dir = self.root.join("builds").join(fresh_id());
+    pub fn begin_build(&self, parent: &Path) -> Result<PathBuf, CacheError> {
+        let dir = parent.join(fresh_build_name());
         private_dir(&dir).context(ReadSnafu { path: &dir })?;
         Ok(dir)
     }
@@ -1152,7 +1289,7 @@ fn check_id(path: &Path, id: &str) -> Result<(), CacheError> {
 mod tests {
     use std::os::unix::fs::symlink;
 
-    use claims::{assert_err, assert_ok};
+    use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -1491,9 +1628,11 @@ mod tests {
     fn inputs() -> ExpectedInputs {
         ExpectedInputs {
             project_key: "pk".into(),
-            project_digest: "p1".into(),
             tool_digest: "t1".into(),
-            server_digest: "s1".into(),
+            servers: BTreeMap::from([
+                ("time".into(), "d1".into()),
+                ("ripgrep".into(), "d2".into()),
+            ]),
             platform: "macos-aarch64".into(),
         }
     }
@@ -1566,11 +1705,15 @@ mod tests {
         publish_by_hand(&root, "g1", &inputs());
         for (what, edit) in [
             (
-                Mismatch::Project,
-                (|i: &mut ExpectedInputs| i.project_digest = "x".into()) as fn(&mut ExpectedInputs),
+                Mismatch::Tool,
+                (|i: &mut ExpectedInputs| i.tool_digest = "x".into()) as fn(&mut ExpectedInputs),
             ),
-            (Mismatch::Tool, |i| i.tool_digest = "x".into()),
-            (Mismatch::Server, |i| i.server_digest = "x".into()),
+            (Mismatch::Server, |i| {
+                i.servers.insert("time".into(), "changed-args".into());
+            }),
+            (Mismatch::Server, |i| {
+                i.servers.insert("never-warmed".into(), "d9".into());
+            }),
             (Mismatch::Platform, |i| i.platform = "linux-x86_64".into()),
         ] {
             let mut changed = inputs();
@@ -1581,6 +1724,15 @@ mod tests {
                 "{got}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_generation_with_extra_servers_serves_a_run_that_needs_fewer() {
+        let (_d, root, store) = store();
+        publish_by_hand(&root, "g1", &inputs());
+        let mut fewer = inputs();
+        fewer.servers.remove("ripgrep");
+        assert_ok!(store.select(&fewer));
     }
 
     #[test]
@@ -1648,6 +1800,14 @@ mod tests {
 
     // ---- store: seal and publish ----
 
+    /// A directory standing in for the per-user temporary directory, removed when the process ends.
+    fn temp_parent() -> PathBuf {
+        let dir = assert_ok!(TempDir::new());
+        let path = assert_ok!(fs::canonicalize(dir.path()));
+        std::mem::forget(dir);
+        path
+    }
+
     fn loose() -> CacheLimits {
         CacheLimits {
             min_free_bytes: 0,
@@ -1656,7 +1816,7 @@ mod tests {
     }
 
     fn workspace(store: &CacheStore, files: &[(&str, &str)]) -> PathBuf {
-        let ws = assert_ok!(store.begin_build());
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
         for (name, text) in files {
             put(&ws.join(name), text);
         }
@@ -1760,5 +1920,127 @@ mod tests {
         assert_ok!(store.lock_warm("other"));
         drop(first);
         assert_ok!(store.lock_warm("pk"));
+    }
+
+    // ---- expected inputs ----
+
+    fn tools_in(dir: &Path, name: &str, body: &str) -> ToolLookup {
+        put(&dir.join(name), body);
+        ToolLookup {
+            found: vec![crate::system::FoundTool {
+                name: assert_ok!(crate::policy::ToolName::parse(name)),
+                dir: assert_ok!(CanonicalPath::from_canonical(dir)),
+            }],
+            missing: Vec::new(),
+        }
+    }
+
+    fn server(name: &str, args: &[&str]) -> Server {
+        Server {
+            name: name.into(),
+            command: "uvx".into(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            allowlist: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_expected_inputs_change_with_a_tool_a_server_argument_and_the_project_but_not_with_time()
+    {
+        let (d, root, _store) = store();
+        let bin = d.path().join("bin");
+        let proj = assert_ok!(CanonicalPath::from_canonical(&root));
+        let tools = tools_in(
+            &assert_ok!(fs::canonicalize({
+                assert_ok!(fs::create_dir_all(&bin));
+                &bin
+            })),
+            "uvx",
+            "v1",
+        );
+        let a = assert_ok!(expected_inputs_for(
+            &proj,
+            &[server("time", &["x"])],
+            &tools
+        ));
+        let again = assert_ok!(expected_inputs_for(
+            &proj,
+            &[server("time", &["x"])],
+            &tools
+        ));
+        assert_eq!(a, again);
+        let other_args = assert_ok!(expected_inputs_for(
+            &proj,
+            &[server("time", &["y"])],
+            &tools
+        ));
+        assert_ne!(a.servers, other_args.servers);
+        assert_eq!(a.tool_digest, other_args.tool_digest);
+        let replaced = tools_in(
+            &assert_ok!(fs::canonicalize(&bin)),
+            "uvx",
+            "a longer replacement",
+        );
+        let c = assert_ok!(expected_inputs_for(
+            &proj,
+            &[server("time", &["x"])],
+            &replaced
+        ));
+        assert_ne!(a.tool_digest, c.tool_digest);
+        let elsewhere = assert_ok!(CanonicalPath::from_canonical(assert_ok!(fs::canonicalize(
+            &bin
+        ))));
+        let moved = assert_ok!(expected_inputs_for(
+            &elsewhere,
+            &[server("time", &["x"])],
+            &tools
+        ));
+        assert_ne!(a.project_key, moved.project_key);
+    }
+
+    #[test]
+    fn test_seed_python_copies_the_newest_interpreter_into_the_workspace_and_none_is_fine() {
+        let (d, root, store) = store();
+        let uv_python = d.path().join("uvpy");
+        assert_eq!(assert_ok!(seed_python(&uv_python, &root, loose())), None);
+        put(&uv_python.join("cpython-3.11.1-x/bin/python3.11"), "old");
+        put(&uv_python.join("cpython-3.12.9-x/bin/python3.12"), "new");
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
+        let seeded = assert_some!(assert_ok!(seed_python(&uv_python, &ws, loose())));
+        assert_eq!(seeded, ws.join("python/cpython-3.12.9-x"));
+        assert_eq!(
+            assert_ok!(fs::read_to_string(seeded.join("bin/python3.12"))),
+            "new"
+        );
+        assert_ok!(fs::write(seeded.join("bin/python3.12"), "tampered"));
+        assert_eq!(
+            assert_ok!(fs::read_to_string(
+                uv_python.join("cpython-3.12.9-x/bin/python3.12")
+            )),
+            "new"
+        );
+    }
+
+    #[test]
+    fn test_seed_python_refuses_an_interpreter_whose_link_leaves_its_tree() {
+        let (d, _root, store) = store();
+        let uv_python = d.path().join("uvpy");
+        put(&uv_python.join("cpython-3.12.9-x/bin/real"), "x");
+        assert_ok!(symlink(
+            "/usr/bin/python3",
+            uv_python.join("cpython-3.12.9-x/bin/python")
+        ));
+        let ws = assert_ok!(store.begin_build(&temp_parent()));
+        let got = assert_err!(seed_python(&uv_python, &ws, loose()));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
     }
 }

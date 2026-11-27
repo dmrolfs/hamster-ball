@@ -13,7 +13,7 @@ fs.read
 fs.write
   ~/work/proj  <- [2] fs.write[0]
 
-deny (102 from the floor, which no config can change; 2 from config)
+deny (103 from the floor, which no config can change; 2 from config)
   floor  ssh                       deny_read_write  ~/.ssh  (credentials)
   floor  aws                       deny_read_write  ~/.aws  (credentials)
   floor  gnupg                     deny_read_write  ~/.gnupg  (credentials)
@@ -83,6 +83,7 @@ deny (102 from the floor, which no config can change; 2 from config)
   floor  connect-podman-data       deny_connect     ~/.local/share/containers  (container runtime access is host access)
   floor  hb-config                 deny_read_write  ~/.config/hamster-ball  (hamster-ball's own configuration and approvals)
   floor  hb-state                  deny_read_write  ~/.local/state/hamster-ball  (hamster-ball's own configuration and approvals)
+  floor  hb-cache                  deny_read_write  ~/.cache/hamster-ball  (hamster-ball's published cache generations: a run gets its own copy, never these)
   floor  zshrc                     deny_write       ~/.zshrc  (runs outside the sandbox at the next shell start)
   floor  zshenv                    deny_write       ~/.zshenv  (runs outside the sandbox at the next shell start)
   floor  zprofile                  deny_write       ~/.zprofile  (runs outside the sandbox at the next shell start)

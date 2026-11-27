@@ -35,8 +35,8 @@
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F6")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F7")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F8")))
-(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F9")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F0")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F10")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F11")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F12")))
@@ -89,9 +89,9 @@
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F59")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F60")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F61")))
+(deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (subpath (param "F62")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G6")))
 (deny file-read-data file-read-metadata file-read-xattr file-test-existence file-map-executable file-write* (regex (param "G7")))
-(deny file-write* (subpath (param "F62")))
 (deny file-write* (subpath (param "F63")))
 (deny file-write* (subpath (param "F64")))
 (deny file-write* (subpath (param "F65")))
@@ -117,10 +117,10 @@
 (deny file-write* (subpath (param "F85")))
 (deny file-write* (subpath (param "F86")))
 (deny file-write* (subpath (param "F87")))
-(deny file-write* (subpath (param "F88")) (literal (param "F89")))
-(deny file-write* (subpath (param "F90")))
-(deny file-write* (literal (param "F91")))
-(deny file-write* (subpath (param "F92")))
+(deny file-write* (subpath (param "F88")))
+(deny file-write* (subpath (param "F89")) (literal (param "F90")))
+(deny file-write* (subpath (param "F91")))
+(deny file-write* (literal (param "F92")))
 (deny file-write* (subpath (param "F93")))
 (deny file-write* (subpath (param "F94")))
 (deny file-write* (subpath (param "F95")))
@@ -130,6 +130,7 @@
 (deny file-write* (subpath (param "F99")))
 (deny file-write* (subpath (param "F100")))
 (deny file-write* (subpath (param "F101")))
+(deny file-write* (subpath (param "F102")))
 (deny file-write* (regex (param "G8")))
 (deny file-write* (regex (param "G9")))
 (deny file-write* (regex (param "G10")))
@@ -149,13 +150,13 @@
 (deny network-outbound (remote unix-socket (subpath (param "K6"))))
 (deny network-outbound (remote unix-socket (subpath (param "K7"))))
 ; pins
-(deny file-write-unlink (literal (param "F102")))
 (deny file-write-unlink (literal (param "F103")))
 (deny file-write-unlink (literal (param "F104")))
 (deny file-write-unlink (literal (param "F105")))
 (deny file-write-unlink (literal (param "F106")))
 (deny file-write-unlink (literal (param "F107")))
 (deny file-write-unlink (literal (param "F108")))
+(deny file-write-unlink (literal (param "F109")))
 
 ;; parameters
 ;; A0=<FIX>/home/Library
@@ -174,105 +175,106 @@
 ;; G5=^<FIX>/home/work/proj(/[^/]+)*/[^/]*\.lock(/.*)?$
 ;; F3=<FIX>/home/.aws
 ;; F4=<FIX>/home/.azure
-;; F5=<FIX>/home/.config/atuin
-;; F6=<FIX>/home/.config/containers
-;; F7=<FIX>/home/.config/doctl
-;; F8=<FIX>/home/.config/gcloud
-;; F9=<FIX>/home/.config/glab-cli
-;; F10=<FIX>/home/.config/hamster-ball
-;; F11=<FIX>/home/.config/hub
-;; F12=<FIX>/home/.config/op
-;; F13=<FIX>/home/.config/rclone
-;; F14=<FIX>/home/.docker
-;; F15=<FIX>/home/.gem/credentials
-;; F16=<FIX>/home/.git-credentials
-;; F17=<FIX>/home/.gnupg
-;; F18=<FIX>/home/.kube
-;; F19=<FIX>/home/.local/share/atuin
-;; F20=<FIX>/home/.local/share/containers
-;; F21=<FIX>/home/.local/state/hamster-ball
-;; F22=<FIX>/home/.netrc
-;; F23=<FIX>/home/.npmrc
-;; F24=<FIX>/home/.oci
-;; F25=<FIX>/home/.pgpass
-;; F26=<FIX>/home/.pypirc
-;; F27=<FIX>/home/.ssh
-;; F28=<FIX>/home/.terraform.d/credentials.tfrc.json
-;; F29=<FIX>/home/.vault-token
-;; F30=<FIX>/home/.zsh_sessions
-;; F31=<FIX>/home/Library/Application Support/1Password
-;; F32=<FIX>/home/Library/Application Support/Arc
-;; F33=<FIX>/home/Library/Application Support/BraveSoftware
-;; F34=<FIX>/home/Library/Application Support/Chromium
-;; F35=<FIX>/home/Library/Application Support/Comet
-;; F36=<FIX>/home/Library/Application Support/Firefox
-;; F37=<FIX>/home/Library/Application Support/Google
-;; F38=<FIX>/home/Library/Application Support/Microsoft Edge
-;; F39=<FIX>/home/Library/Application Support/Microsoft Edge Beta
-;; F40=<FIX>/home/Library/Application Support/Microsoft Edge Canary
-;; F41=<FIX>/home/Library/Application Support/Microsoft Edge Dev
-;; F42=<FIX>/home/Library/Application Support/Mozilla
-;; F43=<FIX>/home/Library/Application Support/TorBrowser-Data
-;; F44=<FIX>/home/Library/Application Support/Vivaldi
-;; F45=<FIX>/home/Library/Application Support/Vivaldi Snapshot
-;; F46=<FIX>/home/Library/Application Support/com.operasoftware.Opera
-;; F47=<FIX>/home/Library/Application Support/zen
-;; F48=<FIX>/home/Library/Caches/Arc
-;; F49=<FIX>/home/Library/Caches/Firefox
-;; F50=<FIX>/home/Library/Caches/Google
-;; F51=<FIX>/home/Library/Caches/Mozilla
-;; F52=<FIX>/home/Library/Caches/com.apple.Safari
-;; F53=<FIX>/home/Library/Caches/company.thebrowser.Browser
-;; F54=<FIX>/home/Library/Containers/com.apple.Safari
-;; F55=<FIX>/home/Library/Cookies
-;; F56=<FIX>/home/Library/Group Containers/2BUA8C4S2C.com.1password
-;; F57=<FIX>/home/Library/Group Containers/group.com.apple.Safari.SandboxBroker
-;; F58=<FIX>/home/Library/HTTPStorages
-;; F59=<FIX>/home/Library/Keychains
-;; F60=<FIX>/home/Library/Safari
-;; F61=<FIX>/home/Library/WebKit
+;; F5=<FIX>/home/.cache/hamster-ball
+;; F6=<FIX>/home/.config/atuin
+;; F7=<FIX>/home/.config/containers
+;; F8=<FIX>/home/.config/doctl
+;; F9=<FIX>/home/.config/gcloud
+;; F10=<FIX>/home/.config/glab-cli
+;; F11=<FIX>/home/.config/hamster-ball
+;; F12=<FIX>/home/.config/hub
+;; F13=<FIX>/home/.config/op
+;; F14=<FIX>/home/.config/rclone
+;; F15=<FIX>/home/.docker
+;; F16=<FIX>/home/.gem/credentials
+;; F17=<FIX>/home/.git-credentials
+;; F18=<FIX>/home/.gnupg
+;; F19=<FIX>/home/.kube
+;; F20=<FIX>/home/.local/share/atuin
+;; F21=<FIX>/home/.local/share/containers
+;; F22=<FIX>/home/.local/state/hamster-ball
+;; F23=<FIX>/home/.netrc
+;; F24=<FIX>/home/.npmrc
+;; F25=<FIX>/home/.oci
+;; F26=<FIX>/home/.pgpass
+;; F27=<FIX>/home/.pypirc
+;; F28=<FIX>/home/.ssh
+;; F29=<FIX>/home/.terraform.d/credentials.tfrc.json
+;; F30=<FIX>/home/.vault-token
+;; F31=<FIX>/home/.zsh_sessions
+;; F32=<FIX>/home/Library/Application Support/1Password
+;; F33=<FIX>/home/Library/Application Support/Arc
+;; F34=<FIX>/home/Library/Application Support/BraveSoftware
+;; F35=<FIX>/home/Library/Application Support/Chromium
+;; F36=<FIX>/home/Library/Application Support/Comet
+;; F37=<FIX>/home/Library/Application Support/Firefox
+;; F38=<FIX>/home/Library/Application Support/Google
+;; F39=<FIX>/home/Library/Application Support/Microsoft Edge
+;; F40=<FIX>/home/Library/Application Support/Microsoft Edge Beta
+;; F41=<FIX>/home/Library/Application Support/Microsoft Edge Canary
+;; F42=<FIX>/home/Library/Application Support/Microsoft Edge Dev
+;; F43=<FIX>/home/Library/Application Support/Mozilla
+;; F44=<FIX>/home/Library/Application Support/TorBrowser-Data
+;; F45=<FIX>/home/Library/Application Support/Vivaldi
+;; F46=<FIX>/home/Library/Application Support/Vivaldi Snapshot
+;; F47=<FIX>/home/Library/Application Support/com.operasoftware.Opera
+;; F48=<FIX>/home/Library/Application Support/zen
+;; F49=<FIX>/home/Library/Caches/Arc
+;; F50=<FIX>/home/Library/Caches/Firefox
+;; F51=<FIX>/home/Library/Caches/Google
+;; F52=<FIX>/home/Library/Caches/Mozilla
+;; F53=<FIX>/home/Library/Caches/com.apple.Safari
+;; F54=<FIX>/home/Library/Caches/company.thebrowser.Browser
+;; F55=<FIX>/home/Library/Containers/com.apple.Safari
+;; F56=<FIX>/home/Library/Cookies
+;; F57=<FIX>/home/Library/Group Containers/2BUA8C4S2C.com.1password
+;; F58=<FIX>/home/Library/Group Containers/group.com.apple.Safari.SandboxBroker
+;; F59=<FIX>/home/Library/HTTPStorages
+;; F60=<FIX>/home/Library/Keychains
+;; F61=<FIX>/home/Library/Safari
+;; F62=<FIX>/home/Library/WebKit
 ;; G6=^<FIX>/home/\.[^/]*_history(/.*)?$
 ;; G7=^<FIX>/home/\.cargo/credentials[^/]*(/.*)?$
-;; F62=<FIX>/bin
-;; F63=<FIX>/home/.bash_login
-;; F64=<FIX>/home/.bash_logout
-;; F65=<FIX>/home/.bash_profile
-;; F66=<FIX>/home/.bashrc
-;; F67=<FIX>/home/.bun/bin
-;; F68=<FIX>/home/.cargo/bin
-;; F69=<FIX>/home/.cargo/config
-;; F70=<FIX>/home/.cargo/config.toml
-;; F71=<FIX>/home/.cargo/env
-;; F72=<FIX>/home/.config/fish
-;; F73=<FIX>/home/.config/git
-;; F74=<FIX>/home/.config/pip
-;; F75=<FIX>/home/.config/uv
-;; F76=<FIX>/home/.gitconfig
-;; F77=<FIX>/home/.local/bin
-;; F78=<FIX>/home/.m2/settings.xml
-;; F79=<FIX>/home/.profile
-;; F80=<FIX>/home/.terraformrc
-;; F81=<FIX>/home/.yarnrc
-;; F82=<FIX>/home/.yarnrc.yml
-;; F83=<FIX>/home/.zlogin
-;; F84=<FIX>/home/.zlogout
-;; F85=<FIX>/home/.zprofile
-;; F86=<FIX>/home/.zshenv
-;; F87=<FIX>/home/.zshrc
-;; F88=<FIX>/home/dotfiles/LaunchAgents
-;; F89=<FIX>/home/Library/LaunchAgents
-;; F90=<FIX>/home/go/bin
-;; F91=<FIX>/home/work/proj/.git
-;; F92=<FIX>/home/work/proj/hamster-ball.toml
-;; F93=<FIX>/install/hb
-;; F94=<FIX>/main/.git/commondir
-;; F95=<FIX>/main/.git/config
-;; F96=<FIX>/main/.git/config.worktree
-;; F97=<FIX>/main/.git/hooks
-;; F98=<FIX>/main/.git/worktrees/wt/commondir
-;; F99=<FIX>/main/.git/worktrees/wt/config
-;; F100=<FIX>/main/.git/worktrees/wt/config.worktree
-;; F101=<FIX>/main/.git/worktrees/wt/hooks
+;; F63=<FIX>/bin
+;; F64=<FIX>/home/.bash_login
+;; F65=<FIX>/home/.bash_logout
+;; F66=<FIX>/home/.bash_profile
+;; F67=<FIX>/home/.bashrc
+;; F68=<FIX>/home/.bun/bin
+;; F69=<FIX>/home/.cargo/bin
+;; F70=<FIX>/home/.cargo/config
+;; F71=<FIX>/home/.cargo/config.toml
+;; F72=<FIX>/home/.cargo/env
+;; F73=<FIX>/home/.config/fish
+;; F74=<FIX>/home/.config/git
+;; F75=<FIX>/home/.config/pip
+;; F76=<FIX>/home/.config/uv
+;; F77=<FIX>/home/.gitconfig
+;; F78=<FIX>/home/.local/bin
+;; F79=<FIX>/home/.m2/settings.xml
+;; F80=<FIX>/home/.profile
+;; F81=<FIX>/home/.terraformrc
+;; F82=<FIX>/home/.yarnrc
+;; F83=<FIX>/home/.yarnrc.yml
+;; F84=<FIX>/home/.zlogin
+;; F85=<FIX>/home/.zlogout
+;; F86=<FIX>/home/.zprofile
+;; F87=<FIX>/home/.zshenv
+;; F88=<FIX>/home/.zshrc
+;; F89=<FIX>/home/dotfiles/LaunchAgents
+;; F90=<FIX>/home/Library/LaunchAgents
+;; F91=<FIX>/home/go/bin
+;; F92=<FIX>/home/work/proj/.git
+;; F93=<FIX>/home/work/proj/hamster-ball.toml
+;; F94=<FIX>/install/hb
+;; F95=<FIX>/main/.git/commondir
+;; F96=<FIX>/main/.git/config
+;; F97=<FIX>/main/.git/config.worktree
+;; F98=<FIX>/main/.git/hooks
+;; F99=<FIX>/main/.git/worktrees/wt/commondir
+;; F100=<FIX>/main/.git/worktrees/wt/config
+;; F101=<FIX>/main/.git/worktrees/wt/config.worktree
+;; F102=<FIX>/main/.git/worktrees/wt/hooks
 ;; G8=^<FIX>/main/\.git/modules(/[^/]+)*/commondir(/.*)?$
 ;; G9=^<FIX>/main/\.git/modules(/[^/]+)*/config(/.*)?$
 ;; G10=^<FIX>/main/\.git/modules(/[^/]+)*/config\.worktree(/.*)?$
@@ -291,10 +293,10 @@
 ;; K5=<FIX>/home/.rd
 ;; K6=<FIX>/home/Library/Containers/com.docker.docker
 ;; K7=<FIX>/tmp/podman
-;; F102=<FIX>/home/Library
-;; F103=<FIX>/home/Library/Application Support
-;; F104=<FIX>/home/Library/Caches
-;; F105=<FIX>/home/Library/Containers
-;; F106=<FIX>/home/Library/Group Containers
-;; F107=<FIX>/home/work/proj
-;; F108=<FIX>/home/work/proj/secrets
+;; F103=<FIX>/home/Library
+;; F104=<FIX>/home/Library/Application Support
+;; F105=<FIX>/home/Library/Caches
+;; F106=<FIX>/home/Library/Containers
+;; F107=<FIX>/home/Library/Group Containers
+;; F108=<FIX>/home/work/proj
+;; F109=<FIX>/home/work/proj/secrets

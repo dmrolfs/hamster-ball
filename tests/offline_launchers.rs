@@ -31,7 +31,7 @@ fn fake(world: &World, name: &str) -> PathBuf {
     write(
         &path,
         &format!(
-            "#!/bin/sh\necho \"fake-{name} args=$* uv_cache=${{UV_CACHE_DIR:-unset}} uv_tools=${{UV_TOOL_DIR:-unset}} npm_cache=${{npm_config_cache:-unset}}\"\n\
+            "#!/bin/sh\necho \"fake-{name} args=$* uv_cache=${{UV_CACHE_DIR:-unset}} uv_tools=${{UV_TOOL_DIR:-unset}} npm_cache=${{npm_config_cache:-unset}} py=${{UV_PYTHON_INSTALL_DIR:-unset}}|${{UV_PYTHON_PREFERENCE:-unset}}|${{UV_PYTHON_DOWNLOADS:-unset}}|${{UV_LINK_MODE:-unset}}\"\n\
              if [ -n \"$UV_CACHE_DIR\" ]; then mkdir -p \"$UV_CACHE_DIR/pkg\" && echo x > \"$UV_CACHE_DIR/pkg/cacert.pem\" && echo wrote-cacert; fi\n"
         ),
     );
@@ -46,6 +46,14 @@ fn world(project: &str) -> World {
     let w = World::with_base(BASE, project);
     fake(&w, "uvx");
     fake(&w, "npx");
+    if !project.is_empty() {
+        w.publish_cache(&[
+            ("uv/seed", "published"),
+            ("uv-tools/seed", "published"),
+            ("npm/seed", "published"),
+            ("python/seed", "published"),
+        ]);
+    }
     w
 }
 
@@ -70,31 +78,54 @@ fn cache(w: &World) -> PathBuf {
 }
 
 #[test]
-fn with_a_declared_server_uvx_and_npx_run_offline_from_hbs_cache_for_that_call_only() {
+fn with_a_declared_server_uvx_and_npx_run_offline_from_the_runs_own_cache_copy_for_that_call_only()
+{
     sandboxed!();
     let w = world(SERVER);
     let ran = run(
         &w,
         "uvx --from x serena; npx -y pkg; echo \"outside: ${UV_CACHE_DIR:-unset} ${npm_config_cache:-unset}\"",
     );
-    let root = fs::canonicalize(cache(&w)).unwrap_or_else(|_| cache(&w));
-    let root = root.display();
+    let line = |tool: &str| {
+        ran.stdout
+            .lines()
+            .find(|l| l.starts_with(tool))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (uvx, npx) = (line("fake-uvx"), line("fake-npx"));
     assert!(
-        ran.stdout.contains(&format!(
-            "fake-uvx args=--offline --from x serena uv_cache={root}/uv uv_tools={root}/uv-tools npm_cache=unset"
-        )),
+        uvx.starts_with("fake-uvx args=--offline --from x serena uv_cache="),
         "{}{}",
         ran.stdout,
         ran.stderr
     );
     assert!(
-        ran.stdout.contains(&format!(
-            "fake-npx args=--offline -y pkg uv_cache=unset uv_tools=unset npm_cache={root}/npm"
-        )),
+        npx.starts_with("fake-npx args=--offline -y pkg "),
         "{}{}",
         ran.stdout,
         ran.stderr
     );
+    let uv_cache = uvx
+        .split("uv_cache=")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .unwrap_or("");
+    let root = uv_cache.strip_suffix("/uv").unwrap_or(uv_cache);
+    assert!(
+        root.ends_with("/cache"),
+        "the run's own copy is <session>/cache: {uvx}"
+    );
+    assert!(
+        !root.contains(".cache/hamster-ball"),
+        "never the shared store: {uvx}"
+    );
+    assert!(uvx.contains(&format!("uv_tools={root}/uv-tools")), "{uvx}");
+    assert!(
+        uvx.contains(&format!("py={root}/python|only-managed|never|copy")),
+        "{uvx}"
+    );
+    assert!(npx.contains(&format!("npm_cache={root}/npm")), "{npx}");
     assert!(
         ran.stdout.contains("outside: unset unset"),
         "{}",
@@ -103,54 +134,113 @@ fn with_a_declared_server_uvx_and_npx_run_offline_from_hbs_cache_for_that_call_o
 }
 
 #[test]
-fn the_cache_is_writable_by_the_launcher_and_the_guard_still_guards_the_project() {
+fn a_run_writes_only_its_own_copy_and_the_published_generation_and_the_next_run_stay_clean() {
     sandboxed!();
     let w = world(SERVER);
-    let ran = run(
+    let first = run(
         &w,
-        "uvx a; echo secret > ./key.pem 2>/dev/null && echo project-pem-written",
+        "uvx a; echo secret > ./key.pem 2>/dev/null && echo project-pem-written; \
+         echo poisoned > \"$TMPDIR/cache/uv/seed\"",
     );
     assert!(
-        ran.stdout.contains("wrote-cacert"),
+        first.stdout.contains("wrote-cacert"),
         "{}{}",
-        ran.stdout,
-        ran.stderr
+        first.stdout,
+        first.stderr
     );
     assert!(
-        !ran.stdout.contains("project-pem-written"),
-        "the guard denies a .pem in the project: {}",
-        ran.stdout
+        !first.stdout.contains("project-pem-written"),
+        "the guard still denies a .pem in the project: {}",
+        first.stdout
     );
-    assert!(cache(&w).join("uv/pkg/cacert.pem").exists());
-    let mode = assert_ok!(fs::metadata(cache(&w).join("uv")))
+    let published = assert_ok!(fs::read_dir(cache(&w).join("generations")))
+        .flatten()
+        .next()
+        .map(|e| e.path().join("data"))
+        .unwrap_or_default();
+    assert_eq!(
+        assert_ok!(fs::read_to_string(published.join("uv/seed"))),
+        "published"
+    );
+    assert!(
+        !published.join("uv/pkg").exists(),
+        "the run's write did not reach the generation"
+    );
+    let second = run(&w, "cat \"$TMPDIR/cache/uv/seed\"; ls \"$TMPDIR/cache/uv\"");
+    assert!(
+        second.stdout.starts_with("published"),
+        "a later run starts from the generation: {}{}",
+        second.stdout,
+        second.stderr
+    );
+    assert!(
+        !second.stdout.contains("pkg"),
+        "and sees nothing the first run wrote: {}",
+        second.stdout
+    );
+    let mode = assert_ok!(fs::metadata(published.join("uv")))
         .permissions()
         .mode()
         & 0o777;
     assert_eq!(mode, 0o700);
 }
 
+fn refused(w: &World) -> (bool, String, String) {
+    let out = assert_ok!(
+        w.drive(DRIVE, &["run", "--", "/bin/sh", "-c", "echo ran"])
+            .output()
+    );
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 #[test]
-fn the_hint_names_hb_warm_until_the_cache_is_marked_warmed() {
+fn a_run_with_no_published_generation_does_not_start_and_says_to_run_hb_warm() {
+    sandboxed!();
+    let w = World::with_base(BASE, SERVER);
+    fake(&w, "uvx");
+    let (ok, stdout, stderr) = refused(&w);
+    assert!(!ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("ran"), "the agent never started: {stdout}");
+    assert!(stderr.contains("hb warm"), "{stderr}");
+}
+
+#[test]
+fn only_the_old_shared_cache_is_refused_and_left_untouched() {
+    sandboxed!();
+    let w = World::with_base(BASE, SERVER);
+    fake(&w, "uvx");
+    write(&cache(&w).join("uv/old"), "legacy bytes");
+    let (ok, stdout, stderr) = refused(&w);
+    assert!(!ok && !stdout.contains("ran"), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("old shared cache") && stderr.contains("hb warm"),
+        "{stderr}"
+    );
+    assert_eq!(
+        assert_ok!(fs::read_to_string(cache(&w).join("uv/old"))),
+        "legacy bytes"
+    );
+}
+
+#[test]
+fn a_changed_tool_makes_the_generation_stale_and_the_run_refuses() {
     sandboxed!();
     let w = world(SERVER);
-    let cold = run(&w, "uvx a");
+    let path = w.base.join("bin/uvx");
+    write(&path, "#!/bin/sh\necho a different, longer uvx\n");
+    assert_ok!(fs::set_permissions(
+        &path,
+        fs::Permissions::from_mode(0o755)
+    ));
+    let (ok, stdout, stderr) = refused(&w);
+    assert!(!ok && !stdout.contains("ran"), "{stdout}{stderr}");
     assert!(
-        cold.stderr
-            .contains("hb has not warmed its offline cache; run `hb warm`"),
-        "{}",
-        cold.stderr
-    );
-    assert!(
-        cold.stdout.contains("fake-uvx"),
-        "the tool still runs: {}",
-        cold.stdout
-    );
-    write(&cache(&w).join("warmed"), "");
-    let warm = run(&w, "uvx a");
-    assert!(
-        !warm.stderr.contains("hb has not warmed its offline cache"),
-        "{}",
-        warm.stderr
+        stderr.contains("stale") && stderr.contains("tool"),
+        "{stderr}"
     );
 }
 
@@ -188,6 +278,7 @@ fn a_declared_launcher_that_env_tools_does_not_list_is_warned_about() {
         "[mcp.ripgrep]\ncommand = \"npx\"\n",
     );
     fake(&w, "uvx");
+    w.publish_cache(&[("uv/seed", "published")]);
     let ran = run(&w, "true");
     assert!(
         ran.stderr.contains("[mcp.ripgrep] starts `npx`") && ran.stderr.contains("[env] tools"),

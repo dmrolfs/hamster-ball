@@ -3,6 +3,7 @@
 //! The secrets guard (design section 8).
 
 pub mod doctor;
+pub mod git_config;
 pub mod patterns;
 pub mod prepare;
 pub mod repos;

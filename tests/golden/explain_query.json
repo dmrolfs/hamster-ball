@@ -1523,6 +1523,27 @@
     },
     {
       "source": "floor",
+      "rule": "hb-cache",
+      "group": "table",
+      "effect": "deny_read_write",
+      "extent": "subtree",
+      "path": "<FIX>/home/.cache/hamster-ball",
+      "alias": null,
+      "tail": null,
+      "reason": "hamster-ball's published cache generations: a run gets its own copy, never these",
+      "origins": [
+        {
+          "layer": "floor",
+          "file_index": null,
+          "name": null,
+          "file": null,
+          "key": null,
+          "floor_rule": "hb-cache"
+        }
+      ]
+    },
+    {
+      "source": "floor",
       "rule": "zshrc",
       "group": "table",
       "effect": "deny_write",

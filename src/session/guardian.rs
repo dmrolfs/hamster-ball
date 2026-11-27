@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -593,20 +593,33 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
     // A session of its own: no terminal signal (Ctrl-C, hangup) reaches the guard. It is
     // already a leader when started by hand, which is fine.
     let _ = setsid();
-    let queue = Kqueue::new().context(QueueSnafu)?;
     let stdin = io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .context(ReadSnafu)?;
-    let mut commands = File::from(stdin);
-    let mut replies = File::from(
+    let commands = File::from(stdin);
+    let replies = File::from(
         io::stdout()
             .as_fd()
             .try_clone_to_owned()
             .context(ReadSnafu)?,
     );
+    run_loop(grace, commands, replies, |_| {})
+}
+
+/// The actual loop, with owned I/O and a one-shot observation seam after initial recovery.
+/// Process-wide setup stays in `guard_loop`; tests can drive this loop without changing their session.
+fn run_loop(
+    grace: Duration,
+    mut commands: File,
+    mut replies: File,
+    after_first_sweep: impl FnOnce(Swept),
+) -> Result<(Ended, Option<TerminalWatch>), GuardError> {
+    let queue = Kqueue::new().context(QueueSnafu)?;
+    let command_fd = commands.as_raw_fd() as usize;
+    let mut after_first_sweep = Some(after_first_sweep);
     let read_event = KEvent::new(
-        0,
+        command_fd,
         EventFilter::EVFILT_READ,
         EvFlags::EV_ADD,
         FilterFlag::empty(),
@@ -647,9 +660,11 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             terminating = Some(Instant::now() + grace);
             // Leftovers the tracker missed are adopted and get the same TERM and the same deadline.
             let by = sweep_budget(grace, terminating);
-            if sweep_for_leftovers(&mut tracker, &queue, &registered, by).adopted > 0
-                && terminating.is_some_and(|deadline| Instant::now() < deadline)
-            {
+            let swept = sweep_for_leftovers(&mut tracker, &queue, &registered, by);
+            if let Some(observe) = after_first_sweep.take() {
+                observe(swept);
+            }
+            if swept.adopted > 0 && terminating.is_some_and(|deadline| Instant::now() < deadline) {
                 let _ = tracker.term_until(terminating.unwrap_or_else(Instant::now));
             }
         }
@@ -720,7 +735,7 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
                     if !open {
                         // End of input stays readable; stop being told about it.
                         let done = KEvent::new(
-                            0,
+                            command_fd,
                             EventFilter::EVFILT_READ,
                             EvFlags::EV_DELETE,
                             FilterFlag::empty(),
@@ -1082,6 +1097,67 @@ mod tests {
     use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
     use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+
+    #[test]
+    fn the_second_sweep_finds_a_holder_created_after_the_first_completed() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::sync::mpsc;
+
+        let dir = assert_ok!(tempfile::tempdir());
+        let real = assert_ok!(dir.path().canonicalize());
+        let (mut client, server) = assert_ok!(UnixStream::pair());
+        assert_ok!(client.set_read_timeout(Some(Duration::from_secs(30))));
+        let commands = File::from(OwnedFd::from(assert_ok!(server.try_clone())));
+        let replies = File::from(OwnedFd::from(server));
+        let (swept_tx, swept_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (ended_tx, ended_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run_loop(Duration::from_secs(20), commands, replies, |swept| {
+                let _ = swept_tx.send(swept);
+                let _ = resume_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let _ = ended_tx.send(result);
+        });
+        let mut root = sleeper();
+        let mut response = BufReader::new(assert_ok!(client.try_clone()));
+        assert_ok!(writeln!(client, "ack 1 watch core process {}", root.id()));
+        let mut line = String::new();
+        assert_ok!(response.read_line(&mut line));
+        assert_eq!(line, "1 armed\n");
+        assert_ok!(writeln!(client, "ack 2 sessiondir {}", real.display()));
+        line.clear();
+        assert_ok!(response.read_line(&mut line));
+        assert_eq!(line, "2 ok\n");
+        let _ = root.kill();
+        let _ = root.wait();
+        drop(response);
+        drop(client);
+        let first = assert_ok!(swept_rx.recv_timeout(Duration::from_secs(30)));
+        assert_eq!(first.adopted, 0);
+        assert!(first.complete);
+        let mut holder = assert_ok!(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .current_dir(&real)
+                .process_group(0)
+                .spawn()
+        );
+        assert_ok!(resume_tx.send(()));
+        let ended = ended_rx.recv_timeout(Duration::from_secs(30));
+        let status = assert_ok!(holder.try_wait());
+        // Always clean our child before assertions, including mutant failures.
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert_eq!(assert_ok!(assert_ok!(ended)).0, Ended::HbGone);
+        assert!(worker.join().is_ok());
+        // The deadline backstop sends KILL. TERM proves the empty-tracker recovery pass found it.
+        assert_eq!(
+            claims::assert_some!(status).signal(),
+            Some(Signal::SIGTERM as i32)
+        );
+    }
 
     #[test]
     fn a_watch_line_names_a_group_or_a_single_process() {
