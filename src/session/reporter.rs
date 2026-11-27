@@ -17,12 +17,12 @@
 //!   during the pre-run hooks.
 
 use std::collections::VecDeque;
-use std::io::{BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use snafu::{ResultExt, Snafu};
 
@@ -77,6 +77,9 @@ pub enum ChannelError {
 #[derive(Default)]
 struct Queues {
     lifecycle: VecDeque<Event>,
+    /// Includes lifecycle events already taken by the writer but not completely written.
+    deadlines: VecDeque<Instant>,
+    close_deadline: Option<Instant>,
     telemetry: VecDeque<Event>,
     dropped_denials: u64,
     dropped_proxy: u64,
@@ -90,6 +93,7 @@ struct Shared {
     queues: Mutex<Queues>,
     wake: Condvar,
     stop: Arc<StopSignal>,
+    write_timeout: Duration,
 }
 
 impl Shared {
@@ -98,8 +102,23 @@ impl Shared {
         self.queues.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn deadline(&self, frame_deadline: Instant) -> Instant {
+        let q = self.lock();
+        q.deadlines
+            .front()
+            .copied()
+            .into_iter()
+            .chain(q.close_deadline)
+            .fold(frame_deadline, Instant::min)
+    }
+
     fn break_channel(&self) {
-        self.lock().broken = true;
+        let mut q = self.lock();
+        if q.broken {
+            return;
+        }
+        q.broken = true;
+        drop(q);
         self.wake.notify_all();
         self.stop.request();
     }
@@ -108,6 +127,7 @@ impl Shared {
 /// What the writer takes next.
 struct Batch {
     events: Vec<Event>,
+    lifecycle: usize,
     /// Nothing more will come: the closing event, if any, is the last of `events`.
     finished: bool,
 }
@@ -122,6 +142,7 @@ impl Shared {
                 return None;
             }
             let mut events: Vec<Event> = q.lifecycle.drain(..).collect();
+            let lifecycle = events.len();
             if q.dropped_denials > 0 || q.dropped_proxy > 0 {
                 events.push(Event::Dropped {
                     denials: std::mem::take(&mut q.dropped_denials),
@@ -135,7 +156,11 @@ impl Shared {
                 events.extend(q.last.take());
             }
             if finished || !events.is_empty() {
-                return Some(Batch { events, finished });
+                return Some(Batch {
+                    events,
+                    lifecycle,
+                    finished,
+                });
             }
             q = self.wake.wait(q).unwrap_or_else(|e| e.into_inner());
         }
@@ -200,11 +225,12 @@ impl Lifecycle {
         if q.broken || q.closing {
             return;
         }
-        if q.lifecycle.len() >= LIFECYCLE_CAPACITY {
+        if q.deadlines.len() >= LIFECYCLE_CAPACITY {
             drop(q);
             self.0.break_channel();
             return;
         }
+        q.deadlines.push_back(Instant::now() + self.0.write_timeout);
         q.lifecycle.push_back(event);
         drop(q);
         self.0.wake.notify_one();
@@ -250,13 +276,11 @@ impl Reporter {
         write_timeout: Duration,
         spawn_reader: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
     ) -> Result<Self, ChannelError> {
-        stream
-            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-            .context(IoSnafu)?;
-        stream
-            .set_write_timeout(Some(write_timeout))
-            .context(IoSnafu)?;
-        let mut reader = BufReader::new(stream.try_clone().context(IoSnafu)?);
+        let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let mut reader = BufReader::new(HandshakeReader {
+            stream: stream.try_clone().context(IoSnafu)?,
+            deadline: Some(handshake_deadline),
+        });
         let line = read_line(&mut reader)
             .context(HandshakeSnafu)?
             .ok_or(ProtocolError::Truncated)
@@ -269,15 +293,21 @@ impl Reporter {
             pid: std::process::id(),
         };
         let mut writer_end = stream.try_clone().context(IoSnafu)?;
-        writer_end
-            .write_all(&encode_line(&ack).context(AnswerSnafu)?)
-            .context(IoSnafu)?;
-        // Commands may come at any time after this, so the read has no timeout.
+        let ack_deadline = handshake_deadline.min(Instant::now() + write_timeout);
+        write_before(
+            &mut writer_end,
+            &encode_line(&ack).context(AnswerSnafu)?,
+            || ack_deadline,
+        )
+        .context(IoSnafu)?;
+        // Preserve read-ahead commands while removing only the handshake deadline.
+        reader.get_mut().deadline = None;
         stream.set_read_timeout(None).context(IoSnafu)?;
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues::default()),
             wake: Condvar::new(),
             stop,
+            write_timeout,
         });
         let writer = {
             let shared = Arc::clone(&shared);
@@ -324,12 +354,13 @@ impl Reporter {
         self.lifecycle_handle().send(event);
     }
 
-    /// Sends what is queued, then `exited`, and closes the channel. Waits at most about one write
-    /// timeout, because the writer gives up on a supervisor that does not read.
+    /// Sends queued events and then `exited` within one absolute write-timeout budget.
+    /// Older lifecycle deadlines still apply. Scheduler stalls are not a hard real-time bound.
     pub fn finish(mut self, exited: Event) {
         {
             let mut q = self.shared.lock();
             q.last = Some(exited);
+            q.close_deadline = Some(Instant::now() + self.shared.write_timeout);
             q.closing = true;
         }
         self.shared.wake.notify_all();
@@ -354,33 +385,114 @@ impl Drop for Reporter {
         {
             let mut q = self.shared.lock();
             q.closing = true;
+            q.broken = true;
         }
         self.shared.wake.notify_all();
+        let _ = self.stream.shutdown(Shutdown::Both);
         self.close();
     }
 }
 
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "supervisor channel deadline expired",
+            )
+        })
+}
+
+/// Retains BufReader read-ahead when the handshake becomes the command stream.
+struct HandshakeReader {
+    stream: UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for HandshakeReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            self.stream.set_read_timeout(Some(remaining(deadline)?))?;
+        }
+        let read = self.stream.read(bytes)?;
+        if let Some(deadline) = self.deadline {
+            remaining(deadline)?;
+        }
+        Ok(read)
+    }
+}
+
+fn write_before(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: impl Fn() -> Instant,
+) -> io::Result<()> {
+    write_timed(bytes, deadline, |bytes, left| {
+        stream.set_write_timeout(Some(left))?;
+        stream.write(bytes)
+    })
+}
+
+fn write_timed(
+    mut bytes: &[u8],
+    deadline: impl Fn() -> Instant,
+    mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match write(bytes, remaining(deadline())?) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        remaining(deadline())?;
+    }
+    Ok(())
+}
+
 fn write_loop(stream: &mut UnixStream, shared: &Shared) {
+    if write_batches(shared, |line, deadline| {
+        write_before(stream, line, || shared.deadline(deadline))
+    })
+    .is_err()
+    {
+        shared.break_channel();
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+fn write_batches(
+    shared: &Shared,
+    mut write: impl FnMut(&[u8], Instant) -> io::Result<()>,
+) -> io::Result<()> {
     let mut sent = 0u64;
     while let Some(batch) = shared.next_batch() {
-        for event in batch.events {
-            // An event that cannot be encoded is not sent and does not use a number.
-            let Ok(line) = encode_frame(sent + 1, event) else {
-                continue;
+        for (index, event) in batch.events.into_iter().enumerate() {
+            let deadline = Instant::now() + shared.write_timeout;
+            let line = encode_frame(sent + 1, event);
+            let result = match line {
+                Ok(line) => write(&line, shared.deadline(deadline)),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid lifecycle or telemetry frame",
+                )),
             };
-            if stream.write_all(&line).is_err() {
-                shared.break_channel();
-                return;
+            result?;
+            if index < batch.lifecycle {
+                shared.lock().deadlines.pop_front();
             }
             sent += 1;
         }
         if batch.finished {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
-fn read_loop(reader: &mut BufReader<UnixStream>, shared: &Shared) {
+fn read_loop(reader: &mut BufReader<HandshakeReader>, shared: &Shared) {
     loop {
         let stopping = match read_line(reader) {
             Ok(Some(line)) => match decode_command(&line) {
@@ -452,6 +564,275 @@ mod tests {
     }
 
     #[test]
+    fn partial_writes_retry_only_unsent_bytes_and_preserve_io_errors() {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut calls = 0;
+        let mut received = Vec::new();
+        assert_ok!(write_timed(
+            b"frame",
+            || deadline,
+            |bytes, _| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                received.push(bytes[0]);
+                Ok(1)
+            }
+        ));
+        assert_eq!(received, b"frame");
+        for kind in [io::ErrorKind::WriteZero, io::ErrorKind::BrokenPipe] {
+            let error = claims::assert_err!(write_timed(
+                b"frame",
+                || deadline,
+                |_, _| {
+                    if kind == io::ErrorKind::WriteZero {
+                        Ok(0)
+                    } else {
+                        Err(kind.into())
+                    }
+                }
+            ));
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn full_frame_progress_after_expiry_is_still_a_timeout() {
+        use std::cell::Cell;
+        let deadline = Cell::new(Instant::now() + WRITE_TIMEOUT);
+        let error = claims::assert_err!(write_timed(
+            b"frame",
+            || deadline.get(),
+            |bytes, _| {
+                deadline.set(Instant::now() - WRITE_TIMEOUT);
+                Ok(bytes.len())
+            }
+        ));
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    fn queued() -> Arc<Shared> {
+        Arc::new(Shared {
+            queues: Mutex::new(Queues::default()),
+            wake: Condvar::new(),
+            stop: StopSignal::new(),
+            write_timeout: WRITE_TIMEOUT,
+        })
+    }
+
+    #[test]
+    fn writer_retires_only_written_lifecycle_deadlines_and_preserves_the_close_budget() {
+        let shared = queued();
+        let lifecycle = Lifecycle(Arc::clone(&shared));
+        lifecycle.send(Event::Starting {});
+        for _ in 0..BATCH + 2 {
+            Telemetry(Arc::clone(&shared)).denial("queued");
+        }
+        let first_deadline = shared.lock().deadlines[0];
+        let mut written = 0;
+        let mut final_written = false;
+        let result = write_batches(&shared, |line, deadline| {
+            remaining(deadline)?;
+            final_written |= String::from_utf8_lossy(line).contains("last");
+            if written == 0 {
+                assert_eq!(deadline, first_deadline);
+                // Enqueue while the first lifecycle entry is in flight.
+                lifecycle.send(Event::Stopping {});
+                assert_eq!(shared.lock().deadlines.len(), 2);
+            } else if written == 1 {
+                let mut q = shared.lock();
+                assert_eq!(q.deadlines.len(), 1);
+                q.closing = true;
+                q.last = Some(Event::warning("last"));
+                q.close_deadline = Some(first_deadline + WRITE_TIMEOUT);
+                assert_eq!(deadline, q.deadlines[0]);
+            } else if written == BATCH {
+                shared.lock().close_deadline = Some(Instant::now() - WRITE_TIMEOUT);
+            }
+            written += 1;
+            Ok(())
+        });
+        assert_eq!(claims::assert_err!(result).kind(), io::ErrorKind::TimedOut);
+        assert_eq!(written, BATCH + 1);
+        assert!(!final_written, "final frame must not be delivered");
+        assert_eq!(
+            shared.lock().deadlines.len(),
+            1,
+            "unsent lifecycle must remain pending"
+        );
+    }
+
+    #[test]
+    fn one_unchanged_close_deadline_bounds_successful_frames_across_batches() {
+        let shared = queued();
+        for _ in 0..BATCH * 2 {
+            Telemetry(Arc::clone(&shared)).denial("queued");
+        }
+        let close_deadline = Instant::now() + Duration::from_secs(1);
+        {
+            let mut q = shared.lock();
+            q.closing = true;
+            q.close_deadline = Some(close_deadline);
+            q.last = Some(Event::warning("last"));
+        }
+        let mut written = 0;
+        let result = write_batches(&shared, |line, deadline| {
+            assert_eq!(deadline, close_deadline);
+            if written == BATCH + 1 {
+                thread::sleep(
+                    close_deadline.saturating_duration_since(Instant::now())
+                        + Duration::from_millis(1),
+                );
+            }
+            remaining(deadline)?;
+            assert!(!String::from_utf8_lossy(line).contains("last"));
+            written += 1;
+            Ok(())
+        });
+        assert_eq!(claims::assert_err!(result).kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            written,
+            BATCH + 1,
+            "must pass the batch boundary before expiry"
+        );
+        assert_eq!(shared.lock().close_deadline, Some(close_deadline));
+    }
+
+    #[test]
+    fn expired_lifecycle_stops_the_actual_writer_without_sending_a_prefix() {
+        let shared = queued();
+        Lifecycle(Arc::clone(&shared)).send(Event::Starting {});
+        shared.lock().deadlines[0] = Instant::now() - WRITE_TIMEOUT;
+        let (mut stream, mut peer) = assert_ok!(UnixStream::pair());
+        write_loop(&mut stream, &shared);
+        assert!(shared.stop.is_requested());
+        let mut bytes = Vec::new();
+        assert_ok!(peer.read_to_end(&mut bytes));
+        assert!(bytes.is_empty());
+        assert_eq!(shared.lock().deadlines.len(), 1);
+    }
+
+    #[test]
+    fn intentional_drop_during_an_active_writer_does_not_request_stop() {
+        let shared = queued();
+        Lifecycle(Arc::clone(&shared)).send(Event::Starting {});
+        let (stream, mut peer) = assert_ok!(UnixStream::pair());
+        let mut writer_end = assert_ok!(stream.try_clone());
+        assert_ok!(writer_end.set_read_timeout(Some(Duration::from_secs(5))));
+        let writing = Arc::clone(&shared);
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (completed, outcome) = std::sync::mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            let result = write_batches(&writing, |line, _| {
+                assert_ok!(entered.send(()));
+                // Observe Drop's abort before allowing the pending write to fail.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !writing.lock().broken {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                // The peer stays open; only Drop's shutdown releases this read.
+                assert_eq!(assert_ok!(writer_end.read(&mut [0])), 0);
+                writer_end.write_all(line)
+            });
+            writing.break_channel();
+            assert_ok!(completed.send(result.is_err()));
+        });
+        let reporter = Reporter {
+            shared: Arc::clone(&shared),
+            stream,
+            writer: Some(writer),
+            reader: None,
+        };
+        assert_ok!(waiting.recv_timeout(Duration::from_secs(5)));
+        drop(reporter);
+        assert!(assert_ok!(outcome.recv_timeout(Duration::from_secs(5))));
+        assert!(!shared.stop.is_requested());
+        assert_eq!(assert_ok!(peer.read(&mut [0])), 0);
+    }
+
+    #[test]
+    fn progress_and_interruption_do_not_reset_the_write_deadline() {
+        use std::cell::Cell;
+        for interrupted in [false, true] {
+            let deadline = Cell::new(Instant::now() + Duration::from_secs(10));
+            let mut calls = 0;
+            let error = claims::assert_err!(write_timed(
+                b"frame",
+                || deadline.get(),
+                |_, _| {
+                    calls += 1;
+                    deadline.set(Instant::now() - Duration::from_secs(1));
+                    if interrupted {
+                        Err(io::ErrorKind::Interrupted.into())
+                    } else {
+                        Ok(1)
+                    }
+                }
+            ));
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn lifecycle_deadline_survives_dequeue_and_bounds_intervening_telemetry() {
+        let shared = Arc::new(Shared {
+            queues: Mutex::new(Queues::default()),
+            wake: Condvar::new(),
+            stop: StopSignal::new(),
+            write_timeout: WRITE_TIMEOUT,
+        });
+        Telemetry(Arc::clone(&shared)).denial("waiting telemetry");
+        let telemetry = claims::assert_some!(shared.next_batch());
+        Lifecycle(Arc::clone(&shared)).send(Event::Starting {});
+        let expired = Instant::now() - Duration::from_secs(1);
+        shared.lock().deadlines[0] = expired;
+        assert_eq!(telemetry.lifecycle, 0);
+        assert_eq!(shared.deadline(Instant::now() + WRITE_TIMEOUT), expired);
+        let lifecycle = claims::assert_some!(shared.next_batch());
+        assert_eq!(lifecycle.lifecycle, 1);
+        assert_eq!(shared.deadline(Instant::now() + WRITE_TIMEOUT), expired);
+    }
+
+    #[test]
+    fn expired_final_drain_stops_even_when_the_socket_is_writable() {
+        let shared = Shared {
+            queues: Mutex::new(Queues {
+                closing: true,
+                close_deadline: Some(Instant::now() - Duration::from_secs(1)),
+                last: Some(Event::Stopping {}),
+                ..Queues::default()
+            }),
+            wake: Condvar::new(),
+            stop: StopSignal::new(),
+            write_timeout: WRITE_TIMEOUT,
+        };
+        let (mut stream, mut peer) = assert_ok!(UnixStream::pair());
+        write_loop(&mut stream, &shared);
+        assert!(shared.stop.is_requested());
+        let mut received = Vec::new();
+        assert_ok!(peer.read_to_end(&mut received));
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn a_command_buffered_with_the_handshake_is_not_lost() {
+        let (ours, mut peer) = assert_ok!(UnixStream::pair());
+        let mut bytes = assert_ok!(encode_line(&Hello::new(7, 2)));
+        bytes.extend_from_slice(b"{\"cmd\":\"stop\"}\n");
+        assert_ok!(peer.write_all(&bytes));
+        let stop = StopSignal::new();
+        let _reporter = assert_ok!(Reporter::connect(ours, Arc::clone(&stop)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stop.is_requested() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stop.is_requested());
+    }
+
+    #[test]
     fn reader_spawn_failure_closes_the_already_started_writer_channel() {
         let (ours, mut peer) = assert_ok!(UnixStream::pair());
         assert_ok!(peer.set_read_timeout(Some(Duration::from_millis(200))));
@@ -496,6 +877,26 @@ mod tests {
     }
 
     #[test]
+    fn handshake_progress_does_not_renew_its_total_deadline() {
+        let (ours, mut peer) = assert_ok!(UnixStream::pair());
+        let sender = thread::spawn(move || {
+            for _ in 0..7 {
+                if peer.write_all(b" ").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(900));
+            }
+            let _ = peer.write_all(&assert_ok!(encode_line(&Hello::new(7, 2))));
+            let _ = peer.read(&mut [0u8; 256]);
+        });
+        let result = Reporter::connect(ours, StopSignal::new());
+        let refused = result.is_err();
+        drop(result);
+        assert_ok!(sender.join());
+        assert!(refused, "trickled handshake outlived its absolute deadline");
+    }
+
+    #[test]
     fn a_supervisor_that_sends_no_handshake_is_not_waited_for_forever() {
         // Closing the peer is the quick form of "no handshake".
         let (ours, theirs) = assert_ok!(UnixStream::pair());
@@ -536,6 +937,7 @@ mod tests {
             queues: Mutex::new(Queues::default()),
             wake: Condvar::new(),
             stop: StopSignal::new(),
+            write_timeout: WRITE_TIMEOUT,
         };
         let shared = Arc::new(shared);
         let telemetry = Telemetry(Arc::clone(&shared));

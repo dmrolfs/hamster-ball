@@ -393,23 +393,24 @@ fn closing_the_channel_stops_the_agent_and_the_session_directory_is_removed() {
     let w = World::new(PROJECT);
     let pid_file = w.project.join("agent.pid");
     let script = format!(
-        "echo $$ > '{}'; echo tmp=$TMPDIR; sleep 120",
+        "printf '%s\\n%s\\n' \"$$\" \"$TMPDIR\" > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 120",
         pid_file.display()
     );
     let mut session = Session::start(&w, &[], &["/bin/sh", "-c", &script], true);
     session.wait_for("running", 60);
-    let pid: i32 = wait_for_file(&pid_file, 20).trim().parse().unwrap_or(0);
-    assert!(pid > 0 && alive(pid), "the agent did not start");
+    let ready = wait_for_file(&pid_file, 20);
+    let mut lines = ready.lines();
+    let pid: i32 = assert_ok!(assert_some!(lines.next()).parse());
+    let tmp = assert_some!(lines.next()).to_owned();
+    assert!(
+        tmp.contains("/hb-") && PathBuf::from(&tmp).is_dir(),
+        "invalid readiness {ready:?}"
+    );
+    assert!(pid > 1 && alive(pid), "the agent did not start");
     session.close_channel();
     let ended = session.finish(30);
     assert!(ended.took < Duration::from_secs(25), "{:?}", ended.took);
     assert!(!alive(pid), "the agent {pid} survived the supervisor");
-    let tmp = ended
-        .stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("tmp="))
-        .unwrap_or_default()
-        .to_owned();
     assert!(
         tmp.contains("/hb-") && !PathBuf::from(&tmp).exists(),
         "session directory {tmp:?} left behind"
