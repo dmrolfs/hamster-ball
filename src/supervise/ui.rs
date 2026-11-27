@@ -408,6 +408,9 @@ impl Loop<'_> {
         drain_events()?;
         // A flush that fails here leaves possible stale keys for the UI; say so, stay in the UI.
         let flushed = flush_input();
+        // If the terminal was not fully given back for the review, this does not resume the UI and
+        // fails; the run then ends through the normal path rather than carrying on in a terminal
+        // that is partly cooked.
         self.guard.resume().context(TerminalSnafu)?;
         // `clear` would ask the terminal where the cursor is and wait for the reply, which fails
         // right after a hand-over; `resize` clears the same area and forgets what was drawn.

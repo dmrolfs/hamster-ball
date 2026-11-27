@@ -82,10 +82,23 @@ pub fn flush_input() -> io::Result<()> {
         .map_err(io::Error::from)
 }
 
+/// Who has the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The UI has it: raw mode, alternate screen, paste and focus reporting.
+    Ui,
+    /// It was given back and every restoring step succeeded.
+    Released,
+    /// It was given back but a restoring step failed, so the terminal may be partly restored and
+    /// the UI's modes are not on. Restoring is tried again at the next `suspend` and on drop,
+    /// and `resume` refuses to build on it.
+    Pending,
+}
+
 /// Restores the terminal when dropped.
 #[derive(Debug)]
 pub struct TerminalGuard {
-    active: bool,
+    hold: Hold,
 }
 
 impl TerminalGuard {
@@ -95,7 +108,7 @@ impl TerminalGuard {
     /// The OS error if a mode cannot be set.
     pub fn enter() -> io::Result<Self> {
         // Armed first: a failure below restores through Drop.
-        let mut guard = Self { active: true };
+        let mut guard = Self { hold: Hold::Ui };
         if let Err(error) = enter_modes(&mut io::stdout()) {
             let _ = guard.suspend();
             return Err(error);
@@ -107,45 +120,78 @@ impl TerminalGuard {
     #[cfg(test)]
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active
+        self.hold == Hold::Ui
+    }
+
+    /// Whether a restoring step failed and has not yet been made good.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.hold == Hold::Pending
     }
 
     /// Gives the terminal back, for a program that needs the real one. Does nothing if it is
     /// already given back.
     ///
     /// # Errors
-    /// The first error of the restoring steps; all of them were tried. The guard counts the
-    /// terminal as given back either way, since nothing more can be done with it.
+    /// The first error of the restoring steps; all of them were tried. After an error the guard is
+    /// pending, not released: the next call and drop try again.
     pub fn suspend(&mut self) -> io::Result<()> {
         self.suspend_with(|| restore_modes(&mut io::stdout(), true))
     }
 
     /// [`TerminalGuard::suspend`] with the restoring passed in, so a failure can be tested.
     ///
-    /// Every step is tried by `restore`; the guard stays active if it failed, so Drop tries again
-    /// rather than leaving the owner's terminal in raw mode for want of one transient error.
+    /// Every step is tried by `restore`. A failure leaves the guard pending so that Drop tries
+    /// again, rather than leaving the owner's terminal in raw mode for want of one transient error.
     fn suspend_with(&mut self, restore: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        if !self.active {
+        if self.hold == Hold::Released {
             return Ok(());
         }
         let restored = restore();
-        if restored.is_ok() {
-            self.active = false;
-        }
+        self.hold = if restored.is_ok() {
+            Hold::Released
+        } else {
+            Hold::Pending
+        };
         restored
     }
 
     /// Takes the terminal again after [`TerminalGuard::suspend`].
     ///
     /// # Errors
-    /// The OS error if a mode cannot be set; the terminal is then given back again.
+    /// The OS error if a mode cannot be set, or if the terminal was never fully given back
+    /// (pending): modes are not built on a terminal in an unknown state. The terminal is then
+    /// given back again.
     pub fn resume(&mut self) -> io::Result<()> {
-        if self.active {
-            return Ok(());
+        self.resume_with(
+            || enter_modes(&mut io::stdout()),
+            || restore_modes(&mut io::stdout(), true),
+        )
+    }
+
+    /// [`TerminalGuard::resume`] with entering and restoring passed in, so each can be tested.
+    fn resume_with(
+        &mut self,
+        enter: impl FnOnce() -> io::Result<()>,
+        restore: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self.hold {
+            Hold::Ui => return Ok(()),
+            Hold::Pending => {
+                // Try once more to finish what failed; whatever the answer, the UI does not resume.
+                self.suspend_with(restore)?;
+                return Err(io::Error::other(
+                    "the terminal was not fully restored before the review, so the UI was not resumed",
+                ));
+            }
+            Hold::Released => {}
         }
-        self.active = true;
-        if let Err(error) = enter_modes(&mut io::stdout()) {
-            let _ = self.suspend();
+        self.hold = Hold::Ui;
+        if let Err(error) = enter() {
+            // Part of the modes may be on. Put everything back, and keep the failure if that fails.
+            self.hold = Hold::Pending;
+            let _ = self.suspend_with(|| restore_modes(&mut io::stdout(), true));
             return Err(error);
         }
         Ok(())
@@ -212,15 +258,16 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_that_fails_leaves_the_guard_active_and_the_next_one_tries_again() {
+    fn a_restore_that_fails_leaves_the_guard_pending_and_the_next_one_tries_again() {
         use claims::{assert_err, assert_ok};
-        let mut guard = TerminalGuard { active: true };
+        let mut guard = TerminalGuard { hold: Hold::Ui };
         let mut attempts = 0;
         assert_err!(guard.suspend_with(|| {
             attempts += 1;
             Err(io::Error::other("the terminal went away for a moment"))
         }));
-        assert!(guard.is_active(), "a failed restore must stay pending");
+        assert!(guard.is_pending(), "a failed restore must stay pending");
+        assert!(!guard.is_active(), "and is not the UI");
         // Drop calls suspend again; this time it works.
         assert_ok!(guard.suspend_with(|| {
             attempts += 1;
@@ -238,8 +285,72 @@ mod tests {
 
     #[test]
     fn a_guard_that_is_not_active_suspends_without_touching_the_terminal() {
-        let mut guard = TerminalGuard { active: false };
+        let mut guard = TerminalGuard {
+            hold: Hold::Released,
+        };
         assert!(guard.suspend().is_ok());
         assert!(!guard.is_active());
+    }
+
+    // ========================================================================
+    // A terminal that was not fully given back is not built on again
+    // ========================================================================
+
+    fn failing() -> io::Result<()> {
+        Err(io::Error::other("a restoring step failed"))
+    }
+
+    #[test]
+    fn a_failed_suspend_makes_the_guard_pending_and_resume_does_not_enter_the_ui() {
+        use claims::{assert_err, assert_ok};
+        let mut guard = TerminalGuard { hold: Hold::Ui };
+        assert_err!(guard.suspend_with(failing));
+        assert!(guard.is_pending());
+        let mut entered = false;
+        let mut restored = 0;
+        let error = assert_err!(guard.resume_with(
+            || {
+                entered = true;
+                Ok(())
+            },
+            || {
+                restored += 1;
+                Ok(())
+            }
+        ));
+        assert!(
+            !entered,
+            "modes were built on a terminal in an unknown state"
+        );
+        assert_eq!(restored, 1, "it tries once more to finish restoring");
+        assert!(error.to_string().contains("not fully restored"), "{error}");
+        // The retry worked, so the terminal is released now and a later resume may proceed.
+        assert!(!guard.is_pending() && !guard.is_active());
+        assert_ok!(guard.resume_with(|| Ok(()), || Ok(())));
+        assert!(guard.is_active());
+    }
+
+    #[test]
+    fn a_resume_whose_retry_also_fails_stays_pending_and_reports_the_not_resumed_error() {
+        use claims::assert_err;
+        let mut guard = TerminalGuard {
+            hold: Hold::Pending,
+        };
+        let error = assert_err!(guard.resume_with(|| Ok(()), failing));
+        assert!(guard.is_pending());
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_resume_that_fails_to_enter_puts_everything_back_and_leaves_no_ui_claim() {
+        use claims::assert_err;
+        let mut guard = TerminalGuard {
+            hold: Hold::Released,
+        };
+        assert_err!(guard.resume_with(failing, || Ok(())));
+        assert!(
+            !guard.is_active(),
+            "a half-entered UI must not count as the UI"
+        );
     }
 }
