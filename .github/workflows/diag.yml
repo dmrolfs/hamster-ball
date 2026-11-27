@@ -1,4 +1,4 @@
-# TEMPORARY (hb-je6): measure descendant_cleanup timing on the hosted runner. Deleted before merge.
+# TEMPORARY (hb-je6): time lsof on the hosted runner. Deleted before merge.
 name: diag
 on:
   pull_request:
@@ -8,17 +8,16 @@ permissions:
 jobs:
   diag:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
-      - run: sudo xcode-select -s /Library/Developer/CommandLineTools
-      - name: Escape rates with more trials
-        run: HB_CAJ_TRIALS=200 cargo test --locked --all-features --test descendant_cleanup -- --nocapture detach_patterns 2>&1 | grep -E "RATES|escaped|test result" || true
-      - name: Leftover test, 5 times, alone
+      - name: lsof +D on an empty temp dir, cold then warm
         run: |
-          for _ in 1 2 3 4 5; do
-            cargo test --locked --all-features --test descendant_cleanup -- --nocapture a_leftover_is_still 2>&1 | grep -E "^test |panicked|not found|test result" || true
-          done
+          d=$(mktemp -d)
+          python3 - "$d" <<'PY'
+          import subprocess, sys, time
+          d = sys.argv[1]
+          for i in range(8):
+              t = time.perf_counter()
+              r = subprocess.run(["/usr/sbin/lsof", "-t", "+D", d], capture_output=True)
+              print("run %d: %.0f ms rc=%d" % (i, (time.perf_counter() - t) * 1000, r.returncode))
+          PY
