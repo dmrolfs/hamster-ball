@@ -646,7 +646,8 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             let _ = tracker.signal(Signal::SIGTERM);
             terminating = Some(Instant::now() + grace);
             // Leftovers the tracker missed are adopted and get the same TERM and the same deadline.
-            if sweep_for_leftovers(&mut tracker, &queue, &registered) > 0 {
+            let by = sweep_budget(grace, terminating);
+            if sweep_for_leftovers(&mut tracker, &queue, &registered, by) > 0 {
                 let _ = tracker.signal(Signal::SIGTERM);
             }
         }
@@ -655,7 +656,8 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
             // concluding. Anything found is ended under the original deadline.
             if !registered.final_sweep_done {
                 registered.final_sweep_done = true;
-                if sweep_for_leftovers(&mut tracker, &queue, &registered) > 0 {
+                let by = sweep_budget(grace, terminating);
+                if sweep_for_leftovers(&mut tracker, &queue, &registered, by) > 0 {
                     let _ = tracker.signal(Signal::SIGTERM);
                 }
             }
@@ -665,9 +667,11 @@ fn guard_loop(grace: Duration) -> Result<(Ended, Option<TerminalWatch>), GuardEr
         }
         // The deadline is checked on every pass, so a busy stream of fork events cannot defer it.
         if terminating.is_some_and(|deadline| Instant::now() >= deadline) {
-            // One last look: work that left every tie since the first sweep is still a leftover.
-            let _ = sweep_for_leftovers(&mut tracker, &queue, &registered);
-            let _ = tracker.signal(Signal::SIGKILL);
+            // What is known is killed first, so a slow sweep never delays it. Then one last look: work
+            // that left every tie since the first sweep is still a leftover, and gets KILL too.
+            kill_then_sweep(&mut tracker, |tracker| {
+                sweep_for_leftovers(tracker, &queue, &registered, Instant::now() + SWEEP_FLOOR)
+            });
             return Ok((Ended::HbGone, registered.terminal));
         }
         let timeout = terminating.map(|deadline| {
@@ -733,6 +737,26 @@ fn zero() -> nix::libc::timespec {
     *TimeSpec::from_duration(Duration::ZERO).as_ref()
 }
 
+/// The deadline step: KILL everything known, and only then look for leftovers, which get KILL too.
+/// The order matters: a sweep can be slow, and must never delay the kill of what is already known.
+fn kill_then_sweep(tracker: &mut Tracker, sweep: impl FnOnce(&mut Tracker) -> usize) {
+    let _ = tracker.signal(Signal::SIGKILL);
+    if sweep(tracker) > 0 {
+        let _ = tracker.signal(Signal::SIGKILL);
+    }
+}
+
+/// The least time the sweeps get, however short the grace period is.
+const SWEEP_FLOOR: Duration = Duration::from_secs(1);
+
+/// When the sweeps must finish: half the grace period, never less than [`SWEEP_FLOOR`]. The grace
+/// period started when `terminating` was set, so the sweeps come out of it and the TERM-to-KILL
+/// gap stays what the caller asked for.
+fn sweep_budget(grace: Duration, terminating: Option<Instant>) -> Instant {
+    let start = terminating.map_or_else(Instant::now, |end| end - grace);
+    start + (grace / 2).max(SWEEP_FLOOR)
+}
+
 /// Finds leftovers the process tracker missed and adopts them, so they are signalled with the rest.
 ///
 /// Two sources, neither of which proves anything: processes whose environment holds the run's
@@ -740,11 +764,16 @@ fn zero() -> nix::libc::timespec {
 /// processes still using the per-run directory. Every candidate is re-read and must be the same
 /// user and no older than the earliest root before it is adopted. A source that cannot be read is
 /// skipped; the tracker stays the primary mechanism. Returns how many leftovers were adopted.
-fn sweep_for_leftovers(tracker: &mut Tracker, queue: &Kqueue, registered: &Registered) -> usize {
+fn sweep_for_leftovers(
+    tracker: &mut Tracker,
+    queue: &Kqueue,
+    registered: &Registered,
+    by: Instant,
+) -> usize {
     let own = i32::try_from(std::process::id()).unwrap_or(0);
     let mut candidates: Vec<i32> = Vec::new();
     if let Some(token) = &registered.token {
-        if let (Ok(with_env), Ok(plain)) = (listing(true), listing(false)) {
+        if let (Ok(with_env), Ok(plain)) = (listing(true, by), listing(false, by)) {
             let entry = token.entry();
             // The text only nominates: an argument that shrank between the two reads, or a value
             // containing a space, reads the same. Only a whole environment entry counts.
@@ -757,7 +786,7 @@ fn sweep_for_leftovers(tracker: &mut Tracker, queue: &Kqueue, registered: &Regis
         }
     }
     if let Some(dir) = &registered.session_dir {
-        if let Ok(holders) = holders_of(dir) {
+        if let Ok(holders) = holders_of(dir, by) {
             candidates.extend(holders);
         }
     }
@@ -1051,6 +1080,38 @@ mod tests {
 
     fn sleeper() -> std::process::Child {
         assert_ok!(Command::new("/bin/sleep").arg("30").spawn())
+    }
+
+    /// A stalled sweep must not delay the kill of what is already known: the sweep stand-in checks,
+    /// when it runs, that the known process is already dead.
+    #[test]
+    fn the_known_members_are_killed_before_the_sweep_runs() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut child = sleeper();
+        let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        assert_ok!(tracker.arm(&queue, pid, false));
+        let mut dead_when_swept = None;
+        kill_then_sweep(&mut tracker, |_| {
+            // Reaping here is the only way to see the kill: a killed child is a zombie until waited on.
+            dead_when_swept = Some(matches!(child.wait(), Ok(status) if !status.success()));
+            0
+        });
+        assert_eq!(dead_when_swept, Some(true));
+    }
+
+    /// The budget is part of the grace period, never more than half of it, and never under the floor.
+    #[test]
+    fn the_sweeps_budget_comes_out_of_the_grace_period() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(10);
+        let by = sweep_budget(grace, Some(now + grace));
+        assert!(by >= now + Duration::from_millis(4990) && by <= now + Duration::from_millis(5100));
+        let short = sweep_budget(
+            Duration::from_millis(100),
+            Some(now + Duration::from_millis(100)),
+        );
+        assert!(short >= now + Duration::from_millis(990));
     }
 
     #[test]

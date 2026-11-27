@@ -22,6 +22,7 @@ const LSOF: &str = "/usr/sbin/lsof";
 /// The most `ps` output the sweep reads. A longer listing is an error, not a truncated answer.
 const MAX_OUTPUT: u64 = 8 * 1024 * 1024;
 /// How long one `ps` may run.
+/// Longest any one command runs, whatever budget the caller gives the whole sweep.
 const DEADLINE: Duration = Duration::from_secs(5);
 
 /// The name of the variable that carries a run's token into the agent's environment.
@@ -145,7 +146,7 @@ const REAP: Duration = Duration::from_millis(500);
 /// Runs `program` with `args`, never longer than the deadline and never reading more than the cap.
 /// Every wait is bounded, including the wait after a kill: a program stuck in the kernel is
 /// abandoned (it is the guard's own child, and the guard is about to exit) rather than waited on.
-fn run_bounded(program: &'static str, args: &[&str]) -> Result<Ran, SweepError> {
+fn run_bounded(program: &'static str, args: &[&str], by: Instant) -> Result<Ran, SweepError> {
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -161,7 +162,7 @@ fn run_bounded(program: &'static str, args: &[&str]) -> Result<Ran, SweepError> 
     // The readers run on their own threads so a stalled child cannot hold the deadline hostage.
     let stdout = thread::spawn(move || read_capped(out, MAX_OUTPUT));
     let stderr = thread::spawn(move || read_capped(err, MAX_STDERR));
-    let end = Instant::now() + DEADLINE;
+    let end = by.min(Instant::now() + DEADLINE);
     let status = loop {
         if let Some(status) = child.try_wait().context(ReadSnafu { program })? {
             break status;
@@ -225,9 +226,9 @@ fn reap(child: &mut std::process::Child) {
 ///
 /// # Errors
 /// [`SweepError`] for every way the listing can be incomplete.
-pub(super) fn listing(with_env: bool) -> Result<String, SweepError> {
+pub(super) fn listing(with_env: bool, by: Instant) -> Result<String, SweepError> {
     let flags = if with_env { "-Eaxww" } else { "-axww" };
-    let ran = run_bounded(PS, &[flags, "-o", "pid=,command="])?;
+    let ran = run_bounded(PS, &[flags, "-o", "pid=,command="], by)?;
     if ran.code == Some(0) {
         Ok(ran.stdout)
     } else {
@@ -248,12 +249,12 @@ pub(super) fn listing(with_env: bool) -> Result<String, SweepError> {
 ///
 /// # Errors
 /// [`SweepError`] for every way the answer can be incomplete.
-pub(super) fn holders_of(dir: &std::path::Path) -> Result<Vec<i32>, SweepError> {
+pub(super) fn holders_of(dir: &std::path::Path, by: Instant) -> Result<Vec<i32>, SweepError> {
     // `lsof` answers a missing directory exactly like an empty one, so a directory that has
     // vanished would read as "nothing left". Say so instead.
     std::fs::metadata(dir).context(DirectorySnafu)?;
     let dir = dir.to_string_lossy();
-    let ran = run_bounded(LSOF, &["-t", "+D", &dir])?;
+    let ran = run_bounded(LSOF, &["-t", "+D", &dir], by)?;
     if !matches!(ran.code, Some(0 | 1)) {
         return IncompleteSnafu { program: LSOF }.fail();
     }
@@ -357,11 +358,26 @@ mod tests {
     use pretty_assertions::{assert_eq, assert_ne};
     use std::{thread, time::Duration};
 
+    /// A budget that is never the limit in these tests.
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    /// A budget that has already run out ends the command at once with a deadline error, rather than
+    /// letting it run to its own 5 s limit.
+    #[test]
+    fn a_sweep_command_stops_at_the_budget_it_is_given() {
+        let started = Instant::now();
+        let err = claims::assert_err!(listing(true, Instant::now()));
+        assert!(matches!(err, SweepError::Deadline { .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn a_real_listing_has_this_test_process_in_it() {
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
-        let plain = assert_ok!(listing(false));
-        let with_env = assert_ok!(listing(true));
+        let plain = assert_ok!(listing(false, soon()));
+        let with_env = assert_ok!(listing(true, soon()));
         assert!(lines_by_pid(&plain).contains_key(&me));
         assert!(lines_by_pid(&with_env).contains_key(&me));
     }
@@ -382,7 +398,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let dir = assert_ok!(tempfile::tempdir());
         let real = assert_ok!(dir.path().canonicalize());
-        assert_eq!(assert_ok!(holders_of(&real)), Vec::<i32>::new());
+        assert_eq!(assert_ok!(holders_of(&real, soon())), Vec::<i32>::new());
         let mut holder = assert_ok!(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
@@ -391,10 +407,10 @@ mod tests {
                 .spawn()
         );
         let pid = i32::try_from(holder.id()).unwrap_or(i32::MAX);
-        assert!(assert_ok!(holders_of(&real)).contains(&pid));
+        assert!(assert_ok!(holders_of(&real, soon())).contains(&pid));
         let _ = holder.kill();
         let _ = holder.wait();
-        assert_eq!(assert_ok!(holders_of(&real)), Vec::<i32>::new());
+        assert_eq!(assert_ok!(holders_of(&real, soon())), Vec::<i32>::new());
     }
 
     /// Names the program that failed, where it used to say `ps` for everything.
@@ -409,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_an_error_not_an_empty_answer() {
-        let result = holders_of(std::path::Path::new("/no/such/dir/anywhere"));
+        let result = holders_of(std::path::Path::new("/no/such/dir/anywhere"), soon());
         assert!(result.is_err(), "{result:?}");
     }
 

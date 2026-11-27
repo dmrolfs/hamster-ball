@@ -231,6 +231,15 @@ impl Tracker {
         leader: Identity,
         root: Identity,
     ) -> Result<(), TrackerError> {
+        // The leader is usually gone by now. If a different process holds its number, that number was
+        // reissued and the group listed under it is not ours. (A dead root is not kept as a zombie:
+        // launchd reaps an orphan first, measured 0 of 300, so this check cannot be a hold on the
+        // number. It narrows the window; the remaining case needs a pid wrap, at least 38 s.)
+        match Identity::of(leader.pid()) {
+            Ok(now) if now != leader => return Ok(()),
+            Ok(_) | Err(IdentityError::Gone { .. }) => {}
+            Err(source) => return Err(TrackerError::Identity { source }),
+        }
         for pid in group_members(leader.pid()).context(ListSnafu)? {
             if pid <= 1 || self.members.contains_key(&pid) {
                 continue;
@@ -741,6 +750,53 @@ mod descendants {
         let _ = gated.leader.wait();
         let _ = other.kill();
         let _ = other.wait();
+    }
+
+    /// The reissued-number case from the review: the recorded root's number now belongs to another
+    /// process that leads a group with a member of its own. Every other check passes for that member
+    /// (same group number, same user, newer than the root), so only the leader check refuses it.
+    #[test]
+    fn a_group_listed_under_a_reissued_leader_number_is_not_scanned() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut tracker = Tracker::default();
+        let mut gated = Gated::start("exit 0");
+        assert_ok!(tracker.arm(&queue, gated.pid(), true));
+        let root = tracker.members[&gated.pid()].identity;
+        let mut stranger = assert_ok!(
+            Command::new("/bin/sh")
+                .args(["-c", "sleep 30 & wait"])
+                .process_group(0)
+                .spawn()
+        );
+        let stranger_pid = i32::try_from(stranger.id()).unwrap_or(i32::MAX);
+        let mut member = 0;
+        for _ in 0..100 {
+            if let Some(pid) = group_members(stranger_pid)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|pid| *pid != stranger_pid)
+            {
+                member = pid;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(member, 0, "the stranger's member never appeared");
+        // The recorded leader claims the stranger's number with another start time.
+        let recorded = assert_ok!(Identity::of(stranger_pid)).with_start(1);
+        assert_ok!(tracker.scan_group(&queue, recorded, root));
+        assert!(
+            !tracker.members.contains_key(&member),
+            "a member of a group under a reissued number was adopted"
+        );
+        let _ = gated.go.write_all(b"go\n");
+        let _ = gated.leader.wait();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(member),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     }
 
     #[test]
