@@ -76,10 +76,13 @@ impl Gated {
     }
 }
 
+/// A guardian with the production grace period. The sweeps get half of it, so a shorter one would
+/// test the sweeps' time budget (a machine at a load average of 100 needs more than 250 ms for `ps`
+/// and `lsof`) instead of what they find.
 fn guardian() -> Guardian {
     assert_ok!(Guardian::start_with(
         std::path::Path::new(HB),
-        Duration::from_millis(500)
+        hamster_ball::session::guardian::DEFAULT_GRACE
     ))
 }
 
@@ -378,6 +381,38 @@ fn a_leftover_is_still_looked_for_after_everything_tracked_has_exited() {
         within(Duration::from_secs(6), || assert_ok!(late.try_wait())
             .is_some()),
         "a leftover that appeared after the first sweep was not found"
+    );
+}
+
+/// When one complete look after tracking empties finds nothing, the guard is done: it does not sit out
+/// the rest of a long grace period. The guard is the test's own child, so its exit is seen by reaping it.
+#[test]
+fn a_guard_with_nothing_left_after_a_complete_look_does_not_wait_out_the_grace_period() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let real = assert_ok!(dir.path().canonicalize());
+    let mut guardian = assert_ok!(Guardian::start_with(
+        std::path::Path::new(HB),
+        Duration::from_secs(6)
+    ));
+    assert_ok!(guardian.session_dir(&real));
+    let mut gated = Gated::start("exit 0");
+    arm(&mut guardian, &gated);
+    let _ = gated.go.write_all(b"go\n");
+    let _ = gated.leader.wait();
+    let guard = nix::unistd::Pid::from_raw(i32::try_from(guardian.pid()).unwrap_or(i32::MAX));
+    let started = Instant::now();
+    drop(guardian);
+    let ended = within(Duration::from_secs(4), || {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        matches!(
+            waitpid(guard, Some(WaitPidFlag::WNOHANG)),
+            Ok(status) if status != WaitStatus::StillAlive
+        )
+    });
+    assert!(
+        ended,
+        "the guard was still running {:?} after hb went, with a grace of 6 s",
+        started.elapsed()
     );
 }
 
