@@ -780,7 +780,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     if let Some(ctl) = ctl {
         ctl.broker.finish();
     }
-    // Everything hb started has ended and been reaped, so the guard has nothing left to do.
+    // A failed wait cannot authorize the guardian to stand down.
+    // On error, dropping it retains its independent cleanup path.
+    let waited = waited?;
     if let Some(guardian) = guardian {
         guardian.release();
     }
@@ -789,7 +791,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         stdout,
         stderr,
         clipboard,
-    } = waited?;
+    } = waited;
     drop(session);
     warnings.extend(clipboard_notices(clipboard));
     let seen = proxy.finish();

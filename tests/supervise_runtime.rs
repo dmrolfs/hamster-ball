@@ -134,6 +134,12 @@ fn the_ninth_session_is_refused_with_a_message_and_starts_nothing() {
         rt.app.notice.as_deref(),
         Some("8 sessions are already running; stop one first")
     );
+    // Exercise capacity and ordinary shutdown separately from unconfirmed setup cancellation.
+    assert!(run_until(&mut rt, 90, |r| r
+        .app
+        .sessions()
+        .iter()
+        .all(|s| s.phase == Phase::Running)));
     // Leave: ask to quit, confirm, and every session ends.
     rt.send(Msg::AskQuit);
     let quit = rt.send(Msg::Answer(true));
@@ -148,6 +154,21 @@ fn the_ninth_session_is_refused_with_a_message_and_starts_nothing() {
             .collect::<Vec<_>>()
     );
     assert!(rt.shut_down(Duration::from_secs(20)));
+}
+
+#[test]
+fn unconfirmed_cleanup_refuses_restart_and_marks_shutdown_unclean() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(&w, &["/does-not-exist/hb-test-agent"]));
+    assert!(run_until(&mut rt, 30, |r| phase(r, 1) == Phase::Exited));
+    rt.send(Msg::AskRestart);
+    assert!(run_until(&mut rt, 30, |r| r.app.sessions()[0]
+        .failure
+        .as_deref()
+        .is_some_and(|f| f.contains("could not be confirmed"))));
+    assert!(!rt.shut_down(Duration::from_secs(1)));
 }
 
 #[test]
@@ -390,7 +411,7 @@ fn kill_logged(log: &std::path::Path) {
 }
 
 #[test]
-fn a_restart_does_not_start_the_new_agent_while_the_old_one_that_ignores_stop_still_runs() {
+fn an_abandoned_generation_cannot_authorize_a_restart_from_incomplete_reports() {
     sandboxed!();
     let w = World::new(PROJECT);
     // The guardian waits 8 s before it kills what ignores TERM, far longer than a start takes.
@@ -404,26 +425,16 @@ fn a_restart_does_not_start_the_new_agent_while_the_old_one_that_ignores_stop_st
     rt.send(Msg::AskRestart);
     rt.send(Msg::Answer(true));
     rt.abandon_for_test(SessionId(1));
-    assert!(
-        run_until(&mut rt, 90, |_| log_lines(&log).len() >= 2),
-        "the new agent never started: {:?}; row: {:?} {:?}; blocked/retiring: {rt:?}",
-        log_lines(&log),
-        phase(&rt, 1),
-        rt.app.sessions().first().and_then(|s| s.failure.clone())
+    assert!(run_until(&mut rt, 30, |r| phase(r, 1) == Phase::Failed));
+    assert_eq!(
+        log_lines(&log).len(),
+        1,
+        "an abandoned generation authorized a new agent"
     );
-    // Checked from here, not from inside the sandbox, which may not signal other processes.
-    let first_pid: i32 = assert_some!(
-        log_lines(&log)
-            .first()
-            .and_then(|l| l.split(' ').next())
-            .and_then(|p| p.parse().ok())
-    );
-    let overlapped = alive(first_pid);
-    let lines = log_lines(&log);
+    // Even after the known leader goes away, discarded terminal reports cannot be recovered.
     kill_logged(&log);
-    assert!(
-        !overlapped,
-        "the new agent started while the old one ({first_pid}) was still running: {lines:?}"
-    );
-    rt.shut_down(Duration::from_secs(30));
+    rt.send(Msg::AskRestart);
+    assert!(run_until(&mut rt, 30, |r| phase(r, 1) == Phase::Failed));
+    assert_eq!(log_lines(&log).len(), 1);
+    assert!(!rt.shut_down(Duration::from_secs(1)));
 }

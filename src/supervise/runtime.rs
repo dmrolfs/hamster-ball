@@ -66,8 +66,87 @@ struct Retiring {
 struct Evidence {
     /// The agent's process id, as reported by `Running`. Never 0, 1 or out of range.
     agent: Option<u32>,
-    /// `hb` said its run ended and everything it started is gone.
+    /// A valid no-run report or normal leader-exit/teardown report, not a descendant census.
     settled: bool,
+    last_seq: u64,
+    started: bool,
+    approval: bool,
+    stopping: bool,
+    exited: bool,
+    invalid: bool,
+    cleanup_failed: bool,
+}
+
+impl Evidence {
+    fn observe(&mut self, seq: u64, event: &crate::session::supervised::Event) {
+        use crate::session::supervised::{Cleanup, Event};
+        if self.invalid {
+            return;
+        }
+        if self.last_seq.checked_add(1) != Some(seq) || self.exited {
+            self.invalid = true;
+            self.settled = false;
+            return;
+        }
+        self.last_seq = seq;
+        match event {
+            Event::Starting {} if !self.started => self.started = true,
+            Event::ApprovalRequired { .. }
+                if self.started && self.agent.is_none() && !self.approval && !self.stopping =>
+            {
+                self.approval = true;
+                self.settled = true;
+            }
+            Event::Running { agent_pid }
+                if self.started
+                    && self.agent.is_none()
+                    && !self.approval
+                    && !self.stopping
+                    && usable_pid(*agent_pid) =>
+            {
+                self.agent = Some(*agent_pid);
+            }
+            Event::Stopping {} if self.started && !self.stopping => self.stopping = true,
+            Event::Exited {
+                code,
+                signal,
+                cleanup,
+            } if self.started && !(code.is_some() && signal.is_some()) => {
+                self.exited = true;
+                self.cleanup_failed = matches!(cleanup, Cleanup::Failed { .. });
+                self.settled = !self.cleanup_failed;
+            }
+            Event::Starting {}
+            | Event::ApprovalRequired { .. }
+            | Event::Running { .. }
+            | Event::Stopping {}
+            | Event::Exited { .. } => self.invalid = true,
+            _ if !self.started => self.invalid = true,
+            _ => {}
+        }
+        if self.invalid {
+            self.settled = false;
+        }
+    }
+
+    fn after_delivery(mut self, reliable: bool, now: Instant) -> Option<Blocker> {
+        self.invalid |= !reliable;
+        self.blocker(now)
+    }
+
+    fn blocker(self, now: Instant) -> Option<Blocker> {
+        if self.invalid || self.cleanup_failed {
+            return Some(Blocker::Unknown);
+        }
+        if self.settled {
+            return None;
+        }
+        match self.agent {
+            Some(pid) if process_exists(pid) => Some(Blocker::Agent { pid, since: now }),
+            Some(_) => None,
+            None => Some(Blocker::Unknown),
+        }
+    }
 }
 
 /// Why a session's next run may not start yet. Ending `hb` is not ending its agent: when `hb` is
@@ -222,26 +301,24 @@ impl Runtime {
 
     /// Lifecycle reports belong to their generation even after the app has replaced its row.
     fn observe(&mut self, msg: &Msg) {
-        use crate::session::supervised::{Cleanup, Event};
-        if let Msg::Channel {
-            id,
-            generation,
-            event,
-            ..
-        } = msg
-            && let Some(evidence) = self.evidence.get_mut(&(*id, *generation))
-        {
-            match event {
-                Event::Running { agent_pid } if usable_pid(*agent_pid) => {
-                    evidence.agent = Some(*agent_pid);
+        match msg {
+            Msg::Channel {
+                id,
+                generation,
+                seq,
+                event,
+            } => {
+                if let Some(evidence) = self.evidence.get_mut(&(*id, *generation)) {
+                    evidence.observe(*seq, event);
                 }
-                Event::Exited {
-                    cleanup: Cleanup::Complete {},
-                    ..
-                }
-                | Event::ApprovalRequired { .. } => evidence.settled = true,
-                _ => {}
             }
+            Msg::SessionLost { id, generation, .. } => {
+                if let Some(evidence) = self.evidence.get_mut(&(*id, *generation)) {
+                    evidence.invalid = true;
+                    evidence.settled = false;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -302,6 +379,7 @@ impl Runtime {
             }
             if Instant::now() >= deadline {
                 for old in &mut self.retiring {
+                    old.abandoned = true;
                     old.worker.abandon();
                 }
                 return false;
@@ -378,10 +456,16 @@ impl Runtime {
     /// exists, the agent is waited for as well, because the guardian stops it only after `hb` is
     /// gone and a stubborn agent can outlast `hb` by its whole grace period.
     fn collect_finished(&mut self, now: Instant) {
-        // A worker that has finished has already queued every report it will make, so they are
-        // applied before judging what it left behind.
-        if self.retiring.iter().any(|r| r.worker.is_finished()) {
-            for _ in 0..INBOX * 2 {
+        // Freeze the set before draining: a worker finishing during the drain belongs to
+        // the next pass, after its own final reports have been consumed.
+        let finished: Vec<_> = self
+            .retiring
+            .iter()
+            .filter(|r| r.worker.is_finished())
+            .map(|r| (r.id, r.generation))
+            .collect();
+        if !finished.is_empty() {
+            for _ in 0..INBOX {
                 let Ok(msg) = self.inbox.try_recv() else {
                     break;
                 };
@@ -390,24 +474,16 @@ impl Runtime {
         }
         let mut i = 0;
         while i < self.retiring.len() {
-            if self.retiring[i].worker.is_finished() {
+            if finished.contains(&(self.retiring[i].id, self.retiring[i].generation)) {
                 let done = self.retiring.swap_remove(i);
-                done.worker.join();
+                let reliable = done.worker.join();
                 let evidence = self
                     .evidence
                     .remove(&(done.id, done.generation))
                     .unwrap_or_default();
-                if !evidence.settled {
-                    match evidence.agent {
-                        Some(pid) if process_exists(pid) => {
-                            self.blocked
-                                .insert(done.id, Blocker::Agent { pid, since: now });
-                        }
-                        None => {
-                            self.blocked.insert(done.id, Blocker::Unknown);
-                        }
-                        Some(_) => {}
-                    }
+                // Either source of abandonment can discard failures after an earlier Complete.
+                if let Some(blocker) = evidence.after_delivery(reliable && !done.abandoned, now) {
+                    self.blocked.insert(done.id, blocker);
                 }
             } else {
                 let old = &mut self.retiring[i];
@@ -581,6 +657,155 @@ impl Runtime {
         if !effects.is_empty() {
             let _ = self.run(effects);
         }
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use crate::session::supervised::{Cleanup, Event};
+
+    fn complete() -> Event {
+        Event::Exited {
+            code: Some(0),
+            signal: None,
+            cleanup: Cleanup::Complete {},
+        }
+    }
+
+    #[test]
+    fn a_complete_prefix_cannot_clear_abandoned_delivery() {
+        let mut evidence = Evidence::default();
+        evidence.observe(1, &Event::Starting {});
+        evidence.observe(2, &complete());
+        assert!(evidence.after_delivery(true, Instant::now()).is_none());
+        assert!(matches!(
+            evidence.after_delivery(false, Instant::now()),
+            Some(Blocker::Unknown)
+        ));
+    }
+
+    #[test]
+    fn contradictions_and_sequence_errors_cannot_authorize_restart() {
+        for stream in [
+            vec![(1, Event::Starting {}), (3, complete())],
+            vec![(1, Event::Starting {}), (1, complete())],
+            vec![
+                (1, Event::Starting {}),
+                (2, Event::Running { agent_pid: 0 }),
+                (3, complete()),
+            ],
+            vec![
+                (1, Event::Starting {}),
+                (2, Event::ApprovalRequired { root: "/p".into() }),
+                (3, Event::Running { agent_pid: 42 }),
+                (4, complete()),
+            ],
+            vec![
+                (1, Event::Starting {}),
+                (2, complete()),
+                (3, Event::Running { agent_pid: 42 }),
+            ],
+            vec![
+                (1, Event::Starting {}),
+                (
+                    2,
+                    Event::Exited {
+                        code: None,
+                        signal: None,
+                        cleanup: Cleanup::Failed {
+                            what: "unknown".into(),
+                        },
+                    },
+                ),
+                (3, complete()),
+            ],
+        ] {
+            let mut evidence = Evidence::default();
+            for (seq, event) in stream {
+                evidence.observe(seq, &event);
+            }
+            assert!(
+                matches!(evidence.blocker(Instant::now()), Some(Blocker::Unknown)),
+                "{evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_cleanup_is_sticky_even_when_the_agent_pid_is_absent() {
+        let mut evidence = Evidence::default();
+        evidence.observe(1, &Event::Starting {});
+        evidence.observe(
+            2,
+            &Event::Running {
+                agent_pid: i32::MAX as u32,
+            },
+        );
+        evidence.observe(
+            3,
+            &Event::Exited {
+                code: Some(0),
+                signal: None,
+                cleanup: Cleanup::Failed {
+                    what: "unconfirmed".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            evidence.blocker(Instant::now()),
+            Some(Blocker::Unknown)
+        ));
+    }
+
+    #[test]
+    fn approval_stopping_exit_is_valid_without_running_an_agent() {
+        let mut evidence = Evidence::default();
+        evidence.observe(1, &Event::Starting {});
+        evidence.observe(2, &Event::ApprovalRequired { root: "/p".into() });
+        evidence.observe(3, &Event::Stopping {});
+        evidence.observe(
+            4,
+            &Event::Exited {
+                code: None,
+                signal: None,
+                cleanup: Cleanup::Complete {},
+            },
+        );
+        assert!(evidence.blocker(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn reader_failure_invalidates_an_earlier_complete_report_for_a_retired_generation() {
+        let mut runtime = Runtime::new(Paths {
+            hb: "/missing".into(),
+            me: "/missing".into(),
+            env: vec![],
+        });
+        runtime
+            .evidence
+            .insert((SessionId(1), 1), Evidence::default());
+        runtime.send(Msg::Channel {
+            id: SessionId(1),
+            generation: 1,
+            seq: 1,
+            event: Event::Starting {},
+        });
+        runtime.send(Msg::Channel {
+            id: SessionId(1),
+            generation: 1,
+            seq: 2,
+            event: complete(),
+        });
+        runtime.send(Msg::SessionLost {
+            id: SessionId(1),
+            generation: 1,
+            reason: "malformed suffix".into(),
+        });
+        assert!(matches!(
+            runtime.evidence[&(SessionId(1), 1)].blocker(Instant::now()),
+            Some(Blocker::Unknown)
+        ));
     }
 }
 

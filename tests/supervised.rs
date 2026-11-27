@@ -283,6 +283,27 @@ fn a_run_reports_its_whole_life_in_order_with_contiguous_numbers() {
 }
 
 #[test]
+fn a_session_start_error_reports_unconfirmed_cleanup_not_a_clean_exit() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut session = Session::start(&w, &[], &["/does-not-exist/hb-test-agent"], true);
+    let ended = session.wait_for("exited", 30);
+    assert!(
+        matches!(
+            ended.event,
+            Event::Exited {
+                code: None,
+                signal: None,
+                cleanup: hamster_ball::session::supervised::Cleanup::Failed { .. },
+            }
+        ),
+        "{:?}",
+        ended.event
+    );
+    session.finish(10);
+}
+
+#[test]
 fn an_unapproved_config_is_reported_not_asked_about_and_nothing_runs() {
     sandboxed!();
     let w = World::new(PROJECT);

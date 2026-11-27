@@ -118,15 +118,22 @@ fn report_run(
                 event: exited_event(outcome.exit),
             }
         }
-        Err(RunError::Stopped) => Ended {
-            code: ExitCode::from(143),
-            event: Event::Exited {
-                code: None,
-                signal: Some(Signal::SIGTERM as i32),
-                cleanup: Cleanup::Complete {},
+        Err(RunError::Stopped) => unconfirmed(ExitCode::from(143)),
+        Err(error) => unconfirmed(fail(err, crate::Error::from(error))),
+    }
+}
+
+/// Returning from session setup or waiting does not establish successful resource cleanup.
+fn unconfirmed(code: ExitCode) -> Ended {
+    Ended {
+        code,
+        event: Event::Exited {
+            code: None,
+            signal: None,
+            cleanup: Cleanup::Failed {
+                what: "session cleanup could not be confirmed after an error".to_owned(),
             },
         },
-        Err(error) => Ended::failed(fail(err, crate::Error::from(error))),
     }
 }
 
@@ -198,5 +205,37 @@ fn exited_event(exit: ExitKind) -> Event {
         code,
         signal,
         cleanup: Cleanup::Complete {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claims::assert_matches;
+
+    #[test]
+    fn session_errors_never_claim_cleanup_or_an_unobserved_agent_exit() {
+        for code in [ExitCode::FAILURE, ExitCode::from(143)] {
+            assert_matches!(
+                unconfirmed(code).event,
+                Event::Exited {
+                    code: None,
+                    signal: None,
+                    cleanup: Cleanup::Failed { .. },
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failure_before_session_work_can_report_complete() {
+        assert_matches!(
+            Ended::failed(ExitCode::FAILURE).event,
+            Event::Exited {
+                code: None,
+                signal: None,
+                cleanup: Cleanup::Complete {},
+            }
+        );
     }
 }

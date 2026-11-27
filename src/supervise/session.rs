@@ -619,10 +619,12 @@ impl Worker {
     }
 
     /// Waits for threads that have already finished. Call it only when [`Worker::is_finished`].
-    pub fn join(mut self) {
+    /// Returns whether report delivery remained reliable, before Drop abandons the worker.
+    pub fn join(mut self) -> bool {
         for handle in std::mem::take(&mut self.threads) {
             let _ = handle.join();
         }
+        !self.kill.load(Ordering::Acquire)
     }
 }
 
@@ -669,9 +671,37 @@ fn read_channel(
         Ok(Some(line)) if decode_ack(&line).is_ok_and(|ack| expected.check(&ack).is_ok())
     );
     if acknowledged {
-        while let Ok(Some(line)) = read_line(&mut reader) {
-            let Ok(frame) = decode_frame(&line) else {
-                break;
+        loop {
+            let line = match read_line(&mut reader) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    deliver(
+                        inbox,
+                        kill,
+                        Msg::SessionLost {
+                            id,
+                            generation,
+                            reason: error.to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            let frame = match decode_frame(&line) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    deliver(
+                        inbox,
+                        kill,
+                        Msg::SessionLost {
+                            id,
+                            generation,
+                            reason: error.to_string(),
+                        },
+                    );
+                    return;
+                }
             };
             let msg = Msg::Channel {
                 id,
@@ -696,6 +726,93 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::mpsc::sync_channel;
     use std::thread;
+
+    #[test]
+    fn writer_failure_marks_dropped_failure_reports_unreliable_before_join_drops_the_worker() {
+        for fail_writer in [false, true] {
+            let (channel, _peer) = assert_ok!(UnixStream::pair());
+            let outbox = Arc::new(Outbox::new());
+            let kill = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = sync_channel(1);
+            assert_ok!(tx.send(Msg::Notice("earlier completion fills inbox".into())));
+            let terminal = assert_ok!(File::open("/dev/null"));
+            let mut threads = Vec::new();
+            if fail_writer {
+                // Read-only descriptor makes the production writer fail without test-only hooks.
+                assert_ok!(outbox.push(vec![1]));
+                threads.push(assert_ok!(spawn_writer(
+                    SessionId(7),
+                    assert_ok!(terminal.try_clone()),
+                    assert_ok!(channel.try_clone()),
+                    &Wiring {
+                        id: SessionId(7),
+                        generation: 3,
+                        outbox: &outbox,
+                        kill: &kill
+                    },
+                    &tx
+                )));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !kill.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "writer did not fail");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(!deliver(
+                    &tx,
+                    &kill,
+                    Msg::SessionLost {
+                        id: SessionId(7),
+                        generation: 3,
+                        reason: "malformed suffix after completion".into()
+                    }
+                ));
+            }
+            let worker = Worker {
+                shared: Shared::new(2, 2),
+                terminal,
+                channel,
+                outbox,
+                stop_asked: Arc::new(Mutex::new(None)),
+                kill: Arc::clone(&kill),
+                threads,
+            };
+            let reliable = worker.join();
+            assert_eq!(reliable, !fail_writer);
+            assert!(
+                kill.load(Ordering::Acquire),
+                "Drop should abandon only after sampling"
+            );
+            assert!(matches!(assert_ok!(rx.try_recv()), Msg::Notice(_)));
+        }
+    }
+
+    #[test]
+    fn malformed_suffix_is_not_normal_eof_after_a_complete_report() {
+        use crate::session::supervised::{Cleanup, Event, Frame};
+        let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+        let ack = HelloAck {
+            v: Hello::new(7, 3).v,
+            launch: 7,
+            generation: 3,
+            pid: 1,
+        };
+        assert_ok!(theirs.write_all(&assert_ok!(encode_line(&ack))));
+        let frame = Frame {
+            seq: 1,
+            event: Event::Exited {
+                code: Some(0),
+                signal: None,
+                cleanup: Cleanup::Complete {},
+            },
+        };
+        assert_ok!(theirs.write_all(&assert_ok!(encode_line(&frame))));
+        assert_ok!(theirs.write_all(b"not a frame\n"));
+        assert_ok!(theirs.shutdown(Shutdown::Write));
+        let (tx, rx) = sync_channel(4);
+        read_channel(SessionId(7), 3, ours, &tx, &AtomicBool::new(false));
+        assert!(matches!(assert_ok!(rx.try_recv()), Msg::Channel { .. }));
+        assert!(matches!(assert_ok!(rx.try_recv()), Msg::SessionLost { .. }));
+    }
 
     /// What the app would be sent when `hb` answers the handshake with `ack` and then says
     /// nothing more and closes.

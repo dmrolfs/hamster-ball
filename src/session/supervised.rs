@@ -178,9 +178,11 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Cleanup {
-    /// Everything the session started is gone.
+    /// No session was started, or hb observed its agent leader exit and finished its normal
+    /// teardown path without a reported failure. This is not proof of descendant or resource
+    /// absence: some teardown is best effort. Supervisors use it for leader non-overlap only.
     Complete {},
-    /// Something was left behind.
+    /// Cleanup failed or its completion could not be confirmed.
     Failed {
         /// What failed, in one line.
         what: String,

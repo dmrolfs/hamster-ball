@@ -62,6 +62,22 @@ path /Users/you/.ssh/id_rsa
 
 Warnings you may see include `project_not_granted` (no grant covers the project), `grant_shadowed_by_floor` (a grant the floor overrides), `git_config_unreadable` and `not_approved`.
 
+## `hb-supervise`: restart and cleanup evidence
+
+Restart prevents overlap between the old and new agent leaders.
+It does not certify that every descendant, background task or temporary resource is gone.
+A valid normal-exit report permits restart after the old worker ends.
+Without that report, a known leader's disappearance can also permit restart,
+provided no cleanup failure, invalid report or abandonment was recorded.
+The protocol's `cleanup: complete` means normal leader exit and teardown without a reported failure,
+or that no session work started; it is not an all-descendants cleanup certificate.
+
+Failed or malformed cleanup evidence, an unknown agent, and abandoned report delivery block restart.
+Those blockers survive retries and make shutdown unclean, even if a known leader PID later disappears.
+A session error during setup is conservative too: lack of a Running report does not prove nothing started.
+When a known leader remains alive, the timeout refuses the requested restart but preserves its exclusion.
+PID reuse may cause a conservative false refusal; stored PIDs are probed, never used to kill strangers.
+
 ## `hb-supervise`: suspending the terminal UI
 
 SIGTSTP restores the terminal before suspending the supervisor.
