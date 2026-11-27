@@ -175,7 +175,12 @@ impl World {
     /// A config that does not load is left alone: the run then fails for that reason. The store is
     /// the world's own, under its temporary home.
     pub fn approve(&self) {
-        let Ok(discovery) = discover(&self.project, &self.home) else {
+        self.approve_at(&self.project);
+    }
+
+    /// [`World::approve`] for another project under the same home (see [`World::add_project`]).
+    pub fn approve_at(&self, project: &Path) {
+        let Ok(discovery) = discover(project, &self.home) else {
             return;
         };
         let user = UserConfigDir::locate(&self.home);
@@ -187,6 +192,21 @@ impl World {
         };
         let store = ApprovalStore::new(&StateDir::locate(&self.home));
         assert_ok!(store.approve(discovery.root.path(), &Fingerprint::of(&loaded.closure)));
+    }
+
+    /// Creates a second project `home/work/<rel>` with config `toml`, sharing this world's home.
+    pub fn add_project(&self, rel: &str, toml: &str) -> PathBuf {
+        let dir = self.home_dir().join("work").join(rel);
+        write(&dir.join("hamster-ball.toml"), toml);
+        assert_ok!(fs::canonicalize(dir))
+    }
+
+    /// [`World::drive`] for the project at `project` instead of this world's own.
+    pub fn drive_at(&self, project: &Path, testdrive: &str, args: &[&str]) -> Command {
+        self.approve_at(project);
+        let mut cmd = self.drive_unapproved(testdrive, args);
+        cmd.env("HB_TD_CWD", project).current_dir(project);
+        cmd
     }
 
     /// Like [`World::drive`], without approving the config first.
