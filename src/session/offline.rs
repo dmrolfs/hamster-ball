@@ -139,19 +139,23 @@ impl Installed {
 }
 
 impl OfflinePlan {
-    /// The plan for `policy`, or `None` when no declared server has a command.
+    /// The plan for `policy`, or `None` when no declared server starts a bare `uvx` or `npx`.
     ///
     /// A launcher is planned for each of `uvx` and `npx` that `[env] tools` found. A declared
     /// server that starts one of them by its bare name without `[env] tools` naming it gets a
     /// warning: there is no real tool to run.
     #[must_use]
     pub fn plan(policy: &Policy, tools: &ToolLookup, home: &HomeDir) -> Option<Self> {
+        // Only a bare `uvx` or `npx` reaches a registry, so only those need a launcher and a cache
+        // generation. A project whose servers start anything else (an absolute path, another
+        // program) runs with no cache at all and needs no `hb warm`.
         let commands: Vec<(&str, &str)> = policy
             .mcp
             .iter()
             .filter_map(|(name, server)| {
                 Some((name.as_str(), server.value.command.as_ref()?.as_str()))
             })
+            .filter(|(_, command)| Launcher::iter().any(|k| k.as_ref() == *command))
             .collect();
         if commands.is_empty() {
             return None;
@@ -445,14 +449,21 @@ mod tests {
     }
 
     #[test]
-    fn a_server_started_by_absolute_path_needs_no_launcher_and_no_warning() {
+    fn a_server_started_by_absolute_path_needs_no_plan_no_launcher_and_so_no_cache() {
         let tmp = assert_ok!(tempfile::tempdir());
         let dir = canon(tmp.path());
         let home = HomeDir::new(dir.clone());
         let p = policy(&[("obscura", Some("/Users/me/.local/bin/obscura"))], &[]);
-        let plan = assert_some!(OfflinePlan::plan(&p, &ToolLookup::default(), &home));
-        assert!(plan.launchers().is_empty());
-        assert!(plan.warnings().is_empty());
+        assert_none!(OfflinePlan::plan(&p, &ToolLookup::default(), &home));
+        let mixed = policy(
+            &[
+                ("a", Some("/Users/me/.local/bin/obscura")),
+                ("b", Some("uvx")),
+            ],
+            &["uvx"],
+        );
+        let plan = assert_some!(OfflinePlan::plan(&mixed, &ToolLookup::default(), &home));
+        assert!(plan.warnings().is_empty(), "{:?}", plan.warnings());
     }
 
     #[test]

@@ -227,6 +227,19 @@ fn only_the_old_shared_cache_is_refused_and_left_untouched() {
 }
 
 #[test]
+fn a_project_whose_only_server_is_not_uvx_or_npx_starts_with_no_cache_and_no_warm() {
+    sandboxed!();
+    let w = World::with_base(BASE, "[mcp.local]\ncommand = \"/usr/bin/true\"\n");
+    fake(&w, "uvx");
+    let (ok, stdout, stderr) = refused(&w);
+    assert!(ok && stdout.contains("ran"), "{stdout}{stderr}");
+    assert!(
+        !cache(&w).exists(),
+        "no cache store is made for a project that needs none"
+    );
+}
+
+#[test]
 fn a_changed_tool_makes_the_generation_stale_and_the_run_refuses() {
     sandboxed!();
     let w = world(SERVER);

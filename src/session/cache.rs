@@ -91,14 +91,19 @@ pub enum Phase {
     Sync,
     /// Renaming the sealed tree into place.
     Rename,
-    /// Replacing the project's current record.
+    /// Replacing the project's current record (before the rename).
     Current,
+    /// Flushing the directory after the record was renamed into place. The record may already
+    /// be what readers see, so nothing it names may be removed.
+    CurrentSync,
 }
 
 /// Which input a published generation no longer matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum Mismatch {
+    /// The record belongs to another project.
+    Project,
     /// A tool (uv, npm, node) changed.
     Tool,
     /// A declared server was not warmed, or was warmed with other arguments.
@@ -233,6 +238,21 @@ pub enum CacheError {
         /// The underlying error.
         source: io::Error,
     },
+}
+
+impl CacheError {
+    /// Whether the failure came after the `current` record may have been replaced, so the
+    /// generation it names must be kept.
+    #[must_use]
+    pub fn may_have_committed(&self) -> bool {
+        matches!(
+            self,
+            Self::Publish {
+                phase: Phase::CurrentSync,
+                ..
+            }
+        )
+    }
 }
 
 /// Bounds on a tree that is sealed or copied.
@@ -858,6 +878,7 @@ impl ExpectedInputs {
             .iter()
             .all(|(name, digest)| self.servers.get(name) == Some(digest));
         let what = [
+            (self.project_key != expected.project_key, Mismatch::Project),
             (self.platform != expected.platform, Mismatch::Platform),
             (self.tool_digest != expected.tool_digest, Mismatch::Tool),
             (!served, Mismatch::Server),
@@ -1063,9 +1084,14 @@ impl CacheStore {
         let staging = self.root.join("staging").join(&id);
         let result =
             self.seal_and_publish_inner(workspace, &staging, &id, inputs, old_root, limits);
-        if result.is_err() {
+        if let Err(error) = &result {
             remove_tree(&staging)?;
-            let _ = std::fs::remove_dir_all(self.generation_dir(&id));
+            // Once the `current` rename may have happened the new generation is what the record
+            // names; deleting it would leave a record pointing at nothing. Only an error before
+            // that point removes the published directory.
+            if !error.may_have_committed() {
+                let _ = std::fs::remove_dir_all(self.generation_dir(&id));
+            }
         }
         result
     }
@@ -1130,6 +1156,8 @@ impl CacheStore {
     }
 
     fn replace_current(&self, project_key: &str, record: &CurrentRecord) -> Result<(), CacheError> {
+        // shortcut: fault-injection of the rename/sync boundary is covered by a unit test on
+        // `may_have_committed`; a real power-loss test needs a crash harness.
         let path = self.current_path(project_key);
         let dir = path.parent().unwrap_or(&self.root);
         DirBuilder::new()
@@ -1148,7 +1176,7 @@ impl CacheStore {
         fs::rename(&tmp, &path).context(PublishSnafu {
             phase: Phase::Current,
         })?;
-        sync_dir(dir, Phase::Current)
+        sync_dir(dir, Phase::CurrentSync)
     }
 }
 
@@ -2037,6 +2065,49 @@ mod tests {
                 got,
                 CacheError::InvalidEntry {
                     reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_a_failure_after_the_current_rename_must_keep_the_generation_and_one_before_it_must_not()
+    {
+        let after = CacheError::Publish {
+            phase: Phase::CurrentSync,
+            source: io::Error::other("sync failed"),
+        };
+        assert!(after.may_have_committed());
+        for phase in [Phase::Metadata, Phase::Sync, Phase::Rename, Phase::Current] {
+            let before = CacheError::Publish {
+                phase,
+                source: io::Error::other("x"),
+            };
+            assert!(!before.may_have_committed(), "{phase}");
+        }
+        assert!(!CacheError::WarmBusy.may_have_committed());
+    }
+
+    #[test]
+    fn test_select_refuses_a_generation_published_for_another_project() {
+        let (_d, root, store) = store();
+        publish_by_hand(&root, "g1", &inputs());
+        let mut other = inputs();
+        other.project_key = "pk2".into();
+        // Same record file copied under another project key: the manifest names project "pk".
+        assert_ok!(fs::create_dir_all(root.join("projects/pk2")));
+        assert_ok!(fs::copy(
+            root.join("projects/pk/current"),
+            root.join("projects/pk2/current")
+        ));
+        let got = assert_err!(store.select(&other));
+        assert!(
+            matches!(
+                &got,
+                CacheError::StaleManifest {
+                    what: Mismatch::Project,
                     ..
                 }
             ),
