@@ -388,3 +388,55 @@ fn a_malformed_token_is_refused_and_never_widens_the_search() {
         assert!(guardian.token(bad).is_err(), "{bad}");
     }
 }
+
+// ====================================================================================
+// Rates: how often the product tracker loses a detach race
+// ====================================================================================
+
+/// Runs `trials` gated roots that each detach a descendant by `script`, and counts how many of those
+/// descendants the guardian did not end. The detached process prints its pid and sleeps.
+fn escapes(script: &str, trials: usize) -> usize {
+    let mut escaped = 0;
+    for _ in 0..trials {
+        let mut guardian = guardian();
+        let mut gated = Gated::start(script);
+        arm(&mut guardian, &gated);
+        let pids = gated.release();
+        let _ = gated.leader.wait();
+        // Zero grace is not needed: the guardian's own 500 ms grace covers a polite stop.
+        drop(guardian);
+        let survivor = pids.first().copied();
+        if let Some(pid) = survivor {
+            if !within(Duration::from_secs(4), || !alive(pid)) {
+                escaped += 1;
+                let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+    escaped
+}
+
+/// A perl daemon is the survivor: Apple's `sleep` would work too, but perl lets one script fork,
+/// call `setsid`, print its pid and close stdout so the gated shell can read it.
+const DAEMON_LINGER: &str = "/usr/bin/perl -e 'use POSIX; if (fork == 0) { setsid; print \"$$\\n\"; close STDOUT; sleep 60; exit } sleep 1; exit 0'";
+const DAEMON_DOUBLE_FORK: &str = "/usr/bin/perl -e 'use POSIX; if (fork == 0) { setsid; if (fork == 0) { print \"$$\\n\"; close STDOUT; sleep 60; exit } exit 0 } sleep 1; exit 0'";
+const DAEMON_QUICK_EXIT: &str = "/usr/bin/perl -e 'use POSIX; if (fork == 0) { setsid; print \"$$\\n\"; close STDOUT; sleep 60; exit } exit 0'";
+
+/// Every pattern is run and its escape count printed, so a run documents the rates. Only the
+/// patterns the design promises are asserted, and only on a quiet machine: the double fork and the
+/// instant exit can lose the race by scheduling alone, which is the documented residual.
+#[test]
+fn detach_patterns_are_ended_and_the_escape_rates_are_reported() {
+    let trials: usize = std::env::var("HB_CAJ_TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    let linger = escapes(DAEMON_LINGER, trials);
+    let double = escapes(DAEMON_DOUBLE_FORK, trials);
+    let quick = escapes(DAEMON_QUICK_EXIT, trials);
+    println!("RATES trials={trials} linger={linger} double_fork={double} quick_exit={quick}");
+    assert_eq!(
+        linger, 0,
+        "a descendant that left its session while its leader lingered escaped"
+    );
+}
