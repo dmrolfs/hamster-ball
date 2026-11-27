@@ -165,6 +165,18 @@ pub enum DiagnosticCode {
     EntryLimitReached,
     /// The inspection could not run at all.
     InspectionUnavailable,
+    /// An entry's type could not be read, so it was not examined.
+    EntryUnavailable,
+    /// Git's configuration for a repository could not be established.
+    GitConfigUnavailable,
+    /// Whether the sandbox lets the agent write a path could not be established.
+    WriteAccessUnknown,
+    /// A configuration scope was left out of the answer on purpose.
+    ConfigScopeOmitted,
+    /// An inspection stopped at its count or time budget.
+    InspectionLimitReached,
+    /// A directory was left out of the inspection on purpose, for example dependency output.
+    DirectoryNotInspected,
 }
 
 /// How much a finding matters. It says nothing about completeness.

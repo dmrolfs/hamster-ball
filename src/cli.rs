@@ -941,7 +941,16 @@ fn doctor_command(env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -
         survey_complete,
         launchd: launchd_environment(),
         notes: prepared.notes.iter().map(ToString::to_string).collect(),
-        repos: survey_repos(&roots, discovery.root.path(), 100_000),
+        repos: survey_repos(
+            &roots,
+            discovery.root.path(),
+            100_000,
+            &crate::guard::repos::GitContext {
+                policy: &loaded.policy,
+                home: &env.home,
+                xdg_config_home: env.vars.get("XDG_CONFIG_HOME"),
+            },
+        ),
         proxies: crate::system::proxy_settings::system_proxies(),
         proxies_readable: loaded
             .policy
