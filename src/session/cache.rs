@@ -13,7 +13,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
@@ -311,65 +311,114 @@ pub struct CopyPlan<'a> {
     pub rewrite_from: Option<&'a Path>,
 }
 
-/// Copies the tree at `src` to the new directory `dst`, one entry at a time, never following a
-/// symlink. Every regular file becomes a new inode, so no hard link survives.
+/// Copies the tree at `src` to the new directory `dst`, never following a symlink. Every regular
+/// file becomes a new inode, so no hard link survives.
+///
+/// The walk is descriptor-confined: `src` is opened one component at a time without following
+/// links, each subdirectory is opened by name relative to the directory descriptor already held
+/// (`O_NOFOLLOW`, `O_DIRECTORY`), and each file is opened the same way and then judged by
+/// `fstat` on the descriptor it actually got, not by an earlier path lookup. A writer that swaps
+/// a directory or file for a link between two steps therefore makes the open fail, instead of
+/// making the copy read outside the tree. `dst` is built the same way, relative to its own held
+/// descriptors. Bytes are counted from what is actually read, so a file that grows after it was
+/// inspected still hits the cap.
 ///
 /// # Errors
 /// [`CacheError`] naming the first entry that is not allowed, or the bound that was exceeded.
 pub fn copy_tree(src: &Path, dst: &Path, plan: CopyPlan<'_>) -> Result<CopyStats, CacheError> {
-    let root_meta = fs::symlink_metadata(src).context(ReadSnafu { path: src })?;
+    copy_tree_with(src, dst, plan, |_| {})
+}
+
+/// [`copy_tree`] with a test hook run between inspecting an entry and opening it.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn copy_tree_with(
+    src: &Path,
+    dst: &Path,
+    plan: CopyPlan<'_>,
+    between: impl FnMut(&Path) + 'static,
+) -> Result<CopyStats, CacheError> {
+    // The caller names the roots; whatever links lead to them (macOS's /var, a home that is a
+    // link) are resolved once, here. Everything below the roots is walked with no link followed.
+    let src_real = fs::canonicalize(src).context(ReadSnafu { path: src })?;
+    let src_fd = open_path_nofollow(&src_real).map_err(|e| CacheError::Read {
+        path: src.to_path_buf(),
+        source: e.into(),
+    })?;
+    let root = rustix::fs::fstat(&src_fd).map_err(|e| CacheError::Read {
+        path: src.to_path_buf(),
+        source: e.into(),
+    })?;
+    let (dst_parent, dst_name) = match (dst.parent(), dst.file_name()) {
+        (Some(parent), Some(name)) => (parent, name),
+        _ => {
+            return InvalidEntrySnafu {
+                path: dst.to_path_buf(),
+                reason: Rejection::BadName,
+            }
+            .fail();
+        }
+    };
+    let dst_parent_real = fs::canonicalize(dst_parent).context(ReadSnafu { path: dst_parent })?;
+    let dst_parent_fd = open_path_nofollow(&dst_parent_real).map_err(|e| CacheError::Read {
+        path: dst_parent.to_path_buf(),
+        source: e.into(),
+    })?;
     let mut walk = Walk {
+        #[cfg(test)]
+        between: None,
         plan,
         src_root: src,
         dst_root: dst,
-        dev: root_meta.dev(),
+        dev: root.st_dev as u64,
         uid: geteuid().as_raw(),
         stats: CopyStats::default(),
-        names_per_inode: HashMap::new(),
+        ledger: LinkLedger::default(),
         links: Vec::new(),
     };
-    private_dir(dst).context(CopySnafu { from: src, to: dst })?;
-    walk.dir(src, dst, 0)?;
+    #[cfg(test)]
+    {
+        walk.between = Some(Box::new(between));
+    }
+    let dst_fd = make_dir_at(&dst_parent_fd, dst_name).context(CopySnafu { from: src, to: dst })?;
+    walk.dir(&src_fd, &dst_fd, Path::new(""), 0)?;
     walk.check_hard_links()?;
     walk.check_links()?;
     Ok(walk.stats)
 }
 
+/// Creates the private directory `name` under `parent` (which must not exist) and returns a
+/// descriptor on the directory it made.
+fn make_dir_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
+    rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_raw_mode(0o700))?;
+    Ok(open_dir_nofollow(parent, name)?)
+}
+
 struct Walk<'a> {
+    /// Test only: runs after an entry was inspected and before it is opened, to swap it.
+    #[cfg(test)]
+    between: Option<Box<dyn FnMut(&Path)>>,
     plan: CopyPlan<'a>,
     src_root: &'a Path,
     dst_root: &'a Path,
     dev: u64,
     uid: u32,
     stats: CopyStats,
-    /// (device, inode) -> (names seen in the tree, link count the filesystem reports).
-    names_per_inode: HashMap<(u64, u64), (u64, u64)>,
-    /// Links written, to check once the whole tree exists.
+    /// (device, inode) -> (names seen in the tree, link count seen on the first open).
+    ledger: LinkLedger,
+    /// Links written, as paths relative to the destination root, checked once the tree exists.
     links: Vec<PathBuf>,
 }
 
 impl Walk<'_> {
-    fn rel(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(self.src_root)
-            .unwrap_or(path)
-            .to_path_buf()
-    }
-
-    fn reject<T>(&self, path: &Path, reason: Rejection) -> Result<T, CacheError> {
+    fn reject<T>(&self, rel: &Path, reason: Rejection) -> Result<T, CacheError> {
         InvalidEntrySnafu {
-            path: self.rel(path),
+            path: rel.to_path_buf(),
             reason,
         }
         .fail()
     }
 
-    fn count(
-        &mut self,
-        resource: Resource,
-        now: u64,
-        add: u64,
-        limit: u64,
-    ) -> Result<u64, CacheError> {
+    fn count(&self, resource: Resource, now: u64, add: u64, limit: u64) -> Result<u64, CacheError> {
         let total = now.saturating_add(add);
         ensure!(
             total <= limit,
@@ -382,7 +431,14 @@ impl Walk<'_> {
         Ok(total)
     }
 
-    fn dir(&mut self, src: &Path, dst: &Path, depth: u32) -> Result<(), CacheError> {
+    /// Copies the entries of `src` into `dst`. `rel` is the directory's path from the tree root.
+    fn dir(
+        &mut self,
+        src: &OwnedFd,
+        dst: &OwnedFd,
+        rel: &Path,
+        depth: u32,
+    ) -> Result<(), CacheError> {
         let limits = self.plan.limits;
         ensure!(
             depth <= limits.max_depth,
@@ -392,161 +448,375 @@ impl Walk<'_> {
                 limit: u64::from(limits.max_depth)
             }
         );
-        let mut names: Vec<_> = fs::read_dir(src)
-            .context(ReadSnafu { path: src })?
-            .map(|e| e.map(|e| e.file_name()).context(ReadSnafu { path: src }))
-            .collect::<Result<_, _>>()?;
-        names.sort();
-        for name in names {
+        let mut names: Vec<OsString> = Vec::new();
+        let mut entries = rustix::fs::Dir::read_from(src).map_err(|e| CacheError::Read {
+            path: self.src_root.join(rel),
+            source: e.into(),
+        })?;
+        while let Some(entry) = entries.read() {
+            let entry = entry.map_err(|e| CacheError::Read {
+                path: self.src_root.join(rel),
+                source: e.into(),
+            })?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            // Counted while collecting, so a directory with millions of names stops here, not after.
             self.stats.entries =
                 self.count(Resource::Entries, self.stats.entries, 1, limits.max_entries)?;
-            let (from, to) = (src.join(&name), dst.join(&name));
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+        names.sort();
+        for name in names {
+            let child = rel.join(&name);
             ensure!(
                 name.to_str().is_some()
-                    && from.as_os_str().len() as u64 <= u64::from(limits.max_path_len),
+                    && child.as_os_str().len() as u64 <= u64::from(limits.max_path_len),
                 InvalidEntrySnafu {
-                    path: self.rel(&from),
+                    path: child.clone(),
                     reason: Rejection::BadName
                 }
             );
-            self.entry(&from, &to, depth)?;
+            self.entry(src, dst, &name, &child, depth)?;
         }
         Ok(())
     }
 
-    fn entry(&mut self, from: &Path, to: &Path, depth: u32) -> Result<(), CacheError> {
-        let meta = fs::symlink_metadata(from).context(ReadSnafu { path: from })?;
-        if meta.dev() != self.dev {
-            return self.reject(from, Rejection::MountCrossing);
+    fn entry(
+        &mut self,
+        src: &OwnedFd,
+        dst: &OwnedFd,
+        name: &OsStr,
+        rel: &Path,
+        depth: u32,
+    ) -> Result<(), CacheError> {
+        use rustix::fs::{AtFlags, FileType, statat};
+        let read_fail = |e: Errno| CacheError::Read {
+            path: self.src_root.join(rel),
+            source: e.into(),
+        };
+        let seen = statat(src, name, AtFlags::SYMLINK_NOFOLLOW).map_err(read_fail)?;
+        #[cfg(test)]
+        if let Some(hook) = self.between.as_mut() {
+            hook(&self.src_root.join(rel));
         }
-        if meta.uid() != self.uid {
-            return self.reject(from, Rejection::ForeignOwner);
+        let kind = FileType::from_raw_mode(seen.st_mode);
+        if kind == FileType::Symlink {
+            return self.link(src, dst, name, rel);
         }
-        let kind = meta.file_type();
-        if kind.is_symlink() {
-            return self.link(from, to);
+        if kind == FileType::Directory {
+            self.judge(&seen, rel)?;
+            let child_src = open_dir_nofollow(src, name).map_err(read_fail)?;
+            // Judge what we actually opened, not what we looked at a moment ago.
+            let opened = rustix::fs::fstat(&child_src).map_err(read_fail)?;
+            ensure!(
+                (opened.st_dev, opened.st_ino) == (seen.st_dev, seen.st_ino),
+                InvalidEntrySnafu {
+                    path: rel.to_path_buf(),
+                    reason: Rejection::EscapingLink
+                }
+            );
+            self.judge(&opened, rel)?;
+            let child_dst = make_dir_at(dst, name).context(CopySnafu {
+                from: self.src_root.join(rel),
+                to: self.dst_root.join(rel),
+            })?;
+            return self.dir(&child_src, &child_dst, rel, depth + 1);
         }
-        if meta.mode() & 0o6000 != 0 {
-            return self.reject(from, Rejection::SpecialMode);
+        if kind == FileType::RegularFile {
+            return self.file(src, dst, name, rel, &seen);
         }
-        if meta.mode() & 0o022 != 0 {
-            return self.reject(from, Rejection::OpenPermissions);
-        }
-        if kind.is_dir() {
-            private_dir(to).context(CopySnafu { from, to })?;
-            return self.dir(from, to, depth + 1);
-        }
-        if kind.is_file() {
-            return self.file(from, to, &meta);
-        }
-        self.reject(from, Rejection::SpecialFile)
+        self.reject(rel, Rejection::SpecialFile)
     }
 
-    fn link(&mut self, from: &Path, to: &Path) -> Result<(), CacheError> {
-        let target = fs::read_link(from).context(ReadSnafu { path: from })?;
+    /// Checks owner, device, special bits and open permissions of one inode.
+    fn judge(&self, stat: &rustix::fs::Stat, rel: &Path) -> Result<(), CacheError> {
+        if stat.st_dev as u64 != self.dev {
+            return self.reject(rel, Rejection::MountCrossing);
+        }
+        if stat.st_uid != self.uid {
+            return self.reject(rel, Rejection::ForeignOwner);
+        }
+        if stat.st_mode & 0o6000 != 0 {
+            return self.reject(rel, Rejection::SpecialMode);
+        }
+        if stat.st_mode & 0o022 != 0 {
+            return self.reject(rel, Rejection::OpenPermissions);
+        }
+        Ok(())
+    }
+
+    fn link(
+        &mut self,
+        src: &OwnedFd,
+        dst: &OwnedFd,
+        name: &OsStr,
+        rel: &Path,
+    ) -> Result<(), CacheError> {
+        let read_fail = |e: Errno| CacheError::Read {
+            path: self.src_root.join(rel),
+            source: e.into(),
+        };
+        let stat = rustix::fs::statat(src, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(read_fail)?;
+        self.judge(&stat, rel)?;
+        let target = PathBuf::from(OsString::from_vec(
+            rustix::fs::readlinkat(src, name, Vec::new())
+                .map_err(read_fail)?
+                .into_bytes(),
+        ));
         let new = match (target.is_absolute(), self.plan.rewrite_from) {
             (false, _) => target,
             (true, Some(old)) => match target.strip_prefix(old) {
                 Ok(inside) => relative_between(
-                    to.parent().unwrap_or(self.dst_root),
+                    &self.dst_root.join(rel.parent().unwrap_or(Path::new(""))),
                     &self.dst_root.join(inside),
                 ),
-                Err(_) => return self.reject(from, Rejection::EscapingLink),
+                Err(_) => return self.reject(rel, Rejection::EscapingLink),
             },
-            (true, None) => return self.reject(from, Rejection::EscapingLink),
+            (true, None) => return self.reject(rel, Rejection::EscapingLink),
         };
-        std::os::unix::fs::symlink(&new, to).context(CopySnafu { from, to })?;
-        self.links.push(to.to_path_buf());
+        rustix::fs::symlinkat(&new, dst, name)
+            .map_err(io::Error::from)
+            .context(CopySnafu {
+                from: self.src_root.join(rel),
+                to: self.dst_root.join(rel),
+            })?;
+        self.links.push(rel.to_path_buf());
         Ok(())
     }
 
-    fn file(&mut self, from: &Path, to: &Path, meta: &fs::Metadata) -> Result<(), CacheError> {
+    fn file(
+        &mut self,
+        src: &OwnedFd,
+        dst: &OwnedFd,
+        name: &OsStr,
+        rel: &Path,
+        seen: &rustix::fs::Stat,
+    ) -> Result<(), CacheError> {
+        let from = self.src_root.join(rel);
+        let to = self.dst_root.join(rel);
+        let source = open_file_nofollow(src, name).map_err(|e| CacheError::Read {
+            path: from.clone(),
+            source: e.into(),
+        })?;
+        // The descriptor we hold is the file we copy; judge it, not the earlier path lookup.
+        let opened = rustix::fs::fstat(&source).map_err(|e| CacheError::Read {
+            path: from.clone(),
+            source: e.into(),
+        })?;
+        ensure!(
+            (opened.st_dev, opened.st_ino) == (seen.st_dev, seen.st_ino),
+            InvalidEntrySnafu {
+                path: rel.to_path_buf(),
+                reason: Rejection::EscapingLink
+            }
+        );
+        self.judge(&opened, rel)?;
+        self.ledger
+            .observe(
+                (opened.st_dev as u64, opened.st_ino as u64),
+                opened.st_nlink as u64,
+            )
+            .or_else(|reason| self.reject(rel, reason))?;
+        let made = clone_or_copy_at(
+            &source,
+            dst,
+            name,
+            self.plan.limits.max_bytes.saturating_sub(self.stats.bytes),
+        )
+        .context(CopySnafu {
+            from: from.clone(),
+            to: to.clone(),
+        })?;
+        let (kind, bytes) = match made {
+            Made::Cloned(n) => (true, n),
+            Made::Copied(n) => (false, n),
+        };
+        if kind {
+            self.stats.cloned += 1
+        } else {
+            self.stats.copied += 1
+        }
+        // Counted from what the new file holds, so a file that grew after it was inspected counts.
         self.stats.bytes = self.count(
             Resource::Bytes,
             self.stats.bytes,
-            meta.len(),
+            bytes,
             self.plan.limits.max_bytes,
         )?;
-        let seen = self
-            .names_per_inode
-            .entry((meta.dev(), meta.ino()))
-            .or_insert((0, meta.nlink()));
-        seen.0 += 1;
-        let executable = meta.mode() & 0o100 != 0;
-        match clone_or_copy(from, to).context(CopySnafu { from, to })? {
-            Made::Cloned => self.stats.cloned += 1,
-            Made::Copied => self.stats.copied += 1,
-        }
+        let executable = opened.st_mode & 0o100 != 0;
         let mode = if executable { 0o700 } else { 0o600 };
-        fs::set_permissions(to, fs::Permissions::from_mode(mode)).context(CopySnafu { from, to })
+        let made_fd = open_file_nofollow(dst, name).map_err(|e| CacheError::Copy {
+            from: from.clone(),
+            to: to.clone(),
+            source: e.into(),
+        })?;
+        rustix::fs::fchmod(&made_fd, rustix::fs::Mode::from_raw_mode(mode))
+            .map_err(io::Error::from)
+            .context(CopySnafu { from, to })
     }
 
     fn check_hard_links(&self) -> Result<(), CacheError> {
-        for (names, count) in self.names_per_inode.values() {
-            if names != count {
+        self.ledger
+            .settle()
+            .or_else(|reason| self.reject(Path::new("."), reason))
+    }
+
+    /// Resolves each written link inside the destination with no step allowed to leave it.
+    fn check_links(&self) -> Result<(), CacheError> {
+        for link in &self.links {
+            if let Err(reason) = resolve_confined(self.dst_root, link) {
                 return InvalidEntrySnafu {
-                    path: PathBuf::from("."),
-                    reason: Rejection::ForeignHardLink,
+                    path: link.clone(),
+                    reason,
                 }
                 .fail();
             }
         }
         Ok(())
     }
+}
 
-    fn check_links(&self) -> Result<(), CacheError> {
-        let root = fs::canonicalize(self.dst_root).context(ReadSnafu {
-            path: self.dst_root,
-        })?;
-        for link in &self.links {
-            let reason = match fs::canonicalize(link) {
-                Ok(real) if real.starts_with(&root) => continue,
-                Ok(_) => Rejection::EscapingLink,
-                Err(e) if e.raw_os_error() == Some(Errno::LOOP.raw_os_error()) => {
-                    Rejection::LinkCycle
-                }
-                Err(_) => Rejection::DanglingLink,
-            };
-            let path = link
-                .strip_prefix(self.dst_root)
-                .unwrap_or(link)
-                .to_path_buf();
-            return InvalidEntrySnafu { path, reason }.fail();
+/// Accounts for hard links among the files of a tree: every name of an inode must be in the tree
+/// and every sighting must agree on the link count, so a name that is also somewhere outside, or
+/// that was moved while the walk ran, is caught.
+#[derive(Debug, Default)]
+struct LinkLedger {
+    /// (device, inode) -> (names seen in the tree, link count at the first sighting).
+    seen: HashMap<(u64, u64), (u64, u64)>,
+}
+
+impl LinkLedger {
+    /// Records one name of `inode` that reported `nlink` links.
+    fn observe(&mut self, inode: (u64, u64), nlink: u64) -> Result<(), Rejection> {
+        let entry = self.seen.entry(inode).or_insert((0, nlink));
+        entry.0 += 1;
+        if entry.1 == nlink {
+            Ok(())
+        } else {
+            Err(Rejection::ForeignHardLink)
         }
-        Ok(())
+    }
+
+    /// Fails if any inode has more links than the tree has names for it.
+    fn settle(&self) -> Result<(), Rejection> {
+        if self.seen.values().all(|(names, links)| names == links) {
+            Ok(())
+        } else {
+            Err(Rejection::ForeignHardLink)
+        }
     }
 }
 
 enum Made {
-    Cloned,
-    Copied,
+    Cloned(u64),
+    Copied(u64),
 }
 
-/// Makes `to` a new file with the bytes of `from`: an APFS clone where the volume supports it,
-/// a byte copy where it says so. Any other error is the caller's, never retried another way.
-fn clone_or_copy(from: &Path, to: &Path) -> io::Result<Made> {
-    let source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc_o_nofollow())
-        .open(from)?;
-    match rustix::fs::fclonefileat(
-        &source,
-        rustix::fs::CWD,
-        to,
-        rustix::fs::CloneFlags::empty(),
-    ) {
-        Ok(()) => Ok(Made::Cloned),
+/// Makes the new file `name` in `dst` from the open `source`: an APFS clone where the volume
+/// supports it, a byte copy where it says so. Any other error is the caller's, never retried
+/// another way. The byte copy stops at `cap` bytes plus one, so a file that grew after it was
+/// inspected cannot copy without bound; the returned length is what the new file holds.
+fn clone_or_copy_at(source: &OwnedFd, dst: &OwnedFd, name: &OsStr, cap: u64) -> io::Result<Made> {
+    match rustix::fs::fclonefileat(source, dst, name, rustix::fs::CloneFlags::empty()) {
+        Ok(()) => {
+            let made = open_file_nofollow(dst, name)?;
+            Ok(Made::Cloned(rustix::fs::fstat(&made)?.st_size as u64))
+        }
         Err(Errno::NOTSUP | Errno::XDEV) => {
-            let mut dest = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(to)?;
-            io::copy(&mut &source, &mut dest)?;
-            Ok(Made::Copied)
+            let new = rustix::fs::openat(
+                dst,
+                name,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )?;
+            let mut out = fs::File::from(new);
+            let mut input = fs::File::from(source.try_clone()?);
+            let copied = bounded_copy(&mut input, &mut out, cap)?;
+            Ok(Made::Copied(copied))
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Copies at most `cap` bytes plus one from `input` to `output` and returns how many it wrote.
+/// One byte over the cap is enough for the caller to see the limit was passed, and it stops a file
+/// that grew after it was inspected from being copied without bound.
+fn bounded_copy(
+    input: &mut impl io::Read,
+    output: &mut impl io::Write,
+    cap: u64,
+) -> io::Result<u64> {
+    io::copy(&mut io::Read::take(input, cap.saturating_add(1)), output)
+}
+
+/// Opens the regular file `name` of `dir` read-only without following a link.
+fn open_file_nofollow(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, openat};
+    openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// Follows `link` (a path relative to `root`) one step at a time. Every step stays under `root`;
+/// a step that would leave it, loop, or end nowhere is the answer.
+///
+/// This is lexical and component-wise on purpose: `canonicalize` on the finished tree would
+/// follow a link out of the tree and back in, and accept a detour the tree does not contain.
+fn resolve_confined(root: &Path, link: &Path) -> Result<(), Rejection> {
+    const MAX_STEPS: u32 = 40;
+    let mut current: PathBuf = link.to_path_buf();
+    for _ in 0..MAX_STEPS {
+        let mut resolved = PathBuf::new();
+        let mut parts: Vec<OsString> = current.iter().map(OsString::from).collect();
+        parts.reverse();
+        let mut followed = false;
+        while let Some(part) = parts.pop() {
+            if part == ".." {
+                if !resolved.pop() {
+                    return Err(Rejection::EscapingLink);
+                }
+                continue;
+            }
+            if part == "." || part.is_empty() {
+                continue;
+            }
+            let candidate = resolved.join(&part);
+            match fs::symlink_metadata(root.join(&candidate)) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let target = fs::read_link(root.join(&candidate))
+                        .map_err(|_| Rejection::DanglingLink)?;
+                    if target.is_absolute() {
+                        return Err(Rejection::EscapingLink);
+                    }
+                    let rest: Vec<OsString> = parts.iter().rev().cloned().collect();
+                    let mut next = resolved.clone();
+                    next.push(target);
+                    for r in rest {
+                        next.push(r);
+                    }
+                    current = next;
+                    followed = true;
+                    break;
+                }
+                Ok(_) => resolved = candidate,
+                Err(_) => return Err(Rejection::DanglingLink),
+            }
+        }
+        if !followed {
+            return Ok(());
+        }
+    }
+    Err(Rejection::LinkCycle)
 }
 
 fn libc_o_nofollow() -> i32 {
@@ -769,7 +1039,7 @@ fn remove_entry(parent: &OwnedFd, name: &OsStr) -> io::Result<()> {
 /// its end, makes this fail with `ELOOP` instead of redirecting the caller.
 ///
 /// An ancestor that is a link by design (macOS's `/var`, `/tmp` and `/etc`) is therefore refused
-/// too; callers pass canonical paths, as every path in this module already is.
+/// too, so callers canonicalise the root they were given first.
 fn open_path_nofollow(path: &Path) -> Result<OwnedFd, Errno> {
     use rustix::fs::{CWD, Mode, OFlags, openat};
     let mut dir = openat(
@@ -1387,7 +1657,7 @@ fn check_id(path: &Path, id: &str) -> Result<(), CacheError> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use claims::{assert_err, assert_ok, assert_some};
     use pretty_assertions::assert_eq;
@@ -2254,5 +2524,297 @@ mod tests {
         let got = assert_err!(remove_tree(&via.join("t")));
         assert!(matches!(got, CacheError::Cleanup { .. }), "{got}");
         assert_eq!(assert_ok!(fs::read_to_string(real.join("t/f"))), "keep");
+    }
+
+    // ---- hostile source: the tree changes under the copy (review F1, F4) ----
+
+    /// A source whose subdirectory is replaced by a link to `outside` before the copy descends.
+    /// The walk judges the entry it actually opens, so the copy refuses instead of reading it.
+    #[test]
+    fn test_copy_tree_does_not_follow_a_directory_that_was_swapped_for_a_link() {
+        let (d, src, dst) = world();
+        let outside = d.path().join("outside");
+        put(&outside.join("secret"), "OUTSIDE");
+        put(&src.join("a/f"), "inside");
+        // The swap is already done when the walk looks: a directory entry that is a link.
+        assert_ok!(fs::remove_dir_all(src.join("a")));
+        assert_ok!(symlink(&outside, src.join("a")));
+        let got = assert_err!(copy_tree(&src, &dst, plan(None)));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+        assert!(!dst.join("a/secret").exists(), "nothing outside was copied");
+    }
+
+    #[test]
+    fn test_copy_tree_refuses_a_source_root_that_is_itself_a_link_inside_the_walk_but_resolves_the_given_root_once()
+     {
+        let (d, src, dst) = world();
+        put(&src.join("f"), "x");
+        let via = d.path().join("via");
+        assert_ok!(symlink(&src, &via));
+        // The caller's own root may be reached through a link (macOS /var); it is resolved once.
+        assert_ok!(copy_tree(&via, &dst, plan(None)));
+        assert_eq!(assert_ok!(fs::read_to_string(dst.join("f"))), "x");
+    }
+
+    #[test]
+    fn test_copy_tree_stops_a_file_that_is_bigger_than_the_cap_even_if_it_was_small_when_inspected()
+    {
+        let (_d, src, dst) = world();
+        put(&src.join("f"), "0123456789");
+        // The cap is smaller than the file: counted from what is actually copied, never from
+        // the length read earlier.
+        let tight = CopyPlan {
+            limits: CacheLimits {
+                max_bytes: 4,
+                ..CacheLimits::default()
+            },
+            rewrite_from: None,
+        };
+        let got = assert_err!(copy_tree(&src, &dst, tight));
+        assert!(
+            matches!(
+                got,
+                CacheError::BudgetExceeded {
+                    resource: Resource::Bytes,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_copy_tree_counts_entries_while_listing_so_a_wide_directory_stops_early() {
+        let (_d, src, dst) = world();
+        for i in 0..20 {
+            put(&src.join(format!("f{i}")), "x");
+        }
+        let few = CopyPlan {
+            limits: CacheLimits {
+                max_entries: 5,
+                ..CacheLimits::default()
+            },
+            rewrite_from: None,
+        };
+        let got = assert_err!(copy_tree(&src, &dst, few));
+        assert!(
+            matches!(got, CacheError::BudgetExceeded { resource: Resource::Entries, required, .. } if required == 6),
+            "stops at the first name over the cap: {got}"
+        );
+        assert!(!dst.join("f19").exists());
+    }
+
+    #[test]
+    fn test_a_link_that_leaves_the_tree_and_comes_back_in_is_refused() {
+        let (d, src, dst) = world();
+        put(&src.join("target"), "x");
+        // `../<tree-name>/target` leaves the tree and re-enters it: canonicalize would accept it.
+        let name = assert_some!(src.file_name()).to_owned();
+        let detour = Path::new("..").join(name).join("target");
+        assert_ok!(symlink(&detour, src.join("detour")));
+        let got = assert_err!(copy_tree(&src, &dst, plan(None)));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn test_a_chain_of_relative_links_that_stays_inside_is_accepted_and_a_long_cycle_is_refused() {
+        let (_d, src, dst) = world();
+        put(&src.join("real/f"), "x");
+        assert_ok!(symlink("real", src.join("a")));
+        assert_ok!(symlink("a/f", src.join("b")));
+        assert_ok!(copy_tree(&src, &dst, plan(None)));
+        assert_eq!(assert_ok!(fs::read_to_string(dst.join("b"))), "x");
+        let (_d2, src2, dst2) = world();
+        assert_ok!(symlink("y", src2.join("x")));
+        assert_ok!(symlink("x", src2.join("y")));
+        let got = assert_err!(copy_tree(&src2, &dst2, plan(None)));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::LinkCycle,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_the_open_primitives_refuse_a_link_at_the_last_component_and_at_any_parent() {
+        let (d, src, _dst) = world();
+        let outside = d.path().join("outside");
+        put(&outside.join("f"), "OUTSIDE");
+        assert_ok!(symlink(&outside, src.join("dirlink")));
+        assert_ok!(symlink(outside.join("f"), src.join("filelink")));
+        let held = assert_ok!(open_path_nofollow(&src));
+        assert_err!(open_dir_nofollow(&held, OsStr::new("dirlink")));
+        assert_err!(open_file_nofollow(&held, OsStr::new("filelink")));
+        // A link as a parent component of the path: refused, not followed.
+        assert_err!(open_path_nofollow(&src.join("dirlink")));
+        // And the real thing opens.
+        put(&src.join("real/f"), "x");
+        assert_ok!(open_dir_nofollow(&held, OsStr::new("real")));
+        assert_ok!(open_file_nofollow(
+            &assert_ok!(open_dir_nofollow(&held, OsStr::new("real"))),
+            OsStr::new("f")
+        ));
+    }
+
+    #[test]
+    fn test_bounded_copy_stops_one_byte_past_the_cap_however_big_the_input() {
+        let big = vec![7_u8; 10_000];
+        let mut out = Vec::new();
+        let n = assert_ok!(bounded_copy(&mut big.as_slice(), &mut out, 100));
+        assert_eq!(n, 101, "cap plus one, so the caller can see it was passed");
+        assert_eq!(out.len(), 101);
+        let mut small = Vec::new();
+        assert_eq!(
+            assert_ok!(bounded_copy(&mut b"abc".as_slice(), &mut small, 100)),
+            3
+        );
+    }
+
+    #[test]
+    fn test_link_ledger_catches_an_outside_name_and_a_count_that_changed_mid_walk() {
+        let mut ledger = LinkLedger::default();
+        // Two names, both in the tree, and the filesystem says 2 links: fine.
+        assert_ok!(ledger.observe((1, 10), 2));
+        assert_ok!(ledger.observe((1, 10), 2));
+        assert_ok!(ledger.settle());
+        // Another inode reports 2 links but only one name is in the tree.
+        assert_ok!(ledger.observe((1, 11), 2));
+        assert_eq!(assert_err!(ledger.settle()), Rejection::ForeignHardLink);
+        // A name that sees a different link count than the first sighting was added or moved.
+        let mut moved = LinkLedger::default();
+        assert_ok!(moved.observe((1, 12), 1));
+        assert_eq!(
+            assert_err!(moved.observe((1, 12), 2)),
+            Rejection::ForeignHardLink
+        );
+    }
+
+    /// The directory is inspected as a real directory, then swapped for a link to outside before
+    /// the walk opens it. The open refuses a link, and if a directory of a different identity were
+    /// opened the identity check would. Either way nothing outside is copied.
+    #[test]
+    fn test_a_directory_swapped_for_a_link_between_inspection_and_open_is_refused() {
+        let (d, src, dst) = world();
+        let outside = d.path().join("outside");
+        put(&outside.join("secret"), "OUTSIDE");
+        put(&src.join("a/f"), "inside");
+        let (a, out) = (src.join("a"), outside.clone());
+        let swapped = std::cell::Cell::new(false);
+        let swapped = std::rc::Rc::new(swapped);
+        let flag = swapped.clone();
+        let got = copy_tree_with(&src, &dst, plan(None), move |path| {
+            if path == a && !flag.get() {
+                flag.set(true);
+                let _ = fs::remove_dir_all(&a);
+                let _ = symlink(&out, &a);
+            }
+        });
+        assert!(swapped.get(), "the hook ran between inspection and open");
+        assert_err!(got);
+        assert!(!dst.join("a/secret").exists(), "nothing outside was copied");
+    }
+
+    /// The same swap for a regular file: inspected as a file, replaced by a link to a secret.
+    #[test]
+    fn test_a_file_swapped_for_a_link_between_inspection_and_open_is_refused() {
+        let (d, src, dst) = world();
+        let outside = d.path().join("outside-secret");
+        put(&outside, "OUTSIDE");
+        put(&src.join("f"), "inside");
+        let f = src.join("f");
+        let target = outside.clone();
+        let got = copy_tree_with(&src, &dst, plan(None), move |path| {
+            if path == f {
+                let _ = fs::remove_file(&f);
+                let _ = symlink(&target, &f);
+            }
+        });
+        assert_err!(got);
+        assert!(
+            !dst.join("f").exists(),
+            "the secret was not copied under the file's name"
+        );
+    }
+
+    /// A file replaced by a DIFFERENT regular file between inspection and open: the descriptor
+    /// that was opened is not the inode that was inspected, so it is refused.
+    #[test]
+    fn test_a_file_replaced_by_another_file_between_inspection_and_open_is_refused() {
+        let (_d, src, dst) = world();
+        put(&src.join("f"), "inspected");
+        let f = src.join("f");
+        let got = copy_tree_with(&src, &dst, plan(None), move |path| {
+            if path == f {
+                let _ = fs::remove_file(&f);
+                let _ = fs::write(&f, "a different file");
+                let _ = fs::set_permissions(&f, fs::Permissions::from_mode(0o600));
+            }
+        });
+        let got = assert_err!(got);
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    /// A directory replaced by a DIFFERENT real directory between inspection and open (a rename
+    /// over it): `O_NOFOLLOW` does not object, only the identity check does.
+    #[test]
+    fn test_a_directory_replaced_by_another_directory_between_inspection_and_open_is_refused() {
+        let (_d, src, dst) = world();
+        put(&src.join("a/f"), "inspected");
+        put(&src.join("b/g"), "the stand-in");
+        let (a, b) = (src.join("a"), src.join("b"));
+        let got = copy_tree_with(&src, &dst, plan(None), move |path| {
+            if path == a {
+                let _ = fs::remove_dir_all(&a);
+                let _ = fs::rename(&b, &a);
+            }
+        });
+        let got = assert_err!(got);
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+        assert!(
+            !dst.join("a/g").exists(),
+            "the stand-in's contents were not copied"
+        );
     }
 }
