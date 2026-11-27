@@ -147,6 +147,9 @@ const REAP: Duration = Duration::from_millis(500);
 /// Every wait is bounded, including the wait after a kill: a program stuck in the kernel is
 /// abandoned (it is the guard's own child, and the guard is about to exit) rather than waited on.
 fn run_bounded(program: &'static str, args: &[&str], by: Instant) -> Result<Ran, SweepError> {
+    if Instant::now() >= by {
+        return DeadlineSnafu { program }.fail();
+    }
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -169,13 +172,13 @@ fn run_bounded(program: &'static str, args: &[&str], by: Instant) -> Result<Ran,
         }
         if Instant::now() >= end {
             let _ = child.kill();
-            reap(&mut child);
+            reap(&mut child, by);
             return DeadlineSnafu { program }.fail();
         }
         thread::sleep(Duration::from_millis(5));
     };
-    let stdout = finish(stdout).context(ReadSnafu { program })?;
-    let stderr = finish(stderr).context(ReadSnafu { program })?;
+    let stdout = finish(stdout, by).context(ReadSnafu { program })?;
+    let stderr = finish(stderr, by).context(ReadSnafu { program })?;
     if u64::try_from(stdout.len()).unwrap_or(u64::MAX) > MAX_OUTPUT {
         return TooLargeSnafu { program }.fail();
     }
@@ -195,8 +198,8 @@ fn read_capped(source: impl Read, cap: u64) -> io::Result<Vec<u8>> {
 }
 
 /// Joins a reader thread, giving up after [`REAP`] rather than waiting on a pipe something else holds.
-fn finish(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    let end = Instant::now() + REAP;
+fn finish(reader: thread::JoinHandle<io::Result<Vec<u8>>>, by: Instant) -> io::Result<Vec<u8>> {
+    let end = by.min(Instant::now() + REAP);
     while !reader.is_finished() {
         if Instant::now() >= end {
             return Err(io::Error::new(
@@ -212,8 +215,8 @@ fn finish(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>
 }
 
 /// Waits briefly for a killed child; a child stuck in the kernel is left behind.
-fn reap(child: &mut std::process::Child) {
-    let end = Instant::now() + REAP;
+fn reap(child: &mut std::process::Child, by: Instant) {
+    let end = by.min(Instant::now() + REAP);
     while Instant::now() < end {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
@@ -250,6 +253,9 @@ pub(super) fn listing(with_env: bool, by: Instant) -> Result<String, SweepError>
 /// # Errors
 /// [`SweepError`] for every way the answer can be incomplete.
 pub(super) fn holders_of(dir: &std::path::Path, by: Instant) -> Result<Holders, SweepError> {
+    if Instant::now() >= by {
+        return DeadlineSnafu { program: LSOF }.fail();
+    }
     // `lsof` answers a missing directory exactly like an empty one, so a directory that has
     // vanished would read as "nothing left". Say so instead.
     std::fs::metadata(dir).context(DirectorySnafu)?;
@@ -387,6 +393,36 @@ mod tests {
         let err = claims::assert_err!(listing(true, Instant::now()));
         assert!(matches!(err, SweepError::Deadline { .. }), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_running_sweep_command_stops_at_its_shared_budget() {
+        let started = Instant::now();
+        let result = run_bounded("/bin/sleep", &["1"], started + Duration::from_millis(50));
+        assert!(matches!(result, Err(SweepError::Deadline { .. })));
+    }
+
+    #[test]
+    fn an_expired_budget_does_not_start_a_command() {
+        // A spawn attempt would return Start, not Deadline, so this cannot pass merely because
+        // the child was killed before it wrote a marker.
+        let result = run_bounded("/nonexistent/hb-sweep-command", &[], Instant::now());
+        assert!(matches!(result, Err(SweepError::Deadline { .. })));
+    }
+
+    #[test]
+    fn reader_cleanup_does_not_receive_a_new_budget() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _ = receive.recv();
+            Ok(Vec::new())
+        });
+        let started = Instant::now();
+        let result = finish(reader, started);
+        // Always release our worker, including on assertion failure.
+        let _ = send.send(());
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     #[test]

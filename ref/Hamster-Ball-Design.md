@@ -675,16 +675,25 @@ not signalled, so a number the system has given to an unrelated program is left 
 so a gap remains that is unlikely and not bounded in time (hb-caj).
 
 **Descendants** (hb-caj). macOS refuses `NOTE_TRACK`, so the kernel does not follow forks. The guard registers `NOTE_FORK` and
-`NOTE_EXIT` on each owned process and, on a fork, lists the children and adopts them; a root that leads its own group has the
-group scanned too, after the leader exits. Each adoption checks that the process is still where it was listed (parent or
-group), is the same user, and started no earlier than the root. This keeps a descendant that calls `setsid` or whose parent
-has exited. Two recovery sweeps then look for what it missed: processes whose environment holds this run's `HB_LAUNCH_TOKEN`
+`NOTE_EXIT` on each owned process and, on a fork, lists the children and adopts them.
+A group's original leader must still be identifiable (live or unreaped zombie) through observation before additional members are adopted.
+Already-owned members remain tracked after the leader is gone; a bare leaderless group number authorizes no new adoption.
+Parent identity is likewise retained through child observation.
+Each adoption checks the listed relation, user and root age.
+Recovery retains the identity captured before token confirmation or before the `lsof` directory scan and checks it again at registration.
+The directory snapshot can miss a process born during that scan; this is an incomplete pass, not proof of absence.
+Two recovery sweeps look for missed descendants: processes whose environment holds this run's `HB_LAUNCH_TOKEN`
 (candidates from two `ps` listings, each confirmed by reading the process's environment as separate entries) and processes
 using the per-run directory (`lsof`). A sweep finds candidates only and never shows that cleanup is complete. **Residual,
 measured:** a process started in a chain of fork-then-exit generations can win the race against discovery; a process that
 clears its environment is invisible to the token sweep; macOS hides the environment of Apple's own tools (`/bin/sh`, `perl`,
 `sleep`), so such a survivor that has also left the directory and closed its files there is not found; processes of other users
-are out of scope. A VM is the only complete answer. Measured before the
+are out of scope.
+An unreadable subtree can hide directory holders without a diagnostic.
+Known members receive KILL before the final sweep; deadlines are cooperative between operations, not guarantees against OS stalls.
+No durable cleanup report is produced once hb dies.
+Stopping a dedicated VM stops its guest processes; simply using one does not arrange that teardown.
+Measured before the
 guard: with no terminal, a killed `hb` left both the agent and the `log stream` running (with a pty the kernel hangs up the agent,
 and `log stream` dies with the session). **The raw terminal cannot be repaired, so the guard says so.** Bash puts the terminal back itself. zsh (the macOS login shell)
 adopts the settings of a job that was killed and applies them to every later command: measured, with a guard that restored the
@@ -1316,7 +1325,7 @@ Tracked in beads (stealth mode, prefix `hb`) as epic `hb-ghd`. Milestones 1, 2, 
 | D63 | `session::run` builds the child environment from empty (sorted, deterministic; `HB_SESSION=1` marker), refuses reserved names again in the builder, and checks the whole exec size (1 MiB minus 32 KiB); `hb run` runs the nesting check first, looks the command up itself, and returns the child's code or `128+signal` (the D60 re-raise is 2.3b); the child has its own process group only when stdin is not a tty (with a pty, D65, it leads its own session); the `hb` binary closes every inherited descriptor above 2 at start; `RunSpec.pty` is a `#[non_exhaustive]` enum (`Off`, and `On` from D65) | owner, hb-ghd.2.3 |
 | D64 | `RunSpec.signals` is `Off` (default) or `Forward { grace }`; the `hb` binary blocks INT/TERM/HUP, receives them via kqueue, forwards them (group, or child only while the child shares hb's group), escalates to SIGKILL on a second signal or after 5 s, and is passive for INT/HUP when the terminal already delivers them; the child starts through the hidden `hb __child`, which clears the signal mask; the D60 re-raise is in `cli::main`; `--log-denials` streams live when stderr is redirected and prints after exit on a terminal, with 300 ms of quiet after the child ends; tests use the test-only `hb-testdrive` binary | owner, hb-ghd.2.3b |
 | D65 | When `hb run` supervises and stdin is a terminal it allocates a pty (`PtyMode::On`; typed error `PtyUnavailable` otherwise, no fallback); the child is a session leader with the slave as its controlling terminal (`hb __child --controlling-tty`); one relay thread copies bytes, drains at the end, and is paused while the terminal is handed back; Ctrl-Z in the child stops `hb` with SIGSTOP after restoring the terminal, and `fg` re-enters raw mode and sends SIGCONT; the restore uses `TCSAFLUSH`; SIGWINCH is received by the same kqueue and copied to the pty; `TIOCSTI` is closed by the absence of `hid-control`, measured by a probe on sacrificial ptys | owner, hb-ghd.2.4 |
-| D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it watches each with a kernel exit notification so it never signals a reused number; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
+| D66 | `hb run` starts a guard process (`hb __guard`, own session) that ends the agent's process or group and the `log stream` helper with SIGTERM then SIGKILL if `hb` dies without a `release`; it retains identities and rechecks before each signal, with an accepted non-atomic check-to-signal race; the raw terminal after SIGKILL is not repaired (zsh wins the race, measured) | owner, hb-ghd.2.4 follow-up |
 | D67 | The agent's output goes through `session::sanitize` (strict UTF-8, no C1 controls or ENQ, OSC and DCS by allowlist, APC/PM/SOS dropped, title report dropped, clipboard read dropped); at the end of a run and at Ctrl-Z `hb` switches off input modes and discards input until the terminal answers a device-attributes query (750 ms at most); the expect-driven tests answer that query and fail on any silent timeout; with no pty a stdout or stderr that is a terminal goes through a pipe and the same filter; the end of a run says how many times the agent set the clipboard, and `[terminal] clipboard_write = false` (any file wins) removes the writes and says it did; after a no-pty run `hb` runs the same mode reset and device-attributes fence on the terminal; the guard prints a one-line hint when a killed `hb` left the terminal raw | owner, hb-ghd.2.4 follow-up |
 | D68 | `session::env` sets `NODE_USE_SYSTEM_CA=1` with `system_trust` and `NODE_EXTRA_CA_CERTS` to a per-session `ca-bundle.pem` (only the PEM certificates of `tls.extra_ca_files`, 0600, size-capped; a file with no certificate stops the run); no other CA variable is set; `com.apple.TrustEvaluationAgent` joins the system-trust grants because curl and git fail against a TLS-inspected host without it | owner, hb-ghd.2.2 |
 | D69 | The profile allows `file-read*` on `^/private/var/folders/[^/]+/[^/]+/T/xcrun_db$` and never a write: `/usr/bin/git` and the other developer-tool shims read that cache to find the real tool and print two error lines per call without it; the user's own unsandboxed `xcrun` trusts the same file, so a write grant would let the agent redirect `git` for the user's shells. If the cache has no entry for a tool the first call still fails to write it and prints once | owner, hb-ghd.2.2 |

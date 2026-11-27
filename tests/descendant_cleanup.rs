@@ -139,12 +139,34 @@ fn work_that_left_its_session_is_ended_when_hb_dies() {
 #[test]
 fn a_released_guardian_leaves_detached_work_alone() {
     let mut guardian = guardian();
+    let dir = assert_ok!(tempfile::tempdir());
+    let real = assert_ok!(dir.path().canonicalize());
+    let value = token();
+    assert_ok!(guardian.token(&value));
+    assert_ok!(guardian.session_dir(&real));
+    let mut token_holder = stranger_with_token(&value);
+    let mut directory_holder = assert_ok!(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&real)
+            .spawn()
+    );
     let mut gated = Gated::start("sleep 60 </dev/null >/dev/null 2>&1 & echo $!; exit 0");
     arm(&mut guardian, &gated);
     let pids = gated.release();
     let _ = gated.leader.wait();
     guardian.release();
     thread::sleep(Duration::from_millis(800));
+    let token_alive = assert_ok!(token_holder.try_wait()).is_none();
+    let directory_alive = assert_ok!(directory_holder.try_wait()).is_none();
+    let _ = token_holder.kill();
+    let _ = token_holder.wait();
+    let _ = directory_holder.kill();
+    let _ = directory_holder.wait();
+    assert!(
+        token_alive && directory_alive,
+        "release ran a recovery sweep"
+    );
     assert!(alive(pids[0]), "a normal release must not end anything");
     let _ = kill(Pid::from_raw(pids[0]), nix::sys::signal::Signal::SIGKILL);
 }
