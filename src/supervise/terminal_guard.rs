@@ -116,12 +116,18 @@ impl TerminalGuard {
     /// The first error of the restoring steps; all of them were tried. The guard counts the
     /// terminal as given back either way, since nothing more can be done with it.
     pub fn suspend(&mut self) -> io::Result<()> {
+        self.suspend_with(|| restore_modes(&mut io::stdout(), true))
+    }
+
+    /// [`TerminalGuard::suspend`] with the restoring passed in, so a failure can be tested.
+    ///
+    /// Every step is tried by `restore`; the guard stays active if it failed, so Drop tries again
+    /// rather than leaving the owner's terminal in raw mode for want of one transient error.
+    fn suspend_with(&mut self, restore: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        // Every step is tried; the guard stays active if any failed, so Drop tries again rather
-        // than leaving the owner's terminal in raw mode for want of one transient error.
-        let restored = restore_modes(&mut io::stdout(), true);
+        let restored = restore();
         if restored.is_ok() {
             self.active = false;
         }
@@ -205,18 +211,28 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_that_fails_leaves_the_guard_active_so_drop_tries_again() {
-        // Under a test harness stdout is not a terminal, so raw mode cannot be turned off and
-        // restoring reports an error: exactly the case that must stay pending.
+    fn a_restore_that_fails_leaves_the_guard_active_and_the_next_one_tries_again() {
+        use claims::{assert_err, assert_ok};
         let mut guard = TerminalGuard { active: true };
-        let result = guard.suspend();
-        if result.is_err() {
-            assert!(guard.is_active(), "a failed restore must stay pending");
-        } else {
-            assert!(!guard.is_active());
-        }
-        // Do not let Drop write reset bytes into the test output.
-        guard.active = false;
+        let mut attempts = 0;
+        assert_err!(guard.suspend_with(|| {
+            attempts += 1;
+            Err(io::Error::other("the terminal went away for a moment"))
+        }));
+        assert!(guard.is_active(), "a failed restore must stay pending");
+        // Drop calls suspend again; this time it works.
+        assert_ok!(guard.suspend_with(|| {
+            attempts += 1;
+            Ok(())
+        }));
+        assert!(!guard.is_active());
+        assert_eq!(attempts, 2);
+        // Once restored, nothing more is done: a third call must not restore again.
+        assert_ok!(guard.suspend_with(|| {
+            attempts += 1;
+            Ok(())
+        }));
+        assert_eq!(attempts, 2);
     }
 
     #[test]
