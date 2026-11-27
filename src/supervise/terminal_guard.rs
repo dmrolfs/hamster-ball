@@ -9,7 +9,7 @@
 //! SIGKILL cannot be caught, so it cannot restore the terminal; the sessions still stop, through
 //! the end of their channels.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::{Hide, Show};
@@ -60,6 +60,16 @@ fn restore_modes<W: Write>(out: &mut W, raw: bool) -> io::Result<()> {
     }
 }
 
+/// Puts the real terminal back, unless stdout is not one: then nothing was ever set, and the escape
+/// sequences would be written into a file or pipe.
+fn restore_terminal() -> io::Result<()> {
+    if io::stdout().is_terminal() {
+        restore_modes(&mut io::stdout(), true)
+    } else {
+        Ok(())
+    }
+}
+
 /// Takes the terminal's modes for the UI.
 fn enter_modes<W: Write>(out: &mut W) -> io::Result<()> {
     enable_raw_mode()?;
@@ -107,6 +117,14 @@ impl TerminalGuard {
     /// # Errors
     /// The OS error if a mode cannot be set.
     pub fn enter() -> io::Result<Self> {
+        // Nothing is changed, and nothing is written, unless both ends are a terminal: the escape
+        // sequences would otherwise land in whatever file or pipe stdout was redirected to.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "hb-supervise needs a terminal for both input and output",
+            ));
+        }
         // Armed first: a failure below restores through Drop.
         let mut guard = Self { hold: Hold::Ui };
         if let Err(error) = enter_modes(&mut io::stdout()) {
@@ -137,7 +155,7 @@ impl TerminalGuard {
     /// The first error of the restoring steps; all of them were tried. After an error the guard is
     /// pending, not released: the next call and drop try again.
     pub fn suspend(&mut self) -> io::Result<()> {
-        self.suspend_with(|| restore_modes(&mut io::stdout(), true))
+        self.suspend_with(restore_terminal)
     }
 
     /// [`TerminalGuard::suspend`] with the restoring passed in, so a failure can be tested.
@@ -164,10 +182,7 @@ impl TerminalGuard {
     /// (pending): modes are not built on a terminal in an unknown state. The terminal is then
     /// given back again.
     pub fn resume(&mut self) -> io::Result<()> {
-        self.resume_with(
-            || enter_modes(&mut io::stdout()),
-            || restore_modes(&mut io::stdout(), true),
-        )
+        self.resume_with(|| enter_modes(&mut io::stdout()), restore_terminal)
     }
 
     /// [`TerminalGuard::resume`] with entering and restoring passed in, so each can be tested.
@@ -191,7 +206,7 @@ impl TerminalGuard {
         if let Err(error) = enter() {
             // Part of the modes may be on. Put everything back, and keep the failure if that fails.
             self.hold = Hold::Pending;
-            let _ = self.suspend_with(|| restore_modes(&mut io::stdout(), true));
+            let _ = self.suspend_with(restore);
             return Err(error);
         }
         Ok(())
@@ -214,7 +229,7 @@ pub fn install_panic_hook() {
     let earlier = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         FATAL.store(true, Ordering::SeqCst);
-        let _ = restore_modes(&mut io::stdout(), true);
+        let _ = restore_terminal();
         earlier(info);
     }));
 }
@@ -347,10 +362,38 @@ mod tests {
         let mut guard = TerminalGuard {
             hold: Hold::Released,
         };
-        assert_err!(guard.resume_with(failing, || Ok(())));
+        let mut restored = 0;
+        assert_err!(guard.resume_with(failing, || {
+            restored += 1;
+            Ok(())
+        }));
+        assert_eq!(
+            restored, 1,
+            "everything was not put back after a half entry"
+        );
         assert!(
             !guard.is_active(),
             "a half-entered UI must not count as the UI"
         );
+    }
+
+    #[test]
+    fn a_failed_enter_whose_restore_also_fails_stays_pending_so_drop_tries_again() {
+        use claims::assert_err;
+        let mut guard = TerminalGuard {
+            hold: Hold::Released,
+        };
+        assert_err!(guard.resume_with(failing, failing));
+        assert!(guard.is_pending());
+    }
+
+    #[test]
+    fn entering_without_a_terminal_changes_nothing_and_writes_nothing() {
+        // Under cargo test stdin is not a terminal, which is the case being asserted.
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            return;
+        }
+        let error = assert_err!(TerminalGuard::enter());
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
 }

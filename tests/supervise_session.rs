@@ -333,6 +333,9 @@ fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_sta
         // A full inbox that nobody reads, so a started reader that sends would stay blocked on
         // it unless cancelling really reaches it.
         let (tx, rx) = sync_channel(1);
+        // Filled now, so that every message a reader tries to deliver has nowhere to go until
+        // someone reads; nobody will.
+        assert_ok!(tx.send(Msg::Notice("filler".into())));
         let threads_before = session_threads(1).len();
         FAIL_AT.store(index, std::sync::atomic::Ordering::SeqCst);
         let result = spawn(SessionId(1), 1, started, Shared::new(30, 100), tx);

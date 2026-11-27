@@ -60,13 +60,17 @@ impl Terminal for StdTerminal {
         let mut err = io::stderr().lock();
         write!(err, "{question}")?;
         err.flush()?;
-        let mut line = String::new();
-        io::stdin()
-            .lock()
-            .take(MAX_ANSWER_BYTES)
-            .read_line(&mut line)?;
-        Ok(line)
+        read_answer(io::stdin().lock())
     }
+}
+
+/// Reads one line of answer, at most [`MAX_ANSWER_BYTES`] long. A line cut off at the bound is not
+/// an answer, whatever its first bytes say: it is returned as no answer, so it declines.
+fn read_answer(reader: impl BufRead) -> io::Result<String> {
+    let mut line = String::new();
+    let read = reader.take(MAX_ANSWER_BYTES).read_line(&mut line)?;
+    let cut = read as u64 >= MAX_ANSWER_BYTES && !line.ends_with('\n');
+    Ok(if cut { String::new() } else { line })
 }
 
 /// No terminal at all: nobody is ever asked. For callers that must not prompt, such as in-process tests.
@@ -499,6 +503,31 @@ mod tests {
         let answer = format!("approve {old}");
         let (verdict, _) = run(&f, &mut Scripted::saying(&[answer.as_str()]));
         assert_matches!(verdict, Verdict::Declined);
+    }
+
+    #[test]
+    fn an_answer_cut_at_the_read_bound_is_no_answer_even_if_it_starts_with_the_approval() {
+        let padding = " ".repeat(MAX_ANSWER_BYTES as usize);
+        let long = format!("approve 3fa9c2{padding}reject\n");
+        // Without the cut check this returns the first 256 bytes, which parse as an approval.
+        let cut = assert_ok!(read_answer(io::Cursor::new(long.as_bytes())));
+        assert_eq!(cut, "");
+        assert!(!is_approval(&cut, "3fa9c2"));
+        // A line that fits is returned whole, with or without its newline at the end of the input.
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(b"approve 3fa9c2\n".as_slice()))),
+            "approve 3fa9c2\n"
+        );
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(b"approve 3fa9c2".as_slice()))),
+            "approve 3fa9c2"
+        );
+        // Exactly the bound with its newline is an ordinary line.
+        let exact = format!("{}\n", "y".repeat(MAX_ANSWER_BYTES as usize - 1));
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(exact.as_bytes()))),
+            exact
+        );
     }
 
     #[test]

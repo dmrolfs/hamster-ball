@@ -153,6 +153,9 @@ pub fn spawn(
         Err(error) => {
             // One way out for every failure: ends the writer and the readers already running (the
             // channel closing wakes the channel reader, cancel wakes the others), then the process.
+            // `kill` as well: a reader already waiting to hand over a message sees only that, not
+            // the socket closing, and there is no `Worker` whose drop would set it.
+            kill.store(true, Ordering::SeqCst);
             outbox.cancel();
             let _ = channel.shutdown(Shutdown::Both);
             if let Some(mut child) = cell.lock().ok().and_then(|mut slot| slot.take()) {

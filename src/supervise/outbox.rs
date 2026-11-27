@@ -74,7 +74,7 @@ pub enum WriterError {
 #[derive(Debug, Default)]
 struct State {
     queue: VecDeque<Vec<u8>>,
-    /// Bytes waiting in `queue`, plus the item the writer is sending now until it has been sent:
+    /// Bytes waiting in `queue`, plus the item the writer is sending now until it has been dropped:
     /// the budget bounds everything the outbox holds, not only what has not been picked up yet.
     pending: usize,
     stop: bool,
@@ -213,15 +213,19 @@ impl Outbox {
                 }
                 Next::Input(bytes) => {
                     let written = self.write_input(terminal, &bytes);
-                    self.finished(bytes.len());
+                    self.finished(bytes);
                     written?;
                 }
             }
         }
     }
 
-    /// An item is no longer held: written, abandoned for a stop, or failed.
-    fn finished(&self, len: usize) {
+    /// An item is no longer held: written, abandoned for a stop, or failed. It is taken by value
+    /// so it is dropped before its bytes stop being charged: releasing the charge first would let
+    /// a new item be accepted while this one's memory is still held.
+    fn finished(&self, bytes: Vec<u8>) {
+        let len = bytes.len();
+        drop(bytes);
         let mut state = self.lock();
         state.pending = state.pending.saturating_sub(len);
     }
