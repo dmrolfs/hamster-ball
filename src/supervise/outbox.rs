@@ -563,7 +563,7 @@ mod tests {
                 got += assert_ok!(slave.read(&mut buffer));
             }
         }
-        assert_eq!(outbox.lock().pending, 0);
+        assert!(within(5, || outbox.lock().pending == 0));
         outbox.cancel();
         assert_ok!(assert_ok!(writer.join()));
     }

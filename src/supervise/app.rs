@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use snafu::Snafu;
 use strum::{Display, IntoStaticStr};
 
+pub use super::argv::SplitError;
+
 use crate::session::supervised::{Cleanup, Event};
 
 /// Most sessions at once.
@@ -34,9 +36,29 @@ pub struct SessionId(pub u32);
 /// Which start of a session this is; a restart raises it.
 pub type Generation = u32;
 
+/// Streams requested from hb for one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Logging {
+    /// Report denial events.
+    pub denials: bool,
+    /// Report proxy events.
+    pub proxy: bool,
+}
+
+impl Default for Logging {
+    fn default() -> Self {
+        Self {
+            denials: true,
+            proxy: true,
+        }
+    }
+}
+
 /// What the owner asked to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
+    /// Logging choices retained across restarts.
+    pub logging: Logging,
     /// The project directory `hb` runs in.
     pub project: PathBuf,
     /// The agent command and its arguments, after `--`.
@@ -64,8 +86,11 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Whether the session still has a process. `Approve` does not: `hb` has already exited 78
-    /// and nothing runs until the owner reviews the config and restarts the session.
+    fn holds_slot(&self) -> bool {
+        self.is_live() || *self == Self::Lost
+    }
+
+    /// Whether the session accepts live lifecycle reports.
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Stopping)
@@ -260,6 +285,10 @@ pub enum Field {
     Project,
     /// The agent command.
     Command,
+    /// Denial logging switch.
+    Denials,
+    /// Proxy logging switch.
+    Proxy,
 }
 
 /// One edit of the launch form.
@@ -271,6 +300,8 @@ pub enum FormEdit {
     Backspace,
     /// Move to the other field.
     SwitchField,
+    /// Move to the preceding field.
+    PreviousField,
     /// Pick a recent project: `true` for an older one, `false` for a newer one.
     Recent(bool),
 }
@@ -278,9 +309,11 @@ pub enum FormEdit {
 /// The launch form: two single-line fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchForm {
+    /// Requested event streams.
+    pub logging: Logging,
     /// The project directory, as typed.
     pub project: String,
-    /// The agent command, as typed; split on whitespace when started.
+    /// The agent command with literal shell-style quoting, without expansion.
     pub command: String,
     /// Which field takes typing.
     pub field: Field,
@@ -291,6 +324,7 @@ pub struct LaunchForm {
 impl LaunchForm {
     fn empty() -> Self {
         Self {
+            logging: Logging::default(),
             project: String::new(),
             command: String::new(),
             field: Field::Project,
@@ -320,6 +354,12 @@ pub enum Refusal {
     /// There is no command to run.
     #[snafu(display("the agent command is empty"))]
     EmptyCommand,
+    /// The command contains unfinished quoting.
+    #[snafu(display("invalid command: {source}"))]
+    MalformedCommand {
+        /// The quoting error.
+        source: SplitError,
+    },
     /// The terminal is too small to show the agent, so keys must not be sent to it unseen.
     #[snafu(display("the terminal is too small to interact; make it larger"))]
     TerminalTooSmall,
@@ -378,15 +418,23 @@ pub enum Msg {
         /// What it said.
         event: Event,
     },
-    /// The channel ended: end of input, or a frame that could not be read.
+    /// The channel ended normally at end of input.
     ChannelLost {
         /// The session.
         id: SessionId,
         /// The generation.
         generation: Generation,
     },
-    /// The session's process could not be observed to end, or its reports may be incomplete: it
-    /// was killed, and nothing is known about how it ended.
+    /// The channel is malformed; its process still needs to be stopped and reaped.
+    ChannelBroken {
+        /// The session whose channel broke.
+        id: SessionId,
+        /// The launch generation.
+        generation: Generation,
+        /// Why reports can no longer be trusted.
+        reason: String,
+    },
+    /// The reaper could not observe the process or reliably collect its reports.
     SessionLost {
         /// The session.
         id: SessionId,
@@ -615,7 +663,10 @@ impl App {
     /// How many sessions still have a process.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.phase.is_live()).count()
+        self.sessions
+            .iter()
+            .filter(|s| s.phase.holds_slot())
+            .count()
     }
 
     fn find(&mut self, id: SessionId) -> Option<&mut Session> {
@@ -650,6 +701,7 @@ impl App {
         | Msg::SpawnFailed { id, generation, .. }
         | Msg::Channel { id, generation, .. }
         | Msg::ChannelLost { id, generation }
+        | Msg::ChannelBroken { id, generation, .. }
         | Msg::SessionLost { id, generation, .. }
         | Msg::ProcessExited { id, generation, .. }
         | Msg::Input { id, generation, .. }
@@ -664,6 +716,7 @@ impl App {
                 | Msg::SpawnFailed { .. }
                 | Msg::Channel { .. }
                 | Msg::ChannelLost { .. }
+                | Msg::ChannelBroken { .. }
                 | Msg::SessionLost { .. }
                 | Msg::ProcessExited { .. }
         ) {
@@ -705,6 +758,11 @@ impl App {
                 event,
             } => self.channel(id, generation, seq, event),
             Msg::ChannelLost { id, generation } => self.channel_lost(id, generation),
+            Msg::ChannelBroken {
+                id,
+                generation,
+                reason,
+            } => self.channel_broken(id, generation, &reason),
             Msg::SessionLost {
                 id,
                 generation,
@@ -943,6 +1001,22 @@ impl App {
         Vec::new()
     }
 
+    fn channel_broken(
+        &mut self,
+        id: SessionId,
+        generation: Generation,
+        reason: &str,
+    ) -> Vec<Effect> {
+        let Some(session) = self.current(id, generation) else {
+            return Vec::new();
+        };
+        if session.exit.is_some() || session.phase == Phase::Approve {
+            self.alert(id, format!("channel broke: {reason}"));
+            return vec![Effect::Stop { id, generation }];
+        }
+        self.break_session(id, reason)
+    }
+
     fn channel_lost(&mut self, id: SessionId, generation: Generation) -> Vec<Effect> {
         let Some(session) = self.current(id, generation) else {
             return Vec::new();
@@ -1121,7 +1195,7 @@ impl App {
             && self
                 .sessions
                 .iter()
-                .any(|s| s.id == id && !s.phase.is_live())
+                .any(|s| s.id == id && !s.phase.holds_slot())
         {
             self.refuse(&Refusal::TooManySessions);
             return Vec::new();
@@ -1252,7 +1326,7 @@ impl App {
             .iter()
             .rev()
             .find(|s| s.spec.project == project)
-            .map(|s| s.spec.command.join(" "))
+            .map(|s| super::argv::join(&s.spec.command))
             .unwrap_or_default()
     }
 
@@ -1261,6 +1335,7 @@ impl App {
             return Vec::new();
         }
         self.form = LaunchForm {
+            logging: Logging::default(),
             project: cwd.display().to_string(),
             command: self.last_command(cwd),
             field: Field::Command,
@@ -1275,26 +1350,42 @@ impl App {
             return Vec::new();
         }
         match edit {
-            FormEdit::SwitchField => {
-                self.form.field = match self.form.field {
-                    Field::Project => Field::Command,
-                    Field::Command => Field::Project,
-                };
+            FormEdit::SwitchField | FormEdit::PreviousField => {
+                let fields = [Field::Project, Field::Command, Field::Denials, Field::Proxy];
+                let at = fields
+                    .iter()
+                    .position(|f| *f == self.form.field)
+                    .unwrap_or(0);
+                self.form.field =
+                    fields[(at + if edit == FormEdit::SwitchField { 1 } else { 3 }) % 4];
             }
-            FormEdit::Char(c) if !c.is_control() => self.field_mut().push(c),
+            FormEdit::Char(' ') if self.form.field == Field::Denials => {
+                self.form.logging.denials = !self.form.logging.denials
+            }
+            FormEdit::Char(' ') if self.form.field == Field::Proxy => {
+                self.form.logging.proxy = !self.form.logging.proxy
+            }
+            FormEdit::Char(c) if !c.is_control() => {
+                if let Some(field) = self.field_mut() {
+                    field.push(c);
+                }
+            }
             FormEdit::Char(_) => {}
             FormEdit::Backspace => {
-                self.field_mut().pop();
+                if let Some(field) = self.field_mut() {
+                    field.pop();
+                }
             }
             FormEdit::Recent(older) => self.pick_recent(older),
         }
         Vec::new()
     }
 
-    fn field_mut(&mut self) -> &mut String {
+    fn field_mut(&mut self) -> Option<&mut String> {
         match self.form.field {
-            Field::Project => &mut self.form.project,
-            Field::Command => &mut self.form.command,
+            Field::Project => Some(&mut self.form.project),
+            Field::Command => Some(&mut self.form.command),
+            Field::Denials | Field::Proxy => None,
         }
     }
 
@@ -1326,14 +1417,17 @@ impl App {
             self.refuse(&Refusal::EmptyProject);
             return Vec::new();
         }
+        let command = match super::argv::split(&self.form.command) {
+            Ok(command) => command,
+            Err(error) => {
+                self.refuse(&Refusal::MalformedCommand { source: error });
+                return Vec::new();
+            }
+        };
         let spec = LaunchSpec {
+            logging: self.form.logging,
             project: PathBuf::from(project),
-            command: self
-                .form
-                .command
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect(),
+            command,
         };
         let effects = self.launch(spec);
         if !effects.is_empty() {
@@ -1352,6 +1446,7 @@ mod tests {
 
     fn spec(name: &str) -> LaunchSpec {
         LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from(format!("/work/{name}")),
             command: vec!["claude".to_owned()],
         }
@@ -1391,6 +1486,92 @@ mod tests {
 
     fn only(app: &App) -> &Session {
         assert_some!(app.sessions().first())
+    }
+
+    #[test]
+    fn a_broken_channel_stops_live_and_reported_sessions_but_ignores_stale_generations() {
+        for final_report in [false, true] {
+            let mut app = running();
+            if final_report {
+                app.update(channel(
+                    1,
+                    1,
+                    3,
+                    Event::Exited {
+                        code: Some(0),
+                        signal: None,
+                        cleanup: Cleanup::Complete {},
+                    },
+                ));
+            }
+            let before = app.clone();
+            assert!(
+                app.update(Msg::ChannelBroken {
+                    id: SessionId(1),
+                    generation: 0,
+                    reason: "bad".into()
+                })
+                .is_empty()
+            );
+            assert_eq!(app, before);
+            let effects = app.update(Msg::ChannelBroken {
+                id: SessionId(1),
+                generation: 1,
+                reason: "bad".into(),
+            });
+            assert_eq!(
+                effects,
+                vec![Effect::Stop {
+                    id: SessionId(1),
+                    generation: 1
+                }]
+            );
+            assert_eq!(
+                only(&app).phase,
+                if final_report {
+                    Phase::Exited
+                } else {
+                    Phase::Lost
+                }
+            );
+            assert_eq!(only(&app).exit, only(&before).exit);
+        }
+    }
+
+    #[test]
+    fn a_lost_channel_holds_its_slot_until_the_process_is_reaped() {
+        let mut app = App::new();
+        for _ in 0..MAX_SESSIONS {
+            app.update(Msg::Launch(spec("shop")));
+        }
+        app.update(Msg::ChannelLost {
+            id: SessionId(1),
+            generation: 1,
+        });
+        assert_eq!(app.live_count(), MAX_SESSIONS);
+        let mut replacement = app.clone();
+        assert!(matches!(
+            replacement.restart(SessionId(1)).as_slice(),
+            [Effect::Spawn { .. }]
+        ));
+        let mut quit = app.clone();
+        assert!(quit.update(Msg::AskQuit).is_empty());
+        assert!(
+            !quit.is_quitting(),
+            "lost processes still require quit confirmation"
+        );
+        assert!(app.update(Msg::Launch(spec("ninth"))).is_empty());
+        app.update(Msg::ProcessExited {
+            id: SessionId(1),
+            generation: 1,
+            code: None,
+            signal: Some(9),
+        });
+        assert_eq!(app.live_count(), MAX_SESSIONS - 1);
+        assert!(matches!(
+            app.update(Msg::Launch(spec("replacement"))).as_slice(),
+            [Effect::Spawn { .. }]
+        ));
     }
 
     #[test]
@@ -2201,7 +2382,7 @@ mod tests {
         assert_eq!(app.form.command, "pi --x");
         app.update(Msg::Form(FormEdit::Backspace));
         assert_eq!(app.form.command, "pi --");
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         type_text(&mut app, "/q");
         assert_eq!(app.form.project, "/p/q");
         // Backspace on an empty field is harmless.
@@ -2209,6 +2390,49 @@ mod tests {
         app.update(Msg::Form(FormEdit::SwitchField));
         app.update(Msg::Form(FormEdit::Backspace));
         assert_eq!(app.form.command, "");
+    }
+
+    #[test]
+    fn command_recall_preserves_arguments_and_logging_survives_restart() {
+        let mut app = App::new();
+        let mut original = spec("shop");
+        original.command = vec!["agent".into(), "two words".into(), "".into(), "a'b".into()];
+        app.update(Msg::Launch(original.clone()));
+        open_form(&mut app, "/work/shop");
+        app.update(Msg::Form(FormEdit::SwitchField));
+        assert_eq!(app.form.field, Field::Denials);
+        app.update(Msg::Form(FormEdit::Char(' ')));
+        let effects = app.update(Msg::SubmitLaunch);
+        let (spec, id) = claims::assert_some!(effects.iter().find_map(|e| match e {
+            Effect::Spawn { spec, id, .. } => Some((spec, id)),
+            _ => None,
+        }));
+        assert_eq!(spec.command, original.command);
+        assert_eq!(
+            spec.logging,
+            Logging {
+                denials: false,
+                proxy: true
+            }
+        );
+        let id = *id;
+        let saved = spec.clone();
+        let restarted = app.restart(id);
+        assert!(
+            restarted
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn { spec, .. } if spec == &saved))
+        );
+    }
+
+    #[test]
+    fn malformed_command_keeps_the_form_open() {
+        let mut app = App::new();
+        open_form(&mut app, "/work/shop");
+        type_text(&mut app, "agent 'unclosed");
+        assert!(app.update(Msg::SubmitLaunch).is_empty());
+        assert_eq!(app.mode, Mode::Launch);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("quote")));
     }
 
     #[test]
@@ -2223,6 +2447,7 @@ mod tests {
                 id: SessionId(1),
                 generation: 1,
                 spec: LaunchSpec {
+                    logging: Default::default(),
                     project: PathBuf::from("/work/shop"),
                     command: vec!["claude".into(), "--resume".into()],
                 },
@@ -2238,13 +2463,13 @@ mod tests {
         assert_eq!(app.update(Msg::SubmitLaunch), vec![]);
         assert_eq!(app.mode, Mode::Launch);
         assert_eq!(app.notice.as_deref(), Some("the agent command is empty"));
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         for _ in 0..10 {
             app.update(Msg::Form(FormEdit::Backspace));
         }
         app.update(Msg::Form(FormEdit::SwitchField));
         type_text(&mut app, "pi");
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         for _ in 0..20 {
             app.update(Msg::Form(FormEdit::Backspace));
         }
@@ -2276,6 +2501,7 @@ mod tests {
         let mut app = App::new();
         for (name, cmd) in [("a", "claude"), ("b", "pi")] {
             app.update(Msg::Launch(LaunchSpec {
+                logging: Default::default(),
                 project: PathBuf::from(format!("/work/{name}")),
                 command: vec![cmd.to_owned()],
             }));

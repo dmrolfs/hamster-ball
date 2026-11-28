@@ -13,7 +13,7 @@ expression: text
 │                                                                              │
 │                                                                              │
 │    ┌ Confirm ───────────────────────────────────────────────────────────┐    │
-│    │Stop shopfront (/work/shopfront)?                                   │    │
+│    │Stop 1: shopfront (/work/shopfront)?                                │    │
 │    │                                                                    │    │
 │    │y = yes, any other key = cancel                                     │    │
 │    └────────────────────────────────────────────────────────────────────┘    │

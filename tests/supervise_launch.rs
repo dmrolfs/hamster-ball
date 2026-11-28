@@ -31,10 +31,59 @@ macro_rules! sandboxed {
     };
 }
 
+#[test]
+fn logging_flags_and_literal_arguments_reach_the_launched_hb() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new(PROJECT);
+    let program = w.project.join("argv-recorder");
+    let output = w.project.join("argv");
+    assert_ok!(std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf '%s\\0' \"$@\" > argv\n"
+    ));
+    assert_ok!(std::fs::set_permissions(
+        &program,
+        std::fs::Permissions::from_mode(0o700)
+    ));
+    for (denials, proxy) in [(false, false), (true, false), (false, true), (true, true)] {
+        let spec = LaunchSpec {
+            project: w.project.clone(),
+            command: vec!["agent".into(), "two words".into(), "".into()],
+            logging: hamster_ball::supervise::app::Logging { denials, proxy },
+        };
+        let mut started = assert_ok!(start_with_env(
+            &program,
+            &PathBuf::from(SUPERVISE),
+            &spec,
+            24,
+            80,
+            &[]
+        ));
+        assert!(assert_ok!(started.child.wait()).success());
+        let bytes = assert_ok!(std::fs::read(&output));
+        let mut expected = vec!["run", "--supervised"];
+        if denials {
+            expected.push("--log-denials");
+        }
+        if proxy {
+            expected.push("--log-proxy");
+        }
+        expected.extend(["--", "agent", "two words", ""]);
+        assert_eq!(
+            bytes,
+            expected
+                .iter()
+                .flat_map(|s| s.as_bytes().iter().copied().chain([0]))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Starts `command` through the real launch path, with the testdrive standing in for `hb`.
 fn launch(w: &World, command: &[&str]) -> Started {
     w.approve();
     let spec = LaunchSpec {
+        logging: Default::default(),
         project: w.project.clone(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
     };
@@ -196,6 +245,7 @@ fn a_helper_that_cannot_exec_hb_reports_why_on_the_terminal_and_exits_2() {
     sandboxed!();
     let w = World::new(PROJECT);
     let spec = LaunchSpec {
+        logging: Default::default(),
         project: w.project.clone(),
         command: vec!["/bin/true".to_owned()],
     };
@@ -216,6 +266,7 @@ fn a_helper_that_cannot_exec_hb_reports_why_on_the_terminal_and_exits_2() {
 fn a_launch_with_no_such_project_directory_fails_to_start_and_leaves_nothing_running() {
     sandboxed!();
     let spec = LaunchSpec {
+        logging: Default::default(),
         project: PathBuf::from("/nonexistent/project"),
         command: vec!["/bin/true".to_owned()],
     };

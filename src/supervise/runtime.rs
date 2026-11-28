@@ -312,7 +312,7 @@ impl Runtime {
                     evidence.observe(*seq, event);
                 }
             }
-            Msg::SessionLost { id, generation, .. } => {
+            Msg::SessionLost { id, generation, .. } | Msg::ChannelBroken { id, generation, .. } => {
                 if let Some(evidence) = self.evidence.get_mut(&(*id, *generation)) {
                     evidence.invalid = true;
                     evidence.settled = false;
@@ -322,19 +322,34 @@ impl Runtime {
         }
     }
 
-    /// One turn: apply what workers sent, carry out the effects, and report.
+    /// One turn: apply up to `MAX_PER_STEP + INBOX` messages, including the final-report drain.
     pub fn step(&mut self) -> Stepped {
+        let (applied, quit) = self.apply_waiting(MAX_PER_STEP);
+        let (final_applied, final_quit) = self.advance(Instant::now());
+        Stepped {
+            applied: applied + final_applied,
+            quit: quit || final_quit,
+        }
+    }
+
+    fn apply_waiting(&mut self, limit: usize) -> (usize, bool) {
         let mut applied = 0;
         let mut quit = false;
-        while applied < MAX_PER_STEP {
+        while applied < limit {
             let Ok(msg) = self.inbox.try_recv() else {
                 break;
             };
             applied += 1;
             quit |= self.send(msg);
         }
-        self.advance(Instant::now());
-        Stepped { applied, quit }
+        (applied, quit)
+    }
+
+    /// Test-only producer for exercising shared-inbox backpressure with real workers.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn event_sender_for_test(&self) -> std::sync::mpsc::SyncSender<Msg> {
+        self.outbox.clone()
     }
 
     /// Whether a redraw is due: something changed (a message, or a dirty screen) and a frame has
@@ -441,8 +456,8 @@ impl Runtime {
 
     /// Reaps workers that have ended, abandons ones that have not ended in time, waits for the
     /// agents of workers that ended, and starts the replacements that were waiting.
-    fn advance(&mut self, now: Instant) {
-        self.collect_finished(now);
+    fn advance(&mut self, now: Instant) -> (usize, bool) {
+        let applied = self.collect_finished(now);
         self.check_blocked(now);
         let ready: Vec<SessionId> = self
             .waiting
@@ -457,12 +472,14 @@ impl Runtime {
                 self.start(id, generation, &spec);
             }
         }
+        applied
     }
 
     /// A worker whose threads have all ended is joined. If its `hb` reported an agent that still
     /// exists, the agent is waited for as well, because the guardian stops it only after `hb` is
     /// gone and a stubborn agent can outlast `hb` by its whole grace period.
-    fn collect_finished(&mut self, now: Instant) {
+    fn collect_finished(&mut self, now: Instant) -> (usize, bool) {
+        let mut applied = (0, false);
         // Freeze the set before draining: a worker finishing during the drain belongs to
         // the next pass, after its own final reports have been consumed.
         let finished: Vec<_> = self
@@ -472,12 +489,7 @@ impl Runtime {
             .map(|r| (r.id, r.generation))
             .collect();
         if !finished.is_empty() {
-            for _ in 0..INBOX {
-                let Ok(msg) = self.inbox.try_recv() else {
-                    break;
-                };
-                self.send(msg);
-            }
+            applied = self.apply_waiting(INBOX);
         }
         let mut i = 0;
         while i < self.retiring.len() {
@@ -503,6 +515,7 @@ impl Runtime {
                 i += 1;
             }
         }
+        applied
     }
 
     /// A start still waiting behind the old run is dropped when the owner stops it, and its row says
@@ -804,7 +817,18 @@ mod evidence_tests {
             seq: 2,
             event: complete(),
         });
+        let before = runtime.evidence[&(SessionId(1), 1)];
         runtime.send(Msg::SessionLost {
+            id: SessionId(1),
+            generation: 1,
+            reason: "reader panicked".into(),
+        });
+        assert!(matches!(
+            runtime.evidence[&(SessionId(1), 1)].blocker(Instant::now()),
+            Some(Blocker::Unknown)
+        ));
+        runtime.evidence.insert((SessionId(1), 1), before);
+        runtime.send(Msg::ChannelBroken {
             id: SessionId(1),
             generation: 1,
             reason: "malformed suffix".into(),
@@ -834,6 +858,7 @@ mod tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from("/nonexistent/project"),
             command: vec!["agent".to_owned()],
         }
@@ -1002,25 +1027,12 @@ mod tests {
 
     #[test]
     fn a_step_never_applies_more_than_the_limit_even_when_more_is_waiting() {
-        // The limit is what keeps a flood from holding the loop; it is only reachable when it is
-        // below the inbox size, so check the relation the design depends on rather than a number.
-        const { assert!(MAX_PER_STEP >= INBOX, "one step can empty a full inbox") };
         let mut runtime = Runtime::new(paths());
-        let mut sent = 0;
-        let refill = |runtime: &Runtime, sent: &mut u64| {
-            while runtime.outbox.try_send(Msg::Select(0)).is_ok() {
-                *sent += 1;
-            }
-        };
-        refill(&runtime, &mut sent);
-        let mut applied = 0u64;
-        for _ in 0..4 {
-            let step = runtime.step();
-            assert!(step.applied <= MAX_PER_STEP);
-            applied += step.applied as u64;
-            refill(&runtime, &mut sent);
+        for _ in 0..INBOX {
+            claims::assert_ok!(runtime.outbox.try_send(Msg::Select(0)));
         }
-        assert!(applied >= INBOX as u64, "each step drained what was there");
+        assert_eq!(runtime.apply_waiting(8), (8, false));
+        assert_eq!(runtime.step().applied, INBOX - 8);
     }
 
     #[test]

@@ -107,8 +107,8 @@ impl Callbacks for Recorder {
 /// Everything this supervisor does with an OSC string is to count it, so a cut one loses nothing.
 pub const MAX_OSC_BYTES: usize = 4096;
 
-/// The most bytes the session's reader gives the emulator in one call. See the test that
-/// measures why it must stay small.
+/// The most bytes the session's reader gives the emulator in one call.
+/// The local vte patch also bounds ESC-search work within each call.
 pub const READ_SIZE: usize = 8192;
 
 /// Where the filter thinks the emulator's parser is. Only the entry to and exit from an OSC
@@ -659,12 +659,9 @@ mod tests {
 
     #[test]
     fn hostile_utf8_read_in_pty_sized_pieces_is_parsed_in_linear_time() {
-        // The emulator's parser takes time quadratic in the size of one call on invalid UTF-8:
-        // measured 7.8 s for 1 MiB in one call and 0.07 s for the same bytes in 8 KiB calls.
-        // The session's reader reads at most 8 KiB at a time, which is what keeps this bounded.
-        // A debug build is about 50 times slower (3.8 s here), so the limit is 20 s there and 2 s
-        // in release. One 1 MiB call would take about 400 s in debug and 8 s in release, so a
-        // READ_SIZE raised far enough to matter fails either way.
+        // The unpatched parser repeatedly searched each invalid UTF-8 suffix for ESC.
+        // The local vte patch caches that position without splitting reads or changing callbacks.
+        // Keep the original debug/release limits and PTY-sized input as a performance regression.
         let limit = if cfg!(debug_assertions) { 20 } else { 2 };
         for hostile in [&b"\xff"[..], b"\xe2\x82", b"\xc3\x28"] {
             let mut screen = SessionScreen::new(24, 80);
@@ -735,6 +732,16 @@ mod tests {
             let forwarded = rss_free_len(&mut filter, &sent);
             assert_eq!(forwarded, entry.len() + MAX_OSC_BYTES, "{entry:?}");
         }
+    }
+
+    #[test]
+    fn a_complete_c1_sequence_does_not_consume_the_following_space() {
+        let mut screen = SessionScreen::new(6, 30);
+        // Extra parser boundaries enter vte's partial decoder, which can swallow the space.
+        screen.process(&[0, 0, 0, 0, 0, 194, 128, 32, 128]);
+        screen.process(b"\x18\x1b[0mEND");
+        assert_eq!(screen.text(), " END");
+        assert_eq!(screen.screen().cursor_position(), (0, 4));
     }
 
     #[test]

@@ -19,4 +19,4 @@ expression: "render(&scene(), 60, 15, COLOR)"
 └──────────────────────────────────────────────────────────┘
 billing: needs approval
   styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
- OVERVIEW  Enter interact · n new · s stop · r restart · a a
+ OVERVIEW Enter interact | n new | Tab panels | ? | q quit

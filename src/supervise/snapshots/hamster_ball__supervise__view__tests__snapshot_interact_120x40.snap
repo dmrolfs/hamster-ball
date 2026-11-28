@@ -2,7 +2,7 @@
 source: src/supervise/view.rs
 expression: "render(&scene, 120, 40, COLOR)"
 ---
-┌ Sessions ────────────────┐┌ keys: to the agent · Running · shopfront · claude · /work/shopfront ─────────────────────┐
+┌ Sessions ────────────────┐┌ keys: agent | Running | shopfront | claude | /work/shopfront ────────────────────────────┐
   styles:                             cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 │> 1 shopfront Running     ││$ claude                                                                                  │
   styles:  RRRRRRRRRRRRRRRRRRRRRRRRRR c                                                                                          c
@@ -71,4 +71,4 @@ expression: "render(&scene, 120, 40, COLOR)"
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 billing: needs approval
   styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
- INTERACT -> shopfront  every key goes to the agent · Ctrl-g leaves · Ctrl-g Ctrl-g sends Ctrl-g
+ INTERACT Ctrl-g leaves | Ctrl-g Ctrl-g sends Ctrl-g | keys to shopfront

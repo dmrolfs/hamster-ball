@@ -25,6 +25,8 @@ use super::view::Layout;
 pub struct Context<'a> {
     /// How much of the screen the terminal allows.
     pub layout: Layout,
+    /// Whether every affected session and the confirmation instructions fit.
+    pub confirm_fits: bool,
     /// The selected agent's input modes, which decide how its keys are encoded.
     pub modes: InputModes,
     /// Where the supervisor was started; the launch form's default project.
@@ -69,6 +71,9 @@ impl Router {
 
     /// The messages for one key event.
     pub fn route(&mut self, app: &App, key: KeyEvent, ctx: &Context<'_>) -> Vec<Msg> {
+        if app.mode == Mode::Confirm && (ctx.layout == Layout::Tiny || !ctx.confirm_fits) {
+            return vec![Msg::Answer(false), Msg::TooSmall];
+        }
         let hidden = self.visibility(app, ctx.layout);
         if !hidden.is_empty() {
             return hidden;
@@ -221,7 +226,8 @@ fn launch(key: &KeyEvent) -> Vec<Msg> {
     let msg = match key.code {
         KeyCode::Esc => Msg::CancelLaunch,
         KeyCode::Enter => Msg::SubmitLaunch,
-        KeyCode::Tab | KeyCode::BackTab => Msg::Form(FormEdit::SwitchField),
+        KeyCode::Tab => Msg::Form(FormEdit::SwitchField),
+        KeyCode::BackTab => Msg::Form(FormEdit::PreviousField),
         KeyCode::Up => Msg::Form(FormEdit::Recent(true)),
         KeyCode::Down => Msg::Form(FormEdit::Recent(false)),
         KeyCode::Backspace => Msg::Form(FormEdit::Backspace),
@@ -243,6 +249,7 @@ mod tests {
 
     fn ctx(layout: Layout) -> Context<'static> {
         Context {
+            confirm_fits: true,
             layout,
             modes: InputModes::default(),
             cwd: Path::new(CWD),
@@ -270,6 +277,7 @@ mod tests {
     fn running() -> App {
         let mut app = App::new();
         app.update(Msg::Launch(LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from("/work/shop"),
             command: vec!["claude".to_owned()],
         }));
@@ -660,6 +668,7 @@ mod tests {
         let (mut router, mut app) = (Router::new(), interacting());
         feed(&mut router, &mut app, ctrl_g(), &c);
         app.update(Msg::Launch(LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from("/work/other"),
             command: vec!["pi".to_owned()],
         }));
@@ -820,6 +829,19 @@ mod tests {
         }
         // A stop key does nothing while help is open.
         assert_eq!(Router::new().route(&app, plain('s'), &c), vec![]);
+    }
+
+    #[test]
+    fn hidden_confirmation_never_accepts_yes() {
+        let mut app = running();
+        app.update(Msg::AskQuit);
+        let mut context = ctx(Layout::Narrow);
+        context.confirm_fits = false;
+        let mut router = Router::new();
+        assert_eq!(
+            router.route(&app, plain('y'), &context),
+            vec![Msg::Answer(false), Msg::TooSmall]
+        );
     }
 
     #[test]

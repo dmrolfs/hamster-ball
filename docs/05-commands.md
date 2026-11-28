@@ -68,6 +68,16 @@ The terminal supervisor is optional: `cargo install --locked --path . --features
 Keep these matching binaries in the same directory; the supervisor launches the `hb` beside itself.
 A default build installs only `hb` and does not compile the UI dependencies.
 
+## `hb-supervise`: launch form
+
+Press `n` to open the launch form.
+Tab and Shift-Tab move between project, command, denial logging and proxy logging; Space toggles logging.
+Both logs default to on; restarting a session preserves its choices.
+Command arguments accept single or double quotes and backslash escapes, but never shell expansion or execution.
+Inside double quotes, backslash escapes only a double quote or another backslash.
+For example, `agent --prompt 'fix the cart'` passes one prompt argument, and `''` passes an empty argument.
+Unclosed quotes are refused without closing the form.
+
 ## `hb-supervise`: private channel environment
 
 The launcher passes the private channel descriptor number in `HB_SUPERVISOR_FD`.
@@ -223,6 +233,36 @@ It needs an approved config, takes a lock per project (a second `hb warm` of the
 The store is `~/.cache/hamster-ball/`, kept apart from your own `~/.cache/uv` and `~/.npm`.
 The ball cannot read or write it, and each `hb run` works in its own copy.
 An older shared cache in that directory is never used or deleted.
+
+### Moving to cache generations, and freeing space
+
+`hb` never deletes a cache, a cache generation or an agent's state, and never imports an old cache.
+The only thing it removes by itself is a run's own scratch directory (under your temp directory, named `hb-<pid>-...`),
+and only after the process that made it has exited.
+Everything below is a command you run yourself, outside the ball, with no `hb` running.
+
+Moving from the old shared cache (`~/.cache/hamster-ball/uv`, `uv-tools`, `npm` and the `warmed` file):
+
+1. In each project, run `hb warm`. It builds a new generation from the registries. It does not read the old cache.
+2. Check with `hb explain`: the `generation` line says `ready: <id>`, or `a run would stop: ...` and why.
+3. When no project needs the old cache, remove it: `rm -rf ~/.cache/hamster-ball/{uv,uv-tools,npm,warmed}`.
+   A run of an older `hb` that is still running would lose its cache, so close those first.
+
+Every `hb warm` leaves the previous generation on disk. To remove the ones no project uses:
+
+```sh
+cd ~/.cache/hamster-ball
+for g in generations/*; do
+  id=${g#generations/}
+  grep -q "\"id\":\"$id\"" projects/*/current 2>/dev/null || echo "unused: $id"
+done
+# review the list, then for each id you want gone:
+rm -rf ~/.cache/hamster-ball/generations/<id>
+```
+
+Do not remove a generation that a project's `current` names: its next run stops until you run `hb warm` again.
+Do not remove one while a run is starting in that project; there is no lock to stop that.
+Agent state (`~/.claude`, `~/.pi/agent`, `~/.kiro`, ...) has no `hb` command: `hb` never changes a host agent home.
 
 ## `hb ctl`
 

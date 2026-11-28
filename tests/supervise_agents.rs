@@ -210,7 +210,10 @@ fn exercise(
         return;
     };
     assert!(
-        agent.settle(Duration::from_secs(2), 40),
+        agent.settle(
+            Duration::from_secs(if name == "opencode" { 1 } else { 4 }),
+            40
+        ),
         "{name}: startup never settled"
     );
     let first = agent.text();

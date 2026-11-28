@@ -32,6 +32,7 @@ macro_rules! sandboxed {
 
 fn spec(w: &World, command: &[&str]) -> LaunchSpec {
     LaunchSpec {
+        logging: Default::default(),
         project: w.project.clone(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
     }

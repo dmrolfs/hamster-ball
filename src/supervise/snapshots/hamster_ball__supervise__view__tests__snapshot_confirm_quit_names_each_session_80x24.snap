@@ -13,11 +13,11 @@ expression: "render(&scene, 80, 24, COLOR)"
 │                                                                              │
 │                                                                              │
 │    ┌ Confirm ───────────────────────────────────────────────────────────┐    │
-│    │Stop 1 running session(s) and quit?                                 │    │
+│    │End these sessions and quit?                                        │    │
+│    │1: shopfront (/work/shopfront)                                      │    │
 │    │                                                                    │    │
 │    │y = yes, any other key = cancel                                     │    │
 │    └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │

@@ -272,8 +272,27 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, screens: Screens<'_>, look: Look) 
             areas.alert,
         );
     }
-    frame.render_widget(Paragraph::new(status_line(app)), areas.status);
+    let status = status_line(app);
+    let short = match app.mode {
+        Mode::Overview => " OVERVIEW Enter interact | n new | Tab panels | ? | q quit",
+        Mode::Interact => " INTERACT Ctrl-g leaves | Ctrl-g x2 sends Ctrl-g",
+        Mode::Launch => " LAUNCH Enter starts | Tab field | Space toggle | Esc cancel",
+        Mode::Confirm => " CONFIRM y confirms | other key cancels",
+        Mode::Help => " HELP Esc or ? closes",
+    };
+    let status = if Span::raw(&status).width() > usize::from(areas.status.width) {
+        short
+    } else {
+        &status
+    };
+    frame.render_widget(Paragraph::new(status), areas.status);
     draw_modal(frame, areas.body, app);
+    if !look.color {
+        for cell in &mut frame.buffer_mut().content {
+            let modifiers = cell.modifier;
+            cell.set_style(Style::reset().add_modifier(modifiers));
+        }
+    }
 }
 
 fn draw_sessions(frame: &mut Frame<'_>, rect: Rect, app: &App, look: Look) {
@@ -336,27 +355,42 @@ fn shown_path(path: &std::path::Path) -> String {
     crate::text::EscapedBounded::new(&path.to_string_lossy(), SHOWN_CHARS).to_string()
 }
 
-/// The title of the terminal pane: where keys go and the state come first, and the agent's own
-/// words (name, command, project) after them. Anything the agent chooses is escaped and bounded,
-/// so a long or hostile project path cannot push the supervisor's words out of the title.
+fn fit(text: &str, cells: usize) -> String {
+    let span = Span::raw(text);
+    if span.width() <= cells {
+        return text.to_owned();
+    }
+    let mut left = cells.saturating_sub(1);
+    let mut out = String::new();
+    for g in span.styled_graphemes(Style::default()) {
+        let width = Span::raw(g.symbol).width();
+        if width > left {
+            break;
+        }
+        left -= width;
+        out.push_str(g.symbol);
+    }
+    if cells > 0 {
+        out.push('~');
+    }
+    out
+}
+
 fn terminal_title(app: &App, session: &Session, blocked: bool) -> String {
     let command = session.spec.command.first().map_or("", String::as_str);
-    let mut title = format!(
-        " keys: {} \u{b7} {} \u{b7} {} \u{b7} {} \u{b7} {} ",
+    format!(
+        " keys: {} | {}{} | {} | {} | {} ",
         if app.mode == Mode::Interact {
-            "to the agent"
+            "agent"
         } else {
-            "to the supervisor"
+            "supervisor"
         },
         state_words(session),
+        if blocked { " | clipboard blocked" } else { "" },
         session_name(session),
         crate::text::EscapedBounded::new(command, SHOWN_CHARS),
         shown_path(&session.spec.project),
-    );
-    if blocked {
-        title.push_str("\u{b7} clipboard blocked ");
-    }
-    title
+    )
 }
 
 fn draw_terminal(frame: &mut Frame<'_>, rect: Rect, app: &App, screens: Screens<'_>, look: Look) {
@@ -479,6 +513,13 @@ fn newest<'a, T>(items: impl Iterator<Item = &'a T>, rows: u16) -> Vec<&'a T> {
 }
 
 fn draw_denials(frame: &mut Frame<'_>, rect: Rect, session: &Session) {
+    if !session.spec.logging.denials {
+        frame.render_widget(
+            Paragraph::new("Denial logging is off for this session."),
+            rect,
+        );
+        return;
+    }
     if session.denials.is_empty() {
         frame.render_widget(Paragraph::new("No denials."), rect);
         return;
@@ -491,6 +532,13 @@ fn draw_denials(frame: &mut Frame<'_>, rect: Rect, session: &Session) {
 }
 
 fn draw_proxy(frame: &mut Frame<'_>, rect: Rect, session: &Session, look: Look) {
+    if !session.spec.logging.proxy {
+        frame.render_widget(
+            Paragraph::new("Proxy logging is off for this session."),
+            rect,
+        );
+        return;
+    }
     if session.proxy.is_empty() {
         frame.render_widget(Paragraph::new("No proxy connections."), rect);
         return;
@@ -529,7 +577,7 @@ fn status_line(app: &App) -> String {
     match app.mode {
         Mode::Overview => " OVERVIEW  Enter interact \u{b7} n new \u{b7} s stop \u{b7} r restart \u{b7} a approve \u{b7} Tab switch \u{b7} ? help \u{b7} q quit".to_owned(),
         Mode::Interact => format!(
-            " INTERACT -> {}  every key goes to the agent \u{b7} Ctrl-g leaves \u{b7} Ctrl-g Ctrl-g sends Ctrl-g",
+            " INTERACT Ctrl-g leaves | Ctrl-g Ctrl-g sends Ctrl-g | keys to {}",
             app.selected().map_or_else(String::new, session_name)
         ),
         Mode::Help => " HELP  Esc or ? closes".to_owned(),
@@ -549,22 +597,39 @@ fn centered(body: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// Whether the confirmation can name every affected row with its instructions.
+#[must_use]
+pub fn confirm_fits(app: &App, area: Rect) -> bool {
+    let body = areas(area, app.panel).body;
+    confirm_text(app).lines().count() <= usize::from(body.height.saturating_sub(2))
+        && area.width >= MIN_COLS
+        && area.height >= MIN_ROWS
+}
+
 fn draw_modal(frame: &mut Frame<'_>, body: Rect, app: &App) {
     let (title, text) = match app.mode {
         Mode::Help => (" Help ", help_text()),
         Mode::Confirm => (" Confirm ", confirm_text(app)),
-        Mode::Launch => (" Launch a session ", launch_text(app)),
+        Mode::Launch => (
+            " Launch a session ",
+            launch_text(app, usize::from(body.width.min(70).saturating_sub(2))),
+        ),
         Mode::Overview | Mode::Interact => return,
     };
-    let height = u16::try_from(text.lines().count())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
+    let width = body.width.min(70).saturating_sub(2) as usize;
+    let mut lines: Vec<String> = text.lines().map(|line| fit(line, width)).collect();
+    let available = body.height.saturating_sub(2) as usize;
+    if lines.len() > available && available > 0 {
+        lines.truncate(available);
+        if app.mode == Mode::Confirm {
+            lines[available - 1] = fit("Names hidden; enlarge. Any key cancels", width);
+        }
+    }
+    let height = (lines.len() as u16).saturating_add(2);
     let rect = centered(body, 70, height);
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(title)),
+        Paragraph::new(lines.join("\n")).block(Block::bordered().title(title)),
         rect,
     );
 }
@@ -572,15 +637,15 @@ fn draw_modal(frame: &mut Frame<'_>, body: Rect, app: &App) {
 fn help_text() -> String {
     [
         "Overview keys",
-        "  j k, arrows   select a session        1-8   jump to a session",
-        "  Enter         type to the agent       n     start a session",
-        "  s             stop (asks first)       r     restart (asks first)",
-        "  a             review approval         Tab   switch Denials / Proxy",
-        "  ?             this help               q     quit (asks first)",
+        "  j/k or arrows: select     1-8: jump",
+        "  Enter: interact          n: new session",
+        "  s: stop (confirm)        r: restart (confirm)",
+        "  a: review approval       Tab: switch panel",
+        "  ?: help                  q: quit (confirm)",
         "",
-        "While typing to an agent, every key goes to it.",
-        "Ctrl-g returns here. Ctrl-g Ctrl-g sends one Ctrl-g to the agent.",
-        "Denials are information; there is no allow action here.",
+        "Interact: every key goes to the selected agent.",
+        "Ctrl-g leaves. Ctrl-g twice sends one Ctrl-g.",
+        "Denials are information, never permission grants.",
     ]
     .join("\n")
 }
@@ -589,33 +654,94 @@ fn confirm_text(app: &App) -> String {
     let named = |id: SessionId| {
         app.sessions().iter().find(|s| s.id == id).map_or_else(
             || "this session".to_owned(),
-            |s| format!("{} ({})", session_name(s), shown_path(&s.spec.project)),
+            |s| {
+                format!(
+                    "{}: {} ({})",
+                    s.id.0,
+                    session_name(s),
+                    shown_path(&s.spec.project),
+                )
+            },
         )
     };
     let question = match &app.pending {
         Some(Pending::Stop(id)) => format!("Stop {}?", named(*id)),
         Some(Pending::Restart(id)) => format!("Restart {} as a new run?", named(*id)),
-        Some(Pending::Quit) => format!("Stop {} running session(s) and quit?", app.live_count()),
+        Some(Pending::Quit) => {
+            let mut question = "End these sessions and quit?".to_owned();
+            for session in app
+                .sessions()
+                .iter()
+                .filter(|s| s.phase.is_live() || s.phase == Phase::Lost)
+            {
+                question.push_str(&format!(
+                    "\n{}{}",
+                    named(session.id),
+                    if session.phase == Phase::Lost {
+                        " [Lost; stopping]"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            question
+        }
         None => "Continue?".to_owned(),
     };
     format!("{question}\n\ny = yes, any other key = cancel")
 }
 
-fn launch_text(app: &App) -> String {
+fn field_tail(text: &str, cells: usize) -> String {
+    let escaped = crate::text::Escaped(text).to_string();
+    if Span::raw(&escaped).width() <= cells {
+        return escaped;
+    }
+    let span = Span::raw(&escaped);
+    let graphemes: Vec<_> = span.styled_graphemes(Style::default()).collect();
+    let mut width = 1;
+    let mut start = graphemes.len();
+    while start > 0 {
+        let next = Span::raw(graphemes[start - 1].symbol).width();
+        if width + next > cells {
+            break;
+        }
+        width += next;
+        start -= 1;
+    }
+    format!(
+        "~{}",
+        graphemes[start..]
+            .iter()
+            .map(|g| g.symbol)
+            .collect::<String>()
+    )
+}
+
+fn launch_text(app: &App, width: usize) -> String {
     let mark = |field: Field| if app.form.field == field { ">" } else { " " };
     let cursor = |field: Field| if app.form.field == field { "_" } else { "" };
     let mut lines = vec![
         format!(
             "{} Project: {}{}",
             mark(Field::Project),
-            app.form.project,
+            field_tail(&app.form.project, width.saturating_sub(12)),
             cursor(Field::Project)
         ),
         format!(
             "{} Command: {}{}",
             mark(Field::Command),
-            app.form.command,
+            field_tail(&app.form.command, width.saturating_sub(12)),
             cursor(Field::Command)
+        ),
+        format!(
+            "{} [{}] Log denials",
+            mark(Field::Denials),
+            if app.form.logging.denials { "x" } else { " " }
+        ),
+        format!(
+            "{} [{}] Log proxy",
+            mark(Field::Proxy),
+            if app.form.logging.proxy { "x" } else { " " }
         ),
         String::new(),
     ];
@@ -664,6 +790,7 @@ mod tests {
 
     fn launch(app: &mut App, name: &str, command: &str) {
         app.update(Msg::Launch(LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from(format!("/work/{name}")),
             command: vec![command.to_owned()],
         }));
@@ -824,6 +951,7 @@ mod tests {
         app.update(Msg::Launch(LaunchSpec {
             project: PathBuf::from(path),
             command: vec!["claude".to_owned()],
+            logging: Default::default(),
         }));
         event(&mut app, 1, 1, Event::Starting {});
         event(&mut app, 1, 2, Event::Running { agent_pid: 11 });
@@ -923,7 +1051,7 @@ mod tests {
             "the last column was not defused"
         );
         // The trusted title is untouched by the pass over the pane.
-        assert!(text.contains("keys: to the supervisor"), "{text}");
+        assert!(text.contains("keys: supervisor"), "{text}");
         assert!(
             text.contains('\u{250c}') && text.contains('\u{2510}'),
             "the border was damaged"
@@ -951,7 +1079,7 @@ mod tests {
             .lines()
             .find(|l| l.contains("keys:"))
             .unwrap_or_default();
-        assert!(title.contains("keys: to the supervisor"), "{title}");
+        assert!(title.contains("keys: supervisor"), "{title}");
         assert!(title.contains("Running"), "{title}");
         assert!(
             !text.contains(&"d".repeat(100)),
@@ -1003,6 +1131,92 @@ mod tests {
             !text.contains('\u{202e}'),
             "a direction override reached the dialog"
         );
+    }
+
+    #[test]
+    fn confirmation_fit_agrees_with_visible_rows_and_instructions() {
+        let mut scene = scene();
+        scene.app.update(Msg::AskQuit);
+        assert!(confirm_fits(&scene.app, Rect::new(0, 0, 80, 24)));
+        let shown = render(&scene, 80, 24, PLAIN);
+        assert!(shown.contains("1: shopfront") && shown.contains("y = yes"));
+        let mut crowded = App::new();
+        for _ in 0..super::super::app::MAX_SESSIONS {
+            crowded.update(Msg::Launch(LaunchSpec {
+                logging: Default::default(),
+                project: "/same/project".into(),
+                command: vec!["agent".into()],
+            }));
+        }
+        crowded.update(Msg::AskQuit);
+        assert!(confirm_fits(&crowded, Rect::new(0, 0, 60, 15)));
+        assert!(!confirm_fits(&crowded, Rect::new(0, 0, 60, 14)));
+        let question = confirm_text(&crowded);
+        for id in 1..=8 {
+            assert!(question.contains(&format!("{id}: project")));
+        }
+        assert!(!confirm_fits(&scene.app, Rect::new(0, 0, 60, 6)));
+        // Rows beyond the eight live slots can exist, but are not quit targets.
+        assert!(!shown.contains("3: docs"));
+    }
+
+    #[test]
+    fn compact_screens_keep_escape_fields_and_named_confirmation_visible() {
+        let mut scene = scene();
+        scene.app.update(Msg::EnterInteract);
+        let shown = render(&scene, 60, 15, PLAIN);
+        assert!(shown.contains("INTERACT") && shown.contains("Ctrl-g leaves"));
+        scene.app.update(Msg::LeaveInteract);
+        scene.app.update(Msg::OpenLaunch {
+            cwd: PathBuf::from(format!("/{}TAIL", "界".repeat(90))),
+        });
+        scene.app.form.command = format!("agent {}END", "x".repeat(180));
+        let shown = render(&scene, 60, 15, PLAIN);
+        for word in [
+            "Project:",
+            "TAIL",
+            "Command:",
+            "END_",
+            "Log denials",
+            "Log proxy",
+            "Esc cancel",
+        ] {
+            assert!(shown.contains(word), "missing {word}: {shown}");
+        }
+        scene.app.update(Msg::CancelLaunch);
+        scene.app.update(Msg::AskQuit);
+        let shown = render(&scene, 60, 15, PLAIN);
+        assert!(
+            shown.contains("shopfront") && !shown.contains("3: docs"),
+            "{shown}"
+        );
+        assert!(shown.contains("y = yes") && shown.contains("CONFIRM"));
+    }
+
+    #[test]
+    fn no_color_resets_indexed_rgb_and_background_agent_cells() {
+        let mut scene = scene();
+        scene.app.panel = Panel::Terminal;
+        let shared = claims::assert_some!(scene.screens.get(&SessionId(1)));
+        claims::assert_ok!(shared.screen.lock())
+            .process(b"\x1b[2J\x1b[H\x1b[38;5;196mI\x1b[38;2;1;2;3mR\x1b[41mB");
+        for look in [COLOR, PLAIN] {
+            let mut terminal = claims::assert_ok!(Terminal::new(TestBackend::new(80, 24)));
+            let lookup = |id| scene.screens.get(&id).cloned();
+            claims::assert_ok!(terminal.draw(|f| draw(f, &scene.app, &lookup, look)));
+            let cells = &terminal.backend().buffer().content;
+            if look.color {
+                assert!(cells.iter().any(|c| matches!(c.fg, Color::Indexed(_))));
+                assert!(cells.iter().any(|c| matches!(c.fg, Color::Rgb(..))));
+                assert!(cells.iter().any(|c| c.bg != Color::Reset));
+            } else {
+                assert!(
+                    cells
+                        .iter()
+                        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1077,12 +1291,15 @@ mod tests {
         let mut scene = scene();
         scene.app.update(Msg::AskStop);
         let text = render(&scene, 80, 24, COLOR);
-        assert!(text.contains("Stop shopfront (/work/shopfront)?"), "{text}");
+        assert!(
+            text.contains("Stop 1: shopfront (/work/shopfront)?"),
+            "{text}"
+        );
         insta::assert_snapshot!(text);
     }
 
     #[test]
-    fn snapshot_confirm_quit_counts_running_sessions_80x24() {
+    fn snapshot_confirm_quit_names_each_session_80x24() {
         let mut scene = scene();
         scene.app.update(Msg::AskQuit);
         insta::assert_snapshot!(render(&scene, 80, 24, COLOR));
