@@ -1,0 +1,41 @@
+# agent/kiro: kiro-cli 3.5.0, measured 2026-11-23 with `kiro-cli chat --no-interactive` behind the proxy.
+#
+# `~/Library/Application Support/kiro-cli` holds the login database and the agent server (a Node
+# program under `kas/`) that kiro-cli starts. It is written, because the login token is refreshed there,
+# except for the programs a plain `kiro-cli` runs outside the sandbox (`node`, `bun`, `tui.js`,
+# `bunfig.toml`, `kas`): the agent must not be able to change them. kiro runs without them being
+# writable; it cannot update its own agent server from inside hb, so update it outside.
+# `~/.kiro` holds sessions, settings and logs.
+#
+# Hosts a one-shot chat contacted: app.kiro.dev, runtime / management / telemetry .us-east-1.kiro.dev and
+# client-telemetry.us-east-1.amazonaws.com. cognito-identity is the credential source for that telemetry
+# and was seen in some runs only.
+#
+# Denied and harmless: the MCP servers named in ~/.kiro/settings (they are not part of the agent; give each
+# its own `[mcp.*]`), ~/.aws and ~/Library/Keychains probes, ~/.gitconfig and ~/.config/git/ignore reads,
+# FSEvents (the config watcher logs EMFILE and carries on), and the self-update write probe in ~/.local/bin.
+# Some runs log `getaddrinfo ENOTFOUND telemetry.us-east-1.kiro.dev`: a lookup made outside the proxy, which
+# the sandbox refuses. The chat is unaffected. Two early runs timed out for a cause not found; five later
+# runs passed in about 9 s each.
+[fs]
+write = ["~/.kiro", "~/Library/Application Support/kiro-cli"]
+deny_write = [
+  "~/Library/Application Support/kiro-cli/bun",
+  "~/Library/Application Support/kiro-cli/bunfig.toml",
+  "~/Library/Application Support/kiro-cli/kas",
+  "~/Library/Application Support/kiro-cli/node",
+  "~/Library/Application Support/kiro-cli/tui.js",
+]
+
+[net]
+allow = [
+  "app.kiro.dev",
+  "runtime.us-east-1.kiro.dev",
+  "management.us-east-1.kiro.dev",
+  "telemetry.us-east-1.kiro.dev",
+  "client-telemetry.us-east-1.amazonaws.com",
+  "cognito-identity.us-east-1.amazonaws.com",
+]
+
+[tls]
+system_trust = true

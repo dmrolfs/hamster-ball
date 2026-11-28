@@ -234,6 +234,36 @@ The store is `~/.cache/hamster-ball/`, kept apart from your own `~/.cache/uv` an
 The ball cannot read or write it, and each `hb run` works in its own copy.
 An older shared cache in that directory is never used or deleted.
 
+### Moving to cache generations, and freeing space
+
+`hb` never deletes a cache, a cache generation or an agent's state, and never imports an old cache.
+The only thing it removes by itself is a run's own scratch directory (under your temp directory, named `hb-<pid>-...`),
+and only after the process that made it has exited.
+Everything below is a command you run yourself, outside the ball, with no `hb` running.
+
+Moving from the old shared cache (`~/.cache/hamster-ball/uv`, `uv-tools`, `npm` and the `warmed` file):
+
+1. In each project, run `hb warm`. It builds a new generation from the registries. It does not read the old cache.
+2. Check with `hb explain`: the `generation` line says `ready: <id>`, or `a run would stop: ...` and why.
+3. When no project needs the old cache, remove it: `rm -rf ~/.cache/hamster-ball/{uv,uv-tools,npm,warmed}`.
+   A run of an older `hb` that is still running would lose its cache, so close those first.
+
+Every `hb warm` leaves the previous generation on disk. To remove the ones no project uses:
+
+```sh
+cd ~/.cache/hamster-ball
+for g in generations/*; do
+  id=${g#generations/}
+  grep -q "\"id\":\"$id\"" projects/*/current 2>/dev/null || echo "unused: $id"
+done
+# review the list, then for each id you want gone:
+rm -rf ~/.cache/hamster-ball/generations/<id>
+```
+
+Do not remove a generation that a project's `current` names: its next run stops until you run `hb warm` again.
+Do not remove one while a run is starting in that project; there is no lock to stop that.
+Agent state (`~/.claude`, `~/.pi/agent`, `~/.kiro`, ...) has no `hb` command: `hb` never changes a host agent home.
+
 ## `hb ctl`
 
 Works inside the ball only.

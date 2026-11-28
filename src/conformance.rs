@@ -490,8 +490,10 @@ struct Rig {
 
 impl Rig {
     fn create(preset: &str, env: &[(&str, &str)], settings: &Settings) -> Result<Self, String> {
+        // Not the per-user temp directory: `hb` refuses a write grant over it (hb-dai), and the
+        // project is granted. `/tmp` is shared, but this directory is 0700 and removed after.
         let parent = CanonicalPath::from_canonical(
-            &fs::canonicalize(std::env::temp_dir()).map_err(|e| format!("temp dir: {e}"))?,
+            &fs::canonicalize("/tmp").map_err(|e| format!("temp dir: {e}"))?,
         )
         .map_err(|e| format!("temp dir: {e}"))?;
         let dir = SessionDir::create(&parent).map_err(|e| format!("work dir: {e}"))?;

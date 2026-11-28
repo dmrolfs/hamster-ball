@@ -83,7 +83,14 @@ fn the_kiro_preset_writes_its_own_state_not_its_programs_and_reaches_only_its_ow
             "{program}: {denied:?}"
         );
     }
-    assert_eq!(hosts.len(), 6, "{hosts:?}");
+    // Six hosts for a chat, and `oidc.us-east-1.amazonaws.com` for refreshing an expired login token (hb-82i).
+    assert_eq!(hosts.len(), 7, "{hosts:?}");
+    assert!(
+        hosts
+            .iter()
+            .any(|h| h == "oidc.us-east-1.amazonaws.com:443"),
+        "{hosts:?}"
+    );
     assert!(
         hosts
             .iter()
