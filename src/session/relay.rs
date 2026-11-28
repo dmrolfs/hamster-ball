@@ -25,11 +25,11 @@ pub(super) const BUFFER: usize = 8192;
 
 /// How long a relay keeps draining after the child has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Drain {
+pub(super) struct Drain {
     /// How long the master may stay silent before the relay stops.
-    quiet: Duration,
+    pub(super) quiet: Duration,
     /// The most time spent draining.
-    max: Duration,
+    pub(super) max: Duration,
 }
 
 impl Default for Drain {

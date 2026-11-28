@@ -662,8 +662,32 @@ mod tests {
         }
     }
 
+    /// Whether System Integrity Protection is on, which is what makes macOS hide the environment
+    /// of Apple's own binaries. `None` if `csrutil` cannot say.
+    fn sip_enabled() -> Option<bool> {
+        let out = std::process::Command::new("/usr/bin/csrutil")
+            .arg("status")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if text.contains("enabled") {
+            Some(true)
+        } else if text.contains("disabled") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn a_process_whose_environment_macos_hides_is_not_confirmed() {
+        // The premise is a macOS rule that holds only with SIP on. A hosted CI runner has it off
+        // (measured: `ps -E` shows /bin/sleep's environment there), and then the process is
+        // readable and rightly confirmed, so there is nothing hidden to test.
+        if sip_enabled() == Some(false) {
+            eprintln!("SKIP: SIP is disabled, so macOS does not hide Apple binaries' environments");
+            return;
+        }
         let entry = "HB_LAUNCH_TOKEN=hb1-abc123";
         let mut apple = assert_ok!(
             std::process::Command::new("/bin/sleep")

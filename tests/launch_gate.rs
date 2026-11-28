@@ -243,6 +243,96 @@ fn a_silent_parent_after_prepared_times_out_and_nothing_runs() {
     drop(gate);
 }
 
+/// Like [`helper`], through `__child --gate`, the helper that execs `sandbox-exec` for the agent.
+/// The launch gate is the same, but this is the entry point `hb run` uses for the agent, and a
+/// different function from the broker's `__exec`.
+fn child_helper(marker: &std::path::Path) -> (std::process::Child, UnixStream) {
+    let (ours, theirs) = assert_ok!(UnixStream::pair());
+    let child = assert_ok!(
+        Command::new(DRIVE)
+            .args([
+                "__child",
+                "--gate",
+                "--",
+                "-p",
+                "(version 1)(allow default)"
+            ])
+            .args(["/usr/bin/touch"])
+            .arg(marker)
+            .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    );
+    (child, ours)
+}
+
+#[test]
+fn the_agent_helper_runs_nothing_before_release_and_runs_it_after() {
+    sandboxed!();
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let (mut child, ours) = child_helper(&marker);
+    let mut gate = hamster_ball::session::launch::ParentGate::new(ours);
+    let null = assert_ok!(std::fs::File::open("/dev/null"));
+    assert_ok!(gate.prepare(&null));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the agent ran before release");
+    assert!(
+        assert_ok!(child.try_wait()).is_none(),
+        "the helper exited early"
+    );
+    assert_ok!(gate.release());
+    let status = assert_ok!(child.wait());
+    assert!(status.success(), "{status:?}");
+    assert!(marker.exists(), "the agent did not run after release");
+}
+
+#[test]
+fn the_agent_helper_whose_parent_dies_before_release_runs_nothing_and_says_why() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let (child, ours) = child_helper(&marker);
+    let mut gate = hamster_ball::session::launch::ParentGate::new(ours);
+    let null = assert_ok!(std::fs::File::open("/dev/null"));
+    assert_ok!(gate.prepare(&null));
+    drop(gate);
+    let out = assert_ok!(child.wait_with_output());
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(!marker.exists(), "the agent ran without a release");
+    // The Gate error from the changed branch, not a failure to exec.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("launch gate"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_agent_helper_whose_parent_goes_silent_after_prepared_times_out_and_runs_nothing() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let marker = dir.path().join("ran");
+    let (child, ours) = child_helper(&marker);
+    let mut gate = hamster_ball::session::launch::ParentGate::new(ours);
+    let null = assert_ok!(std::fs::File::open("/dev/null"));
+    assert_ok!(gate.prepare(&null));
+    let started = Instant::now();
+    let out = assert_ok!(child.wait_with_output());
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!marker.exists(), "the agent ran without a release");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("launch gate"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(gate);
+}
+
 /// A python driver for the gate protocol: start `<hb> __exec /bin/cat <file>` with the gate on
 /// stdin, send /dev/null by SCM_RIGHTS, wait for prepared, release, print what cat printed.
 fn exec_driver(hb: &str, file: &std::path::Path) -> String {
