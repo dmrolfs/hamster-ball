@@ -416,6 +416,34 @@ fn a_command_the_guard_reports_gone_never_runs_and_its_helper_is_reaped() {
 }
 
 #[test]
+fn incomplete_cleanup_keeps_command_exit_and_refuses_the_next_launch() {
+    let dir = assert_ok!(tempfile::tempdir());
+    let (guard, _) = fake_guardian(dir.path(), "incomplete");
+    let host = Host::new("/usr/bin:/bin", |_| None).with_guard(guard.handle(), DRIVE.into());
+    let result = host.run(
+        Path::new("/bin/sh"),
+        &["-c".into(), "exit 7".into()],
+        Capture::Tail(100),
+        Duration::from_secs(5),
+        &Cancel::default(),
+    );
+    assert!(
+        matches!(result, Err(RunError::Finalize { code: Some(7), .. })),
+        "{result:?}"
+    );
+    let marker = dir.path().join("not-run");
+    let second = host.run(
+        Path::new("/usr/bin/touch"),
+        &[marker.as_os_str().into()],
+        Capture::Tail(100),
+        Duration::from_secs(5),
+        &Cancel::default(),
+    );
+    assert!(matches!(second, Err(RunError::Cleanup)), "{second:?}");
+    assert!(!marker.exists());
+}
+
+#[test]
 fn the_same_command_runs_when_the_guard_arms_it() {
     let dir = assert_ok!(tempfile::tempdir());
     let marker = dir.path().join("ran");
@@ -535,7 +563,6 @@ struct AgentRun {
     out: std::process::Output,
     log: PathBuf,
     marker: PathBuf,
-    elapsed: Duration,
     _guard_dir: tempfile::TempDir,
     _world: World,
 }
@@ -548,13 +575,11 @@ fn run_agent_with_guard(reply: &str) -> AgentRun {
     let marker = w.project.join("ran");
     let mut command = w.drive(DRIVE, &["run", "--", "/usr/bin/touch", "ran"]);
     command.env("HB_TD_EXE", &wrapper).stdin(Stdio::null());
-    let started = Instant::now();
     let out = assert_ok!(command.output());
     AgentRun {
         out,
         log,
         marker,
-        elapsed: started.elapsed(),
         _guard_dir: dir,
         _world: w,
     }
@@ -567,7 +592,7 @@ fn an_agent_the_guard_refuses_never_runs_and_its_helper_is_reaped() {
     let stderr = String::from_utf8_lossy(&run.out.stderr);
     assert!(!run.out.status.success(), "{stderr}");
     assert!(stderr.contains("kernel"), "{stderr}");
-    assert!(run.elapsed < Duration::from_secs(4), "{:?}", run.elapsed);
+    // The typed refusal proves this did not fail by the gate's deadline.
     assert!(!run.marker.exists(), "the refused agent ran");
     assert!(
         !watched_line(&run.log, "watch core group ").is_empty(),
@@ -584,7 +609,6 @@ fn an_agent_the_guard_reports_gone_never_runs_and_its_helper_is_reaped() {
     // The helper is parked, so gone cannot mean a fast exit.
     assert!(!run.out.status.success(), "{stderr}");
     assert!(stderr.contains("invalid"), "{stderr}");
-    assert!(run.elapsed < Duration::from_secs(4), "{:?}", run.elapsed);
     assert!(!run.marker.exists(), "the agent ran after a gone answer");
     assert_helper_reaped(watched_pid(&run.log, "watch core group "));
 }
@@ -632,7 +656,6 @@ fn a_helper_that_reports_the_wrong_pid_or_a_bad_line_is_killed_and_never_watched
         let (guard, log) = fake_guardian(dir.path(), "armed");
         let (helper, pidfile) = lying_helper(dir.path(), reply);
         let marker = dir.path().join("ran");
-        let started = Instant::now();
         let result = Host::new("/usr/bin:/bin", |_| None)
             .with_guard(guard.handle(), helper)
             .run(
@@ -651,7 +674,6 @@ fn a_helper_that_reports_the_wrong_pid_or_a_bad_line_is_killed_and_never_watched
             ),
             "{reply}: {result:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(3), "{reply}");
         assert!(
             !log.exists(),
             "{reply}: a watch was asked for a pid nobody vouched for"

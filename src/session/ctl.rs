@@ -57,6 +57,8 @@ pub enum CtlError {
 pub struct RunCtl {
     /// The broker and what startup found.
     pub service: Service,
+    /// Retains cleanup failure even if a disconnected command's result was discarded.
+    pub(crate) host: Arc<Host>,
     /// The socket, for `HB_CTL_SOCKET` and the profile.
     pub socket: CanonicalPath,
 }
@@ -127,6 +129,17 @@ pub fn start(
     scope: Scope,
     guard: Option<GuardHandle>,
 ) -> Result<RunCtl, CtlError> {
+    start_with_stop(env, project, session, scope, guard, None)
+}
+
+pub(crate) fn start_with_stop(
+    env: &Environment,
+    project: &CanonicalPath,
+    session: &CanonicalPath,
+    scope: Scope,
+    guard: Option<GuardHandle>,
+    stop: Option<Arc<super::signals::StopSignal>>,
+) -> Result<RunCtl, CtlError> {
     let socket = session.as_path().join(SOCKET_NAME);
     let programs = Programs {
         podman: find_podman(env.floor.path_var.as_deref()),
@@ -148,11 +161,15 @@ pub fn start(
     if let (Some(guard), Some(hb)) = (guard, env.floor.hb_exe.as_ref()) {
         host = host.with_guard(guard, hb.clone());
     }
+    if let Some(stop) = stop {
+        host = host.with_stop(stop);
+    }
+    let host = Arc::new(host);
     let service = service::start(Inputs {
         scope,
         project: project.clone(),
         programs,
-        exec: Arc::new(host),
+        exec: host.clone(),
         socket: socket.clone(),
         euid: nix::unistd::geteuid().as_raw(),
         connection: text_var(env, "CONTAINER_CONNECTION"),
@@ -164,6 +181,7 @@ pub fn start(
         source: io::Error::other(e.to_string()),
     })?;
     Ok(RunCtl {
+        host,
         service,
         socket: canonical,
     })

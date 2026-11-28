@@ -8,7 +8,6 @@ use std::io::{self, IsTerminal};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -20,6 +19,7 @@ use rustix::process::Pid as RustixPid;
 use snafu::{ResultExt, Snafu, ensure};
 
 use super::ca_bundle::{CaBundleError, write_bundle};
+use super::custody::{Group, Lease, Permit};
 use super::denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 use super::dir::{SessionDir, SessionDirError, sweep_stale};
 use super::env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
@@ -27,7 +27,7 @@ use super::fence::settle;
 use super::guardian::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
 use super::hooks::{HookRunError, run_pre_run};
 use super::interactive::{Interactive, InteractiveError};
-use super::launch::{GateError, ParentGate};
+use super::launch::{GateError, ParentGate, prepare_launch};
 use super::offline::{OfflineError, OfflinePlan};
 use super::ports::{closed_ports, closed_ports_warning};
 use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
@@ -284,6 +284,18 @@ pub struct Outcome {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum RunError {
+    /// Child cleanup ownership could not be reserved before launch.
+    #[snafu(display("the agent has no cleanup owner"))]
+    Custody {
+        /// The reservation failure.
+        source: super::CustodyError,
+    },
+    /// Cleanup failed after an agent exit was observed, or during setup.
+    #[snafu(display("session cleanup could not be confirmed"))]
+    Cleanup {
+        /// The agent's observed exit, if it ran.
+        exit: Option<ExitKind>,
+    },
     /// There was no command to run.
     #[snafu(display("there is no command to run"))]
     EmptyCommand,
@@ -527,6 +539,9 @@ pub enum RunError {
 /// # Errors
 /// [`RunError`] if the run could not start. A child that fails is an [`Outcome`], not an error.
 pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome, RunError> {
+    let mut owned_spec = spec.clone();
+    owned_spec.stop.get_or_insert_with(StopSignal::new);
+    let spec = &owned_spec;
     ensure!(!spec.argv.is_empty(), EmptyCommandSnafu);
     check_nesting(env.vars.get(SESSION_MARKER).is_some())?;
     let pty = open_pty(spec)?;
@@ -613,18 +628,15 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         None => None,
     };
     let ctl = match ctl_scope {
-        Some(scope) => {
-            let hb = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
-            Some(start_ctl(
-                env,
-                loaded,
-                &session,
-                hb,
-                scope,
-                guardian.as_mut(),
-                &mut warnings,
-            )?)
-        }
+        Some(scope) => Some(start_ctl(
+            env,
+            loaded,
+            &session,
+            scope,
+            guardian.as_mut(),
+            spec.stop.clone(),
+            &mut warnings,
+        )?),
         None => None,
     };
 
@@ -772,26 +784,18 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         guardian.terminal(&terminal)?;
     }
     // The log is listening before the child starts, so its first denials are not missed.
-    let log = match (&tag, &spec.denials) {
-        (Some(tag), Some(sink)) => Some(LogStream::start(tag, sink.clone())?),
+    let log = match (&tag, &spec.denials, guardian.as_mut()) {
+        (Some(tag), Some(sink), Some(guardian)) => {
+            let helper = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
+            Some(LogStream::start_guarded(
+                tag,
+                sink.clone(),
+                helper,
+                guardian,
+            )?)
+        }
+        (Some(tag), Some(sink), None) => Some(LogStream::start(tag, sink.clone())?),
         _ => None,
-    };
-    let log = match (guardian.as_mut(), log) {
-        (Some(guardian), Some(log)) => match guardian.watch(Target::Child(pid_of(log.pid()))) {
-            Ok(WatchOutcome::Armed) => Some(log),
-            // The log stream never exits by itself, so Gone or a refusal means it is unprotected.
-            Ok(WatchOutcome::Gone) => {
-                let _ = log.finish();
-                return Err(RunError::from(GuardianError::Refused {
-                    reason: WatchRefusal::Invalid,
-                }));
-            }
-            Err(error) => {
-                let _ = log.finish();
-                return Err(error.into());
-            }
-        },
-        (_, log) => log,
     };
     if setup.is_some_and(Setup::finish) {
         if let Some(log) = log {
@@ -799,14 +803,15 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         }
         return StoppedSnafu.fail();
     }
+    let permit = Group::new(1).reserve().context(CustodySnafu)?;
     let launched = match (guardian.as_mut(), gated_stdin) {
         (Some(guardian), Some(stdin)) => {
             let group = pty.is_some() || !stdin_is_tty;
-            gated_spawn(&mut command, stdin, guardian, group)
+            gated_spawn(&mut command, stdin, guardian, group, permit)
         }
         _ => command
             .spawn()
-            .map(|child| (child, None))
+            .map(|child| (permit.install(child), None))
             .context(SpawnSnafu),
     };
     let (mut child, gate) = match launched {
@@ -858,15 +863,23 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         (on_start.0)(running.child.id());
     }
     let waited = running.wait_for_exit(spec.stdio, spec.on_stopping.as_ref());
-    let denials = log.map(LogStream::finish).unwrap_or_default();
-    if let Some(ctl) = ctl {
+    let (denials, logger_failed) = log.map(LogStream::finish_checked).unwrap_or_default();
+    let cleanup_failed = if let Some(ctl) = ctl {
         ctl.broker.finish();
-    }
+        ctl.host.cleanup_failed()
+    } else {
+        false
+    };
     // A failed wait cannot authorize the guardian to stand down.
     // On error, dropping it retains its independent cleanup path.
     let waited = waited?;
-    if let Some(guardian) = guardian {
-        guardian.release();
+    require_clean_exit(waited.exit, cleanup_failed, logger_failed)?;
+    if let Some(guardian) = guardian
+        && guardian.release_checked().is_err()
+    {
+        return Err(RunError::Cleanup {
+            exit: Some(waited.exit),
+        });
     }
     let Waited {
         exit,
@@ -893,8 +906,21 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     })
 }
 
+fn require_clean_exit(
+    exit: ExitKind,
+    broker_failed: bool,
+    logger_failed: bool,
+) -> Result<(), RunError> {
+    if broker_failed || logger_failed {
+        Err(RunError::Cleanup { exit: Some(exit) })
+    } else {
+        Ok(())
+    }
+}
+
 /// What `hb ctl` adds to a run: the broker, and the two things the child needs from it.
 struct CtlRun {
+    host: std::sync::Arc<crate::ctl::runner::Host>,
     broker: crate::ctl::broker::Broker,
     pins: Vec<CanonicalPath>,
     socket: CanonicalPath,
@@ -907,11 +933,12 @@ fn start_ctl(
     env: &Environment,
     loaded: &Loaded,
     session: &SessionDir,
-    hb: &Path,
     scope: crate::ctl::scope::Scope,
     mut guard: Option<&mut Guardian>,
+    stop: Option<Arc<StopSignal>>,
     warnings: &mut Vec<String>,
 ) -> Result<CtlRun, RunError> {
+    let hb = env.floor.hb_exe.as_deref().ok_or(RunError::NoHbExe)?;
     let socket_path = session.path().as_path().join(super::ctl::SOCKET_NAME);
     ensure!(
         super::ctl::socket_fits(session.path()),
@@ -925,11 +952,16 @@ fn start_ctl(
     }
     let bin = session.path().as_path().join("bin");
     super::ctl::install_wrapper(&bin, hb)?;
-    let started = super::ctl::start(env, loaded.root.path(), session.path(), scope, handle)?;
+    let started =
+        super::ctl::start_with_stop(env, loaded.root.path(), session.path(), scope, handle, stop)?;
     warnings.extend(started.service.warnings);
     let bin =
         CanonicalPath::from_canonical(&bin).map_err(|source| RunError::TempDirPath { source })?;
+    if started.host.cleanup_failed() {
+        return Err(RunError::Cleanup { exit: None });
+    }
     Ok(CtlRun {
+        host: started.host,
         broker: started.service.broker,
         pins: started.service.pins,
         socket: started.socket,
@@ -945,7 +977,7 @@ fn stdin_is_tty(stdio: StdioMode, own_stdin_is_terminal: bool) -> bool {
 
 /// A spawned child, with the signal thread that watches over it if there is one.
 struct Running {
-    child: Child,
+    child: Lease,
     supervisor: Option<Supervisor>,
     terminal: Option<Interactive>,
     /// The filters between the agent's streams and the user's terminal, when there is no pty.
@@ -1037,7 +1069,7 @@ fn clipboard_notices(used: ClipboardUse) -> Vec<String> {
 /// Starts forwarding signals to `child`, if `watch` was prepared. If that fails the child is
 /// killed and reaped first, so a failed start never leaves an unsupervised agent running.
 fn start_supervisor(
-    mut child: Child,
+    mut child: Lease,
     watch: Option<Watch>,
     mode: SignalMode,
     stdin_is_tty: bool,
@@ -1065,29 +1097,29 @@ fn start_supervisor(
             pumps: Vec::new(),
         }),
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            abort_child(&mut child);
             Err(error.into())
         }
     }
-}
-
-/// A process number from the standard library's `u32` id.
-fn pid_of(id: u32) -> Pid {
-    Pid::from_raw(i32::try_from(id).unwrap_or(i32::MAX))
 }
 
 /// Kills and reaps a child that was started but cannot be supervised, so a failed start never
 /// leaves an agent running without its parent.
 fn abort_child(child: &mut Child) {
     let _ = child.kill();
-    let _ = child.wait();
+    let by = std::time::Instant::now() + super::launch_end::CLEANUP_BUDGET;
+    while std::time::Instant::now() < by {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
 
 /// Starts the user's side of a pty run (raw mode, relay) and the signal thread with the resize
 /// callback, after the child has been spawned.
 fn start_on_pty(
-    mut child: Child,
+    mut child: Lease,
     pty: Pty,
     watch: Option<Watch>,
     mode: SignalMode,
@@ -1246,44 +1278,31 @@ fn gated_spawn(
     stdin: OwnedFd,
     guardian: &mut Guardian,
     group: bool,
-) -> Result<(Child, Option<ParentGate>), RunError> {
-    let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
-    command.stdin(Stdio::from(OwnedFd::from(theirs)));
-    let spawned = command.spawn();
-    // The Command keeps its Stdio after spawning; drop our copy of the helper's end so a helper
-    // that dies sends the gate end of input instead of leaving it to wait out the deadline.
-    command.stdin(Stdio::null());
-    let mut child = spawned.context(SpawnSnafu)?;
-    let mut gate = ParentGate::new(ours);
-    let prepared = gate
-        .prepare(&stdin)
-        .map_err(|source| RunError::Gate { source });
-    drop(stdin);
-    let outcome = prepared.and_then(|pid| {
-        if u32::try_from(pid).ok() != Some(child.id()) {
-            return Err(RunError::Gate {
-                source: GateError::Protocol,
-            });
-        }
-        let pid = Pid::from_raw(pid);
-        let target = if group {
-            Target::Group(pid)
-        } else {
-            Target::Child(pid)
-        };
-        match guardian.watch(target)? {
-            WatchOutcome::Armed => Ok(()),
-            // The helper is still blocked on the gate, so a gone answer is never acceptable here.
-            WatchOutcome::Gone => Err(GuardianError::Refused {
-                reason: WatchRefusal::Invalid,
+    permit: Permit,
+) -> Result<(Lease, Option<ParentGate>), RunError> {
+    let (child, gate, ()) = prepare_launch(
+        command,
+        stdin,
+        |child| permit.install(child),
+        |lease| &mut **lease,
+        |pid| {
+            let pid = Pid::from_raw(pid);
+            let target = if group {
+                Target::Group(pid)
+            } else {
+                Target::Child(pid)
+            };
+            match guardian.watch(target)? {
+                WatchOutcome::Armed => Ok(()),
+                WatchOutcome::Gone => Err(GuardianError::Refused {
+                    reason: WatchRefusal::Invalid,
+                }
+                .into()),
             }
-            .into()),
-        }
-    });
-    if let Err(error) = outcome {
-        abort_child(&mut child);
-        return Err(error);
-    }
+        },
+        |source| RunError::Spawn { source },
+        |source| RunError::Gate { source },
+    )?;
     Ok((child, Some(gate)))
 }
 
@@ -1495,6 +1514,23 @@ fn check_size(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn broker_or_logger_cleanup_failure_keeps_the_observed_exit_and_fails() {
+        for (broker, logger) in [(true, false), (false, true), (true, true)] {
+            let result = super::require_clean_exit(super::ExitKind::Exited(7), broker, logger);
+            assert!(matches!(
+                result,
+                Err(super::RunError::Cleanup {
+                    exit: Some(super::ExitKind::Exited(7))
+                })
+            ));
+        }
+        claims::assert_ok!(super::require_clean_exit(
+            super::ExitKind::Exited(7),
+            false,
+            false
+        ));
+    }
     use super::*;
     use crate::policy::HomeDir;
     use crate::system::ParentVars;

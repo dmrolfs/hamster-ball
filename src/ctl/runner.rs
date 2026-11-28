@@ -6,8 +6,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,9 +20,10 @@ use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu};
 
 use crate::session::GuardHandle;
-use crate::session::guardian::{GuardianError, WatchOutcome, WatchRefusal};
-use crate::session::launch::{GateError, ParentGate};
-use crate::session::signals::Target;
+use crate::session::custody::{Group, Lease, Permit};
+use crate::session::guardian::{GuardianError, LaunchHandle};
+use crate::session::launch::{GateError, prepare_launch};
+use crate::session::launch_end::{CLEANUP_BUDGET, EndPhase, EndStatus};
 
 /// How the output of a command is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +51,23 @@ pub struct Finished {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum RunError {
+    /// No child was spawned because cleanup capacity or its worker was unavailable.
+    #[snafu(display("child cleanup could not be reserved"))]
+    Custody {
+        /// The allocation or worker failure.
+        source: crate::session::custody::CustodyError,
+    },
+    /// The command ended without confirmed cleanup.
+    #[snafu(display("command cleanup did not finish"))]
+    Cleanup,
+    /// Cleanup failed as well as, or after, the command operation.
+    #[snafu(display("command cleanup failed after the command operation"))]
+    Finalize {
+        /// The command failure, if any, retained independently of cleanup.
+        command_error: Option<Box<RunError>>,
+        /// Observed exit code, if the command was reaped.
+        code: Option<i32>,
+    },
     /// The program could not be started.
     #[snafu(display("could not start {}", program.display()))]
     Spawn {
@@ -134,6 +151,9 @@ pub struct Host {
     guard: Option<GuardHandle>,
     /// `hb` itself, which runs `__exec` so the command waits at the gate until it is protected.
     helper: Option<PathBuf>,
+    custody: Group,
+    cleanup_failed: Arc<AtomicBool>,
+    stop: Option<Arc<crate::session::signals::StopSignal>>,
 }
 
 /// Variables from `hb`'s own environment that host commands may see: where the user's podman
@@ -159,7 +179,26 @@ impl Host {
             env,
             guard: None,
             helper: None,
+            custody: Group::new(14),
+            cleanup_failed: Arc::new(AtomicBool::new(false)),
+            stop: None,
         }
+    }
+
+    pub(crate) fn with_stop(mut self, stop: Arc<crate::session::signals::StopSignal>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    fn fail_cleanup(&self) {
+        self.cleanup_failed.store(true, Ordering::Release);
+        if let Some(stop) = &self.stop {
+            stop.request();
+        }
+    }
+
+    pub(crate) fn cleanup_failed(&self) -> bool {
+        self.cleanup_failed.load(Ordering::Acquire)
     }
 
     /// Registers every command's process group with the cleanup guard, so a killed `hb` does not
@@ -175,8 +214,6 @@ impl Host {
 }
 
 const POLL: Duration = Duration::from_millis(5);
-/// After the leader has exited, how long output may still be arriving before the group is killed.
-const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 struct Tail {
     buf: VecDeque<u8>,
@@ -204,11 +241,22 @@ impl Tail {
     }
 }
 
-fn reader(mut pipe: impl Read + Send + 'static, tail: Option<Arc<Mutex<Tail>>>) -> JoinHandle<()> {
-    thread::spawn(move || {
+fn reader(
+    mut pipe: impl Read + AsFd + Send + 'static,
+    tail: Option<Arc<Mutex<Tail>>>,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<()>> {
+    let flags = rustix::fs::fcntl_getfl(&pipe)?;
+    rustix::fs::fcntl_setfl(&pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
+    thread::Builder::new().spawn(move || {
         let mut chunk = [0u8; 4096];
         loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
             match pipe.read(&mut chunk) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(POLL),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     if let Some(tail) = &tail
@@ -222,9 +270,27 @@ fn reader(mut pipe: impl Read + Send + 'static, tail: Option<Arc<Mutex<Tail>>>) 
     })
 }
 
-fn kill_group(child: &Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+fn kill_group(child: &Child) -> std::io::Result<()> {
+    let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    let wait_pid = rustix::process::Pid::from_raw(pid)
+        .ok_or_else(|| std::io::Error::other("invalid child pid"))?;
+    // ECHILD means a foreign waiter released our ownership; never signal that number.
+    let observed = rustix::process::waitid(
+        rustix::process::WaitId::Pid(wait_pid),
+        rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOWAIT
+            | rustix::process::WaitIdOptions::NOHANG,
+    )?;
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(nix::errno::Errno::EPERM)
+            if observed.is_some()
+                && crate::session::identity::group_members(pid)
+                    .is_ok_and(|members| members.iter().all(|member| *member == pid)) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -237,6 +303,10 @@ impl Execute for Host {
         timeout: Duration,
         cancel: &Cancel,
     ) -> Result<Finished, RunError> {
+        if self.cleanup_failed() {
+            return Err(RunError::Cleanup);
+        }
+        let permit = self.custody.reserve().context(CustodySnafu)?;
         let (limit, whole) = match capture {
             Capture::Tail(n) => (n, false),
             Capture::Whole(n) => (n, true),
@@ -259,11 +329,18 @@ impl Execute for Host {
             // Its own group from the first instruction, so a Ctrl-C aimed at hb's foreground group
             // cannot kill a helper that is still parked at the gate.
             .process_group(0);
-        let mut child = match gated {
-            Some((guard, _)) => gated_start(&mut command, guard, program)?,
+        let (mut child, launch, gate) = match gated {
+            Some((guard, _)) => {
+                let (child, launch, gate) = gated_start(&mut command, guard, program, permit)?;
+                (child, Some(launch), Some(gate))
+            }
             None => {
                 command.stdin(Stdio::null());
-                command.spawn().context(SpawnSnafu { program })?
+                (
+                    permit.install(command.spawn().context(SpawnSnafu { program })?),
+                    None,
+                    None,
+                )
             }
         };
         let tail = Arc::new(Mutex::new(Tail {
@@ -272,20 +349,60 @@ impl Execute for Host {
             truncated: false,
             whole,
         }));
-        let mut readers = Vec::new();
-        if let Some(out) = child.stdout.take() {
-            readers.push(reader(out, Some(tail.clone())));
+        let stop_readers = Arc::new(AtomicBool::new(false));
+        let outcome = (|| {
+            if let Some(out) = child.stdout.take() {
+                child.adopt_reader(
+                    reader(out, Some(tail.clone()), stop_readers.clone()).context(WaitSnafu)?,
+                );
+            }
+            if let Some(err) = child.stderr.take() {
+                child.adopt_reader(
+                    reader(err, (!whole).then(|| tail.clone()), stop_readers.clone())
+                        .context(WaitSnafu)?,
+                );
+            }
+            if let Some(gate) = gate {
+                gate.release().context(GateSnafu)?;
+            }
+            wait(&mut child, timeout, cancel)
+        })();
+        let cleanup_by = Instant::now() + CLEANUP_BUDGET;
+        let handover = launch
+            .as_ref()
+            .map(|launch| end_until(launch, EndPhase::Pinned, cleanup_by));
+        // Whatever happened, signal while this parent still owns the unreaped leader.
+        let signalled = kill_group(&child);
+        let final_handover = launch
+            .as_ref()
+            .map(|launch| end_until(launch, EndPhase::Pinned, cleanup_by));
+        let reaped = reap_until(&mut child, cleanup_by);
+        let ended = if reaped.is_ok() {
+            launch
+                .as_ref()
+                .map(|launch| end_until(launch, EndPhase::Reaped, cleanup_by))
+        } else {
+            None
+        };
+        child.join_readers(cleanup_by);
+        stop_readers.store(true, Ordering::Release);
+        let transferred = child.settle();
+        if transferred
+            || reaped.is_err()
+            || signalled.is_err()
+            || handover.is_some_and(|r| r.is_err())
+            || final_handover.is_some_and(|r| r.is_err())
+            || ended.is_some_and(|r| r.is_err())
+        {
+            self.fail_cleanup();
+            cancel.cancel();
+            return Err(RunError::Finalize {
+                command_error: outcome.err().map(Box::new),
+                code: reaped.as_ref().ok().and_then(ExitStatus::code),
+            });
         }
-        if let Some(err) = child.stderr.take() {
-            readers.push(reader(err, (!whole).then(|| tail.clone())));
-        }
-        let outcome = wait(&mut child, timeout, cancel);
-        // Whatever happened, nothing of this command may outlive the call.
-        kill_group(&child);
-        let reaped = child.wait();
-        join_all(readers, Instant::now() + DRAIN_GRACE);
-        let status = outcome?;
-        reaped.context(WaitSnafu)?;
+        let status = reaped?;
+        outcome?;
         let tail = tail.lock().map_err(|_| RunError::Wait {
             source: std::io::Error::other("output buffer poisoned"),
         })?;
@@ -303,48 +420,47 @@ fn gated_start(
     command: &mut Command,
     guard: &GuardHandle,
     program: &Path,
-) -> Result<Child, RunError> {
+    permit: Permit,
+) -> Result<(Lease, LaunchHandle, crate::session::launch::ParentGate), RunError> {
     let spawn_error = |source| RunError::Spawn {
         program: program.to_path_buf(),
         source,
     };
     // Everything fallible is acquired before spawning, so a failure never leaves a helper unreaped.
     let null = File::open("/dev/null").map_err(spawn_error)?;
-    let (ours, theirs) = UnixStream::pair().map_err(spawn_error)?;
-    command.stdin(Stdio::from(OwnedFd::from(theirs)));
-    let spawned = command.spawn();
-    // The Command keeps its Stdio after spawning; drop our copy of the helper's end so a helper
-    // that dies sends the gate end of input instead of leaving it to wait out the deadline.
-    command.stdin(Stdio::null());
-    let mut child = spawned.map_err(spawn_error)?;
-    let mut gate = ParentGate::new(ours);
-    let armed = gate
-        .prepare(&null)
-        .map_err(|source| RunError::Gate { source })
-        .and_then(|pid| {
-            if u32::try_from(pid).ok() != Some(child.id()) {
-                return Err(RunError::Gate {
-                    source: GateError::Protocol,
-                });
-            }
-            match guard.watch(Target::Group(Pid::from_raw(pid))) {
-                Ok(WatchOutcome::Armed) => Ok(()),
-                // The helper is blocked at the gate, so gone is never a valid answer here.
-                Ok(WatchOutcome::Gone) => Err(RunError::Guard {
-                    source: GuardianError::Refused {
-                        reason: WatchRefusal::Invalid,
-                    },
-                }),
-                Err(source) => Err(RunError::Guard { source }),
-            }
-        })
-        .and_then(|()| gate.release().map_err(|source| RunError::Gate { source }));
-    if let Err(error) = armed {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+    let (child, gate, launch) = prepare_launch(
+        command,
+        &null,
+        |child| permit.install(child),
+        |lease| &mut **lease,
+        |pid| guard.launch(pid).context(GuardSnafu),
+        spawn_error,
+        |source| RunError::Gate { source },
+    )?;
+    Ok((child, launch, gate))
+}
+
+fn end_until(launch: &LaunchHandle, phase: EndPhase, by: Instant) -> Result<(), RunError> {
+    loop {
+        match launch.end(phase, by).context(GuardSnafu)? {
+            EndStatus::ReapReady if phase == EndPhase::Pinned => return Ok(()),
+            EndStatus::Complete if phase == EndPhase::Reaped => return Ok(()),
+            EndStatus::Pending if Instant::now() < by => thread::sleep(POLL),
+            _ => return Err(RunError::Cleanup),
+        }
     }
-    Ok(child)
+}
+
+fn reap_until(child: &mut Child, by: Instant) -> Result<ExitStatus, RunError> {
+    loop {
+        if let Some(status) = child.try_wait().context(WaitSnafu)? {
+            return Ok(status);
+        }
+        if Instant::now() >= by {
+            return Err(RunError::Cleanup);
+        }
+        thread::sleep(POLL);
+    }
 }
 
 fn finished(status: ExitStatus, tail: &Tail) -> Finished {
@@ -356,11 +472,22 @@ fn finished(status: ExitStatus, tail: &Tail) -> Finished {
     }
 }
 
-fn wait(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<ExitStatus, RunError> {
+fn wait(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<(), RunError> {
     let deadline = Instant::now() + timeout;
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).ok_or_else(|| RunError::Wait {
+        source: std::io::Error::other("invalid child process number"),
+    })?;
     loop {
-        if let Some(status) = child.try_wait().context(WaitSnafu)? {
-            return Ok(status);
+        let observed = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOWAIT
+                | rustix::process::WaitIdOptions::NOHANG,
+        )
+        .map_err(std::io::Error::from)
+        .context(WaitSnafu)?;
+        if observed.is_some() {
+            return Ok(());
         }
         if cancel.is_cancelled() {
             return Err(RunError::Cancelled);
@@ -369,22 +496,6 @@ fn wait(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<ExitSta
             return Err(RunError::TimedOut { limit: timeout });
         }
         thread::sleep(POLL);
-    }
-}
-
-/// Waits for the reader threads until `by`. The group has been killed, so every pipe a group
-/// member held is closed; a reader still running holds a pipe from a process that left the group.
-///
-/// shortcut: such a reader is abandoned (it ends when that process does), upgrade if a
-/// real command is ever seen to do that.
-fn join_all(readers: Vec<JoinHandle<()>>, by: Instant) {
-    for handle in readers {
-        while !handle.is_finished() && Instant::now() < by {
-            thread::sleep(POLL);
-        }
-        if handle.is_finished() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -409,6 +520,46 @@ mod tests {
     }
 
     const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn a_zombie_only_group_is_resolved_but_a_reaped_number_is_not_signal_authority() {
+        let mut child = assert_ok!(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0)
+                .spawn()
+        );
+        assert_ok!(wait(&mut child, Duration::from_secs(5), &Cancel::default()));
+        let pinned = kill_group(&child);
+        let status = child.wait();
+        assert_ok!(pinned);
+        assert_ok!(status);
+        let error = assert_err!(kill_group(&child));
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ECHILD));
+    }
+
+    #[test]
+    fn observing_a_finished_command_keeps_it_unreaped_until_group_cleanup() {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+
+        let mut child = assert_ok!(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .process_group(0)
+                .spawn()
+        );
+        let observed = wait(&mut child, SECOND, &Cancel::default());
+        let pid = claims::assert_some!(rustix::process::Pid::from_raw(child.id() as i32));
+        let pinned = waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        );
+        // Always collect the fixture before an assertion can fail.
+        let reaped = child.wait();
+        assert_ok!(observed);
+        assert!(claims::assert_some!(assert_ok!(pinned)).exited());
+        assert_eq!(assert_ok!(reaped).code(), Some(7));
+    }
 
     #[test]
     fn test_stdout_and_stderr_are_both_kept_and_the_exit_code_is_reported() {
