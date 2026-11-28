@@ -147,13 +147,21 @@ pub fn scan(roots: &[CanonicalPath], limits: ScanLimits) -> Scan {
         }
         room
     });
+    // A pinned directory whose path cannot be a CanonicalPath (a control character in a name, or
+    // a path over the length limit) cannot be pinned, so the scan did not cover it.
+    let mut unpinnable = false;
+    let pins = pins
+        .into_iter()
+        .filter_map(|path| {
+            let pin = CanonicalPath::from_canonical(&path).ok();
+            unpinnable |= pin.is_none();
+            pin
+        })
+        .collect();
     Scan {
-        pins: pins
-            .into_iter()
-            .filter_map(|path| CanonicalPath::from_canonical(path).ok())
-            .collect(),
+        pins,
         matches,
-        complete: gaps.is_empty() && room,
+        complete: gaps.is_empty() && room && !unpinnable,
         gaps,
     }
 }
@@ -402,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn several_roots_are_each_walked_and_a_missing_one_is_skipped() {
+    fn several_roots_are_each_walked_and_a_missing_one_is_an_unreadable_gap() {
         let (_a, one) = root();
         let (_b, two) = root();
         touch(&one, "x/a.pem");
@@ -411,5 +419,44 @@ mod tests {
         let scan = scan(&[one.clone(), two.clone(), gone], ScanLimits::default());
         assert_eq!(scan.matches, 2);
         assert!(scan.pins.contains(&one) && scan.pins.contains(&two));
+        // A root that cannot be listed was not scanned: the exemption must not rely on it.
+        assert!(!scan.complete, "{scan:?}");
+        assert_eq!(scan.gaps.shown().len(), 1, "{:?}", scan.gaps);
+        assert!(
+            assert_some!(&scan.gaps.shown()[0].subject)
+                .to_string()
+                .ends_with("/missing")
+        );
+    }
+
+    #[test]
+    fn a_sealed_directory_in_the_second_root_makes_the_scan_incomplete() {
+        let (_a, one) = root();
+        let (_b, two) = root();
+        touch(&one, "x/.env");
+        touch(&two, "sealed/id_rsa");
+        let _sealed = Unreadable::new(two.as_path().join("sealed"));
+        let scan = scan(&[one, two], ScanLimits::default());
+        assert!(!scan.complete, "{scan:?}");
+        assert_eq!(scan.matches, 1, "the readable root was still walked");
+        assert_eq!(scan.gaps.shown().len(), 1, "{:?}", scan.gaps);
+        assert!(
+            assert_some!(&scan.gaps.shown()[0].subject)
+                .to_string()
+                .ends_with("/sealed")
+        );
+    }
+
+    #[test]
+    fn a_key_in_a_directory_that_cannot_be_pinned_makes_the_scan_incomplete() {
+        let (_dir, root) = root();
+        // A control character in a directory name cannot be a CanonicalPath, so the pin is lost.
+        touch(&root, "odd\nname/.env");
+        let scan = scan(std::slice::from_ref(&root), ScanLimits::default());
+        assert_eq!(scan.matches, 1);
+        assert!(
+            !scan.complete,
+            "a key was found but its directory could not be pinned: {scan:?}"
+        );
     }
 }
