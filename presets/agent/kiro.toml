@@ -13,18 +13,24 @@
 # stays writable: kiro writes there on every chat. Measured on 3.6.2 with all of them denied: a chat answered normally and
 # a session was written.
 #
-# `data.sqlite3` stays writable and is NOT protected: it holds the login token (so a refresh can work) next to
-# conversations and counters. Its 22 settings keys name no path, command or hook, and a chat ran with the file write-denied,
-# but a token refresh without the write was not measured. SQLite also keeps `data.sqlite3-wal`, `-shm` and `-journal` beside
-# the file, and those can change what the database holds when it is next opened, so an owner who does not want the risk
-# must deny all four names, not only `data.sqlite3`, and log in again outside hb when the token expires.
+# `data.sqlite3` and its `-wal`, `-shm` and `-journal` files are not written. The file holds the login token, a device registration,
+# telemetry counters, the program-version heartbeats kiro uses to prune old program copies, and legacy conversations; SQLite can apply
+# a journal left beside it the next time it is opened, so the whole family is denied, not one name. Measured on 3.6.2: a chat
+# answered and wrote its session (`~/.kiro/sessions`, which is where current history lives); with an expired token and
+# `oidc.us-east-1.amazonaws.com` allowed, `whoami` refreshed in memory and printed the login, and the refreshed token was not saved,
+# so every run that finds an expired token refreshes again (one extra call; one observation says the refresh token is not rotated).
+# Not measured: a refresh token that IS rotated by the provider, a refresh in the middle of a long chat, and kiro's start of its
+# chat/TUI/KAS path against a planted version row. To log in again or change account, do it outside hb.
 #
-# In the PROJECT, `.kiro/settings`, `.kiro/agents` and `.kiro/hooks` are not written (they hold MCP commands and hooks).
-# `.kiro/steering` and `.kiro/skills` stay writable. The names come from strings in kiro-cli 3.6.2, not from a run.
+# In the PROJECT, every `.kiro` directory at any depth is not written: `.kiro/settings`, `.kiro/agents` and `.kiro/hooks` hold MCP
+# commands and hooks, kiro looks for a workspace root from where it starts so a nested `.kiro` can count, and a deny on the files
+# inside alone can be sidestepped by renaming a directory into place (measured). `.kiro/steering` and `.kiro/skills` become
+# read-only with it; edit them outside hb. The names come from strings in kiro-cli 3.6.2, not from a run.
 #
 # Hosts a one-shot chat contacted: app.kiro.dev, runtime / management / telemetry .us-east-1.kiro.dev and
 # client-telemetry.us-east-1.amazonaws.com. cognito-identity is the credential source for that telemetry
-# and was seen in some runs only.
+# and was seen in some runs only. `oidc.us-east-1.amazonaws.com` is where an expired login token is refreshed (seen with an expired
+# token; without it a run whose token has expired ends as "Not logged in"). Another region or identity provider needs its own host.
 #
 # Denied and harmless: the MCP servers named in ~/.kiro/settings (they are not part of the agent; give each
 # its own `[mcp.*]`), ~/.aws and ~/Library/Keychains probes, ~/.gitconfig and ~/.config/git/ignore reads,
@@ -42,11 +48,13 @@ deny_write = [
   "~/Library/Application Support/kiro-cli/tui.js",
   "~/Library/Application Support/kiro-cli/run/chat-cli-*",
   "~/Library/Application Support/kiro-cli/shell-integration-backup",
+  "~/Library/Application Support/kiro-cli/data.sqlite3",
+  "~/Library/Application Support/kiro-cli/data.sqlite3-wal",
+  "~/Library/Application Support/kiro-cli/data.sqlite3-shm",
+  "~/Library/Application Support/kiro-cli/data.sqlite3-journal",
   "~/.kiro/settings",
   "~/.kiro/agents",
-  ".kiro/settings",
-  ".kiro/agents",
-  ".kiro/hooks",
+  "**/.kiro",
 ]
 
 [net]
@@ -57,6 +65,7 @@ allow = [
   "telemetry.us-east-1.kiro.dev",
   "client-telemetry.us-east-1.amazonaws.com",
   "cognito-identity.us-east-1.amazonaws.com",
+  "oidc.us-east-1.amazonaws.com",
 ]
 
 [tls]

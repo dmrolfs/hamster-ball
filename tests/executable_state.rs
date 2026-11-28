@@ -465,8 +465,18 @@ const PROJECT_LOCAL: &[(&str, &[&str], &[&str])] = &[
             ".claude/plugins/p.json",
             ".claude/commands/c.md",
             ".claude/agents/a.md",
+            ".claude/skills/s/SKILL.md",
+            ".claude/workflows/w.js",
+            "pkg/.claude/settings.json",
+            "pkg/sub/.claude/hooks/h.sh",
+            "pkg/.mcp.json",
         ],
-        &[".claude/skills/s.md", ".claude/rules/r.md", "CLAUDE.md"],
+        &[
+            "CLAUDE.md",
+            "pkg/CLAUDE.md",
+            ".claude-notes/n.md",
+            "pkg/main.rs",
+        ],
     ),
     (
         "pi",
@@ -476,8 +486,9 @@ const PROJECT_LOCAL: &[(&str, &[&str], &[&str])] = &[
             ".pi/npm/n.json",
             ".pi/git/g.json",
             ".pi/agents/a.md",
+            "pkg/.pi/settings.json",
         ],
-        &[".pi/skills/s.md", ".pi/prompts/p.md"],
+        &["pkg/main.rs", ".pi-notes/n.md"],
     ),
     (
         "kiro",
@@ -485,13 +496,20 @@ const PROJECT_LOCAL: &[(&str, &[&str], &[&str])] = &[
             ".kiro/settings/mcp.json",
             ".kiro/agents/a.json",
             ".kiro/hooks/h.sh",
+            "pkg/.kiro/settings/mcp.json",
         ],
-        &[".kiro/steering/s.md", ".kiro/skills/s.md"],
+        &["pkg/main.rs", ".kiro-notes/n.md"],
     ),
     (
         "opencode",
-        &[".opencode/plugin/p.js", "opencode.json", "opencode.jsonc"],
-        &[".opencode-notes.md"],
+        &[
+            ".opencode/plugin/p.js",
+            "opencode.json",
+            "opencode.jsonc",
+            "pkg/.opencode/plugin/p.js",
+            "pkg/opencode.json",
+        ],
+        &[".opencode-notes.md", "pkg/main.rs"],
     ),
 ];
 
@@ -503,14 +521,35 @@ fn every_shipped_preset_denies_project_local_executable_settings_and_leaves_inst
         let w = agent_world(name, "");
         // `.opencode-notes.md` also proves `.opencode` is matched as a directory, not as a prefix.
         for path in *denied {
+            // Two independent attempts per path, each its own run: one where the parent is made by the
+            // sandbox and one where the test made the parent first. The write must be refused with EPERM.
             let target = w.project.join(path);
-            let dir = quote(assert_some!(target.parent()));
-            let script = format!("mkdir -p {dir} 2>&1; echo x > {t} 2>&1", t = quote(&target));
-            let out = run(&w, &script);
+            let parent = assert_some!(target.parent()).to_path_buf();
+            let dir = quote(&parent);
+            let made_inside = run(
+                &w,
+                &format!("mkdir -p {dir} 2>&1; echo x > {t} 2>&1", t = quote(&target)),
+            );
             assert!(
                 !target.exists(),
                 "{name}: {path} was written under the shipped preset: {}",
-                text(&out)
+                text(&made_inside)
+            );
+            // The parent chain below the denied directory cannot be made by the test when the deny is
+            // on that directory itself, so only the existing part of it is prepared here.
+            let mut existing = parent.clone();
+            while !existing.exists() {
+                existing = assert_some!(existing.parent()).to_path_buf();
+            }
+            assert!(
+                existing.starts_with(&w.project),
+                "{name}: {path}: fixture left the project"
+            );
+            let direct = run(&w, &format!("echo x > {t}", t = quote(&target)));
+            assert!(
+                !direct.status.success() && !target.exists(),
+                "{name}: {path}: a direct write was not refused: {}",
+                text(&direct)
             );
         }
         for path in *open {
@@ -529,113 +568,221 @@ fn every_shipped_preset_denies_project_local_executable_settings_and_leaves_inst
     }
 }
 
-/// hb-82i criterion 3 and 2: a project that extends a SHIPPED agent preset (so with its denies) and declares an
-/// offline server still gets a working warm-then-run, where the tool uses the run's own cache copy, and an
-/// ordinary history write next to the denied files works. The preset's denies must not touch the session cache.
+/// hb-82i criterion 3: with each SHIPPED agent preset (so with its denies) and the agent's own state
+/// directories present so its grants resolve, a real `hb warm` publishes a generation and a normal run
+/// starts the offline tool from its own copy. The tool must exit 0, print the exact private cache path
+/// and the warmed payload, and a write to the run's copy must not reach the published tree; a second
+/// run then sees clean bytes. No agent binary and no model request: the tool is a fake `uvx`.
 #[test]
-fn a_project_extending_each_shipped_preset_runs_its_offline_tool_from_its_own_cache_copy() {
+fn warm_then_run_works_end_to_end_under_each_shipped_preset() {
     sandboxed!();
-    for agent in ["claude", "pi", "kiro", "opencode"] {
+    let state_dirs: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &[".claude", ".cache/claude", ".local/state/claude"],
+        ),
+        ("pi", &[".pi/agent"]),
+        ("kiro", &[".kiro", "Library/Application Support/kiro-cli"]),
+        (
+            "opencode",
+            &[
+                ".cache/opencode",
+                ".local/share/opencode",
+                ".local/state/opencode",
+                ".config/opencode",
+            ],
+        ),
+    ];
+    for (agent, dirs) in state_dirs {
         let base = "[tls]\nsystem_trust = true\n[fs]\nwrite = [\".\"]\n[env]\ntools = [\"uvx\"]\n";
         let project = format!(
             "extends = [\"agent/{agent}\"]\n[mcp.time]\ncommand = \"uvx\"\nargs = [\"mcp-server-time\"]\n"
         );
         let w = World::with_base(base, &project);
+        for d in *dirs {
+            assert_ok!(fs::create_dir_all(w.home_dir().join(d)));
+        }
+        // One fake tool for warm (answers MCP initialize, writes a payload) and run (prints what it was given).
         executable(
             &w.base.join("bin/uvx"),
-            "#!/bin/sh\necho \"uvx-ran cache=$UV_CACHE_DIR\"\ncat \"$UV_CACHE_DIR/seed\"\n",
+            "#!/bin/sh\n\
+             if [ -n \"$HB_FAKE_PRINT\" ] || [ \"$1\" = \"--offline\" ]; then echo \"ran cache=$UV_CACHE_DIR\"; cat \"$UV_CACHE_DIR/archive-v0/aaa/mod.py\"; exit 0; fi\n\
+             mkdir -p \"$UV_CACHE_DIR/archive-v0/aaa\"; echo warmed-payload > \"$UV_CACHE_DIR/archive-v0/aaa/mod.py\"\n\
+             read line\n\
+             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'\n\
+             sleep 20\n",
         );
-        w.publish_cache(&[("uv/seed", "published")]);
-        let out = run(
+        let warm = assert_ok!(
+            w.drive(DRIVE, &["warm"])
+                .stdin(std::process::Stdio::null())
+                .output()
+        );
+        assert_eq!(
+            warm.status.code(),
+            Some(0),
+            "{agent}: hb warm failed: {}",
+            text(&warm)
+        );
+        let generations = assert_ok!(fs::read_dir(
+            w.home_dir().join(".cache/hamster-ball/generations")
+        ))
+        .count();
+        assert_eq!(generations, 1, "{agent}: one generation was published");
+        let first = run(
             &w,
-            "uvx anything; echo written > \"$TMPDIR/cache/uv/own\" && echo own-copy-writable",
+            "uvx mcp-server-time && echo poisoned > \"$TMPDIR/cache/uv/archive-v0/aaa/mod.py\" \
+             && cat \"$TMPDIR/cache/uv/archive-v0/aaa/mod.py\"",
         );
-        let all = text(&out);
+        let out = text(&first);
         assert!(
-            all.contains("uvx-ran"),
-            "{agent}: the tool did not run: {all}"
-        );
-        assert!(
-            all.contains("published"),
-            "{agent}: the tool did not see the published cache: {all}"
+            first.status.success(),
+            "{agent}: the offline tool failed: {out}"
         );
         assert!(
-            all.contains("own-copy-writable"),
-            "{agent}: the run's own copy is not writable: {all}"
+            out.contains("warmed-payload"),
+            "{agent}: the tool did not read the warmed payload: {out}"
+        );
+        // the run reads back its own write: "poisoned" must be printed AFTER the tool's "warmed-payload".
+        let after_tool = out.split("warmed-payload").nth(1).unwrap_or("");
+        assert!(
+            after_tool.contains("poisoned"),
+            "{agent}: the run's own copy did not hold its write: {out}"
         );
         assert!(
-            !all.contains(".cache/hamster-ball"),
-            "{agent}: the tool was pointed at the shared store: {all}"
+            !out.contains(".cache/hamster-ball"),
+            "{agent}: the tool used the shared store: {out}"
+        );
+        let second = run(&w, "uvx mcp-server-time");
+        let out2 = text(&second);
+        assert!(
+            second.status.success() && out2.contains("warmed-payload"),
+            "{agent}: the second run saw the first run's write: {out2}"
+        );
+        assert!(
+            !out2.contains("poisoned"),
+            "{agent}: a run's write reached the next run: {out2}"
         );
     }
 }
 
 // ---- hb-82i round 3: a denied project-local path cannot be bypassed by moving, replacing or linking around it.
+/// One attack per fresh world, at the project root and in a nested directory. The fixture (parents,
+/// source files, an EXISTING denied target) is made by the test OUTSIDE the sandbox and asserted
+/// before the run, so a failed setup cannot pass for a refusal. The attack must exit nonzero with
+/// "Operation not permitted", leave the planted name absent, and leave existing bytes unchanged.
+/// One bypass attempt: the files made outside the sandbox, the one command run inside, and a
+/// path that must not exist afterwards.
+struct Attack {
+    what: &'static str,
+    files: &'static [(&'static str, &'static str)],
+    attack: &'static str,
+    leftover: &'static str,
+}
+
 #[test]
 fn a_denied_project_path_cannot_be_bypassed_by_rename_symlink_or_hard_link() {
     sandboxed!();
-    let w = agent_world("claude", "");
-    let p = quote(&w.project);
-    // Each script must FAIL and leave no denied path behind; each is its own run so one refusal cannot hide another.
-    for (what, script, leftover) in [
-        (
-            "write into a directory the ball made",
-            format!("cd {p} && mkdir -p .claude && echo x > .claude/settings.json"),
-            ".claude/settings.json",
-        ),
-        (
-            "rename a protected-ancestor aside",
-            format!("cd {p} && mkdir -p .claude && mv .claude .claude-old"),
-            ".claude-old",
-        ),
-        (
-            "replace the directory by a symlink to a writable one",
-            format!(
-                "cd {p} && mkdir -p elsewhere .claude && rm -rf .claude && ln -s elsewhere .claude && echo x > .claude/settings.json"
-            ),
-            "elsewhere/settings.json",
-        ),
-        (
-            "rename a temp file over a denied file",
-            format!("cd {p} && echo x > t.json && mv -f t.json .mcp.json"),
-            ".mcp.json",
-        ),
-        (
-            "create a denied file as a symlink",
-            format!("cd {p} && ln -s /tmp/x .mcp.json"),
-            ".mcp.json",
-        ),
-        (
-            "hard-link a writable file to a denied name",
-            format!("cd {p} && echo x > h.json && ln h.json .mcp.json"),
-            ".mcp.json",
-        ),
-    ] {
-        let out = run(&w, &script);
-        assert!(!out.status.success(), "{what} succeeded: {}", text(&out));
-        assert!(
-            fs::symlink_metadata(w.project.join(leftover)).is_err(),
-            "{what}: {leftover} exists afterwards"
-        );
+    let attacks: &[Attack] = &[
+        Attack {
+            what: "write into an existing denied directory",
+            files: &[(".claude/keep.json", "orig")],
+            attack: "echo x > {d}/.claude/settings.json",
+            leftover: ".claude/settings.json",
+        },
+        Attack {
+            what: "overwrite an existing denied file",
+            files: &[(".mcp.json", "orig")],
+            attack: "echo x > {d}/.mcp.json",
+            leftover: "nothing.absent",
+        },
+        Attack {
+            what: "rename a denied directory aside",
+            files: &[(".claude/keep.json", "orig")],
+            attack: "mv {d}/.claude {d}/.moved",
+            leftover: ".moved",
+        },
+        Attack {
+            what: "rename a prepared directory into the denied name",
+            files: &[("prep/settings.json", "planted")],
+            attack: "mv {d}/prep {d}/.claude",
+            leftover: ".claude",
+        },
+        Attack {
+            what: "rename a temp file over an existing denied file",
+            files: &[(".mcp.json", "orig"), ("t.json", "planted")],
+            attack: "mv -f {d}/t.json {d}/.mcp.json",
+            leftover: "nothing.absent",
+        },
+        Attack {
+            what: "symlink at a denied name",
+            files: &[],
+            attack: "ln -s /tmp/x {d}/.mcp.json",
+            leftover: ".mcp.json",
+        },
+        Attack {
+            what: "hard link at a denied name",
+            files: &[("h.json", "planted")],
+            attack: "ln {d}/h.json {d}/.mcp.json",
+            leftover: ".mcp.json",
+        },
+        Attack {
+            what: "replace a denied directory by a symlink",
+            files: &[(".claude/keep.json", "orig"), ("elsewhere/x", "w")],
+            attack: "rm -rf {d}/.claude && ln -s elsewhere {d}/.claude",
+            leftover: "elsewhere/keep.json",
+        },
+    ];
+    for nested in [false, true] {
+        for Attack {
+            what,
+            files,
+            attack,
+            leftover,
+        } in attacks
+        {
+            let w = agent_world("claude", "");
+            let dir = if nested {
+                w.project.join("pkg/sub")
+            } else {
+                w.project.clone()
+            };
+            assert_ok!(fs::create_dir_all(&dir));
+            for (name, body) in *files {
+                write(&dir.join(name), body);
+                assert!(dir.join(name).exists(), "{what}: fixture {name} not made");
+            }
+            let out = run(&w, &attack.replace("{d}", &quote(&dir)));
+            let all = text(&out);
+            let label = format!("{what} (nested={nested})");
+            assert!(!out.status.success(), "{label} succeeded: {all}");
+            assert!(
+                all.contains("Operation not permitted"),
+                "{label}: not refused as expected: {all}"
+            );
+            assert!(
+                fs::symlink_metadata(dir.join(leftover)).is_err(),
+                "{label}: {leftover} exists afterwards"
+            );
+            for (name, body) in *files {
+                let kept = fs::read_to_string(dir.join(name)).ok();
+                assert!(
+                    kept.as_deref().is_none_or(|t| t == *body),
+                    "{label}: {name} changed to {kept:?}"
+                );
+            }
+        }
     }
 }
 
 // ---- Versioned inventory (hb-tx4 criteria 1 and 3). Test-only table; shortcut: move to src/ when hb-82i makes presets consume it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// What hb-82i is asked to do with a mixed file; nothing here isolates anything yet.
-enum Disposition {
-    RequiresIsolation,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Executable,
     Instruction,
     SessionData,
-    /// Holds code and data in one file; hb-82i must isolate or refuse it, never call it supported.
-    Mixed(Disposition),
+    /// Holds code and data in one file; the shipped presets deny writes to it.
+    Mixed,
 }
 
 struct Entry {
@@ -662,7 +809,6 @@ struct AgentInventory {
 }
 
 use Class::{Executable, Instruction, Mixed, SessionData};
-use Disposition::{RequiresIsolation, Unsupported};
 
 const fn e(path: &'static str, class: Class, evidence: &'static str) -> Entry {
     Entry {
@@ -693,24 +839,21 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.claude/commands",
             "~/.claude/agents",
             "~/.claude/shell-snapshots",
-            ".claude/settings.json",
-            ".claude/settings.local.json",
-            ".mcp.json",
-            ".claude/hooks",
-            ".claude/plugins",
-            ".claude/commands",
-            ".claude/agents",
+            "~/.claude/skills",
+            "~/.claude/workflows",
+            "**/.claude",
+            "**/.mcp.json",
         ],
         preset_toml: include_str!("../presets/agent/claude.toml"),
         entries: &[
             e(
                 "~/.claude/settings.json",
-                Mixed(RequiresIsolation),
+                Mixed,
                 "read: hooks, awsAuthRefresh, otelHeadersHelper, env, enabledPlugins",
             ),
             e(
                 "~/.claude.json",
-                Mixed(RequiresIsolation),
+                Mixed,
                 "read keys; whether isolation breaks OAuth refresh is unmeasured",
             ),
             e("~/.claude/hooks", Executable, "read"),
@@ -723,7 +866,16 @@ const INVENTORY: &[AgentInventory] = &[
                 "assumed: sourced by the Bash tool, unmeasured",
             ),
             e("~/.claude/CLAUDE.md", Instruction, "read"),
-            e("~/.claude/skills", Instruction, "read"),
+            e(
+                "~/.claude/skills",
+                Executable,
+                "read in claude 2.1.328 strings: a skill can register hooks and is a plugin source",
+            ),
+            e(
+                "~/.claude/workflows",
+                Executable,
+                "read in claude 2.1.328 strings: a workflow resolves to a script; absent on this machine",
+            ),
             e("~/.claude/rules", Instruction, "read"),
             e("~/.claude/projects", SessionData, "read"),
             e("~/.claude/sessions", SessionData, "read"),
@@ -751,11 +903,7 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.pi/agent/git",
             "~/.pi/agent/agents",
             "~/.pi/agent/tmp/extensions",
-            ".pi/settings.json",
-            ".pi/extensions",
-            ".pi/npm",
-            ".pi/git",
-            ".pi/agents",
+            "**/.pi",
         ],
         preset_toml: include_str!("../presets/agent/pi.toml"),
         entries: &[
@@ -765,12 +913,12 @@ const INVENTORY: &[AgentInventory] = &[
             e("~/.pi/agent/agents", Executable, "read"),
             e(
                 "~/.pi/agent/settings.json",
-                Mixed(RequiresIsolation),
+                Mixed,
                 "read: `packages` lists code to load",
             ),
             e(
                 "~/.pi/agent/models.json",
-                Mixed(RequiresIsolation),
+                Mixed,
                 "assumed: provider URLs redirect traffic",
             ),
             e(
@@ -785,7 +933,7 @@ const INVENTORY: &[AgentInventory] = &[
             ),
             e(
                 "~/.pi/agent/models-store.json",
-                Mixed(RequiresIsolation),
+                Mixed,
                 "read: provider routing (key names only); denied with models.json",
             ),
             e(
@@ -830,11 +978,13 @@ const INVENTORY: &[AgentInventory] = &[
             "~/Library/Application Support/kiro-cli/tui.js",
             "~/Library/Application Support/kiro-cli/run/chat-cli-*",
             "~/Library/Application Support/kiro-cli/shell-integration-backup",
+            "~/Library/Application Support/kiro-cli/data.sqlite3",
+            "~/Library/Application Support/kiro-cli/data.sqlite3-wal",
+            "~/Library/Application Support/kiro-cli/data.sqlite3-shm",
+            "~/Library/Application Support/kiro-cli/data.sqlite3-journal",
             "~/.kiro/settings",
             "~/.kiro/agents",
-            ".kiro/settings",
-            ".kiro/agents",
-            ".kiro/hooks",
+            "**/.kiro",
         ],
         preset_toml: include_str!("../presets/agent/kiro.toml"),
         entries: &[
@@ -855,8 +1005,23 @@ const INVENTORY: &[AgentInventory] = &[
             ),
             e(
                 "~/Library/Application Support/kiro-cli/data.sqlite3",
-                Mixed(Unsupported),
-                "read: login token and state share one file",
+                Mixed,
+                "read: login token, version heartbeats, counters and legacy conversations in one file; denied with its sidecars (history/hb-82i_kiro-db-decision.md)",
+            ),
+            e(
+                "~/Library/Application Support/kiro-cli/data.sqlite3-wal",
+                Mixed,
+                "assumed: SQLite sidecar, absent while idle (rollback journal mode, header bytes 01 01)",
+            ),
+            e(
+                "~/Library/Application Support/kiro-cli/data.sqlite3-shm",
+                Mixed,
+                "assumed: SQLite sidecar, absent while idle",
+            ),
+            e(
+                "~/Library/Application Support/kiro-cli/data.sqlite3-journal",
+                Mixed,
+                "assumed: a hot rollback journal is applied at the next open; absent while idle",
             ),
             e(
                 "~/Library/Application Support/kiro-cli/bun",
@@ -907,9 +1072,9 @@ const INVENTORY: &[AgentInventory] = &[
         ],
         deny: &[
             "~/.config/opencode",
-            ".opencode",
-            "opencode.json",
-            "opencode.jsonc",
+            "**/.opencode",
+            "**/opencode.json",
+            "**/opencode.jsonc",
             "~/.cache/opencode/bun.lock",
             "~/.cache/opencode/node_modules",
             "~/.cache/opencode/package.json",
@@ -981,7 +1146,7 @@ fn exposed(inv: &AgentInventory) -> Vec<&Entry> {
     let (write, deny) = (grants(inv, "write"), grants(inv, "deny_write"));
     inv.entries
         .iter()
-        .filter(|en| matches!(en.class, Executable | Mixed(_)))
+        .filter(|en| matches!(en.class, Executable | Mixed))
         .filter(|en| write.iter().any(|w| under(en.path, w)))
         .filter(|en| !deny.iter().any(|d| under(en.path, d)))
         .collect()
@@ -1013,7 +1178,7 @@ fn every_write_grant_of_a_shipped_preset_has_inventory_rows_and_every_deny_names
             assert!(
                 inv.entries
                     .iter()
-                    .any(|en| matches!(en.class, Executable | Mixed(_)) && under(en.path, deny)),
+                    .any(|en| matches!(en.class, Executable | Mixed) && under(en.path, deny)),
                 "{}: deny_write {deny} protects no inventoried executable state",
                 inv.preset
             );
@@ -1084,46 +1249,18 @@ fn the_reviewed_grant_sets_equal_the_shipped_presets_and_cover_every_agent_prese
 }
 
 /// hb-82i gate: every Executable or Mixed row the inventory lists under a write grant is denied by
-/// the shipped preset, except the rows this bead decided to leave open and named (below).
+/// the shipped preset. There is no exemption list: a row left open is a failure, and adding one back
+/// is an owner decision recorded in hb-82i, not a test edit.
 #[test]
-fn shipped_presets_deny_every_executable_and_mixed_row_except_the_named_residuals() {
-    // path -> why it is left writable; a new entry here needs the same written reason in the preset header.
-    const RESIDUAL: &[(&str, &str)] = &[(
-        "~/Library/Application Support/kiro-cli/data.sqlite3",
-        "login token shares the file with sessions; a refresh over a denied write is unmeasured (kiro.toml header)",
-    )];
+fn shipped_presets_deny_every_executable_and_mixed_row() {
     for inv in INVENTORY {
-        let open: Vec<&str> = exposed(inv)
-            .iter()
-            .map(|en| en.path)
-            .filter(|path| !RESIDUAL.iter().any(|(r, _)| r == path))
-            .collect();
+        let open: Vec<&str> = exposed(inv).iter().map(|en| en.path).collect();
         assert!(
             open.is_empty(),
             "{}: executable or mixed rows still writable: {open:?}",
             inv.preset
         );
     }
-    // The residual set is pinned by value, not only by the list above: widening it needs an edit
-    // here AND an owner decision recorded in hb-82i, so one more entry in RESIDUAL cannot hide a hole.
-    let mut all_open: Vec<(&str, &str)> = INVENTORY
-        .iter()
-        .flat_map(|inv| {
-            exposed(inv)
-                .into_iter()
-                .map(move |en| (inv.preset, en.path))
-        })
-        .collect();
-    all_open.sort_unstable();
-    assert_eq!(
-        all_open,
-        [(
-            "kiro",
-            "~/Library/Application Support/kiro-cli/data.sqlite3"
-        )],
-        "the rows left writable changed; that is an owner decision (hb-82i), not a test edit"
-    );
-    assert_eq!(RESIDUAL.len(), 1, "RESIDUAL grew without an owner decision");
 }
 
 /// hb-82i criterion 2, stated structurally: hb promises that session history stays writable, so no
@@ -1171,6 +1308,99 @@ fn no_shipped_preset_denies_or_withholds_a_session_data_row_it_promises() {
     }
 }
 
+/// hb-82i criterion 2, behaviourally: for every history row a shipped preset promises, a real sandboxed
+/// run reads what is already there, appends, creates a new session file and replaces one by
+/// temp-file-plus-rename; a SECOND run, and the host, then read exactly what the first wrote. A denied
+/// sibling next to the history stays unchanged. No agent and no model request: this proves hb lets the
+/// agent's own session files survive, not that an agent resumes them.
+#[test]
+fn promised_history_survives_a_second_sandbox_run_for_each_shipped_preset() {
+    sandboxed!();
+    // (preset, [(history dir under home, a denied sibling under home that must stay as it was)])
+    let promised: &[(&str, &[(&str, &str)])] = &[
+        (
+            "claude",
+            &[
+                (".claude/projects", ".claude/settings.json"),
+                (".claude/sessions", ".claude/settings.json"),
+            ],
+        ),
+        ("pi", &[(".pi/agent/sessions", ".pi/agent/settings.json")]),
+        ("kiro", &[(".kiro/sessions", ".kiro/settings/mcp.json")]),
+        (
+            "opencode",
+            &[
+                (
+                    ".local/share/opencode/storage",
+                    ".config/opencode/opencode.json",
+                ),
+                (".local/state/opencode", ".config/opencode/opencode.json"),
+            ],
+        ),
+    ];
+    for (agent, rows) in promised {
+        let w = agent_world(agent, "");
+        let home = w.home_dir();
+        for (hist, sibling) in *rows {
+            write(&home.join(hist).join("old.jsonl"), "first\n");
+            write(&home.join(sibling), "sentinel");
+        }
+        // The presets' write grants must resolve, so the history roots exist before the run.
+        let first = run(
+            &w,
+            &rows
+                .iter()
+                .map(|(h, _)| {
+                    let d = quote(&home.join(h));
+                    format!(
+                        "cat {d}/old.jsonl >/dev/null && echo second >> {d}/old.jsonl && mkdir -p {d}/new && echo made > {d}/new/s.json \
+                         && echo swapped > {d}/tmp.json && mv -f {d}/tmp.json {d}/new/s.json"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" && "),
+        );
+        assert!(
+            first.status.success(),
+            "{agent}: the first run failed: {}",
+            text(&first)
+        );
+        let second = run(
+            &w,
+            &rows
+                .iter()
+                .map(|(h, _)| {
+                    let d = quote(&home.join(h));
+                    format!("grep -q second {d}/old.jsonl && grep -q swapped {d}/new/s.json")
+                })
+                .collect::<Vec<_>>()
+                .join(" && "),
+        );
+        assert!(
+            second.status.success(),
+            "{agent}: the second run did not see the first run's files: {}",
+            text(&second)
+        );
+        for (hist, sibling) in *rows {
+            assert_eq!(
+                assert_ok!(fs::read_to_string(home.join(hist).join("old.jsonl"))),
+                "first\nsecond\n",
+                "{agent}: {hist}"
+            );
+            assert_eq!(
+                assert_ok!(fs::read_to_string(home.join(hist).join("new/s.json"))),
+                "swapped\n",
+                "{agent}: {hist}"
+            );
+            assert_eq!(
+                assert_ok!(fs::read_to_string(home.join(sibling))),
+                "sentinel",
+                "{agent}: {sibling} changed"
+            );
+        }
+    }
+}
+
 /// A report, not a gate: run with `-- --nocapture` to list rows no measurement backs yet.
 #[test]
 fn unmeasured_and_mixed_rows_are_reported() {
@@ -1179,8 +1409,8 @@ fn unmeasured_and_mixed_rows_are_reported() {
             if en.evidence.starts_with("assumed") || en.evidence.contains("unmeasured") {
                 eprintln!("UNMEASURED {} {}: {}", inv.preset, en.path, en.evidence);
             }
-            if let Mixed(d) = en.class {
-                eprintln!("MIXED {} {} {d:?}", inv.preset, en.path);
+            if en.class == Mixed {
+                eprintln!("MIXED {} {}", inv.preset, en.path);
             }
         }
     }
