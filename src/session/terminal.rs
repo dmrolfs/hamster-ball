@@ -1,5 +1,5 @@
 // ABOUTME: RawMode: puts the user's terminal in raw mode for a run and restores it when dropped, flushing pending input.
-// ABOUTME: Restoring uses TCSAFLUSH, so a terminal reply that arrives as the run ends cannot land in the shell afterwards.
+// ABOUTME: Restoring flushes unread input and applies settings immediately, so unread output cannot hold teardown or a later resume.
 //! The user's terminal while the agent runs (design 7.3, hb-ghd.2.4).
 //!
 //! Raw mode is entered as late as possible and left on every path that returns normally: normal
@@ -8,7 +8,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 
-use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr};
+use rustix::termios::{OptionalActions, QueueSelector, Termios, tcflush, tcgetattr, tcsetattr};
 use snafu::{ResultExt, Snafu};
 
 /// Why the terminal could not be changed.
@@ -49,8 +49,13 @@ impl RawMode {
     }
 
     /// Gives the user's settings back, for example while `hb` is stopped by the shell.
+    ///
+    /// The exit fence runs before this and consumes pending terminal replies. Discard unread input
+    /// and apply settings immediately: TCSAFLUSH waits for output to drain and can block forever.
+    /// A deferred restore is unsafe too, because it can undo a later resume.
     pub fn suspend(&self) {
-        let _ = tcsetattr(&self.terminal, OptionalActions::Flush, &self.saved);
+        let _ = tcflush(&self.terminal, QueueSelector::IFlush);
+        let _ = tcsetattr(&self.terminal, OptionalActions::Now, &self.saved);
     }
 
     /// Returns to raw mode after [`RawMode::suspend`].
@@ -80,6 +85,7 @@ mod tests {
     use rustix::termios::{InputModes, LocalModes};
     use std::io::Write;
     use std::os::fd::OwnedFd;
+    use std::time::Duration;
 
     /// A pty slave standing in for the user's terminal, and the master that types into it.
     fn terminal() -> (OwnedFd, std::fs::File, Pty) {
@@ -118,7 +124,12 @@ mod tests {
         );
         drop(raw);
         let after = assert_ok!(tcgetattr(&probe));
-        assert_eq!(after.local_modes, before.local_modes);
+        // PENDIN ("retype pending input at the next read") is set by the kernel whenever canonical
+        // mode comes back with TCSANOW. The input queue was just flushed, so it retypes nothing.
+        assert_eq!(
+            after.local_modes - LocalModes::PENDIN,
+            before.local_modes - LocalModes::PENDIN
+        );
         assert_eq!(after.input_modes, before.input_modes);
         assert!(after.input_modes.contains(InputModes::ICRNL));
     }
@@ -134,6 +145,50 @@ mod tests {
         assert!(!local(&probe).contains(LocalModes::ICANON));
         drop(raw);
         assert!(local(&probe).contains(LocalModes::ICANON));
+    }
+
+    #[test]
+    fn restoring_an_unread_terminal_returns_at_once_and_cannot_undo_a_later_resume() {
+        let (fd, mut master, _pty) = terminal();
+        let probe = assert_ok!(fd.try_clone());
+        let mut slave = std::fs::File::from(assert_ok!(fd.try_clone()));
+        let raw = assert_ok!(RawMode::enter(fd));
+        assert_ok!(rustix::fs::fcntl_setfl(
+            &slave,
+            rustix::fs::fcntl_getfl(&slave).unwrap_or(rustix::fs::OFlags::empty())
+                | rustix::fs::OFlags::NONBLOCK
+        ));
+        while slave.write(&[b'x'; 1024]).is_ok() {}
+        let started = std::time::Instant::now();
+        raw.suspend();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            local(&probe).contains(LocalModes::ICANON),
+            "settings were not restored"
+        );
+        raw.resume();
+        assert!(
+            !local(&probe).contains(LocalModes::ICANON),
+            "resume did not return to raw mode"
+        );
+        // Draining the output must not apply an old restore after the resume.
+        assert_ok!(rustix::fs::fcntl_setfl(
+            &master,
+            rustix::fs::fcntl_getfl(&master).unwrap_or(rustix::fs::OFlags::empty())
+                | rustix::fs::OFlags::NONBLOCK
+        ));
+        let mut sink = [0_u8; 4096];
+        while std::io::Read::read(&mut master, &mut sink).is_ok_and(|n| n > 0) {}
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !local(&probe).contains(LocalModes::ICANON),
+            "a late restore undid the resume"
+        );
+        std::mem::forget(raw);
     }
 
     #[test]

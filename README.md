@@ -77,6 +77,8 @@ hb --version
 
 To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
 This installs `hb-supervise` beside the matching `hb`; default builds omit the UI dependencies.
+`hb-supervise` starts several `hb run` sessions and shows their state, denials and terminals in one screen.
+It adds no enforcement of its own. See [the supervisor chapter](docs/08-supervisor.md) for its keys and limits.
 
 `hb` must live in a directory the agent cannot write. The floor write-denies every directory on your `PATH`, and
 `hb` itself, so `~/.cargo/bin` is fine. `hb` refuses to run as root and refuses to start inside another sandbox

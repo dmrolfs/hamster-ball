@@ -360,9 +360,9 @@ fn sessions_do_not_outlive_a_supervisor_that_is_killed() {
 }
 
 #[test]
-fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
+fn sigterm_sighup_and_sigquit_restore_the_terminal_and_stop_the_agent_before_exiting() {
     sandboxed!();
-    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+    for signal in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGQUIT] {
         let w = World::new(PROJECT);
         let marker = w.project.join("agent.pid");
         let script = w.project.join("agent.sh");
@@ -507,15 +507,59 @@ fn start_review(w: &World) -> Owner {
 }
 
 #[test]
-fn sigterm_during_a_review_ends_the_supervisor_instead_of_only_the_review() {
+fn a_termination_signal_during_a_review_ends_the_supervisor_instead_of_only_the_review() {
     sandboxed!();
-    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+    for signal in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGQUIT] {
         let w = World::new(PROJECT);
         let mut owner = start_review(&w);
         assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
         assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");
         assert_restored(&owner);
     }
+}
+
+/// hb-807 review B, LOW 5: a SIGINT that arrives before the review is not the owner cancelling it.
+///
+/// Seeing the prompt is not enough: a review that was cancelled at once can print it first. The
+/// proof is a fresh, correct answer that approves, after which the agent really starts.
+#[test]
+fn a_sigint_from_before_a_review_does_not_cancel_it() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let ran = w.project.join("ran");
+    let script = w.project.join("agent.sh");
+    common::write(&script, &format!("touch '{}'\nsleep 300\n", ran.display()));
+    let mut owner = Owner::start_unapproved(&w, &[]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    owner.wait_for("Approve", 60);
+    // A SIGINT with no review running, as from a stray Ctrl-C or a script.
+    assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), Signal::SIGINT));
+    std::thread::sleep(Duration::from_millis(300));
+    owner.send(b"a");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while code_shown(&owner).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let code = assert_some!(code_shown(&owner), "no review was offered");
+    // Give a cancelled review time to have ended, then answer it: only a live review can approve.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!ran.exists(), "the agent ran before it was approved");
+    owner.send(format!("approve {code}\n").as_bytes());
+    assert!(
+        appears(&ran, 30),
+        "the review had been cancelled by the earlier SIGINT; the screen:\n{}",
+        owner.screen()
+    );
+    owner.wait_for("Running", 30);
+    owner.send(b"q");
+    owner.send(b"y");
+    assert_eq!(owner.exit_code(60), Some(0));
+    assert_restored(&owner);
 }
 
 #[test]

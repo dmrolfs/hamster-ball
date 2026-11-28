@@ -9,3 +9,4 @@
 - [Commands](05-commands.md)
 - [Use cases](06-use-cases.md)
 - [Reference](07-reference.md)
+- [The supervisor](08-supervisor.md)

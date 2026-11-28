@@ -17,6 +17,8 @@ use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu, ensure};
 
+use super::identity::{Identity, group_members};
+
 /// The signals `hb` blocks and forwards.
 pub const SUPERVISED: [Signal; 3] = [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP];
 
@@ -196,6 +198,20 @@ impl Watch {
     #[must_use]
     pub fn on_stopping(mut self, callback: Option<OnStopping>) -> Self {
         self.on_stopping = callback;
+        self
+    }
+
+    /// Also calls `extra` whenever a stop is accepted, after the callback already installed.
+    ///
+    /// For a part of the run that must change what it does as soon as a stop begins, such as the
+    /// terminal relay, which has to stop waiting on a terminal that nobody reads.
+    #[must_use]
+    pub fn also_on_stopping(mut self, extra: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let first = self.on_stopping.take();
+        self.on_stopping = Some(OnStopping(Arc::new(move || {
+            OnStopping::notify(first.as_ref());
+            extra();
+        })));
         self
     }
 
@@ -456,29 +472,45 @@ fn supervise(
         0,
     );
     let mut events = [blank; 4];
+    // Members of the group, by who they are and not only by number, noted when a stop begins.
+    let mut roster = Roster::default();
+    // Set once the thread was told to end: from then on it only waits for the group to empty.
+    let mut ending = false;
     loop {
+        if ending && roster.settled(&rule) {
+            return;
+        }
         let timeout = rule.deadline().map(|deadline| {
-            TimeSpec::from_duration(deadline.saturating_duration_since(Instant::now()))
+            let wake = if ending {
+                (Instant::now() + SETTLE_POLL).min(deadline)
+            } else {
+                deadline
+            };
+            TimeSpec::from_duration(wake.saturating_duration_since(Instant::now()))
         });
+        let timeout = match (timeout, ending) {
+            (None, true) => Some(TimeSpec::from_duration(SETTLE_POLL)),
+            (timeout, _) => timeout,
+        };
         let ready = match queue.kevent(&[], &mut events, timeout.as_ref().map(|t| *t.as_ref())) {
             Ok(n) => n,
             Err(Errno::EINTR) => continue,
             Err(_) => return,
         };
         if ready == 0 {
-            apply(rule.on_tick(Instant::now()), target, on_stopping);
+            let step = rule.on_tick(Instant::now());
+            roster.before(&step, target, ending);
+            apply(step, target, on_stopping, &roster, ending);
             continue;
         }
         for event in &events[..ready] {
             match event.filter() {
                 Ok(EventFilter::EVFILT_USER) if event.ident() == DISCONNECT_ID => {
-                    apply(
-                        rule.on_signal(Signal::SIGTERM, Instant::now()),
-                        target,
-                        on_stopping,
-                    );
+                    let step = rule.on_signal(Signal::SIGTERM, Instant::now());
+                    roster.before(&step, target, ending);
+                    apply(step, target, on_stopping, &roster, ending);
                 }
-                Ok(EventFilter::EVFILT_USER) => return,
+                Ok(EventFilter::EVFILT_USER) => ending = true,
                 Ok(EventFilter::EVFILT_SIGNAL) => {
                     let Ok(signal) = i32::try_from(event.ident())
                         .map_err(|_| ())
@@ -494,7 +526,9 @@ fn supervise(
                     }
                     // Several signals can arrive before the thread looks; two is enough to escalate.
                     for _ in 0..event.data().clamp(1, 2) {
-                        apply(rule.on_signal(signal, Instant::now()), target, on_stopping);
+                        let step = rule.on_signal(signal, Instant::now());
+                        roster.before(&step, target, ending);
+                        apply(step, target, on_stopping, &roster, ending);
                     }
                 }
                 _ => {}
@@ -503,14 +537,107 @@ fn supervise(
     }
 }
 
-fn apply(step: Step, target: Target, on_stopping: Option<&OnStopping>) {
+/// How often a thread that was told to end looks for members left in the group.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
+
+/// The members of the child's process group, remembered by who they are.
+///
+/// A stop is TERM now and KILL at the end of the grace period. The leader exiting on TERM ends the
+/// wait for the child, and used to end the signal thread with it, which disarmed the KILL meant for
+/// the rest of the group: a member that ignores TERM then outlived the stop, and with it a
+/// supervisor that went away (hb-807 review A, HIGH 1).
+///
+/// So when a stop begins the members are listed and each is recorded with its start time, and what
+/// is signalled afterwards is those processes one at a time, each only while it is still the same
+/// process. A numeric check of the group would not do: after the last member leaves, the number can
+/// name a different group, and a signal to it would reach a stranger.
+///
+/// It records members once, at the first step of a stop (TERM is forwarded as it is taken, so a
+/// member that is not yet a member of the group at that moment, or that leaves the group, is not
+/// followed: that is the documented limit of group cleanup, see hb-caj). Only a group is treated
+/// this way: a lone child has no group to list, and with no stop under way a leader that simply
+/// exits leaves its background children alone.
+#[derive(Debug, Default)]
+struct Roster {
+    members: Vec<Identity>,
+    taken: bool,
+}
+
+impl Roster {
+    /// Notes the group's members the first time a stop does something.
+    ///
+    /// Not once the leader has gone (`ended`): the group number may name a different group by
+    /// then, and listing it would record strangers.
+    fn before(&mut self, step: &Step, target: Target, ended: bool) {
+        if self.taken || *step == Step::Ignore {
+            return;
+        }
+        self.taken = true;
+        let Target::Group(pgid) = target else {
+            return;
+        };
+        if ended {
+            return;
+        }
+        let listed = group_members(pgid.as_raw()).unwrap_or_default();
+        self.members = listed
+            .into_iter()
+            .filter(|pid| *pid != i32::try_from(std::process::id()).unwrap_or(0))
+            .filter_map(|pid| Identity::of(pid).ok())
+            .collect();
+    }
+
+    /// Members that are still the processes that were recorded.
+    fn alive(&self) -> Vec<Identity> {
+        self.members
+            .iter()
+            .copied()
+            .filter(|member| member.is_current().unwrap_or(false))
+            .collect()
+    }
+
+    /// Whether the thread, told to end, may do so now: no stop is pending, nothing recorded is
+    /// left, or the kill has been sent.
+    fn settled(&self, rule: &Escalation) -> bool {
+        rule.deadline().is_none() || self.alive().is_empty()
+    }
+
+    /// Sends `signal` to each recorded member that is still the same process.
+    fn send(&self, signal: Signal) {
+        for member in self.alive() {
+            // A member that left between the check and the signal is a different process only if
+            // its number was reused in those microseconds: the same residual every kill by number
+            // has, and smaller than signalling a whole group number.
+            let _ = kill(Pid::from_raw(member.pid()), signal);
+        }
+    }
+}
+
+/// Acts on a step. Once the leader has gone (`ended`) the group number is no longer proof of the
+/// group, so only the recorded members are signalled, each while it is still the same process.
+fn apply(
+    step: Step,
+    target: Target,
+    on_stopping: Option<&OnStopping>,
+    roster: &Roster,
+    ended: bool,
+) {
     if step != Step::Ignore {
         OnStopping::notify(on_stopping);
     }
-    match step {
-        Step::Ignore => {}
-        Step::Forward(signal) => target.send(signal),
-        Step::Kill => target.send(Signal::SIGKILL),
+    let signal = match step {
+        Step::Ignore => return,
+        Step::Forward(signal) => signal,
+        Step::Kill => Signal::SIGKILL,
+    };
+    if ended {
+        roster.send(signal);
+        return;
+    }
+    target.send(signal);
+    if step == Step::Kill {
+        // The leader may already be gone while members are not; name them as well.
+        roster.send(signal);
     }
 }
 
@@ -594,6 +721,106 @@ mod tests {
     use super::*;
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
+
+    fn sleeper() -> std::process::Child {
+        assert_ok!(std::process::Command::new("/bin/sleep").arg("30").spawn())
+    }
+
+    fn pid_of(child: &std::process::Child) -> i32 {
+        i32::try_from(child.id()).unwrap_or(i32::MAX)
+    }
+
+    fn gone(child: &mut std::process::Child) -> bool {
+        for _ in 0..100 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_recorded_member_is_signalled_while_it_is_the_same_process() {
+        let mut child = sleeper();
+        let roster = Roster {
+            members: vec![assert_ok!(Identity::of(pid_of(&child)))],
+            taken: true,
+        };
+        roster.send(Signal::SIGKILL);
+        assert!(gone(&mut child), "the recorded member was not signalled");
+    }
+
+    #[test]
+    fn a_number_that_now_names_a_different_process_is_never_signalled() {
+        // The group number or a member's number can be reused after the original is gone. A
+        // record whose start time no longer matches stands for exactly that, and must not be hit
+        // (hb-807 re-review: process-group existence is not process-group identity).
+        let mut stranger = sleeper();
+        let real = assert_ok!(Identity::of(pid_of(&stranger)));
+        let roster = Roster {
+            members: vec![real.with_start(real.started().1.wrapping_add(1))],
+            taken: true,
+        };
+        assert!(roster.alive().is_empty());
+        roster.send(Signal::SIGKILL);
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            matches!(stranger.try_wait(), Ok(None)),
+            "a process whose identity did not match was signalled"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+
+    #[test]
+    fn nothing_is_recorded_once_the_leader_has_gone_or_for_a_lone_child() {
+        let child = sleeper();
+        let pid = Pid::from_raw(pid_of(&child));
+        let mut after = Roster::default();
+        after.before(&Step::Forward(Signal::SIGTERM), Target::Group(pid), true);
+        assert!(after.members.is_empty());
+        let mut lone = Roster::default();
+        lone.before(&Step::Forward(Signal::SIGTERM), Target::Child(pid), false);
+        assert!(lone.members.is_empty());
+        let mut nothing_happening = Roster::default();
+        nothing_happening.before(&Step::Ignore, Target::Group(pid), false);
+        assert!(
+            !nothing_happening.taken,
+            "an ignored signal used up the one look"
+        );
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_thread_told_to_end_with_no_stop_pending_does_not_wait() {
+        let rule = Escalation::new(Duration::from_secs(5), false);
+        let roster = Roster::default();
+        assert!(roster.settled(&rule), "a normal exit would be held up");
+    }
+
+    #[test]
+    fn a_thread_told_to_end_waits_for_a_recorded_member_and_not_longer() {
+        let mut child = sleeper();
+        let mut rule = Escalation::new(Duration::from_secs(5), false);
+        let _ = rule.on_signal(Signal::SIGTERM, Instant::now());
+        let roster = Roster {
+            members: vec![assert_ok!(Identity::of(pid_of(&child)))],
+            taken: true,
+        };
+        assert!(
+            !roster.settled(&rule),
+            "ended while a member was still running"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            roster.settled(&rule),
+            "kept waiting for a member that is gone"
+        );
+    }
 
     #[test]
     fn the_mask_helpers_block_check_and_unblock_in_this_thread_only() {
@@ -689,7 +916,13 @@ mod tests {
         let target = Target::Child(Pid::from_raw(child.id() as i32));
         let (mut rule, now) = rule(true);
         for signal in [Signal::SIGINT, Signal::SIGHUP] {
-            apply(rule.on_signal(signal, now), target, Some(&callback));
+            apply(
+                rule.on_signal(signal, now),
+                target,
+                Some(&callback),
+                &Roster::default(),
+                false,
+            );
         }
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let alive = assert_ok!(child.try_wait()).is_none();
@@ -697,6 +930,8 @@ mod tests {
             rule.on_signal(Signal::SIGTERM, now),
             target,
             Some(&callback),
+            &Roster::default(),
+            false,
         );
         let _ = child.kill();
         assert_ok!(child.wait());

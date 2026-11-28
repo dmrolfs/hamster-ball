@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
+use super::fence::{open_for_nonblocking_write, write_until};
 use super::sanitize::{ClipboardPolicy, ClipboardUse, Sanitizer};
 
 /// How often the thread looks at the stop flag when nothing arrives.
@@ -54,6 +55,9 @@ enum Gate {
 #[derive(Debug)]
 struct Shared {
     stop: AtomicBool,
+    /// A stop has begun (a signal, or the supervisor going away): output the terminal will not take
+    /// is dropped from here on, so the child's pty keeps draining and the child can exit.
+    hurry: AtomicBool,
     gate: Mutex<Gate>,
     changed: Condvar,
 }
@@ -104,10 +108,13 @@ impl Relay {
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
+            hurry: AtomicBool::new(false),
             gate: Mutex::new(Gate::Open),
             changed: Condvar::new(),
         });
         let theirs = Arc::clone(&shared);
+        // Started here, so a failure to start it is the relay's failure, not a quieter relay.
+        let mut sink = Sink::new(&output, Arc::clone(&shared))?;
         let handle = thread::Builder::new()
             .name("hb-relay".to_owned())
             .spawn(move || {
@@ -115,7 +122,7 @@ impl Relay {
                 run(
                     File::from(input),
                     master,
-                    File::from(output),
+                    &mut sink,
                     &theirs,
                     &mut filter,
                     drain,
@@ -123,6 +130,17 @@ impl Relay {
                 filter.clipboard_use()
             })?;
         Ok(Self { shared, handle })
+    }
+
+    /// What to call when a stop begins, before the child has ended: output the terminal does not
+    /// take is dropped from then on instead of holding the relay (and so the child) back.
+    pub fn stopping_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+        Self::stopping_hook_for(&self.shared)
+    }
+
+    fn stopping_hook_for(shared: &Arc<Shared>) -> Arc<dyn Fn() + Send + Sync> {
+        let shared = Arc::clone(shared);
+        Arc::new(move || shared.hurry.store(true, Ordering::Relaxed))
     }
 
     /// Stops the relay touching the terminal and returns once it no longer is.
@@ -159,9 +177,90 @@ impl Relay {
     }
 }
 
+/// How long the terminal may take no output at all, once a stop has begun, before the relay stops
+/// waiting for it and drops what it still holds.
+const STALL: Duration = Duration::from_secs(2);
+
+/// The user's terminal, written by the relay thread itself without ever blocking.
+///
+/// A write to a terminal that nobody reads blocks for good, and the relay cannot be the one that
+/// blocks: while it is stuck it reads nothing from the child's pty, the child cannot finish
+/// closing a pty that is full, and `hb` waits for that child. A supervisor that stops draining its
+/// terminal would then keep a session alive after its channel closed (hb-807 review A, HIGH 3).
+///
+/// The output is a second, non-blocking open of the same terminal, so a full terminal returns
+/// "would block" and the relay can look at the stop flag. A write never leaves the relay thread:
+/// when `finish` returns, everything the relay was going to write has been written, or has been
+/// given up on, so what runs next (the exit fence, the settings restore) cannot be interleaved with
+/// it. Output is never dropped because a queue is full or because a stop began: only when the
+/// terminal has taken no byte at all for [`STALL`] after a stop (a terminal that is slow but
+/// reading keeps resetting that clock).
+struct Sink {
+    terminal: Option<File>,
+    shared: Arc<Shared>,
+    /// What has not been written yet.
+    pending: Vec<u8>,
+}
+
+impl Sink {
+    fn new(terminal: &OwnedFd, shared: Arc<Shared>) -> io::Result<Self> {
+        Ok(Self {
+            terminal: Some(open_for_nonblocking_write(terminal)?),
+            shared,
+            pending: Vec::new(),
+        })
+    }
+
+    /// Writes `pending`, waiting for room. Gives up only on a terminal that has taken nothing for
+    /// [`STALL`] while a stop is under way, and then abandons the rest.
+    fn drain(&mut self) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            self.pending.clear();
+            return;
+        };
+        let mut idle_since: Option<Instant> = None;
+        while !self.pending.is_empty() {
+            let stopping = self.shared.hurry.load(Ordering::Relaxed)
+                || self.shared.stop.load(Ordering::Relaxed);
+            // One short wait for room at a time, so the stop flag is looked at between them.
+            let wait = Instant::now() + Duration::from_millis(u64::from(TICK_MS));
+            let wrote = write_until(terminal, &self.pending, wait);
+            if wrote > 0 {
+                self.pending.drain(..wrote);
+                idle_since = None;
+                continue;
+            }
+            if !stopping {
+                // Not stopping: this is back-pressure from a slow terminal, as it always was.
+                idle_since = None;
+                continue;
+            }
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STALL {
+                self.pending.clear();
+                self.terminal = None;
+                return;
+            }
+        }
+    }
+}
+
+impl Write for Sink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        self.drain();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain();
+        Ok(())
+    }
+}
+
 /// Copies one chunk from `from` to `to`, through `filter` if there is one. `false` means `from`
 /// has ended or failed.
-fn copy_chunk(from: &mut File, to: &mut File, filter: Option<&mut Sanitizer>) -> bool {
+fn copy_chunk(from: &mut File, to: &mut impl Write, filter: Option<&mut Sanitizer>) -> bool {
     let mut buffer = [0u8; BUFFER];
     match from.read(&mut buffer) {
         Ok(0) | Err(_) => false,
@@ -184,7 +283,7 @@ fn copy_chunk(from: &mut File, to: &mut File, filter: Option<&mut Sanitizer>) ->
 }
 
 /// Tells the terminal the agent's output is over: a sequence the agent left open is cancelled.
-pub(super) fn end_of_output(filter: &mut Sanitizer, output: &mut File) {
+pub(super) fn end_of_output(filter: &mut Sanitizer, output: &mut impl Write) {
     let mut tail = Vec::new();
     filter.finish(&mut tail);
     if !tail.is_empty() {
@@ -211,7 +310,7 @@ fn hold_while_paused(shared: &Shared) {
 fn run(
     mut input: File,
     mut master: File,
-    mut output: File,
+    output: &mut Sink,
     shared: &Shared,
     filter: &mut Sanitizer,
     drain: Drain,
@@ -239,9 +338,9 @@ fn run(
             };
             (ready(&fds[0]), fds.get(1).is_some_and(ready))
         };
-        if master_ready && !copy_chunk(&mut master, &mut output, Some(filter)) {
+        if master_ready && !copy_chunk(&mut master, output, Some(filter)) {
             // End of the child's output: nothing more can come.
-            end_of_output(filter, &mut output);
+            end_of_output(filter, output);
             return;
         }
         if input_ready && !copy_chunk(&mut input, &mut master, None) {
@@ -250,7 +349,7 @@ fn run(
         if let Some(since) = draining_since
             && (!master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max)
         {
-            end_of_output(filter, &mut output);
+            end_of_output(filter, output);
             return;
         }
     }
@@ -605,6 +704,157 @@ mod tests {
         let _ = reader.join();
         assert!(took >= drain.max - Duration::from_millis(200), "{took:?}");
         assert!(took < drain.max + Duration::from_secs(1), "{took:?}");
+    }
+
+    /// A terminal under test: its slave (what the relay writes to) and its master (the far end).
+    fn terminal_pair() -> (OwnedFd, File, Pty) {
+        let pty = assert_ok!(Pty::open());
+        let slave = open_slave(&pty);
+        let master = assert_ok!(pty.clone_master());
+        (OwnedFd::from(slave), master, pty)
+    }
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            hurry: AtomicBool::new(false),
+            gate: Mutex::new(Gate::Open),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn fill(slave: &OwnedFd) {
+        let mut screen = assert_ok!(open_for_nonblocking_write(slave));
+        while screen.write(&[b'x'; 1024]).is_ok() {}
+    }
+
+    fn read_until(master: &mut File, tail: &[u8], secs: u64) -> Vec<u8> {
+        let mut seen = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end && !seen.ends_with(tail) {
+            if let Ok(n) = std::io::Read::read(master, &mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_slow_reader_gets_every_byte_even_after_a_stop_begins() {
+        // The terminal is full when the stop begins and drains a moment later: nothing may be
+        // dropped just because a stop is under way (hb-807 re-review, HIGH).
+        let (slave, master, _pty) = terminal_pair();
+        fill(&slave);
+        let shared = shared();
+        let mut sink = assert_ok!(Sink::new(&slave, Arc::clone(&shared)));
+        shared.hurry.store(true, Ordering::Relaxed);
+        shared.stop.store(true, Ordering::Relaxed);
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            let mut master = master;
+            read_until(&mut master, b"THE-END", 5)
+        });
+        assert_ok!(sink.write(b"THE-END"));
+        let seen = assert_ok!(reader.join());
+        assert!(seen.ends_with(b"THE-END"), "the last bytes were dropped");
+    }
+
+    #[test]
+    fn a_terminal_that_takes_nothing_is_given_up_on_after_the_stall_once_a_stop_is_under_way() {
+        let (slave, _master, _pty) = terminal_pair();
+        fill(&slave);
+        let shared = shared();
+        let mut sink = assert_ok!(Sink::new(&slave, Arc::clone(&shared)));
+        shared.hurry.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        assert_ok!(sink.write(b"never delivered"));
+        let took = started.elapsed();
+        assert!(
+            took >= STALL - Duration::from_millis(200),
+            "gave up too early: {took:?}"
+        );
+        assert!(took < STALL + Duration::from_secs(3), "{took:?}");
+        // Once abandoned it stays abandoned: later writes return at once.
+        let again = Instant::now();
+        assert_ok!(sink.write(b"x"));
+        assert!(again.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_full_terminal_is_waited_for_when_no_stop_is_under_way() {
+        let (slave, master, _pty) = terminal_pair();
+        fill(&slave);
+        let shared = shared();
+        let mut sink = assert_ok!(Sink::new(&slave, Arc::clone(&shared)));
+        let writer = thread::spawn(move || {
+            let started = Instant::now();
+            assert_ok!(sink.write(b"after the wait"));
+            started.elapsed()
+        });
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            !writer.is_finished(),
+            "gave up on a terminal with no stop under way"
+        );
+        let mut master = master;
+        let seen = read_until(&mut master, b"after the wait", 5);
+        assert!(seen.ends_with(b"after the wait"));
+        assert_ok!(writer.join());
+    }
+
+    #[test]
+    fn finish_is_a_barrier_final_output_is_written_before_it_returns() {
+        // The exit fence runs after `finish`. If a writer outlived it, the fence could be
+        // interleaved with agent output (hb-807 re-review, HIGH). A terminal's queue holds about a
+        // kilobyte, so when `finish` returns the reader must already have most of the output; a
+        // detached writer would still be holding it in memory.
+        use std::sync::atomic::AtomicUsize;
+        let outer = assert_ok!(Pty::open());
+        let inner = assert_ok!(Pty::open());
+        let inner_slave = open_slave(&inner);
+        let outer_slave = open_slave(&outer);
+        let mut outer_master = assert_ok!(outer.clone_master());
+        let relay = assert_ok!(Relay::spawn(
+            assert_ok!(outer_slave.try_clone()).into(),
+            assert_ok!(inner.clone_master()),
+            OwnedFd::from(outer_slave),
+            ClipboardPolicy::default(),
+            Drain::default(),
+        ));
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        let reader = thread::spawn(move || {
+            // A slow terminal: nothing reads for a while.
+            thread::sleep(Duration::from_millis(600));
+            let mut seen = Vec::new();
+            let mut buf = [0_u8; 4096];
+            let end = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < end && !seen.ends_with(b"<END>") {
+                if let Ok(n) = std::io::Read::read(&mut outer_master, &mut buf) {
+                    seen.extend_from_slice(&buf[..n]);
+                    counter.store(seen.len(), Ordering::SeqCst);
+                }
+            }
+            seen
+        });
+        let payload = "x".repeat(60_000);
+        let total = payload.len() + 5;
+        let mut child = assert_ok!(inner_slave.try_clone());
+        let writer = thread::spawn(move || {
+            assert_ok!(child.write_all(payload.as_bytes()));
+            assert_ok!(child.write_all(b"<END>"));
+        });
+        assert_ok!(writer.join().map_err(|_| "child writer panicked"));
+        relay.finish();
+        let at_finish = received.load(Ordering::SeqCst);
+        assert!(
+            at_finish + 4096 >= total,
+            "finish returned with {at_finish} of {total} bytes delivered: a writer outlived it"
+        );
+        let seen = assert_ok!(reader.join());
+        assert_eq!(seen.len(), total);
+        assert!(seen.ends_with(b"<END>"));
     }
 
     #[test]

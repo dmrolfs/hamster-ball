@@ -141,11 +141,15 @@ struct StopSignals {
 }
 
 impl StopSignals {
-    const WATCHED: [Signal; 4] = [
+    /// SIGQUIT is watched so that it ends the supervisor through the normal path, which restores
+    /// the terminal: left alone its default action dumps core and leaves the terminal raw (hb-807
+    /// review B, LOW 7).
+    const WATCHED: [Signal; 5] = [
         Signal::SIGTERM,
         Signal::SIGHUP,
         Signal::SIGINT,
         Signal::SIGTSTP,
+        Signal::SIGQUIT,
     ];
 
     fn watch() -> Result<Self, UiError> {
@@ -209,7 +213,7 @@ impl StopSignals {
             match Signal::try_from(event.ident() as i32) {
                 Ok(Signal::SIGINT) => self.interrupt = true,
                 Ok(Signal::SIGTSTP) => self.suspend = true,
-                Ok(Signal::SIGTERM | Signal::SIGHUP) => self.terminate = true,
+                Ok(Signal::SIGTERM | Signal::SIGHUP | Signal::SIGQUIT) => self.terminate = true,
                 _ => {}
             }
         }
@@ -355,6 +359,12 @@ fn poll_wait(handled: usize) -> Duration {
 }
 
 fn draw(screen: &mut Screen, runtime: &Runtime, look: Look) -> Result<(), UiError> {
+    // A panic on another thread has already put the terminal back (the hook does that before
+    // anything else). A frame drawn now would land on the shell's screen, in a terminal that is no
+    // longer in the UI's modes (hb-807 review B, LOW 6). The caller sees `fatal()` next.
+    if fatal() {
+        return Err(UiError::Panicked);
+    }
     let lookup = |id: SessionId| runtime.screen(id).cloned();
     screen
         .draw(|frame| {
@@ -506,6 +516,11 @@ impl Loop<'_> {
     fn review(&mut self, approval: &Approval) -> Result<bool, UiError> {
         self.router = Router::new();
         drain_events()?;
+        // A SIGINT seen while no review was running is not the owner cancelling this one: it was
+        // kept by the signal queue and would end the review the moment it started, reported as
+        // "not approved" (hb-807 review B, LOW 5). Read what is pending, then forget it.
+        self.stop.poll()?;
+        let _ = self.stop.take_interrupt();
         let outcome = match self.guard.suspend() {
             Ok(()) => match flush_input() {
                 Ok(()) => self.run_review(approval),

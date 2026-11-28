@@ -414,6 +414,9 @@ pub enum Msg {
     EnterInteract,
     /// Back to Overview.
     LeaveInteract,
+    /// The owner deliberately pressed a key after Interact ended by itself: keys are the
+    /// supervisor's again.
+    ReleaseKeys,
     /// Bytes for one session's agent, from the keyboard or a paste.
     Input {
         /// The session.
@@ -538,6 +541,11 @@ pub struct App {
     pub pending: Option<Pending>,
     /// What the owner was last told about a refused request.
     pub notice: Option<String>,
+    /// Set when Interact ended by itself because the agent stopped, while the owner was probably
+    /// still typing to it. Until they release it, no key is a supervisor command: `r`, `q` and
+    /// `n` followed by text would otherwise restart, quit or launch from keys meant for the agent
+    /// (hb-807 review B, MEDIUM 1).
+    keys_held: bool,
     alerts: Vec<Alert>,
     quitting: bool,
 }
@@ -562,9 +570,16 @@ impl App {
             form: LaunchForm::empty(),
             pending: None,
             notice: None,
+            keys_held: false,
             alerts: Vec::new(),
             quitting: false,
         }
+    }
+
+    /// Whether keys are being held back after Interact ended by itself.
+    #[must_use]
+    pub fn keys_held(&self) -> bool {
+        self.keys_held
     }
 
     /// The sessions, in the order they were launched.
@@ -660,6 +675,11 @@ impl App {
         if self.mode == Mode::Interact && self.selected().is_none_or(|s| s.phase != Phase::Running)
         {
             self.mode = Mode::Overview;
+            self.keys_held = true;
+            self.notice = Some(
+                "the session ended while you were typing: keys are held, press Esc or Ctrl-g to continue"
+                    .to_owned(),
+            );
         }
         effects
     }
@@ -703,6 +723,10 @@ impl App {
                 if self.mode == Mode::Interact {
                     self.mode = Mode::Overview;
                 }
+                Vec::new()
+            }
+            Msg::ReleaseKeys => {
+                self.keys_held = false;
                 Vec::new()
             }
             Msg::NextTab => {

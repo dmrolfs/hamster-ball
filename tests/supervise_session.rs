@@ -381,3 +381,76 @@ fn a_spawn_that_fails_at_any_step_leaves_no_process_and_ends_every_thread_it_sta
         drop(rx);
     }
 }
+
+/// hb-807 review A, HIGH 3, with a real handshake: nobody reads the session's terminal, so it
+/// fills while the agent writes without pause; then the channel closes. `hb` must still end.
+///
+/// It used to stay for ever, blocked in three places that each wrote to or waited on the terminal
+/// (the relay's output write, the exit fence's reset and query, the settings restore).
+#[test]
+fn a_terminal_nobody_drains_does_not_stop_hb_from_ending_after_the_channel_closes() {
+    sandboxed!();
+    use hamster_ball::session::supervised::{Hello, decode_ack, encode_line, read_line};
+    use std::io::{BufReader, Write};
+    let w = World::new(PROJECT);
+    w.approve();
+    let launch = spec(
+        &w,
+        &[
+            "/bin/sh",
+            "-c",
+            "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; done",
+        ],
+    );
+    let vars: Vec<(&str, std::ffi::OsString)> = vec![
+        ("HB_TD_HOME", w.home_dir().into_os_string()),
+        ("HB_TD_CWD", w.project.clone().into_os_string()),
+        ("HB_TD_PATH", w.base.join("bin").into_os_string()),
+        ("HB_TD_TMP", w.base.join("tmp").into_os_string()),
+        ("HB_TD_GRACE_MS", "2000".into()),
+    ];
+    let extra: Vec<(&str, &std::ffi::OsStr)> =
+        vars.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+    let started = assert_ok!(start_with_env(
+        &PathBuf::from(DRIVE),
+        &PathBuf::from(SUPERVISE),
+        &launch,
+        30,
+        100,
+        &extra
+    ));
+    let mut child = started.child;
+    let mut channel = started.channel;
+    assert_ok!(channel.write_all(&assert_ok!(encode_line(&Hello::new(1, 1)))));
+    let mut reader = BufReader::new(assert_ok!(channel.try_clone()));
+    let ack = assert_some!(assert_ok!(read_line(&mut reader)));
+    assert_ok!(decode_ack(&ack));
+    // Never read the terminal and never read events again. Let the agent fill the pty.
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        assert_ok!(child.try_wait()).is_none(),
+        "hb ended before the channel closed; nothing was tested"
+    );
+    drop(reader);
+    drop(channel);
+    let begun = Instant::now();
+    let ended = loop {
+        if let Some(status) = assert_ok!(child.try_wait()) {
+            break Some(status);
+        }
+        if begun.elapsed() > Duration::from_secs(40) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("hb ended={ended:?} after={:?}", begun.elapsed());
+    if ended.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(started.terminal);
+    assert!(
+        ended.is_some_and(|_| begun.elapsed() < Duration::from_secs(20)),
+        "hb did not end within 20 s of the channel closing with an undrained terminal"
+    );
+}

@@ -13,8 +13,38 @@
 
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Parser, Screen};
 
-/// Most lines of history kept for scrolling back.
+/// Most lines of history kept for scrolling back, however narrow the screen.
 pub const SCROLLBACK_LINES: usize = 10_000;
+/// The memory one screen's history is sized for, about. Lines are capped by this, not only by count:
+/// 10,000 lines of 250 columns took 91 MiB, and a supervisor holds up to 32 screens (hb-807 review
+/// B, MEDIUM 2).
+///
+/// This is a size chosen when the screen is made, not a ceiling that holds for ever. The emulator
+/// fixes its history length at creation and cannot be told a new one, so a window that is widened
+/// afterwards keeps the line count it was made with and its history grows in proportion to the new
+/// width. That width is the owner's own terminal: the agent cannot change it (its resize requests are
+/// only counted), so what an agent prints can never push a screen past the size it was made for.
+pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+/// What one cell of history costs in resident memory: measured at 76 to 98 bytes with vt100 0.16
+/// (filled history of 80, 100, 200, 250 and 400 columns, by `footprint`), plus the screen itself.
+const BYTES_PER_CELL: usize = 100;
+/// History is sized for at least this many columns, so widening the window later does not take
+/// much more than the budget.
+const HISTORY_COLS: usize = 200;
+
+/// How many lines of history a screen of `cols` columns keeps.
+///
+/// Sized from the width at creation and no narrower than 200 columns; a screen widened afterwards
+/// keeps this count (see [`SCROLLBACK_BYTES`]). Never fewer than [`MIN_HISTORY`] lines.
+#[must_use]
+pub fn scrollback_lines(cols: u16) -> usize {
+    let width = usize::from(cols).max(HISTORY_COLS);
+    (SCROLLBACK_BYTES / (width * BYTES_PER_CELL)).clamp(MIN_HISTORY, SCROLLBACK_LINES)
+}
+
+/// The fewest lines of history a screen keeps. Small enough that even the widest possible window
+/// (65,535 columns) stays near the budget; a real terminal is never that wide.
+pub const MIN_HISTORY: usize = 10;
 /// The smallest size an emulator is given; a hidden pane keeps its last valid size instead.
 pub const MIN_ROWS: u16 = 1;
 /// See [`MIN_ROWS`].
@@ -195,7 +225,7 @@ impl SessionScreen {
             parser: Parser::new_with_callbacks(
                 rows.max(MIN_ROWS),
                 cols.max(MIN_COLS),
-                SCROLLBACK_LINES,
+                scrollback_lines(cols),
                 Recorder::default(),
             ),
             osc: OscCap::new(),
@@ -503,13 +533,77 @@ mod tests {
     #[test]
     fn scrollback_is_bounded_and_the_view_can_move_back_and_return() {
         let mut screen = SessionScreen::new(3, 10);
-        for n in 0..(SCROLLBACK_LINES + 50) {
+        let cap = scrollback_lines(10);
+        for n in 0..(cap + 50) {
             screen.process(format!("line {n}\r\n").as_bytes());
         }
         screen.scroll_to(usize::MAX);
-        assert_eq!(screen.scrolled(), SCROLLBACK_LINES, "history is capped");
+        assert_eq!(screen.scrolled(), cap, "history is capped");
         screen.scroll_to(0);
         assert_eq!(screen.scrolled(), 0);
+    }
+
+    #[test]
+    fn history_is_sized_by_memory_not_only_by_line_count() {
+        // Narrow screens keep the line cap; wide ones keep fewer lines, so the bytes stay bounded.
+        assert_eq!(scrollback_lines(80), scrollback_lines(200));
+        assert!(scrollback_lines(80) <= SCROLLBACK_LINES);
+        assert!(scrollback_lines(250) < scrollback_lines(200));
+        for cols in [1_u16, 80, 100, 200, 250, 400, 1000] {
+            let lines = scrollback_lines(cols);
+            assert!(
+                (MIN_HISTORY..=SCROLLBACK_LINES).contains(&lines),
+                "{cols}: {lines}"
+            );
+            let bytes = lines * usize::from(cols).max(HISTORY_COLS) * BYTES_PER_CELL;
+            assert!(
+                bytes <= SCROLLBACK_BYTES || lines == MIN_HISTORY,
+                "{cols} columns: {bytes} bytes of history"
+            );
+        }
+        // Even the widest window the protocol allows stays within a small multiple of the budget.
+        let widest = scrollback_lines(u16::MAX) * usize::from(u16::MAX) * BYTES_PER_CELL;
+        assert!(
+            widest < 12 * SCROLLBACK_BYTES,
+            "{widest} bytes at 65,535 columns"
+        );
+        for cols in [1_u16, 80, 250, u16::MAX] {
+            assert!(scrollback_lines(cols) >= MIN_HISTORY);
+        }
+    }
+
+    #[test]
+    fn a_wide_screen_keeps_fewer_lines_of_history_than_a_narrow_one_and_never_more_than_its_cap() {
+        // The history that is actually kept, which is what the budget limits. Process memory was
+        // measured once when this was written (87 to 95 MiB for 10,000 lines of 250 columns before,
+        // 26 MiB after) but is too noisy under load to assert on.
+        for cols in [80_u16, 250, 400] {
+            let mut screen = SessionScreen::new(30, cols);
+            let line = format!("{}\r\n", "x".repeat(usize::from(cols) - 1));
+            let cap = scrollback_lines(cols);
+            for _ in 0..(cap + 500) {
+                screen.process(line.as_bytes());
+            }
+            screen.scroll_to(usize::MAX);
+            assert_eq!(screen.scrolled(), cap, "{cols} columns");
+        }
+        assert!(scrollback_lines(250) < scrollback_lines(80));
+        assert!(scrollback_lines(400) < scrollback_lines(250));
+    }
+
+    #[test]
+    fn a_screen_widened_after_it_was_made_keeps_the_line_count_it_was_made_with() {
+        // The documented limit, pinned: the emulator cannot change its history length, so widening
+        // changes how much memory the same number of lines takes, never the number of lines.
+        let made_for = scrollback_lines(80);
+        let mut screen = SessionScreen::new(24, 80);
+        assert!(screen.resize(24, 400));
+        let line = format!("{}\r\n", "x".repeat(399));
+        for _ in 0..(made_for + 500) {
+            screen.process(line.as_bytes());
+        }
+        screen.scroll_to(usize::MAX);
+        assert_eq!(screen.scrolled(), made_for);
     }
 
     #[test]

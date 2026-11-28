@@ -81,6 +81,15 @@ impl Router {
         if is_escape(&key) && key.kind == KeyEventKind::Repeat {
             return Vec::new();
         }
+        if app.keys_held() {
+            // Only a deliberate Ctrl-g or Esc gives the keys back, and that press does nothing else.
+            let deliberate = is_escape(&key) || key.code == KeyCode::Esc;
+            return if deliberate && key.kind == KeyEventKind::Press {
+                vec![Msg::ReleaseKeys]
+            } else {
+                Vec::new()
+            };
+        }
         match app.mode {
             Mode::Interact => self.interact(app, key, ctx),
             mode => {
@@ -106,6 +115,9 @@ impl Router {
             return hidden;
         }
         self.left = None;
+        if app.keys_held() {
+            return Vec::new();
+        }
         match app.mode {
             Mode::Interact => target(app)
                 .map(|(id, generation)| {
@@ -222,7 +234,7 @@ fn launch(key: &KeyEvent) -> Vec<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::supervised::Event;
+    use crate::session::supervised::{Cleanup, Event};
     use crate::supervise::app::{Effect, LaunchSpec};
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -429,6 +441,107 @@ mod tests {
         app.update(Msg::AskStop);
         app.update(Msg::Answer(true));
         assert_eq!(written(&mut app, vec![input(b"x")]), Vec::<Vec<u8>>::new());
+    }
+
+    // ========================================================================
+    // Keys typed to an agent that has just stopped (hb-807 review B, MEDIUM 1)
+    // ========================================================================
+
+    /// The agent exits while the owner is typing to it: Interact ends by itself.
+    fn agent_exits_under_the_owner(app: &mut App) {
+        app.update(Msg::Channel {
+            id: SessionId(1),
+            generation: 1,
+            seq: 3,
+            event: Event::Exited {
+                code: Some(0),
+                signal: None,
+                cleanup: Cleanup::Complete {},
+            },
+        });
+        assert_eq!(app.mode, Mode::Overview, "Interact should have ended");
+    }
+
+    #[test]
+    fn keys_still_being_typed_to_an_agent_that_just_exited_are_not_supervisor_commands() {
+        let (mut router, mut app) = (Router::new(), interacting());
+        agent_exits_under_the_owner(&mut app);
+        assert!(app.keys_held());
+        assert!(
+            app.notice.is_some(),
+            "the owner is told why nothing happens"
+        );
+        // `r` would restart, `q` would quit, `n` opens the launch form, Enter would re-enter.
+        for key in ['r', 'q', 'n', 's', 'a', 'j', '1', '?'] {
+            let msgs = feed(&mut router, &mut app, plain(key), &ctx(Layout::Wide));
+            assert_eq!(msgs, Vec::<Msg>::new(), "key {key:?} acted");
+        }
+        let msgs = feed(
+            &mut router,
+            &mut app,
+            press(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx(Layout::Wide),
+        );
+        assert_eq!(msgs, Vec::<Msg>::new());
+        assert_eq!(app.mode, Mode::Overview);
+        assert!(
+            app.pending.is_none(),
+            "a confirmation was opened by held keys"
+        );
+    }
+
+    #[test]
+    fn a_paste_into_an_agent_that_just_exited_does_nothing() {
+        let (mut router, mut app) = (Router::new(), interacting());
+        agent_exits_under_the_owner(&mut app);
+        assert_eq!(
+            router.paste(&app, "rm everything", &ctx(Layout::Wide)),
+            Vec::<Msg>::new()
+        );
+    }
+
+    #[test]
+    fn esc_or_ctrl_g_gives_the_keys_back_and_does_nothing_else() {
+        for release in [press(KeyCode::Esc, KeyModifiers::NONE), ctrl_g()] {
+            let (mut router, mut app) = (Router::new(), interacting());
+            agent_exits_under_the_owner(&mut app);
+            let msgs = feed(&mut router, &mut app, release, &ctx(Layout::Wide));
+            assert_eq!(msgs, vec![Msg::ReleaseKeys]);
+            assert!(!app.keys_held());
+            // From here keys are the supervisor's again.
+            let msgs = feed(&mut router, &mut app, plain('r'), &ctx(Layout::Wide));
+            assert_eq!(msgs, vec![Msg::AskRestart]);
+        }
+    }
+
+    #[test]
+    fn a_key_release_or_a_repeated_escape_does_not_give_the_keys_back() {
+        let (mut router, mut app) = (Router::new(), interacting());
+        agent_exits_under_the_owner(&mut app);
+        let released = kind(ctrl_g(), KeyEventKind::Release);
+        assert_eq!(
+            feed(&mut router, &mut app, released, &ctx(Layout::Wide)),
+            Vec::<Msg>::new()
+        );
+        let repeated = kind(
+            press(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(
+            feed(&mut router, &mut app, repeated, &ctx(Layout::Wide)),
+            Vec::<Msg>::new()
+        );
+        assert!(app.keys_held());
+    }
+
+    #[test]
+    fn leaving_interact_by_hand_does_not_hold_the_keys() {
+        let (mut router, mut app) = (Router::new(), interacting());
+        let msgs = feed(&mut router, &mut app, ctrl_g(), &ctx(Layout::Wide));
+        assert_eq!(msgs, vec![Msg::LeaveInteract]);
+        assert!(!app.keys_held());
+        let msgs = feed(&mut router, &mut app, plain('r'), &ctx(Layout::Wide));
+        assert_eq!(msgs, vec![Msg::AskRestart]);
     }
 
     // ========================================================================

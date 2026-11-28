@@ -105,6 +105,11 @@ impl Interactive {
         })
     }
 
+    /// What the signal thread calls when a stop begins: see [`Relay::stopping_hook`].
+    pub(super) fn stopping_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.relay.stopping_hook()
+    }
+
     /// Copies the user's current window size to the child's pty.
     pub(super) fn resize_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
         let (master, user) = (Arc::clone(&self.master), Arc::clone(&self.user));
@@ -406,7 +411,8 @@ mod tests {
         terminal.finish();
         let after = assert_ok!(rustix::termios::tcgetattr(&user_slave));
         assert_eq!(
-            after.local_modes, before.local_modes,
+            after.local_modes - rustix::termios::LocalModes::PENDIN,
+            before.local_modes - rustix::termios::LocalModes::PENDIN,
             "the terminal was not restored"
         );
         // The relay has ended: later output from the child goes nowhere.

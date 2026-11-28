@@ -174,7 +174,7 @@ fn session_name(session: &Session) -> String {
         || session.spec.project.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    crate::text::Escaped(&raw).to_string()
+    crate::text::EscapedBounded::new(&raw, SHOWN_CHARS).to_string()
 }
 
 /// The part of a row that is the supervisor's: the state words, and the unread count after them.
@@ -326,20 +326,32 @@ fn draw_too_small(frame: &mut Frame<'_>, body: Rect) {
     );
 }
 
-/// The title of the terminal pane: which agent it is, in which project, and where keys go.
+/// The most characters of an agent-chosen path or command shown in a title or dialog.
+const SHOWN_CHARS: usize = 60;
+
+/// A path as the owner sees it: control, escape and direction characters are visible `\u{..}`
+/// forms, and a long one is cut. A path is the agent's to choose, so it is never shown raw
+/// (hb-807 review B, LOW 4).
+fn shown_path(path: &std::path::Path) -> String {
+    crate::text::EscapedBounded::new(&path.to_string_lossy(), SHOWN_CHARS).to_string()
+}
+
+/// The title of the terminal pane: where keys go and the state come first, and the agent's own
+/// words (name, command, project) after them. Anything the agent chooses is escaped and bounded,
+/// so a long or hostile project path cannot push the supervisor's words out of the title.
 fn terminal_title(app: &App, session: &Session, blocked: bool) -> String {
     let command = session.spec.command.first().map_or("", String::as_str);
     let mut title = format!(
-        " {} \u{b7} {} \u{b7} {} \u{b7} {} \u{b7} keys: {} ",
-        session_name(session),
-        command,
-        state_words(session),
-        session.spec.project.display(),
+        " keys: {} \u{b7} {} \u{b7} {} \u{b7} {} \u{b7} {} ",
         if app.mode == Mode::Interact {
             "to the agent"
         } else {
             "to the supervisor"
         },
+        state_words(session),
+        session_name(session),
+        crate::text::EscapedBounded::new(command, SHOWN_CHARS),
+        shown_path(&session.spec.project),
     );
     if blocked {
         title.push_str("\u{b7} clipboard blocked ");
@@ -395,6 +407,26 @@ fn draw_agent(frame: &mut Frame<'_>, inner: Rect, shared: &Shared, show_cursor: 
         cursor.hide();
     }
     frame.render_widget(PseudoTerminal::new(screen.screen()).cursor(cursor), inner);
+    defuse_cells(frame.buffer_mut(), inner);
+}
+
+/// What replaces a character that can hide or reorder text.
+const DEFUSED: &str = "\u{fffd}";
+
+/// Replaces, in the pane's cells, every character that the product's own text rule escapes
+/// (direction overrides, zero-width and other invisible format characters). The emulator keeps
+/// them in a cell and they would reach the real terminal as written, where one can reorder the
+/// supervisor's words beside the pane or make the agent's text read differently from what it is
+/// (hb-807 review B, LOW 3). Control characters never get into a cell, so only these are left.
+fn defuse_cells(buffer: &mut ratatui::buffer::Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            if cell.symbol().chars().any(crate::text::needs_escaping) {
+                cell.set_symbol(DEFUSED);
+            }
+        }
+    }
 }
 
 fn draw_lower(frame: &mut Frame<'_>, rect: Rect, app: &App, look: Look) {
@@ -557,7 +589,7 @@ fn confirm_text(app: &App) -> String {
     let named = |id: SessionId| {
         app.sessions().iter().find(|s| s.id == id).map_or_else(
             || "this session".to_owned(),
-            |s| format!("{} ({})", session_name(s), s.spec.project.display()),
+            |s| format!("{} ({})", session_name(s), shown_path(&s.spec.project)),
         )
     };
     let question = match &app.pending {
@@ -592,7 +624,7 @@ fn launch_text(app: &App) -> String {
         lines.push("Recent projects (Up/Down):".to_owned());
         for (i, project) in recent.iter().take(5).enumerate() {
             let at = if app.form.recent == Some(i) { "*" } else { " " };
-            lines.push(format!("  {at} {}", project.display()));
+            lines.push(format!("  {at} {}", shown_path(project)));
         }
     }
     lines.join("\n")
@@ -785,6 +817,193 @@ mod tests {
 
     const COLOR: Look = Look { color: true };
     const PLAIN: Look = Look { color: false };
+
+    /// A scene with one running session in a project at `path` (the agent's to choose).
+    fn scene_at(path: &str) -> Scene {
+        let mut app = App::new();
+        app.update(Msg::Launch(LaunchSpec {
+            project: PathBuf::from(path),
+            command: vec!["claude".to_owned()],
+        }));
+        event(&mut app, 1, 1, Event::Starting {});
+        event(&mut app, 1, 2, Event::Running { agent_pid: 11 });
+        let shared = Shared::new(30, 100);
+        Scene {
+            app,
+            screens: HashMap::from([(SessionId(1), shared)]),
+        }
+    }
+
+    #[test]
+    fn invisible_and_reordering_characters_in_the_agents_output_do_not_reach_the_frame() {
+        let scene = scene_at("/work/shop");
+        let shared = &scene.screens[&SessionId(1)];
+        if let Ok(mut screen) = shared.screen.lock() {
+            screen.process("safe \u{202e}gnp.exe\u{200b} \u{2066}x\u{2069} tail".as_bytes());
+        }
+        let text = render(&scene, 100, 24, PLAIN);
+        for bad in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{2069}'] {
+            assert!(!text.contains(bad), "{bad:?} reached the frame");
+        }
+        assert!(text.contains("safe"), "ordinary text was lost:\n{text}");
+        assert!(text.contains("tail"), "ordinary text was lost:\n{text}");
+    }
+
+    /// The pane's row that holds `needle`, with the continuation cells of wide characters dropped,
+    /// so what is compared is the text as written.
+    fn pane_text(text: &str, needle: &str) -> String {
+        let line = text
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_default();
+        line.chars().filter(|c| *c != ' ').collect()
+    }
+
+    /// The column, counted in cells, where `marker` starts in the pane's row. A wide character
+    /// takes two cells (the buffer holds the character and then a blank continuation).
+    fn marker_column(text: &str, marker: char) -> Option<usize> {
+        let line = text.lines().find(|l| l.contains(marker))?;
+        line.chars().position(|c| c == marker)
+    }
+
+    #[test]
+    fn ordinary_wide_text_is_untouched_by_defusing() {
+        let scene = scene_at("/work/shop");
+        let shared = &scene.screens[&SessionId(1)];
+        if let Ok(mut screen) = shared.screen.lock() {
+            screen.process("\u{4e2d}\u{6587}|A".as_bytes());
+        }
+        let text = render(&scene, 100, 24, PLAIN);
+        assert!(
+            pane_text(&text, "|A").contains("\u{4e2d}\u{6587}|A"),
+            "wide text was disturbed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_character_with_a_hiding_mark_is_replaced_and_the_cells_after_it_do_not_move() {
+        // The same row twice: once clean, once with a joiner after the wide character. The marker
+        // after it must sit in the same column in both, so defusing replaced a cell and did not
+        // insert or remove one.
+        let at = |content: &str| {
+            let scene = scene_at("/work/shop");
+            let shared = &scene.screens[&SessionId(1)];
+            if let Ok(mut screen) = shared.screen.lock() {
+                screen.process(content.as_bytes());
+            }
+            render(&scene, 100, 24, PLAIN)
+        };
+        let clean = at("\u{4e2d}|B");
+        let hostile = at("\u{4e2d}\u{200d}|B");
+        assert!(
+            !hostile.contains('\u{200d}'),
+            "the joiner reached the frame"
+        );
+        assert_eq!(
+            marker_column(&clean, 'B'),
+            marker_column(&hostile, 'B'),
+            "the cell after the character moved:\nclean:   {clean}\nhostile: {hostile}"
+        );
+    }
+
+    #[test]
+    fn defusing_covers_the_right_edge_of_the_pane_and_leaves_the_border_and_title_alone() {
+        let scene = scene_at("/work/shop");
+        let shared = &scene.screens[&SessionId(1)];
+        let width = terminal_size(Rect::new(0, 0, 100, 24)).map_or(70, |(_, c)| usize::from(c));
+        // Fill a row so the last column of the pane holds a direction override.
+        let mut row = "a".repeat(width.saturating_sub(1));
+        row.push('\u{202e}');
+        if let Ok(mut screen) = shared.screen.lock() {
+            screen.process(format!("{row}\r\n").as_bytes());
+        }
+        let text = render(&scene, 100, 24, PLAIN);
+        assert!(
+            !text.contains('\u{202e}'),
+            "the last column was not defused"
+        );
+        // The trusted title is untouched by the pass over the pane.
+        assert!(text.contains("keys: to the supervisor"), "{text}");
+        assert!(
+            text.contains('\u{250c}') && text.contains('\u{2510}'),
+            "the border was damaged"
+        );
+    }
+
+    #[test]
+    fn defusing_is_repeatable_across_frames() {
+        let scene = scene_at("/work/shop");
+        let shared = &scene.screens[&SessionId(1)];
+        if let Ok(mut screen) = shared.screen.lock() {
+            screen.process("x\u{202e}y\u{2066}z".as_bytes());
+        }
+        let first = render(&scene, 100, 24, PLAIN);
+        let second = render(&scene, 100, 24, PLAIN);
+        assert_eq!(first, second, "a second frame drew something different");
+        assert!(!second.contains('\u{202e}') && !second.contains('\u{2066}'));
+    }
+
+    #[test]
+    fn a_long_project_path_cannot_push_the_supervisors_words_out_of_the_pane_title() {
+        let long = format!("/work/{}", "d".repeat(400));
+        let text = render(&scene_at(&long), 100, 24, PLAIN);
+        let title = text
+            .lines()
+            .find(|l| l.contains("keys:"))
+            .unwrap_or_default();
+        assert!(title.contains("keys: to the supervisor"), "{title}");
+        assert!(title.contains("Running"), "{title}");
+        assert!(
+            !text.contains(&"d".repeat(100)),
+            "the long path was shown whole"
+        );
+    }
+
+    #[test]
+    fn control_and_direction_characters_in_a_project_path_are_shown_as_escapes() {
+        let hostile = "/work/a\u{1b}[2J\u{202e}gnp.exe/b";
+        let text = render(&scene_at(hostile), 120, 24, PLAIN);
+        assert!(
+            !text.contains('\u{1b}'),
+            "an escape byte reached the screen"
+        );
+        assert!(
+            !text.contains('\u{202e}'),
+            "a direction override reached the screen"
+        );
+        assert!(
+            text.contains("\\u{1b}"),
+            "the escape was not made visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_confirm_dialog_shows_a_hostile_path_escaped_and_cut() {
+        // The long part comes first, so the direction override is past the cut and must not be
+        // needed to see the cut: the dialog is checked for each on its own.
+        // The dialog clips by its own width, so check what it is given, not what fits on a screen.
+        let long = scene_at(&format!("/work/{}", "p".repeat(300)));
+        let asked = {
+            let mut app = long.app;
+            app.update(Msg::AskStop);
+            confirm_text(&app)
+        };
+        assert!(asked.contains("Stop "), "{asked}");
+        assert!(asked.contains("..."), "the long path was not cut: {asked}");
+        assert!(
+            !asked.contains(&"p".repeat(100)),
+            "the dialog was given the long path whole"
+        );
+
+        let mut hostile = scene_at("/work/a\u{202e}x");
+        hostile.app.update(Msg::AskStop);
+        let text = render(&hostile, 120, 30, PLAIN);
+        assert!(text.contains("Stop "), "{text}");
+        assert!(
+            !text.contains('\u{202e}'),
+            "a direction override reached the dialog"
+        );
+    }
 
     #[test]
     fn snapshot_overview_120x40_color() {

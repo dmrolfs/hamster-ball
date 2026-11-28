@@ -1106,6 +1106,8 @@ fn start_on_pty(
         }
     };
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+    // A stop must not wait for a terminal that nobody reads: see `Relay::stopping_hook`.
+    let watch = watch.also_on_stopping(terminal.stopping_hook());
     // The child leads its own session and group, and the terminal's keys reach it through the
     // pty, so every signal hb gets is an explicit one: all are forwarded to the group.
     match watch.start(
