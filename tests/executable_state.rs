@@ -570,6 +570,56 @@ fn a_project_extending_each_shipped_preset_runs_its_offline_tool_from_its_own_ca
     }
 }
 
+// ---- hb-82i round 3: a denied project-local path cannot be bypassed by moving, replacing or linking around it.
+#[test]
+fn a_denied_project_path_cannot_be_bypassed_by_rename_symlink_or_hard_link() {
+    sandboxed!();
+    let w = agent_world("claude", "");
+    let p = quote(&w.project);
+    // Each script must FAIL and leave no denied path behind; each is its own run so one refusal cannot hide another.
+    for (what, script, leftover) in [
+        (
+            "write into a directory the ball made",
+            format!("cd {p} && mkdir -p .claude && echo x > .claude/settings.json"),
+            ".claude/settings.json",
+        ),
+        (
+            "rename a protected-ancestor aside",
+            format!("cd {p} && mkdir -p .claude && mv .claude .claude-old"),
+            ".claude-old",
+        ),
+        (
+            "replace the directory by a symlink to a writable one",
+            format!(
+                "cd {p} && mkdir -p elsewhere .claude && rm -rf .claude && ln -s elsewhere .claude && echo x > .claude/settings.json"
+            ),
+            "elsewhere/settings.json",
+        ),
+        (
+            "rename a temp file over a denied file",
+            format!("cd {p} && echo x > t.json && mv -f t.json .mcp.json"),
+            ".mcp.json",
+        ),
+        (
+            "create a denied file as a symlink",
+            format!("cd {p} && ln -s /tmp/x .mcp.json"),
+            ".mcp.json",
+        ),
+        (
+            "hard-link a writable file to a denied name",
+            format!("cd {p} && echo x > h.json && ln h.json .mcp.json"),
+            ".mcp.json",
+        ),
+    ] {
+        let out = run(&w, &script);
+        assert!(!out.status.success(), "{what} succeeded: {}", text(&out));
+        assert!(
+            fs::symlink_metadata(w.project.join(leftover)).is_err(),
+            "{what}: {leftover} exists afterwards"
+        );
+    }
+}
+
 // ---- Versioned inventory (hb-tx4 criteria 1 and 3). Test-only table; shortcut: move to src/ when hb-82i makes presets consume it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
