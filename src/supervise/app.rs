@@ -64,8 +64,11 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Whether the session still has a process. `Approve` does not: `hb` has already exited 78
-    /// and nothing runs until the owner reviews the config and restarts the session.
+    fn holds_slot(&self) -> bool {
+        self.is_live() || *self == Self::Lost
+    }
+
+    /// Whether the session accepts live lifecycle reports.
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Stopping)
@@ -378,15 +381,23 @@ pub enum Msg {
         /// What it said.
         event: Event,
     },
-    /// The channel ended: end of input, or a frame that could not be read.
+    /// The channel ended normally at end of input.
     ChannelLost {
         /// The session.
         id: SessionId,
         /// The generation.
         generation: Generation,
     },
-    /// The session's process could not be observed to end, or its reports may be incomplete: it
-    /// was killed, and nothing is known about how it ended.
+    /// The channel is malformed; its process still needs to be stopped and reaped.
+    ChannelBroken {
+        /// The session whose channel broke.
+        id: SessionId,
+        /// The launch generation.
+        generation: Generation,
+        /// Why reports can no longer be trusted.
+        reason: String,
+    },
+    /// The reaper could not observe the process or reliably collect its reports.
     SessionLost {
         /// The session.
         id: SessionId,
@@ -600,7 +611,10 @@ impl App {
     /// How many sessions still have a process.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.phase.is_live()).count()
+        self.sessions
+            .iter()
+            .filter(|s| s.phase.holds_slot())
+            .count()
     }
 
     fn find(&mut self, id: SessionId) -> Option<&mut Session> {
@@ -635,6 +649,7 @@ impl App {
         | Msg::SpawnFailed { id, generation, .. }
         | Msg::Channel { id, generation, .. }
         | Msg::ChannelLost { id, generation }
+        | Msg::ChannelBroken { id, generation, .. }
         | Msg::SessionLost { id, generation, .. }
         | Msg::ProcessExited { id, generation, .. }
         | Msg::Input { id, generation, .. }
@@ -649,6 +664,7 @@ impl App {
                 | Msg::SpawnFailed { .. }
                 | Msg::Channel { .. }
                 | Msg::ChannelLost { .. }
+                | Msg::ChannelBroken { .. }
                 | Msg::SessionLost { .. }
                 | Msg::ProcessExited { .. }
         ) {
@@ -685,6 +701,11 @@ impl App {
                 event,
             } => self.channel(id, generation, seq, event),
             Msg::ChannelLost { id, generation } => self.channel_lost(id, generation),
+            Msg::ChannelBroken {
+                id,
+                generation,
+                reason,
+            } => self.channel_broken(id, generation, &reason),
             Msg::SessionLost {
                 id,
                 generation,
@@ -919,6 +940,22 @@ impl App {
         Vec::new()
     }
 
+    fn channel_broken(
+        &mut self,
+        id: SessionId,
+        generation: Generation,
+        reason: &str,
+    ) -> Vec<Effect> {
+        let Some(session) = self.current(id, generation) else {
+            return Vec::new();
+        };
+        if session.exit.is_some() || session.phase == Phase::Approve {
+            self.alert(id, format!("channel broke: {reason}"));
+            return vec![Effect::Stop { id, generation }];
+        }
+        self.break_session(id, reason)
+    }
+
     fn channel_lost(&mut self, id: SessionId, generation: Generation) -> Vec<Effect> {
         let Some(session) = self.current(id, generation) else {
             return Vec::new();
@@ -1097,7 +1134,7 @@ impl App {
             && self
                 .sessions
                 .iter()
-                .any(|s| s.id == id && !s.phase.is_live())
+                .any(|s| s.id == id && !s.phase.holds_slot())
         {
             self.refuse(&Refusal::TooManySessions);
             return Vec::new();
@@ -1367,6 +1404,92 @@ mod tests {
 
     fn only(app: &App) -> &Session {
         assert_some!(app.sessions().first())
+    }
+
+    #[test]
+    fn a_broken_channel_stops_live_and_reported_sessions_but_ignores_stale_generations() {
+        for final_report in [false, true] {
+            let mut app = running();
+            if final_report {
+                app.update(channel(
+                    1,
+                    1,
+                    3,
+                    Event::Exited {
+                        code: Some(0),
+                        signal: None,
+                        cleanup: Cleanup::Complete {},
+                    },
+                ));
+            }
+            let before = app.clone();
+            assert!(
+                app.update(Msg::ChannelBroken {
+                    id: SessionId(1),
+                    generation: 0,
+                    reason: "bad".into()
+                })
+                .is_empty()
+            );
+            assert_eq!(app, before);
+            let effects = app.update(Msg::ChannelBroken {
+                id: SessionId(1),
+                generation: 1,
+                reason: "bad".into(),
+            });
+            assert_eq!(
+                effects,
+                vec![Effect::Stop {
+                    id: SessionId(1),
+                    generation: 1
+                }]
+            );
+            assert_eq!(
+                only(&app).phase,
+                if final_report {
+                    Phase::Exited
+                } else {
+                    Phase::Lost
+                }
+            );
+            assert_eq!(only(&app).exit, only(&before).exit);
+        }
+    }
+
+    #[test]
+    fn a_lost_channel_holds_its_slot_until_the_process_is_reaped() {
+        let mut app = App::new();
+        for _ in 0..MAX_SESSIONS {
+            app.update(Msg::Launch(spec("shop")));
+        }
+        app.update(Msg::ChannelLost {
+            id: SessionId(1),
+            generation: 1,
+        });
+        assert_eq!(app.live_count(), MAX_SESSIONS);
+        let mut replacement = app.clone();
+        assert!(matches!(
+            replacement.restart(SessionId(1)).as_slice(),
+            [Effect::Spawn { .. }]
+        ));
+        let mut quit = app.clone();
+        assert!(quit.update(Msg::AskQuit).is_empty());
+        assert!(
+            !quit.is_quitting(),
+            "lost processes still require quit confirmation"
+        );
+        assert!(app.update(Msg::Launch(spec("ninth"))).is_empty());
+        app.update(Msg::ProcessExited {
+            id: SessionId(1),
+            generation: 1,
+            code: None,
+            signal: Some(9),
+        });
+        assert_eq!(app.live_count(), MAX_SESSIONS - 1);
+        assert!(matches!(
+            app.update(Msg::Launch(spec("replacement"))).as_slice(),
+            [Effect::Spawn { .. }]
+        ));
     }
 
     #[test]
