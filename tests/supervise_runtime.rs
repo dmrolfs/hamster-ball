@@ -46,6 +46,7 @@ fn runtime(w: &World) -> Runtime {
 
 fn launch(w: &World, command: &[&str]) -> Msg {
     Msg::Launch(LaunchSpec {
+        logging: Default::default(),
         project: w.project.clone(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
     })

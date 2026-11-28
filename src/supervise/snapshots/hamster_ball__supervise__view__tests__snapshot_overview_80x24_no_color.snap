@@ -26,4 +26,4 @@ expression: "render(&scene(), 80, 24, PLAIN)"
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 billing: needs approval
- OVERVIEW  Enter interact · n new · s stop · r restart · a approve · Tab switch
+ OVERVIEW Enter interact | n new | Tab panels | ? | q quit

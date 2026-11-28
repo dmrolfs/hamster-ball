@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use snafu::Snafu;
 use strum::{Display, IntoStaticStr};
 
+pub use super::argv::SplitError;
+
 use crate::session::supervised::{Cleanup, Event};
 
 /// Most sessions at once.
@@ -34,9 +36,29 @@ pub struct SessionId(pub u32);
 /// Which start of a session this is; a restart raises it.
 pub type Generation = u32;
 
+/// Streams requested from hb for one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Logging {
+    /// Report denial events.
+    pub denials: bool,
+    /// Report proxy events.
+    pub proxy: bool,
+}
+
+impl Default for Logging {
+    fn default() -> Self {
+        Self {
+            denials: true,
+            proxy: true,
+        }
+    }
+}
+
 /// What the owner asked to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
+    /// Logging choices retained across restarts.
+    pub logging: Logging,
     /// The project directory `hb` runs in.
     pub project: PathBuf,
     /// The agent command and its arguments, after `--`.
@@ -263,6 +285,10 @@ pub enum Field {
     Project,
     /// The agent command.
     Command,
+    /// Denial logging switch.
+    Denials,
+    /// Proxy logging switch.
+    Proxy,
 }
 
 /// One edit of the launch form.
@@ -274,6 +300,8 @@ pub enum FormEdit {
     Backspace,
     /// Move to the other field.
     SwitchField,
+    /// Move to the preceding field.
+    PreviousField,
     /// Pick a recent project: `true` for an older one, `false` for a newer one.
     Recent(bool),
 }
@@ -281,9 +309,11 @@ pub enum FormEdit {
 /// The launch form: two single-line fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchForm {
+    /// Requested event streams.
+    pub logging: Logging,
     /// The project directory, as typed.
     pub project: String,
-    /// The agent command, as typed; split on whitespace when started.
+    /// The agent command with literal shell-style quoting, without expansion.
     pub command: String,
     /// Which field takes typing.
     pub field: Field,
@@ -294,6 +324,7 @@ pub struct LaunchForm {
 impl LaunchForm {
     fn empty() -> Self {
         Self {
+            logging: Logging::default(),
             project: String::new(),
             command: String::new(),
             field: Field::Project,
@@ -323,6 +354,12 @@ pub enum Refusal {
     /// There is no command to run.
     #[snafu(display("the agent command is empty"))]
     EmptyCommand,
+    /// The command contains unfinished quoting.
+    #[snafu(display("invalid command: {source}"))]
+    MalformedCommand {
+        /// The quoting error.
+        source: SplitError,
+    },
     /// The terminal is too small to show the agent, so keys must not be sent to it unseen.
     #[snafu(display("the terminal is too small to interact; make it larger"))]
     TerminalTooSmall,
@@ -1265,7 +1302,7 @@ impl App {
             .iter()
             .rev()
             .find(|s| s.spec.project == project)
-            .map(|s| s.spec.command.join(" "))
+            .map(|s| super::argv::join(&s.spec.command))
             .unwrap_or_default()
     }
 
@@ -1274,6 +1311,7 @@ impl App {
             return Vec::new();
         }
         self.form = LaunchForm {
+            logging: Logging::default(),
             project: cwd.display().to_string(),
             command: self.last_command(cwd),
             field: Field::Command,
@@ -1288,26 +1326,42 @@ impl App {
             return Vec::new();
         }
         match edit {
-            FormEdit::SwitchField => {
-                self.form.field = match self.form.field {
-                    Field::Project => Field::Command,
-                    Field::Command => Field::Project,
-                };
+            FormEdit::SwitchField | FormEdit::PreviousField => {
+                let fields = [Field::Project, Field::Command, Field::Denials, Field::Proxy];
+                let at = fields
+                    .iter()
+                    .position(|f| *f == self.form.field)
+                    .unwrap_or(0);
+                self.form.field =
+                    fields[(at + if edit == FormEdit::SwitchField { 1 } else { 3 }) % 4];
             }
-            FormEdit::Char(c) if !c.is_control() => self.field_mut().push(c),
+            FormEdit::Char(' ') if self.form.field == Field::Denials => {
+                self.form.logging.denials = !self.form.logging.denials
+            }
+            FormEdit::Char(' ') if self.form.field == Field::Proxy => {
+                self.form.logging.proxy = !self.form.logging.proxy
+            }
+            FormEdit::Char(c) if !c.is_control() => {
+                if let Some(field) = self.field_mut() {
+                    field.push(c);
+                }
+            }
             FormEdit::Char(_) => {}
             FormEdit::Backspace => {
-                self.field_mut().pop();
+                if let Some(field) = self.field_mut() {
+                    field.pop();
+                }
             }
             FormEdit::Recent(older) => self.pick_recent(older),
         }
         Vec::new()
     }
 
-    fn field_mut(&mut self) -> &mut String {
+    fn field_mut(&mut self) -> Option<&mut String> {
         match self.form.field {
-            Field::Project => &mut self.form.project,
-            Field::Command => &mut self.form.command,
+            Field::Project => Some(&mut self.form.project),
+            Field::Command => Some(&mut self.form.command),
+            Field::Denials | Field::Proxy => None,
         }
     }
 
@@ -1339,14 +1393,17 @@ impl App {
             self.refuse(&Refusal::EmptyProject);
             return Vec::new();
         }
+        let command = match super::argv::split(&self.form.command) {
+            Ok(command) => command,
+            Err(error) => {
+                self.refuse(&Refusal::MalformedCommand { source: error });
+                return Vec::new();
+            }
+        };
         let spec = LaunchSpec {
+            logging: self.form.logging,
             project: PathBuf::from(project),
-            command: self
-                .form
-                .command
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect(),
+            command,
         };
         let effects = self.launch(spec);
         if !effects.is_empty() {
@@ -1365,6 +1422,7 @@ mod tests {
 
     fn spec(name: &str) -> LaunchSpec {
         LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from(format!("/work/{name}")),
             command: vec!["claude".to_owned()],
         }
@@ -2300,7 +2358,7 @@ mod tests {
         assert_eq!(app.form.command, "pi --x");
         app.update(Msg::Form(FormEdit::Backspace));
         assert_eq!(app.form.command, "pi --");
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         type_text(&mut app, "/q");
         assert_eq!(app.form.project, "/p/q");
         // Backspace on an empty field is harmless.
@@ -2308,6 +2366,49 @@ mod tests {
         app.update(Msg::Form(FormEdit::SwitchField));
         app.update(Msg::Form(FormEdit::Backspace));
         assert_eq!(app.form.command, "");
+    }
+
+    #[test]
+    fn command_recall_preserves_arguments_and_logging_survives_restart() {
+        let mut app = App::new();
+        let mut original = spec("shop");
+        original.command = vec!["agent".into(), "two words".into(), "".into(), "a'b".into()];
+        app.update(Msg::Launch(original.clone()));
+        open_form(&mut app, "/work/shop");
+        app.update(Msg::Form(FormEdit::SwitchField));
+        assert_eq!(app.form.field, Field::Denials);
+        app.update(Msg::Form(FormEdit::Char(' ')));
+        let effects = app.update(Msg::SubmitLaunch);
+        let (spec, id) = claims::assert_some!(effects.iter().find_map(|e| match e {
+            Effect::Spawn { spec, id, .. } => Some((spec, id)),
+            _ => None,
+        }));
+        assert_eq!(spec.command, original.command);
+        assert_eq!(
+            spec.logging,
+            Logging {
+                denials: false,
+                proxy: true
+            }
+        );
+        let id = *id;
+        let saved = spec.clone();
+        let restarted = app.restart(id);
+        assert!(
+            restarted
+                .iter()
+                .any(|e| matches!(e, Effect::Spawn { spec, .. } if spec == &saved))
+        );
+    }
+
+    #[test]
+    fn malformed_command_keeps_the_form_open() {
+        let mut app = App::new();
+        open_form(&mut app, "/work/shop");
+        type_text(&mut app, "agent 'unclosed");
+        assert!(app.update(Msg::SubmitLaunch).is_empty());
+        assert_eq!(app.mode, Mode::Launch);
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("quote")));
     }
 
     #[test]
@@ -2322,6 +2423,7 @@ mod tests {
                 id: SessionId(1),
                 generation: 1,
                 spec: LaunchSpec {
+                    logging: Default::default(),
                     project: PathBuf::from("/work/shop"),
                     command: vec!["claude".into(), "--resume".into()],
                 },
@@ -2337,13 +2439,13 @@ mod tests {
         assert_eq!(app.update(Msg::SubmitLaunch), vec![]);
         assert_eq!(app.mode, Mode::Launch);
         assert_eq!(app.notice.as_deref(), Some("the agent command is empty"));
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         for _ in 0..10 {
             app.update(Msg::Form(FormEdit::Backspace));
         }
         app.update(Msg::Form(FormEdit::SwitchField));
         type_text(&mut app, "pi");
-        app.update(Msg::Form(FormEdit::SwitchField));
+        app.update(Msg::Form(FormEdit::PreviousField));
         for _ in 0..20 {
             app.update(Msg::Form(FormEdit::Backspace));
         }
@@ -2375,6 +2477,7 @@ mod tests {
         let mut app = App::new();
         for (name, cmd) in [("a", "claude"), ("b", "pi")] {
             app.update(Msg::Launch(LaunchSpec {
+                logging: Default::default(),
                 project: PathBuf::from(format!("/work/{name}")),
                 command: vec![cmd.to_owned()],
             }));

@@ -858,6 +858,7 @@ mod tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec {
+            logging: Default::default(),
             project: PathBuf::from("/nonexistent/project"),
             command: vec!["agent".to_owned()],
         }
