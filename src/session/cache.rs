@@ -7,7 +7,7 @@
 //! generation into its own session directory. Nothing here follows a symlink out of a tree, and
 //! nothing falls back to the old shared cache.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
@@ -228,6 +228,16 @@ pub enum CacheError {
         grant: PathBuf,
     },
 
+    /// A tool or server changed while `hb warm` was running, so what it built does not match the
+    /// inputs it will be labelled with.
+    #[snafu(display(
+        "{what} changed while hb warm was running, so nothing was published; run `hb warm` again"
+    ))]
+    InputsChangedDuringWarm {
+        /// What changed.
+        what: Mismatch,
+    },
+
     /// There is no per-user temporary directory to build in.
     #[snafu(display("there is no per-user temporary directory to build the cache in"))]
     NoTempDir,
@@ -341,6 +351,30 @@ pub fn copy_tree(src: &Path, dst: &Path, plan: CopyPlan<'_>) -> Result<CopyStats
     copy_tree_with(src, dst, plan, |_| {})
 }
 
+/// [`copy_tree`] for a root hb itself created (a warm workspace): the root must be a real
+/// directory, not a link. [`copy_tree`] resolves the root it is given once, which is right for a
+/// root a person named (a home that is a link) but not for a directory a warm descendant could
+/// have replaced by a link after hb made it.
+///
+/// # Errors
+/// [`CacheError::InvalidEntry`] ([`Rejection::EscapingLink`]) if `src` is a link, otherwise as
+/// [`copy_tree`].
+pub fn copy_owned_tree(
+    src: &Path,
+    dst: &Path,
+    plan: CopyPlan<'_>,
+) -> Result<CopyStats, CacheError> {
+    let meta = fs::symlink_metadata(src).context(ReadSnafu { path: src })?;
+    ensure!(
+        meta.file_type().is_dir(),
+        InvalidEntrySnafu {
+            path: src.to_path_buf(),
+            reason: Rejection::EscapingLink
+        }
+    );
+    copy_tree(src, dst, plan)
+}
+
 /// [`copy_tree`] with a test hook run between inspecting an entry and opening it.
 #[cfg_attr(not(test), allow(unused_variables))]
 fn copy_tree_with(
@@ -403,6 +437,43 @@ fn copy_tree_with(
 fn make_dir_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
     rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_raw_mode(0o700))?;
     Ok(open_dir_nofollow(parent, name)?)
+}
+
+/// Where a test can make publication fail, to prove what each failure leaves behind. In a
+/// production build the points exist but nothing ever arms them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Fault {
+    /// Writing the manifest.
+    Manifest,
+    /// Flushing the staging tree.
+    SyncTree,
+    /// Renaming staging into `generations/`.
+    RenameGeneration,
+    /// Before the `current` record is written.
+    CurrentRecord,
+    /// After the `current` record was written to a temp file and before it is renamed into place.
+    CurrentRename,
+    /// Flushing the directory after `current` was renamed (the commit may have happened).
+    CurrentSync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fails with `phase` if a test armed `at`. Compiled to `Ok(())` outside tests.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn fault_point(at: Fault, phase: Phase) -> Result<(), CacheError> {
+    #[cfg(test)]
+    if FAULT.with(std::cell::Cell::get) == Some(at) {
+        return Err(CacheError::Publish {
+            phase,
+            source: io::Error::other("injected fault"),
+        });
+    }
+    Ok(())
 }
 
 /// Test only: runs after an entry was inspected and before it is opened, to swap it.
@@ -632,6 +703,7 @@ impl Walk<'_> {
         self.ledger
             .observe(
                 (opened.st_dev as u64, opened.st_ino as u64),
+                rel,
                 opened.st_nlink as u64,
             )
             .or_else(|reason| self.reject(rel, reason))?;
@@ -697,27 +769,37 @@ impl Walk<'_> {
 /// Accounts for hard links among the files of a tree: every name of an inode must be in the tree
 /// and every sighting must agree on the link count, so a name that is also somewhere outside, or
 /// that was moved while the walk ran, is caught.
+///
+/// A name is recorded by its path. A file that is renamed into a directory the walk has not
+/// reached yet is therefore seen once under each path, and the second sighting of the SAME inode
+/// under a different path is a name the tree can only have gained by a rename during the walk, so
+/// it is refused rather than counted as a second link.
 #[derive(Debug, Default)]
 struct LinkLedger {
-    /// (device, inode) -> (names seen in the tree, link count at the first sighting).
-    seen: HashMap<(u64, u64), (u64, u64)>,
+    /// (device, inode) -> the names seen for it, and the link count at the first sighting.
+    seen: HashMap<(u64, u64), (BTreeSet<PathBuf>, u64)>,
 }
 
 impl LinkLedger {
-    /// Records one name of `inode` that reported `nlink` links.
-    fn observe(&mut self, inode: (u64, u64), nlink: u64) -> Result<(), Rejection> {
-        let entry = self.seen.entry(inode).or_insert((0, nlink));
-        entry.0 += 1;
-        if entry.1 == nlink {
-            Ok(())
-        } else {
-            Err(Rejection::ForeignHardLink)
+    /// Records the name `path` of `inode`, which reported `nlink` links.
+    fn observe(&mut self, inode: (u64, u64), path: &Path, nlink: u64) -> Result<(), Rejection> {
+        let (names, first) = self
+            .seen
+            .entry(inode)
+            .or_insert_with(|| (BTreeSet::new(), nlink));
+        if *first != nlink || !names.insert(path.to_path_buf()) {
+            return Err(Rejection::ForeignHardLink);
         }
+        Ok(())
     }
 
     /// Fails if any inode has more links than the tree has names for it.
     fn settle(&self) -> Result<(), Rejection> {
-        if self.seen.values().all(|(names, links)| names == links) {
+        let consistent = self
+            .seen
+            .values()
+            .all(|(names, links)| names.len() as u64 == *links);
+        if consistent {
             Ok(())
         } else {
             Err(Rejection::ForeignHardLink)
@@ -1327,9 +1409,16 @@ pub struct CacheStore {
 }
 
 impl CacheStore {
-    /// The store under `root` (normally `~/.cache/hamster-ball`). Performs no I/O.
+    /// The store under `root` (normally `~/.cache/hamster-ball`).
+    ///
+    /// `root` is resolved once, here, to the directory it names today, and every later path is
+    /// built from that. An allowed link on the way (a dotfile manager's `~/.cache`) is therefore
+    /// followed exactly once, by this call, and the no-follow cleanup and copy code below never
+    /// meets it. A root that does not exist yet is kept as given (nothing can be a link in it).
+    /// [`check_store_path`] has already refused a link that a grant could rewrite.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
+        let root = fs::canonicalize(&root).unwrap_or(root);
         Self { root }
     }
 
@@ -1403,6 +1492,19 @@ impl CacheStore {
 }
 
 impl ExpectedInputs {
+    /// The first input that differs between a warm's starting inputs and its inputs now.
+    #[must_use]
+    pub fn changed_since(&self, now: &Self) -> Option<Mismatch> {
+        [
+            (self.project_key != now.project_key, Mismatch::Project),
+            (self.platform != now.platform, Mismatch::Platform),
+            (self.tool_digest != now.tool_digest, Mismatch::Tool),
+            (self.servers != now.servers, Mismatch::Server),
+        ]
+        .into_iter()
+        .find_map(|(differs, what)| differs.then_some(what))
+    }
+
     /// Checks that this (published) set can serve `expected`, naming the first input that differs.
     fn check(&self, id: &str, expected: &Self) -> Result<(), CacheError> {
         let served = expected
@@ -1613,12 +1715,22 @@ impl CacheStore {
         let result =
             self.seal_and_publish_inner(workspace, &staging, &id, inputs, old_root, limits);
         if let Err(error) = &result {
-            remove_tree(&staging)?;
+            // Every cleanup step runs whatever the others did, and none hides the publish error:
+            // a failed publish with a leftover is reported as the publish error AND the leftover.
+            let mut leftovers: Vec<CacheError> = Vec::new();
+            if let Err(e) = remove_tree(&staging) {
+                leftovers.push(e);
+            }
             // Once the `current` rename may have happened the new generation is what the record
             // names; deleting it would leave a record pointing at nothing. Only an error before
             // that point removes the published directory.
             if !error.may_have_committed() {
-                let _ = std::fs::remove_dir_all(self.generation_dir(&id));
+                if let Err(e) = remove_tree(&self.generation_dir(&id)) {
+                    leftovers.push(e);
+                }
+            }
+            if let Some(first) = leftovers.into_iter().next() {
+                return Err(first);
             }
         }
         result
@@ -1636,7 +1748,7 @@ impl CacheStore {
         self.ensure_dirs()?;
         private_dir(staging).context(ReadSnafu { path: staging })?;
         let data = staging.join("data");
-        let stats = copy_tree(
+        let stats = copy_owned_tree(
             workspace,
             &data,
             CopyPlan {
@@ -1662,13 +1774,16 @@ impl CacheStore {
             phase: Phase::Metadata,
             source: io::Error::other(e),
         })?;
+        fault_point(Fault::Manifest, Phase::Metadata)?;
         write_new(
             &staging.join("manifest.json"),
             &manifest_bytes,
             Phase::Metadata,
         )?;
+        fault_point(Fault::SyncTree, Phase::Sync)?;
         sync_tree(staging)?;
         let published = self.generation_dir(id);
+        fault_point(Fault::RenameGeneration, Phase::Rename)?;
         fs::rename(staging, &published).context(PublishSnafu {
             phase: Phase::Rename,
         })?;
@@ -1703,10 +1818,21 @@ impl CacheStore {
             source: io::Error::other(e),
         })?;
         let tmp = dir.join(format!("current.{}", fresh_id()));
-        write_new(&tmp, &bytes, Phase::Current)?;
-        fs::rename(&tmp, &path).context(PublishSnafu {
-            phase: Phase::Current,
-        })?;
+        let wrote = fault_point(Fault::CurrentRecord, Phase::Current)
+            .and_then(|()| write_new(&tmp, &bytes, Phase::Current))
+            .and_then(|()| fault_point(Fault::CurrentRename, Phase::Current))
+            .and_then(|()| {
+                fs::rename(&tmp, &path).context(PublishSnafu {
+                    phase: Phase::Current,
+                })
+            });
+        if let Err(error) = wrote {
+            // A record that was written but not renamed is not selectable (only `current` is read),
+            // but it is still a leftover; remove it so a failed publish leaves nothing behind.
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        fault_point(Fault::CurrentSync, Phase::CurrentSync)?;
         sync_dir(dir, Phase::CurrentSync)
     }
 }
@@ -2922,17 +3048,17 @@ mod tests {
     fn test_link_ledger_catches_an_outside_name_and_a_count_that_changed_mid_walk() {
         let mut ledger = LinkLedger::default();
         // Two names, both in the tree, and the filesystem says 2 links: fine.
-        assert_ok!(ledger.observe((1, 10), 2));
-        assert_ok!(ledger.observe((1, 10), 2));
+        assert_ok!(ledger.observe((1, 10), Path::new("n1"), 2));
+        assert_ok!(ledger.observe((1, 10), Path::new("n2"), 2));
         assert_ok!(ledger.settle());
         // Another inode reports 2 links but only one name is in the tree.
-        assert_ok!(ledger.observe((1, 11), 2));
+        assert_ok!(ledger.observe((1, 11), Path::new("n3"), 2));
         assert_eq!(assert_err!(ledger.settle()), Rejection::ForeignHardLink);
         // A name that sees a different link count than the first sighting was added or moved.
         let mut moved = LinkLedger::default();
-        assert_ok!(moved.observe((1, 12), 1));
+        assert_ok!(moved.observe((1, 12), Path::new("m1"), 1));
         assert_eq!(
-            assert_err!(moved.observe((1, 12), 2)),
+            assert_err!(moved.observe((1, 12), Path::new("m2"), 2)),
             Rejection::ForeignHardLink
         );
     }
@@ -3183,6 +3309,258 @@ mod tests {
                 }
             ),
             "{got}"
+        );
+    }
+
+    #[test]
+    fn test_changed_since_names_the_first_input_that_moved_and_is_none_for_equal_inputs() {
+        let a = inputs();
+        assert_eq!(a.changed_since(&a.clone()), None);
+        let mut tool = a.clone();
+        tool.tool_digest = "other".into();
+        assert_eq!(a.changed_since(&tool), Some(Mismatch::Tool));
+        let mut server = a.clone();
+        server.servers.insert("time".into(), "new-args".into());
+        assert_eq!(a.changed_since(&server), Some(Mismatch::Server));
+        let mut extra = a.clone();
+        extra.servers.insert("added".into(), "d".into());
+        assert_eq!(
+            a.changed_since(&extra),
+            Some(Mismatch::Server),
+            "a server added mid-warm"
+        );
+        let mut project = a.clone();
+        project.project_key = "elsewhere".into();
+        assert_eq!(a.changed_since(&project), Some(Mismatch::Project));
+    }
+
+    /// The reviewer's sequence: one hard-link name inside the tree and one outside it; while the
+    /// walk runs, the inside name is renamed into a later directory, so the same inode is copied
+    /// under two paths and both sightings report two links.
+    #[test]
+    fn test_a_hard_link_name_moved_into_a_later_directory_during_the_walk_is_refused() {
+        let (d, src, dst) = world();
+        put(&src.join("a/x"), "shared");
+        put(&src.join("b/keep"), "k");
+        assert_ok!(fs::hard_link(
+            src.join("a/x"),
+            d.path().join("outside-name")
+        ));
+        let (from, to) = (src.join("a/x"), src.join("b/x"));
+        let moved = std::cell::Cell::new(false);
+        let moved = std::rc::Rc::new(moved);
+        let flag = moved.clone();
+        let got = copy_tree_with(&src, &dst, plan(None), move |path| {
+            // After `a/x` was copied, move it to `b`, which is enumerated later.
+            if path == src_b_keep(&to) && !flag.get() {
+                flag.set(true);
+                let _ = fs::rename(&from, &to);
+            }
+        });
+        assert!(moved.get(), "the rename happened during the walk");
+        let got = assert_err!(got);
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::ForeignHardLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    /// The path the hook sees for `b/keep`, given where `b/x` will be.
+    fn src_b_keep(moved_to: &Path) -> PathBuf {
+        moved_to.with_file_name("keep")
+    }
+
+    #[test]
+    fn test_the_same_inode_under_two_paths_is_never_two_links() {
+        let mut ledger = LinkLedger::default();
+        assert_ok!(ledger.observe((1, 10), Path::new("a/x"), 2));
+        // The same name again (a revisit) is not a second link either.
+        assert_eq!(
+            assert_err!(ledger.observe((1, 10), Path::new("a/x"), 2)),
+            Rejection::ForeignHardLink
+        );
+        // A different path for the same inode IS the second name, and then two names account for 2.
+        let mut two = LinkLedger::default();
+        assert_ok!(two.observe((1, 11), Path::new("a/x"), 2));
+        assert_ok!(two.observe((1, 11), Path::new("b/y"), 2));
+        assert_ok!(two.settle());
+    }
+
+    #[test]
+    fn test_a_store_behind_an_allowed_link_cleans_up_a_failed_seal_instead_of_leaking_staging() {
+        let (d, root, _store) = store();
+        let real = root.join("real-cache");
+        assert_ok!(fs::create_dir_all(&real));
+        let via = root.join("link-to-cache");
+        assert_ok!(symlink(&real, &via));
+        let store = CacheStore::new(via.clone());
+        let ws = workspace(&store, &[("f", "x")]);
+        assert_ok!(symlink("/etc/passwd", ws.join("escape")));
+        let got = assert_err!(store.seal_and_publish(&ws, &inputs(), None, loose()));
+        assert!(matches!(got, CacheError::InvalidEntry { .. }), "{got}");
+        let left = fs::read_dir(real.join("staging")).map_or(0, Iterator::count);
+        assert_eq!(
+            left, 0,
+            "the staging tree was removed through the resolved store root"
+        );
+        let _ = d;
+    }
+
+    // ---- publication faults: what each failure actually leaves (acceptance criteria 2 and 3) ----
+
+    /// Arms `fault` for the current thread for the duration of `f`.
+    fn with_fault<T>(fault: Fault, f: impl FnOnce() -> T) -> T {
+        FAULT.with(|cell| cell.set(Some(fault)));
+        let out = f();
+        FAULT.with(|cell| cell.set(None));
+        out
+    }
+
+    fn entries_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_a_fault_before_the_current_record_changes_leaves_the_old_generation_and_no_leftovers() {
+        for fault in [
+            Fault::Manifest,
+            Fault::SyncTree,
+            Fault::RenameGeneration,
+            Fault::CurrentRecord,
+            Fault::CurrentRename,
+        ] {
+            let (_d, root, store) = store();
+            let first = workspace(&store, &[("f", "old")]);
+            let old = assert_ok!(store.seal_and_publish(&first, &inputs(), None, loose()));
+            let before = entries_in(&root.join("generations"));
+            let ws = workspace(&store, &[("f", "new")]);
+            let got = with_fault(fault, || {
+                store.seal_and_publish(&ws, &inputs(), None, loose())
+            });
+            let got = assert_err!(got);
+            assert!(!got.may_have_committed(), "{fault:?}: {got}");
+            assert_eq!(
+                assert_ok!(store.select(&inputs())),
+                old,
+                "{fault:?}: still the old generation"
+            );
+            assert_eq!(
+                entries_in(&root.join("staging")),
+                Vec::<String>::new(),
+                "{fault:?}: staging"
+            );
+            assert_eq!(
+                entries_in(&root.join("generations")),
+                before,
+                "{fault:?}: no half generation"
+            );
+            let record_dir = root.join("projects/pk");
+            let stray: Vec<String> = entries_in(&record_dir)
+                .into_iter()
+                .filter(|n| n.starts_with("current."))
+                .collect();
+            assert!(
+                stray.is_empty(),
+                "{fault:?}: a temp record was left: {stray:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_fault_after_the_current_rename_keeps_the_new_generation_the_record_names() {
+        let (_d, root, store) = store();
+        let first = workspace(&store, &[("f", "old")]);
+        let old = assert_ok!(store.seal_and_publish(&first, &inputs(), None, loose()));
+        let ws = workspace(&store, &[("f", "new")]);
+        let got = with_fault(Fault::CurrentSync, || {
+            store.seal_and_publish(&ws, &inputs(), None, loose())
+        });
+        let got = assert_err!(got);
+        assert!(got.may_have_committed(), "{got}");
+        // The rename happened, so `current` names the new generation and it must still be there.
+        let found = assert_ok!(store.select(&inputs()));
+        assert_ne!(found.id, old.id, "the new record is what readers see");
+        assert_eq!(assert_ok!(fs::read_to_string(found.root.join("f"))), "new");
+        assert_eq!(
+            entries_in(&root.join("generations")).len(),
+            2,
+            "both generations are on disk"
+        );
+        assert_eq!(entries_in(&root.join("staging")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_a_fault_with_nothing_published_yet_leaves_no_current_record_and_nothing_selectable() {
+        for fault in [
+            Fault::Manifest,
+            Fault::SyncTree,
+            Fault::RenameGeneration,
+            Fault::CurrentRecord,
+            Fault::CurrentRename,
+        ] {
+            let (_d, root, store) = store();
+            let ws = workspace(&store, &[("f", "x")]);
+            assert_err!(with_fault(fault, || store.seal_and_publish(
+                &ws,
+                &inputs(),
+                None,
+                loose()
+            )));
+            assert!(
+                matches!(
+                    assert_err!(store.select(&inputs())),
+                    CacheError::MissingGeneration
+                ),
+                "{fault:?}"
+            );
+            assert_eq!(
+                entries_in(&root.join("generations")),
+                Vec::<String>::new(),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sealing_refuses_a_workspace_root_that_was_replaced_by_a_link() {
+        let (d, _root, store) = store();
+        let outside = d.path().join("outside-tree");
+        put(&outside.join("secret"), "OUTSIDE");
+        let ws = workspace(&store, &[("f", "x")]);
+        assert_ok!(fs::remove_dir_all(&ws));
+        assert_ok!(symlink(&outside, &ws));
+        let got = assert_err!(store.seal_and_publish(&ws, &inputs(), None, loose()));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+        assert!(matches!(
+            assert_err!(store.select(&inputs())),
+            CacheError::MissingGeneration
+        ));
+        assert_eq!(
+            assert_ok!(fs::read_to_string(outside.join("secret"))),
+            "OUTSIDE"
         );
     }
 }
