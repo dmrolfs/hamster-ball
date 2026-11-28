@@ -9,6 +9,9 @@
 #
 # Writes: `~/.local/share/opencode` (session database, logs), `~/.cache/opencode` (model list, plugin
 # cache) and `~/.local/state/opencode`. The login (`auth.json`) is in the first, so the agent can read it.
+# `~/.config/opencode` is read only because the preset grants only a read, and it is also denied for writes (hb-82i) so a
+# broader write grant in your own config cannot reopen it. opencode is NOT installed on the machine this was last checked on,
+# so the 1.2.0 measurement above has not been repeated.
 # Not written: what a plain `opencode` runs outside the sandbox, so the agent cannot plant code there:
 # the plugin cache (`~/.cache/opencode/node_modules`, `package.json`, `bun.lock`) and downloaded tools
 # (`~/.local/share/opencode/bin`). Run opencode once outside hb after installing or updating it: it
@@ -36,6 +39,7 @@ read = [
 ]
 write = ["~/.cache/opencode", "~/.local/share/opencode", "~/.local/state/opencode"]
 deny_write = [
+  "~/.config/opencode",
   "~/.cache/opencode/bun.lock",
   "~/.cache/opencode/node_modules",
   "~/.cache/opencode/package.json",

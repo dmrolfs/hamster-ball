@@ -198,6 +198,13 @@ fn agent_world(agent: &str, deny: &str) -> World {
     World::with_base(&base, &format!("extends = [\"agent/{agent}\"]\n"))
 }
 
+/// The pre-hb-82i grants of each agent, kept here as the permissive CONTROL: the attack must work
+/// against them (so the canary is real) and fail against the shipped preset.
+fn permissive_world(grants: &str) -> World {
+    let base = "[tls]\nsystem_trust = true\n[fs]\nwrite = [\".\"]\n";
+    World::with_base(base, &format!("[fs]\nwrite = [\".\", {grants}]\n"))
+}
+
 /// Stand-in for the shape of one SessionStart command, not evidence about real claude.
 fn start_like_claude(home: &Path) -> Output {
     let settings: serde_json::Value = assert_ok!(serde_json::from_slice(&assert_ok!(fs::read(
@@ -215,15 +222,12 @@ fn start_like_claude(home: &Path) -> Output {
     )
 }
 
-fn claude_fixture(deny: bool) -> (World, PathBuf, PathBuf) {
-    let w = agent_world(
-        "claude",
-        if deny {
-            "deny_write = [\"~/.claude/settings.json\"]\n"
-        } else {
-            ""
-        },
-    );
+fn claude_fixture(shipped: bool) -> (World, PathBuf, PathBuf) {
+    let w = if shipped {
+        agent_world("claude", "")
+    } else {
+        permissive_world("\"~/.claude\", \"~/.claude.json\"")
+    };
     let settings = w.home_dir().join(".claude/settings.json");
     write(
         &settings,
@@ -287,15 +291,12 @@ fn a_deny_write_on_claude_settings_stops_the_plant_and_the_hook() {
     assert!(!marker.exists());
 }
 
-fn kiro_fixture(deny: bool) -> (World, PathBuf, PathBuf, PathBuf) {
-    let w = agent_world(
-        "kiro",
-        if deny {
-            "deny_write = [\"~/Library/Application Support/kiro-cli/run\"]\n"
-        } else {
-            ""
-        },
-    );
+fn kiro_fixture(shipped: bool) -> (World, PathBuf, PathBuf, PathBuf) {
+    let w = if shipped {
+        agent_world("kiro", "")
+    } else {
+        permissive_world("\"~/.kiro\", \"~/Library/Application Support/kiro-cli\"")
+    };
     let program = w.home_dir().join(".local/bin/kiro-cli");
     let alias = w
         .home_dir()
@@ -502,7 +503,15 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.cache/claude",
             "~/.local/state/claude",
         ],
-        deny: &[],
+        deny: &[
+            "~/.claude/settings.json",
+            "~/.claude.json",
+            "~/.claude/hooks",
+            "~/.claude/plugins",
+            "~/.claude/commands",
+            "~/.claude/agents",
+            "~/.claude/shell-snapshots",
+        ],
         preset_toml: include_str!("../presets/agent/claude.toml"),
         entries: &[
             e(
@@ -538,10 +547,21 @@ const INVENTORY: &[AgentInventory] = &[
         preset: "pi",
         binary: "pi",
         version: "1.7.0",
-        preset_version: "1.6.0",
-        accepted_drift: Some("hb-82i re-measures the preset against the installed agent"),
+        preset_version: "1.7.0",
+        accepted_drift: None,
         write: &["~/.pi/agent"],
-        deny: &["~/.pi/agent/bin", "~/.pi/agent/install"],
+        deny: &[
+            "~/.pi/agent/bin",
+            "~/.pi/agent/install",
+            "~/.pi/agent/settings.json",
+            "~/.pi/agent/models.json",
+            "~/.pi/agent/models-store.json",
+            "~/.pi/agent/trust.json",
+            "~/.pi/agent/extensions",
+            "~/.pi/agent/npm",
+            "~/.pi/agent/git",
+            "~/.pi/agent/agents",
+        ],
         preset_toml: include_str!("../presets/agent/pi.toml"),
         entries: &[
             e("~/.pi/agent/extensions", Executable, "read"),
@@ -563,6 +583,26 @@ const INVENTORY: &[AgentInventory] = &[
                 Executable,
                 "assumed: records what pi trusts",
             ),
+            e(
+                "~/.pi/agent/models-store.json",
+                Mixed(RequiresIsolation),
+                "read: provider routing (key names only); denied with models.json",
+            ),
+            e(
+                "~/.pi/agent/auth.json",
+                SessionData,
+                "read: pi's login, kept writable so a refresh can work; whether pi runs it is unmeasured",
+            ),
+            e(
+                "~/.pi/agent/bead-goals",
+                SessionData,
+                "read: markdown goal files (names only)",
+            ),
+            e(
+                "~/.pi/agent/web-search-cache",
+                SessionData,
+                "read: cache dir, empty here",
+            ),
             e("~/.pi/agent/AGENTS.md", Instruction, "read"),
             e("~/.pi/agent/skills", Instruction, "read"),
             e("~/.pi/agent/prompts", Instruction, "read"),
@@ -579,8 +619,8 @@ const INVENTORY: &[AgentInventory] = &[
         preset: "kiro",
         binary: "kiro-cli",
         version: "3.6.2",
-        preset_version: "3.5.0",
-        accepted_drift: Some("hb-82i re-measures the preset against the installed agent"),
+        preset_version: "3.6.2",
+        accepted_drift: None,
         write: &["~/.kiro", "~/Library/Application Support/kiro-cli"],
         deny: &[
             "~/Library/Application Support/kiro-cli/bun",
@@ -588,6 +628,10 @@ const INVENTORY: &[AgentInventory] = &[
             "~/Library/Application Support/kiro-cli/kas",
             "~/Library/Application Support/kiro-cli/node",
             "~/Library/Application Support/kiro-cli/tui.js",
+            "~/Library/Application Support/kiro-cli/run/chat-cli-*",
+            "~/Library/Application Support/kiro-cli/shell-integration-backup",
+            "~/.kiro/settings",
+            "~/.kiro/agents",
         ],
         preset_toml: include_str!("../presets/agent/kiro.toml"),
         entries: &[
@@ -654,6 +698,7 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.local/state/opencode",
         ],
         deny: &[
+            "~/.config/opencode",
             "~/.cache/opencode/bun.lock",
             "~/.cache/opencode/node_modules",
             "~/.cache/opencode/package.json",
@@ -707,6 +752,13 @@ fn grants(inv: &AgentInventory, key: &str) -> Vec<String> {
 }
 
 fn under(path: &str, root: &str) -> bool {
+    // `dir/prefix*` covers the entries of `dir` that start with `prefix`; the inventory names the
+    // directory (`dir`) because its entries are version-named, so the directory counts as covered.
+    if let Some(star) = root.strip_suffix('*') {
+        return star
+            .rsplit_once('/')
+            .is_some_and(|(dir, _)| path == dir || path.starts_with(star));
+    }
     path == root
         || path
             .strip_prefix(root)
@@ -720,7 +772,7 @@ fn exposed(inv: &AgentInventory) -> Vec<&Entry> {
     let (write, deny) = (grants(inv, "write"), grants(inv, "deny_write"));
     inv.entries
         .iter()
-        .filter(|en| en.class != SessionData)
+        .filter(|en| matches!(en.class, Executable | Mixed(_)))
         .filter(|en| write.iter().any(|w| under(en.path, w)))
         .filter(|en| !deny.iter().any(|d| under(en.path, d)))
         .collect()
@@ -747,7 +799,7 @@ fn every_write_grant_of_a_shipped_preset_has_inventory_rows_and_every_deny_names
             assert!(
                 inv.entries
                     .iter()
-                    .any(|en| en.class == Executable && under(&deny, en.path)),
+                    .any(|en| matches!(en.class, Executable | Mixed(_)) && under(&deny, en.path)),
                 "{}: deny_write {deny} protects no inventoried executable state",
                 inv.preset
             );
@@ -817,39 +869,92 @@ fn the_reviewed_grant_sets_equal_the_shipped_presets_and_cover_every_agent_prese
     assert_eq!(shipped, known, "a shipped agent preset has no inventory");
 }
 
+/// hb-82i gate: every Executable or Mixed row the inventory lists under a write grant is denied by
+/// the shipped preset, except the rows this bead decided to leave open and named (below).
 #[test]
-fn shipped_presets_leave_the_attacked_paths_writable_today() {
-    let claude = exposed(agent("claude"))
-        .iter()
-        .map(|en| en.path)
-        .collect::<Vec<_>>();
-    assert!(
-        claude.contains(&"~/.claude/settings.json") && claude.contains(&"~/.claude/hooks"),
-        "{claude:?}"
-    );
-    let kiro = exposed(agent("kiro"))
-        .iter()
-        .map(|en| en.path)
-        .collect::<Vec<_>>();
-    assert!(
-        kiro.contains(&"~/Library/Application Support/kiro-cli/run"),
-        "{kiro:?}"
-    );
-    assert!(
-        kiro.contains(&"~/Library/Application Support/kiro-cli/data.sqlite3"),
-        "{kiro:?}"
-    );
-    // pi, opencode: the preset denies its own binaries; the rest stays exposed until hb-82i.
-    assert!(
-        exposed(agent("pi"))
+fn shipped_presets_deny_every_executable_and_mixed_row_except_the_named_residuals() {
+    // path -> why it is left writable; a new entry here needs the same written reason in the preset header.
+    const RESIDUAL: &[(&str, &str)] = &[(
+        "~/Library/Application Support/kiro-cli/data.sqlite3",
+        "login token shares the file with sessions; a refresh over a denied write is unmeasured (kiro.toml header)",
+    )];
+    for inv in INVENTORY {
+        let open: Vec<&str> = exposed(inv)
             .iter()
-            .any(|en| en.path == "~/.pi/agent/extensions")
+            .map(|en| en.path)
+            .filter(|path| !RESIDUAL.iter().any(|(r, _)| r == path))
+            .collect();
+        assert!(
+            open.is_empty(),
+            "{}: executable or mixed rows still writable: {open:?}",
+            inv.preset
+        );
+    }
+    // The residual set is pinned by value, not only by the list above: widening it needs an edit
+    // here AND an owner decision recorded in hb-82i, so one more entry in RESIDUAL cannot hide a hole.
+    let mut all_open: Vec<(&str, &str)> = INVENTORY
+        .iter()
+        .flat_map(|inv| {
+            exposed(inv)
+                .into_iter()
+                .map(move |en| (inv.preset, en.path))
+        })
+        .collect();
+    all_open.sort_unstable();
+    assert_eq!(
+        all_open,
+        [(
+            "kiro",
+            "~/Library/Application Support/kiro-cli/data.sqlite3"
+        )],
+        "the rows left writable changed; that is an owner decision (hb-82i), not a test edit"
     );
-    assert!(
-        !exposed(agent("opencode"))
-            .iter()
-            .any(|en| en.path == "~/.local/share/opencode/bin")
-    );
+    assert_eq!(RESIDUAL.len(), 1, "RESIDUAL grew without an owner decision");
+}
+
+/// hb-82i criterion 2, stated structurally: hb promises that session history stays writable, so no
+/// shipped preset may deny (or fail to grant) a row the inventory calls SessionData. This does not
+/// prove an agent resumes a session; the measured evidence for that is in history/hb-82i_probe-facts.md
+/// (claude wrote its transcript, kiro a session, pi's `sessions` is outside every deny).
+#[test]
+fn no_shipped_preset_denies_or_withholds_a_session_data_row_it_promises() {
+    // The rows each agent's history promise names (presets/README.md, State, login and persistence).
+    const PROMISED: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &[
+                "~/.claude/projects",
+                "~/.claude/sessions",
+                "~/.claude/history.jsonl",
+            ],
+        ),
+        ("pi", &["~/.pi/agent/sessions"]),
+        ("kiro", &["~/.kiro/sessions"]),
+        (
+            "opencode",
+            &["~/.local/share/opencode/storage", "~/.local/state/opencode"],
+        ),
+    ];
+    for (name, rows) in PROMISED {
+        let inv = agent(name);
+        let (write, deny) = (grants(inv, "write"), grants(inv, "deny_write"));
+        for row in *rows {
+            assert!(
+                inv.entries
+                    .iter()
+                    .any(|en| en.path == *row && en.class == SessionData),
+                "{name}: {row} is promised but not inventoried as SessionData"
+            );
+            assert!(
+                write.iter().any(|w| under(row, w)),
+                "{name}: promised history {row} is not writable"
+            );
+            assert!(
+                !deny.iter().any(|d| under(row, d) || under(d, row)),
+                "{name}: promised history {row} is denied or sits above a deny"
+            );
+        }
+    }
 }
 
 /// A report, not a gate: run with `-- --nocapture` to list rows no measurement backs yet.

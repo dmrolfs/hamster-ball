@@ -1,4 +1,4 @@
-# agent/kiro: kiro-cli 3.5.0, measured 2026-11-23 with `kiro-cli chat --no-interactive` behind the proxy.
+# agent/kiro: kiro-cli 3.6.2, measured 2026-11-23 on 3.5.0 and 2026-11-27 on 3.6.2 with `kiro-cli chat --no-interactive` behind the proxy.
 #
 # `~/Library/Application Support/kiro-cli` holds the login database and the agent server (a Node
 # program under `kas/`) that kiro-cli starts. It is written, because the login token is refreshed there,
@@ -6,6 +6,17 @@
 # `bunfig.toml`, `kas`): the agent must not be able to change them. kiro runs without them being
 # writable; it cannot update its own agent server from inside hb, so update it outside.
 # `~/.kiro` holds sessions, settings and logs.
+#
+# Also not written (hb-82i): `run/chat-cli-*` (the program copies a plain `kiro-cli` starts; one was a hard link to
+# `~/.local/bin/kiro-cli`, so a write through it changed the real program), `shell-integration-backup` (copies of shell
+# startup files), `~/.kiro/settings` (MCP commands) and `~/.kiro/agents` (hooks and MCP in agent configs). `run/turn-markers`
+# stays writable: kiro writes there on every chat. Measured on 3.6.2 with all of them denied: a chat answered normally and
+# a session was written.
+#
+# `data.sqlite3` stays writable and is NOT protected: it holds the login token (so a refresh can work) next to
+# conversations and counters. Its 22 settings keys name no path, command or hook, and a chat ran with the file write-denied,
+# but a token refresh without the write was not measured. An owner who does not want the risk can add
+# `deny_write = ["~/Library/Application Support/kiro-cli/data.sqlite3"]` and log in again outside hb when the token expires.
 #
 # Hosts a one-shot chat contacted: app.kiro.dev, runtime / management / telemetry .us-east-1.kiro.dev and
 # client-telemetry.us-east-1.amazonaws.com. cognito-identity is the credential source for that telemetry
@@ -25,6 +36,10 @@ deny_write = [
   "~/Library/Application Support/kiro-cli/kas",
   "~/Library/Application Support/kiro-cli/node",
   "~/Library/Application Support/kiro-cli/tui.js",
+  "~/Library/Application Support/kiro-cli/run/chat-cli-*",
+  "~/Library/Application Support/kiro-cli/shell-integration-backup",
+  "~/.kiro/settings",
+  "~/.kiro/agents",
 ]
 
 [net]
