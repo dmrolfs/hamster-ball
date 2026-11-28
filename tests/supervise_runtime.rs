@@ -46,6 +46,7 @@ fn runtime(w: &World) -> Runtime {
 
 fn launch(w: &World, command: &[&str]) -> Msg {
     Msg::Launch(LaunchSpec {
+        logging: Default::default(),
         project: w.project.clone(),
         command: command.iter().map(|s| (*s).to_owned()).collect(),
     })
@@ -88,6 +89,191 @@ fn agent_pid(runtime: &Runtime, id: u32) -> Option<i32> {
 
 fn alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[test]
+fn malformed_wire_data_triggers_stop_and_reaping_through_the_real_reader() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new(PROJECT);
+    let fake = w.project.join("fake-hb");
+    let stopped = w.project.join("stopped");
+    claims::assert_ok!(std::fs::write(
+        &fake,
+        r#"#!/usr/bin/python3
+import json, os, socket
+s = socket.socket(fileno=int(os.environ['HB_SUPERVISOR_FD']))
+f = s.makefile('rb')
+hello = json.loads(f.readline())
+hello['pid'] = os.getpid()
+s.sendall((json.dumps(hello)+'\n').encode())
+s.sendall(b'{"seq":1,"event":"starting"}\n')
+s.sendall(b'garbage\n')
+command = json.loads(f.readline())
+if command == {'cmd': 'stop'}:
+    open('stopped', 'w').close()
+"#
+    ));
+    claims::assert_ok!(std::fs::set_permissions(
+        &fake,
+        std::fs::Permissions::from_mode(0o700)
+    ));
+    let mut rt = Runtime::new(Paths {
+        hb: fake,
+        me: SUPERVISE.into(),
+        env: vec![],
+    });
+    rt.send(launch(&w, &["/bin/true"]));
+    let failed = run_until(&mut rt, 10, |rt| phase(rt, 1) == Phase::Failed);
+    let clean = rt.shut_down(Duration::from_secs(15));
+    assert!(
+        failed && stopped.exists(),
+        "malformed peer was not stopped via its channel"
+    );
+    assert!(!clean, "broken channel authorized clean completion");
+}
+
+#[test]
+fn a_broken_live_channel_stops_the_process_and_keeps_restart_blocked() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 60"]));
+    assert!(run_until(&mut rt, 10, |rt| phase(rt, 1) == Phase::Running));
+    let pid = assert_some!(agent_pid(&rt, 1));
+    rt.send(Msg::ChannelBroken {
+        id: SessionId(1),
+        generation: 1,
+        reason: "malformed frame".into(),
+    });
+    assert_eq!(phase(&rt, 1), Phase::Lost);
+    assert_eq!(rt.app.live_count(), 1);
+    let stopped = run_until(&mut rt, 15, |rt| {
+        phase(rt, 1) == Phase::Failed && !alive(pid)
+    });
+    rt.send(Msg::AskRestart);
+    let refused = run_until(&mut rt, 15, |rt| phase(rt, 1) == Phase::Failed);
+    assert!(
+        refused && agent_pid(&rt, 1).is_none(),
+        "untrusted generation allowed a replacement"
+    );
+    let clean = rt.shut_down(Duration::from_secs(15));
+    assert!(stopped, "broken channel left an agent running");
+    assert!(!clean, "negative channel evidence was lost");
+}
+
+#[test]
+fn a_flooding_session_does_not_starve_the_shared_runtime_or_other_session() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(
+        &w,
+        &[
+            "/bin/sh",
+            "-c",
+            "yes flood | head -c 30000000; echo FLOOD-DONE",
+        ],
+    ));
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 1; echo QUIET-DONE"]));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut frames = 0;
+    let mut max_step = Duration::ZERO;
+    let mut finished = false;
+    while Instant::now() < deadline {
+        let start = Instant::now();
+        let step = rt.step();
+        max_step = max_step.max(start.elapsed());
+        assert!(
+            step.applied
+                <= hamster_ball::supervise::runtime::MAX_PER_STEP
+                    + hamster_ball::supervise::runtime::INBOX
+        );
+        if rt.frame_due(step.applied > 0, Instant::now()) {
+            frames += 1;
+        }
+        if phase(&rt, 1) == Phase::Exited && phase(&rt, 2) == Phase::Exited {
+            finished = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let bounded = rt.screen(SessionId(1)).is_some_and(|shared| {
+        let mut screen = claims::assert_ok!(shared.screen.lock());
+        screen.scroll_to(usize::MAX);
+        screen.scrolled() <= hamster_ball::supervise::terminal::SCROLLBACK_LINES
+    });
+    let clean = rt.shut_down(Duration::from_secs(15));
+    assert!(
+        finished && clean,
+        "sessions did not complete through the shared runtime"
+    );
+    assert!(
+        bounded && frames > 1,
+        "flood must retain bounded scrollback and allow redraws"
+    );
+    assert!(
+        max_step < Duration::from_millis(250),
+        "step stalled: {max_step:?}"
+    );
+}
+
+#[test]
+fn shared_inbox_flood_preserves_quiet_session_progress_and_frame_turns() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut rt = runtime(&w);
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 60"]));
+    assert!(run_until(&mut rt, 10, |rt| phase(rt, 1) == Phase::Running));
+    rt.send(launch(&w, &["/bin/sh", "-c", "sleep 1; echo quiet"]));
+    let sender = rt.event_sender_for_test();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = stop.clone();
+    let producer = std::thread::spawn(move || {
+        let mut seq = 3;
+        while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            let msg = Msg::Channel {
+                id: SessionId(1),
+                generation: 1,
+                seq,
+                event: hamster_ball::session::supervised::Event::Denial {
+                    text: "flood".into(),
+                },
+            };
+            if sender.try_send(msg).is_ok() {
+                seq += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut frames = 0;
+    let mut last_frame = Instant::now();
+    let mut max_gap = Duration::ZERO;
+    while Instant::now() < deadline && phase(&rt, 2) != Phase::Exited {
+        let step = rt.step();
+        let now = Instant::now();
+        if rt.frame_due(step.applied > 0, now) {
+            max_gap = max_gap.max(now.duration_since(last_frame));
+            last_frame = now;
+            frames += 1;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    claims::assert_ok!(producer.join());
+    let quiet_finished = phase(&rt, 2) == Phase::Exited;
+    let ring = &rt.app.sessions()[0].denials;
+    let bounded = ring.len() <= hamster_ball::supervise::app::DENIAL_RING && ring.evicted > 0;
+    let _ = rt.shut_down(Duration::from_secs(15));
+    assert!(
+        quiet_finished && bounded,
+        "shared inbox flood starved progress or did not exercise eviction"
+    );
+    assert!(
+        frames > 1 && max_gap < Duration::from_millis(250),
+        "frame gap {max_gap:?}"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 source: src/supervise/view.rs
 expression: "render(&scene, 80, 24, COLOR)"
 ---
-┌ shopfront · claude · Running · /work/shopfront · keys: to the supervisor ────┐
+┌ keys: supervisor | Running | shopfront | claude | /work/shopfront ───────────┐
 │$ claude                                                                      │
 │Welcome to shopfront                                                          │
   styles:  BBBBBBB
@@ -27,4 +27,4 @@ expression: "render(&scene, 80, 24, COLOR)"
 └──────────────────────────────────────────────────────────────────────────────┘
 billing: needs approval
   styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
- OVERVIEW  Enter interact · n new · s stop · r restart · a approve · Tab switch
+ OVERVIEW Enter interact | n new | Tab panels | ? | q quit

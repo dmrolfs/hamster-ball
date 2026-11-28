@@ -474,6 +474,10 @@ impl Loop<'_> {
             .and_then(|shared| shared.screen.lock().ok().map(|s| s.modes()))
             .unwrap_or_default();
         let ctx = Context {
+            confirm_fits: super::view::confirm_fits(
+                &self.runtime.app,
+                Rect::new(0, 0, size.width, size.height),
+            ),
             layout: Layout::for_size(size.width, size.height),
             modes,
             cwd: self.cwd,

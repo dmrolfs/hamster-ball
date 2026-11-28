@@ -11,15 +11,15 @@ expression: "render(&scene, 80, 24, COLOR)"
 │                                                                              │
 │    ┌ Help ──────────────────────────────────────────────────────────────┐    │
 │    │Overview keys                                                       │    │
-│    │  j k, arrows   select a session        1-8   jump to a session     │    │
-│    │  Enter         type to the agent       n     start a session       │    │
-│    │  s             stop (asks first)       r     restart (asks first)  │    │
-│    │  a             review approval         Tab   switch Denials / Proxy│    │
-│    │  ?             this help               q     quit (asks first)     │    │
+│    │  j/k or arrows: select     1-8: jump                               │    │
+│    │  Enter: interact          n: new session                           │    │
+│    │  s: stop (confirm)        r: restart (confirm)                     │    │
+│    │  a: review approval       Tab: switch panel                        │    │
+│    │  ?: help                  q: quit (confirm)                        │    │
 │    │                                                                    │    │
-│    │While typing to an agent, every key goes to it.                     │    │
-│    │Ctrl-g returns here. Ctrl-g Ctrl-g sends one Ctrl-g to the agent.   │    │
-│    │Denials are information; there is no allow action here.             │    │
+│    │Interact: every key goes to the selected agent.                     │    │
+│    │Ctrl-g leaves. Ctrl-g twice sends one Ctrl-g.                       │    │
+│    │Denials are information, never permission grants.                   │    │
 │    └────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
 │                                                                              │

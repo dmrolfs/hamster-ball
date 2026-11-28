@@ -68,6 +68,16 @@ The terminal supervisor is optional: `cargo install --locked --path . --features
 Keep these matching binaries in the same directory; the supervisor launches the `hb` beside itself.
 A default build installs only `hb` and does not compile the UI dependencies.
 
+## `hb-supervise`: launch form
+
+Press `n` to open the launch form.
+Tab and Shift-Tab move between project, command, denial logging and proxy logging; Space toggles logging.
+Both logs default to on; restarting a session preserves its choices.
+Command arguments accept single or double quotes and backslash escapes, but never shell expansion or execution.
+Inside double quotes, backslash escapes only a double quote or another backslash.
+For example, `agent --prompt 'fix the cart'` passes one prompt argument, and `''` passes an empty argument.
+Unclosed quotes are refused without closing the form.
+
 ## `hb-supervise`: private channel environment
 
 The launcher passes the private channel descriptor number in `HB_SUPERVISOR_FD`.
