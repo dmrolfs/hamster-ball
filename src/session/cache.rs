@@ -3563,4 +3563,116 @@ mod tests {
             "OUTSIDE"
         );
     }
+
+    /// Review-2 gap: the tool digest must follow the tool's BYTES. Same path, same length, same
+    /// modification time, different content must give a different digest.
+    #[test]
+    fn test_a_tool_replaced_by_an_equal_length_file_with_a_restored_mtime_changes_the_digest() {
+        let (d, root, _store) = store();
+        let bin = assert_ok!(fs::canonicalize({
+            let b = d.path().join("bin");
+            assert_ok!(fs::create_dir_all(&b));
+            b
+        }));
+        let proj = assert_ok!(CanonicalPath::from_canonical(&root));
+        let tools = tools_in(&bin, "uvx", "version-AAAA");
+        let digest_of = |tools: &ToolLookup| {
+            assert_ok!(expected_inputs_for(&proj, &[server("time", &["x"])], tools)).tool_digest
+        };
+        let before = digest_of(&tools);
+        let stamp = assert_ok!(fs::metadata(bin.join("uvx")).and_then(|m| m.modified()));
+        assert_ok!(fs::write(bin.join("uvx"), "version-BBBB"));
+        let f = assert_ok!(fs::OpenOptions::new().write(true).open(bin.join("uvx")));
+        assert_ok!(f.set_modified(stamp));
+        let meta = assert_ok!(fs::metadata(bin.join("uvx")));
+        assert_eq!(meta.len(), "version-AAAA".len() as u64, "same length");
+        assert_eq!(assert_ok!(meta.modified()), stamp, "same modification time");
+        assert_ne!(
+            before,
+            digest_of(&tools),
+            "different bytes, different digest"
+        );
+    }
+
+    /// Review-2 gap: the old cap test never grew the file, so it passed even if bytes were counted
+    /// from the length read BEFORE the copy. Here the file is 4 bytes when inspected (under the
+    /// cap of 6) and 20 when copied, so only counting what is really copied can refuse it.
+    #[test]
+    fn test_a_file_that_grows_after_inspection_is_counted_by_what_is_copied() {
+        let (_d, src, dst) = world();
+        put(&src.join("f"), "1234");
+        let f = src.join("f");
+        let tight = CopyPlan {
+            limits: CacheLimits {
+                max_bytes: 6,
+                ..CacheLimits::default()
+            },
+            rewrite_from: None,
+        };
+        let got = copy_tree_with(&src, &dst, tight, move |path| {
+            if path == f {
+                let mut file = fs::OpenOptions::new().append(true).open(&f).ok();
+                if let Some(file) = file.as_mut() {
+                    let _ = std::io::Write::write_all(file, b"0123456789abcdef");
+                }
+            }
+        });
+        let got = assert_err!(got);
+        assert!(
+            matches!(
+                got,
+                CacheError::BudgetExceeded {
+                    resource: Resource::Bytes,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    /// Review-2 gap: a link that leaves the tree and comes back in BY NAME. `canonicalize` plus a
+    /// prefix check accepts it (it ends up inside); only a component-wise walk that never leaves
+    /// the tree refuses it. The detour goes up out of the destination and back down through the
+    /// destination's own directory name, which exists, so it really does resolve.
+    #[test]
+    fn test_a_link_that_goes_up_out_of_the_destination_and_back_in_by_name_is_refused() {
+        let (_d, src, dst) = world();
+        put(&src.join("target"), "x");
+        assert_ok!(fs::create_dir_all(src.join("deep/er")));
+        let dst_name = assert_some!(dst.file_name()).to_owned();
+        // From dst/deep/er/ : ../../../<dst name>/target  ->  up to dst's parent, back into dst.
+        let detour = Path::new("../../..").join(dst_name).join("target");
+        assert_ok!(symlink(&detour, src.join("deep/er/detour")));
+        // The fixture must really be the dangerous shape: with canonicalize it WOULD resolve inside.
+        let got = assert_err!(copy_tree(&src, &dst, plan(None)));
+        assert!(
+            matches!(
+                got,
+                CacheError::InvalidEntry {
+                    reason: Rejection::EscapingLink,
+                    ..
+                }
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_confined_alone_refuses_what_canonicalize_would_accept() {
+        let (_d, _src, dst) = world();
+        assert_ok!(fs::create_dir_all(dst.join("deep/er")));
+        put(&dst.join("target"), "x");
+        let dst_name = assert_some!(dst.file_name()).to_owned();
+        let detour = Path::new("../../..").join(dst_name).join("target");
+        assert_ok!(symlink(&detour, dst.join("deep/er/detour")));
+        let real = assert_ok!(fs::canonicalize(dst.join("deep/er/detour")));
+        assert!(
+            real.starts_with(assert_ok!(fs::canonicalize(&dst))),
+            "canonicalize says it is inside"
+        );
+        assert_eq!(
+            assert_err!(resolve_confined(&dst, Path::new("deep/er/detour"))),
+            Rejection::EscapingLink
+        );
+    }
 }
