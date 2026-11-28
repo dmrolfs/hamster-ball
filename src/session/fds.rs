@@ -8,31 +8,266 @@
 //! [`close_inherited_fds`] first thing in `main`. Library callers must not: it closes every
 //! descriptor of the calling process, including ones other code owns.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 
+use nix::errno::Errno;
 use nix::unistd::close;
+use snafu::{ResultExt, Snafu};
 
 /// The directory that lists this process's open descriptors on macOS.
 const FD_DIR: &str = "/dev/fd";
+
+/// Why the sweep could not be completed. The run must not go on: a descriptor it could not close
+/// might be one the sandbox profile denies by path, or the supervisor's channel.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum SweepError {
+    /// A descriptor could not be closed.
+    #[snafu(display("descriptor {fd} could not be closed"))]
+    Close {
+        /// The descriptor.
+        fd: i32,
+        /// The OS error.
+        source: Errno,
+    },
+}
+
+/// The most descriptor numbers tried when the open ones cannot be listed.
+///
+/// Measured on macOS: `kern.maxfilesperproc` is 65535 and `dup2` to 65535 fails with `EBADF`, so a
+/// descriptor can never be above 65534 whatever `ulimit -n` says (it reports 1048575 here).
+/// Closing the whole range took 0.22 s at 1 Mi numbers and about 15 ms at this one.
+/// shortcut: a kernel with a higher per-process limit would need this raised; the test below
+/// compares it with the limit the machine reports, so it fails when that happens.
+const MAX_RANGE: i32 = 1 << 16;
+
+#[test]
+fn fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered() {
+    use claims::assert_ok;
+    use std::os::fd::IntoRawFd;
+    const CHILD: &str = "HB_FD_LOWERED_LIMIT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = assert_ok!(std::process::Command::new(assert_ok!(std::env::current_exe()))
+            .args(["--exact", "session::fds::fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered", "--nocapture"])
+            .env(CHILD, "1").output());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let file = assert_ok!(std::fs::File::open("/dev/null"));
+    let high = assert_ok!(rustix::io::fcntl_dupfd_cloexec(&file, 200)).into_raw_fd();
+    let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    limit.current = Some(64);
+    assert_ok!(rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        limit
+    ));
+    let closed = assert_ok!(sweep(
+        None,
+        || Err(io::Error::other("forced unavailable listing")),
+        |fd| {
+            if fd == high {
+                close(fd)
+            } else {
+                Err(Errno::EBADF)
+            }
+        }
+    ));
+    assert!(
+        closed.contains(&high),
+        "fallback missed inherited fd {high}"
+    );
+}
 
 /// Closes every descriptor above 2 and returns the numbers it closed.
 ///
 /// Call it once, before opening anything, in a program that is only `hb`. Descriptors 0, 1 and 2
 /// stay: they are the child's standard streams.
-pub fn close_inherited_fds() -> Vec<i32> {
-    let names: Vec<String> = fs::read_dir(FD_DIR)
-        .map(|dir| {
-            dir.flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    // The directory iterator's own descriptor is in the list and is already closed by now, so a
-    // failed close of it is expected and ignored.
-    inherited_from(names.iter().map(String::as_str))
-        .into_iter()
-        .filter(|fd| close(*fd).is_ok())
+///
+/// # Errors
+/// [`SweepError`] if a descriptor cannot be closed.
+pub fn close_inherited_fds() -> Result<Vec<i32>, SweepError> {
+    close_inherited_fds_except(None)
+}
+
+/// [`close_inherited_fds`], sparing `keep`: the supervisor channel claimed by [`claim_channel`].
+///
+/// # Errors
+/// As [`close_inherited_fds`].
+pub fn close_inherited_fds_except(keep: Option<RawFd>) -> Result<Vec<i32>, SweepError> {
+    sweep(keep, list_open, close)
+}
+
+/// The names in the descriptor directory. An entry that cannot be read is an error, not a gap.
+fn list_open() -> io::Result<Vec<String>> {
+    fs::read_dir(FD_DIR)?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect()
+}
+
+/// Every number a descriptor could have, for when the open ones cannot be listed: the sandbox
+/// profile denies reading `/dev/fd`, and `hb ctl` and the helpers run inside it. Closing a number
+/// that is not open finds nothing (`EBADF`), which the sweep allows.
+fn every_possible() -> Vec<String> {
+    // Lowering the allocation limit does not close descriptors already open above it.
+    (3..MAX_RANGE).map(|fd| fd.to_string()).collect()
+}
+
+/// The sweep, with the listing and the closing passed in so each case can be tested. A listing
+/// that fails is not a reason to leave descriptors open: every possible number is closed instead.
+fn sweep(
+    keep: Option<RawFd>,
+    list: impl FnOnce() -> io::Result<Vec<String>>,
+    mut close_fd: impl FnMut(RawFd) -> Result<(), Errno>,
+) -> Result<Vec<i32>, SweepError> {
+    let names = list().unwrap_or_else(|_| every_possible());
+    let mut closed = Vec::new();
+    for fd in inherited_from(names.iter().map(String::as_str)) {
+        if Some(fd) == keep {
+            continue;
+        }
+        match close_fd(fd) {
+            Ok(()) => closed.push(fd),
+            // The directory iterator's own descriptor is in the list and is already closed by
+            // now; that is the one close that is expected to find nothing.
+            Err(Errno::EBADF) => {}
+            Err(source) => return Err(source).context(CloseSnafu { fd }),
+        }
+    }
+    Ok(closed)
+}
+
+/// Takes the supervisor channel the launcher left open as descriptor `number`.
+///
+/// The descriptor is reopened through `/dev/fd`, which gives a new descriptor that is
+/// close-on-exec from the start, so nothing `hb` runs inherits it. The original is not
+/// close-on-exec; the sweep ([`close_inherited_fds_except`]) closes it. This takes no `unsafe`:
+/// `from_raw_fd` would.
+///
+/// # Errors
+/// An [`io::Error`] if `number` is not an open descriptor, is not a unix socket, or is 0, 1 or 2.
+pub fn claim_channel(number: RawFd) -> io::Result<UnixStream> {
+    if number <= 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the channel descriptor must be above 2",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{FD_DIR}/{number}"))?;
+    let stream = UnixStream::from(OwnedFd::from(file));
+    // Fails unless this is a socket.
+    stream.local_addr()?;
+    Ok(stream)
+}
+
+/// What [`start_up`] found: the channel, if a supervisor passed one.
+#[derive(Debug)]
+pub struct StartUp {
+    /// The claimed channel.
+    pub channel: Option<UnixStream>,
+    /// Why the run must not start: the variable was present but unusable, or the sweep failed.
+    pub problem: Option<StartUpError>,
+}
+
+/// Why `hb` must not start.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum StartUpError {
+    /// The supervisor descriptor variable does not name a usable channel.
+    #[snafu(display("the supervisor channel is not usable"))]
+    Channel {
+        /// The OS error.
+        source: io::Error,
+    },
+    /// The inherited descriptors could not all be closed.
+    #[snafu(display("the inherited descriptors could not be closed"))]
+    Sweep {
+        /// What failed.
+        source: SweepError,
+    },
+}
+
+/// What the `hb` binaries do first: claim the supervisor channel named by
+/// [`SUPERVISOR_FD_VAR`](super::supervised::SUPERVISOR_FD_VAR), if any, then close every other
+/// inherited descriptor.
+///
+/// The claim comes first because the sweep closes the original. A variable that does not name a
+/// usable channel is reported in [`StartUp::problem`], never ignored: a supervisor that thinks it
+/// has a channel must not get an unreported session.
+pub fn start_up() -> StartUp {
+    let named = std::env::var_os(super::supervised::SUPERVISOR_FD_VAR);
+    start_up_with(named.as_deref(), close_inherited_fds_except)
+}
+
+/// [`start_up`] with the variable's value and the sweep passed in.
+fn start_up_with(
+    named: Option<&std::ffi::OsStr>,
+    run_sweep: impl FnOnce(Option<RawFd>) -> Result<Vec<i32>, SweepError>,
+) -> StartUp {
+    let number = named.map(|value| {
+        value
+            .to_str()
+            .and_then(|text| text.parse::<RawFd>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the supervisor descriptor is not a number",
+                )
+            })
+    });
+    let claimed = number.map(|number| {
+        let number = number?;
+        let channel = claim_channel(number)?;
+        Ok::<_, io::Error>((number, channel))
+    });
+    let keep = claimed
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|(_, channel)| raw(channel));
+    let swept = run_sweep(keep);
+    // The original is not close-on-exec. A finished sweep has closed it; one that failed half
+    // way may not have, and nothing may be left open for the agent to inherit.
+    if swept.is_err()
+        && let Some(Ok((number, _))) = &claimed
+        && *number > 2
+    {
+        let _ = close(*number);
+    }
+    if let Err(source) = swept {
+        return StartUp {
+            channel: None,
+            problem: Some(StartUpError::Sweep { source }),
+        };
+    }
+    match claimed {
+        None => StartUp {
+            channel: None,
+            problem: None,
+        },
+        Some(Ok((_, channel))) => StartUp {
+            channel: Some(channel),
+            problem: None,
+        },
+        Some(Err(source)) => StartUp {
+            channel: None,
+            problem: Some(StartUpError::Channel { source }),
+        },
+    }
+}
+
+/// The descriptor of `stream`, to spare in the sweep.
+#[must_use]
+pub fn raw(stream: &UnixStream) -> RawFd {
+    stream.as_raw_fd()
 }
 
 /// The descriptor numbers above 2 among `names`, sorted and without repeats.
@@ -82,6 +317,165 @@ mod tests {
         assert_eq!(
             inherited_from(["2147483648", "99999999999"]),
             Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn a_claimed_channel_is_a_new_close_on_exec_descriptor_that_talks_to_the_peer() {
+        use claims::{assert_err, assert_ok};
+        use std::io::{Read, Write};
+        let (mut peer, ours) = assert_ok!(UnixStream::pair());
+        let number = ours.as_raw_fd();
+        let mut claimed = assert_ok!(claim_channel(number));
+        assert_ne!(raw(&claimed), number);
+        let flags = assert_ok!(rustix::io::fcntl_getfd(&claimed));
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "the claimed descriptor leaks"
+        );
+        assert_ok!(claimed.write_all(b"x"));
+        let mut byte = [0u8; 1];
+        assert_ok!(peer.read_exact(&mut byte));
+        assert_eq!(&byte, b"x");
+        // Not a socket, and not a descriptor, are both refused.
+        let file = assert_ok!(fs::File::open("/dev/null"));
+        assert_err!(claim_channel(file.as_raw_fd()));
+        assert_err!(claim_channel(2));
+        assert_err!(claim_channel(2_000_000));
+    }
+
+    #[test]
+    fn the_sweep_spares_only_the_kept_descriptor() {
+        assert_eq!(
+            inherited_from(["3", "4", "5"])
+                .into_iter()
+                .filter(|fd| Some(*fd) != Some(4))
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+    }
+    // ========================================================================
+    // The sweep fails closed (hb-q9o security review)
+    // ========================================================================
+
+    /// A socket whose descriptor nothing owns, as the launcher leaves the original: the peer, and
+    /// the descriptor's number as the variable would give it.
+    fn original_channel() -> (UnixStream, String) {
+        use claims::assert_ok;
+        use std::os::fd::IntoRawFd;
+        let (peer, ours) = assert_ok!(UnixStream::pair());
+        (peer, ours.into_raw_fd().to_string())
+    }
+
+    fn names(list: &[&str]) -> io::Result<Vec<String>> {
+        Ok(list.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    #[test]
+    fn a_descriptor_list_that_cannot_be_read_closes_every_possible_number_instead() {
+        use claims::assert_ok;
+        let mut tried = Vec::new();
+        let closed = assert_ok!(sweep(
+            Some(5),
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |fd| {
+                tried.push(fd);
+                // Almost none of them are open.
+                if fd == 7 { Ok(()) } else { Err(Errno::EBADF) }
+            },
+        ));
+        assert_eq!(closed, vec![7], "only what was open counts as closed");
+        assert!(
+            tried.len() > 100,
+            "it must try the whole range, tried {}",
+            tried.len()
+        );
+        assert!(!tried.contains(&5), "the kept descriptor is not touched");
+        assert!(!tried.iter().any(|fd| *fd <= 2), "standard streams stay");
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_closed_stops_the_sweep_and_is_named() {
+        use claims::assert_err;
+        let mut tried = Vec::new();
+        let failed = sweep(
+            None,
+            || names(&["0", "3", "4", "5"]),
+            |fd| {
+                tried.push(fd);
+                if fd == 4 { Err(Errno::EIO) } else { Ok(()) }
+            },
+        );
+        let error = assert_err!(failed);
+        assert!(
+            matches!(error, SweepError::Close { fd: 4, .. }),
+            "{error:?}"
+        );
+        assert_eq!(tried, vec![3, 4], "it must not go on past the failure");
+    }
+
+    #[test]
+    fn a_descriptor_already_closed_by_the_listing_itself_is_not_a_failure() {
+        use claims::assert_ok;
+        let closed = assert_ok!(sweep(
+            Some(5),
+            || names(&["3", "4", "5", "6"]),
+            |fd| if fd == 4 { Err(Errno::EBADF) } else { Ok(()) },
+        ));
+        assert_eq!(closed, vec![3, 6], "5 is kept, 4 was already gone");
+    }
+
+    #[test]
+    fn a_failed_sweep_means_no_channel_and_a_reported_problem_so_hb_does_not_start() {
+        use claims::assert_some;
+        let (_peer, number) = original_channel();
+        let started = start_up_with(Some(std::ffi::OsStr::new(&number)), |_| {
+            Err(SweepError::Close {
+                fd: 9,
+                source: Errno::EIO,
+            })
+        });
+        assert!(started.channel.is_none());
+        let problem = assert_some!(started.problem);
+        assert!(matches!(problem, StartUpError::Sweep { .. }), "{problem:?}");
+    }
+
+    #[test]
+    fn a_good_sweep_keeps_the_claimed_channel_and_a_bad_variable_is_still_reported() {
+        use claims::assert_some;
+        let (_peer, number) = original_channel();
+        let ok = start_up_with(Some(std::ffi::OsStr::new(&number)), |_| Ok(Vec::new()));
+        assert!(ok.channel.is_some() && ok.problem.is_none());
+        let bad = start_up_with(Some(std::ffi::OsStr::new("x")), |_| Ok(Vec::new()));
+        let problem = assert_some!(bad.problem);
+        assert!(
+            matches!(problem, StartUpError::Channel { .. }),
+            "{problem:?}"
+        );
+        let none = start_up_with(None, |_| Ok(Vec::new()));
+        assert!(none.channel.is_none() && none.problem.is_none());
+    }
+
+    #[test]
+    fn the_fallback_range_covers_every_descriptor_the_kernel_allows() {
+        // sysctl kern.maxfilesperproc is the most descriptors one process may hold, so the highest
+        // possible number is one less. The range must reach it.
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.maxfilesperproc"])
+            .output();
+        let Ok(out) = out else { return };
+        let Ok(limit) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() else {
+            return;
+        };
+        assert!(
+            MAX_RANGE >= limit,
+            "the machine allows {limit} descriptors per process but the fallback stops at {MAX_RANGE}"
+        );
+        let names = every_possible();
+        assert_eq!(names.first().map(String::as_str), Some("3"));
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some((MAX_RANGE - 1).to_string().as_str())
         );
     }
 }

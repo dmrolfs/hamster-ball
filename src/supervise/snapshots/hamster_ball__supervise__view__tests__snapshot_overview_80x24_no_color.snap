@@ -1,0 +1,29 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene(), 80, 24, PLAIN)"
+---
+┌ Sessions ────────────────────────────────────────────────────────────────────┐
+│> 1 shopfront Running                                                         │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                                                           │
+│  3 docs Exited 0                                                             │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+ OVERVIEW  Enter interact · n new · s stop · r restart · a approve · Tab switch

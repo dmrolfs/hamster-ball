@@ -34,8 +34,11 @@ use super::preflight::{PreflightError, SANDBOX_EXEC, check_nesting};
 use super::proxy::{ProxyRun, ProxyTrail, ProxyTuning};
 use super::pty::{Pty, PtyError};
 use super::pump::Pump;
+use super::reporter::Telemetry;
 use super::sanitize::{ClipboardPolicy, ClipboardUse};
-use super::signals::{Escalation, SignalError, Supervisor, Target, Watch};
+use super::signals::{
+    Escalation, OnStopping, Setup, SignalError, StopSignal, Supervisor, Target, Watch,
+};
 use super::sweep::LaunchToken;
 use crate::config::Loaded;
 use crate::guard::{SYSTEM_GIT, prepare as prepare_guard};
@@ -118,6 +121,25 @@ pub struct RunSpec {
     pub proxy_tuning: Option<ProxyTuning>,
     /// Makes this a `hb warm` run: see [`WarmSpec`].
     pub warm: Option<WarmSpec>,
+    /// A way for another thread to stop the run as SIGTERM would, including during the pre-run
+    /// hooks. Only used with [`SignalMode::Forward`].
+    pub stop: Option<Arc<StopSignal>>,
+    /// Where each proxy connection is reported as a typed event, for a supervisor.
+    pub telemetry: Option<Telemetry>,
+    /// Called with the agent's process id once it is running under the sandbox.
+    pub on_start: Option<OnStart>,
+    /// Called when shutdown begins, before cleanup; must return promptly.
+    pub on_stopping: Option<OnStopping>,
+}
+
+/// A function called with the agent's process id; a newtype so [`RunSpec`] can stay `Debug`.
+#[derive(Clone)]
+pub struct OnStart(pub Arc<dyn Fn(u32) + Send + Sync>);
+
+impl std::fmt::Debug for OnStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnStart(..)")
+    }
 }
 
 /// What makes a run a warm run (design 10, hb-ghd.7.3).
@@ -147,7 +169,18 @@ impl RunSpec {
             proxy_summary: true,
             proxy_tuning: None,
             warm: None,
+            stop: None,
+            telemetry: None,
+            on_start: None,
+            on_stopping: None,
         }
+    }
+
+    /// Lets `stop` end the run as SIGTERM would.
+    #[must_use]
+    pub fn stop(mut self, stop: Arc<StopSignal>) -> Self {
+        self.stop = Some(stop);
+        self
     }
 
     /// Makes this a warm run.
@@ -254,6 +287,10 @@ pub enum RunError {
     /// There was no command to run.
     #[snafu(display("there is no command to run"))]
     EmptyCommand,
+
+    /// A stop (INT, TERM, HUP or the supervisor) arrived before the command was started.
+    #[snafu(display("the run was stopped before the command started"))]
+    Stopped,
 
     /// A pre-run hook failed.
     #[snafu(transparent)]
@@ -518,9 +555,28 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     refuse_grants_over_shared_temp(loaded, &temp)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
+    // Registered before the hooks so that a signal or a stop during them is seen: the hooks can
+    // run for minutes and hold credentials. The thread ends just before the child starts, and
+    // anything that arrives after is left for the thread that supervises the child.
+    let watch = match spec.signals {
+        SignalMode::Off => None,
+        SignalMode::Forward { .. } => {
+            Some(Watch::prepare(pty.is_some())?.on_stopping(spec.on_stopping.clone()))
+        }
+    };
+    if let (Some(watch), Some(stop)) = (&watch, &spec.stop) {
+        stop.attach(watch.trigger());
+    }
+    let setup = watch.as_ref().map(Watch::guard_setup).transpose()?;
     // Host-side hooks run now, before the proxy and the profile: a failure ends the run here, and
     // the session directory (with whatever they wrote) goes with it.
-    let hook_outputs = run_pre_run(&loaded.policy.hooks, session.path(), &env.home)?;
+    let stop_flag = setup.as_ref().map(Setup::flag);
+    let hook_outputs = run_pre_run(
+        &loaded.policy.hooks,
+        session.path(),
+        &env.home,
+        stop_flag.as_deref(),
+    )?;
     let (launchers, warm_cache) = match (&offline, &spec.warm) {
         (Some(plan), None) => {
             let cache = run_cache(env, loaded, &tools, session.path())?;
@@ -580,10 +636,10 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
 
     // The proxy lives as long as the child: started before the profile (which names its port)
     // and stopped after the child has gone.
-    let trail = Arc::new(ProxyTrail::new(
-        spec.denials.as_ref(),
-        spec.proxy_log.as_ref(),
-    ));
+    let trail = Arc::new(
+        ProxyTrail::new(spec.denials.as_ref(), spec.proxy_log.as_ref())
+            .with_telemetry(spec.telemetry.clone()),
+    );
     let allowlist = spec.warm.as_ref().map_or_else(
         || loaded.policy.run_allowlist(),
         |warm| warm.allowlist.clone(),
@@ -669,12 +725,8 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
     ensure_command_exists(&spec.argv[0], &child_env)?;
     let launcher = launcher_words(helper, pty.is_some());
     check_size(&profile, &child_env, &spec.argv, &launcher)?;
-    let watch = match spec.signals {
-        SignalMode::Off => None,
-        SignalMode::Forward { .. } => Some(Watch::prepare(pty.is_some())?),
-    };
 
-    let mut command = command_for(&profile, &child_env, spec, &env.cwd, helper, pty.is_some());
+    let mut command = command_for(&profile, &child_env, spec, &env.cwd, launcher);
     // With a guardian the helper is gated: its stdin becomes the gate socket, and the target's
     // real stdin is sent across it, so nothing runs before the guard has armed its watch.
     let mut gated_stdin: Option<OwnedFd> = None;
@@ -738,14 +790,23 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         },
         (_, log) => log,
     };
+    if setup.is_some_and(Setup::finish) {
+        if let Some(log) = log {
+            let _ = log.finish();
+        }
+        return StoppedSnafu.fail();
+    }
     let launched = match (guardian.as_mut(), gated_stdin) {
         (Some(guardian), Some(stdin)) => {
             let group = pty.is_some() || !stdin_is_tty;
             gated_spawn(&mut command, stdin, guardian, group)
         }
-        _ => command.spawn().context(SpawnSnafu),
+        _ => command
+            .spawn()
+            .map(|child| (child, None))
+            .context(SpawnSnafu),
     };
-    let mut child = match launched {
+    let (mut child, gate) = match launched {
         Ok(child) => child,
         Err(error) => {
             if let Some(log) = log {
@@ -775,12 +836,32 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         None => start_supervisor(child, watch, spec.signals, stdin_is_tty)?,
     };
     running.pumps = pumps;
-    let waited = running.wait_for_exit(spec.stdio);
+    #[cfg(feature = "test-support")]
+    if gate.is_some() {
+        pause_before_release(running.child.id());
+    }
+    if let Some(gate) = gate
+        && let Err(source) = gate.release()
+    {
+        let _ = running.child.kill();
+        // Even an unreleased helper owns relay and signal workers once setup succeeds.
+        let _ = running.wait_for_exit(spec.stdio, spec.on_stopping.as_ref());
+        if let Some(log) = log {
+            let _ = log.finish();
+        }
+        return Err(RunError::Gate { source });
+    }
+    if let Some(on_start) = &spec.on_start {
+        (on_start.0)(running.child.id());
+    }
+    let waited = running.wait_for_exit(spec.stdio, spec.on_stopping.as_ref());
     let denials = log.map(LogStream::finish).unwrap_or_default();
     if let Some(ctl) = ctl {
         ctl.broker.finish();
     }
-    // Everything hb started has ended and been reaped, so the guard has nothing left to do.
+    // A failed wait cannot authorize the guardian to stand down.
+    // On error, dropping it retains its independent cleanup path.
+    let waited = waited?;
     if let Some(guardian) = guardian {
         guardian.release();
     }
@@ -789,7 +870,7 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
         stdout,
         stderr,
         clipboard,
-    } = waited?;
+    } = waited;
     drop(session);
     warnings.extend(clipboard_notices(clipboard));
     let seen = proxy.finish();
@@ -1077,7 +1158,11 @@ fn open_pty(spec: &RunSpec) -> Result<Option<Pty>, RunError> {
 
 impl Running {
     /// Waits for the child, then stops the signal thread, and returns how it ended.
-    fn wait_for_exit(self, stdio: StdioMode) -> Result<Waited, RunError> {
+    fn wait_for_exit(
+        self,
+        stdio: StdioMode,
+        on_stopping: Option<&OnStopping>,
+    ) -> Result<Waited, RunError> {
         let Self {
             child,
             supervisor,
@@ -1090,6 +1175,7 @@ impl Running {
                 Some(pid) => terminal.wait(pid),
                 None => Err(io::Error::other("the child has no valid pid")),
             };
+            OnStopping::notify(on_stopping);
             if let Some(supervisor) = supervisor {
                 supervisor.finish();
             }
@@ -1114,6 +1200,7 @@ impl Running {
                     .map(|status| (ExitKind::from_status(status), Vec::new(), Vec::new()))
             }
         };
+        OnStopping::notify(on_stopping);
         if let Some(supervisor) = supervisor {
             supervisor.finish();
         }
@@ -1123,10 +1210,8 @@ impl Running {
             .into_iter()
             .map(Pump::finish)
             .fold(ClipboardUse::default(), |sum, used| sum + used);
-        if filtered {
-            if let Some(terminal) = output_terminal() {
-                settle(&terminal);
-            }
+        if filtered && let Some(terminal) = output_terminal() {
+            settle(&terminal);
         }
         result
             .map(|(exit, stdout, stderr)| Waited {
@@ -1148,14 +1233,15 @@ fn target_stdin(stdio: StdioMode) -> io::Result<OwnedFd> {
     }
 }
 
-/// Starts the gated helper, waits for Prepared, arms the guard on the reported process, and only
-/// then releases it. Any failure kills and reaps the helper before it has run the target.
+/// Starts the helper and arms the guard, retaining the gate until supervision is ready.
+/// Any failure kills and reaps the helper before it has run the target.
+/// Pump and supervisor setup must finish within the helper's gate deadline.
 fn gated_spawn(
     command: &mut Command,
     stdin: OwnedFd,
     guardian: &mut Guardian,
     group: bool,
-) -> Result<Child, RunError> {
+) -> Result<(Child, Option<ParentGate>), RunError> {
     let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
     command.stdin(Stdio::from(OwnedFd::from(theirs)));
     let spawned = command.spawn();
@@ -1189,13 +1275,30 @@ fn gated_spawn(
             .into()),
         }
     });
-    let released =
-        outcome.and_then(|()| gate.release().map_err(|source| RunError::Gate { source }));
-    if let Err(error) = released {
+    if let Err(error) = outcome {
         abort_child(&mut child);
         return Err(error);
     }
-    Ok(child)
+    Ok((child, Some(gate)))
+}
+
+#[cfg(feature = "test-support")]
+fn pause_before_release(pid: u32) {
+    let Some(path) = std::env::var_os("HB_TEST_ARMED_GATE") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let pending = path.with_extension("pending");
+    if fs::write(&pending, pid.to_string())
+        .and_then(|()| fs::rename(&pending, &path))
+        .is_err()
+    {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while !path.with_extension("continue").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The words that start the command: `sandbox-exec`, or the helper that execs it.
@@ -1300,10 +1403,9 @@ fn command_for(
     child_env: &ChildEnv,
     spec: &RunSpec,
     cwd: &Path,
-    helper: Option<&Path>,
-    controlling_tty: bool,
+    launcher: Vec<OsString>,
 ) -> Command {
-    let mut words = launcher_words(helper, controlling_tty).into_iter();
+    let mut words = launcher.into_iter();
     let mut command = Command::new(words.next().unwrap_or_default());
     command
         .args(words)

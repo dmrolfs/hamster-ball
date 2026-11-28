@@ -25,9 +25,11 @@ pub mod proxy;
 pub mod pty;
 pub mod pump;
 pub mod relay;
+pub mod reporter;
 pub mod run;
 pub mod sanitize;
 pub mod signals;
+pub mod supervised;
 mod sweep;
 pub mod terminal;
 mod tracker;
@@ -37,7 +39,10 @@ pub use child_helper::{HelperError, exec_gated, exec_sandbox_exec};
 pub use denials::{DenialSink, Denials, DenialsError, LogStream, generate_tag};
 pub use dir::{SessionDir, SessionDirError, SweepReport, sweep_stale};
 pub use env::{ChildEnv, EnvBuildError, EnvInputs, SESSION_MARKER, TlsEnv};
-pub use fds::close_inherited_fds;
+pub use fds::{
+    StartUp, StartUpError, SweepError, claim_channel, close_inherited_fds,
+    close_inherited_fds_except, start_up,
+};
 pub use guardian::{
     GuardError, GuardHandle, Guardian, GuardianError, WatchOutcome, WatchRefusal, run_guard,
 };
@@ -50,8 +55,8 @@ pub use pty::{Pty, PtyError, Winsize};
 pub use pump::Pump;
 pub use relay::Relay;
 pub use run::{
-    DEFAULT_GRACE, ExitKind, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode, WarmSpec,
-    run,
+    DEFAULT_GRACE, ExitKind, OnStart, Outcome, PtyMode, RunError, RunSpec, SignalMode, StdioMode,
+    WarmSpec, run,
 };
-pub use signals::{Escalation, Step};
+pub use signals::{Escalation, OnStopping, Setup, Step, StopSignal, Trigger, Watch};
 pub use terminal::{RawMode, TerminalError};

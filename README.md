@@ -64,7 +64,7 @@ Opt-in tests prove the parts that need real tools: agent presets (`HB_CONFORMANC
 ### Requirements
 
 - macOS (15 tested) on Apple silicon. `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
-- Rust 1.85 or newer to build it.
+- Rust 1.88 or newer to build it.
 - An agent you already use and can run outside the ball (log in to it there first).
 
 ### Install
@@ -74,6 +74,9 @@ git clone https://github.com/dmrolfs/hamster-ball && cd hamster-ball
 cargo install --path .
 hb --version
 ```
+
+To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
+This installs `hb-supervise` beside the matching `hb`; default builds omit the UI dependencies.
 
 `hb` must live in a directory the agent cannot write. The floor write-denies every directory on your `PATH`, and
 `hb` itself, so `~/.cargo/bin` is fine. `hb` refuses to run as root and refuses to start inside another sandbox
@@ -146,7 +149,7 @@ Run `hb doctor` once per project to see secret-looking files the guard does not 
 | `hb init` | Creates `~/.config/hamster-ball/base.toml` from a commented template. Never overwrites. |
 | `hb run [--log-denials] [--log-proxy] [--no-proxy-summary] [--] <command>...` | Runs the command in the ball and exits with its status (`128 + n` for a signal). Needs an approved config. |
 | `hb explain [--format text\|json] [--show-args] [--path <path>]` | Prints every effective rule with the file it came from, what the floor overrides, skipped grants and warnings (including a project that no grant covers). Runs nothing, needs no approval. `--path` answers one question about one path (merged config and floor only). |
-| `hb approve [--revoke]` | Shows what the project adds beyond your base and asks `Approve this config? [y/N]`. Needs a terminal. `--revoke` takes the approval back and needs none. |
+| `hb approve [--revoke]` | Shows what the project adds beyond your base and asks you to type `approve` and a fresh six-digit code. Needs a terminal. `--revoke` takes the approval back and needs none. |
 | `hb warm [--timeout SECS] [--log-denials] [--log-proxy] [NAME...]` | Fills hb's offline cache: starts each declared `[mcp.*]` server whose command is `uvx` or `npx` once, in the same ball a run uses, with only the package registries (and the server's `warm_net`) reachable, and waits for it to answer an MCP `initialize`. The only command that reaches a registry. Needs an approved config; refuses inside a ball. |
 | `hb doctor` | Lists secret-looking files the guard misses, tracked files it would deny, secret-looking launchd variable names, git hooks the floor does not cover (repositories below a write grant, hook managers, `core.hooksPath`), the proxy settings the system has on, and the `uvx`/`npx` MCP servers that cannot start offline (never warmed, a moving version tag, an unpinned git source, a launcher missing from `[env] tools`). Prints names and the one flagged argument, never contents. Always exits 0. |
 | `hb profile` | Prints the Seatbelt profile and its parameters for this project. |
@@ -408,7 +411,7 @@ A project's `hamster-ball.toml`, and any file it extends from inside the project
 So `hb run` runs them only when their exact bytes were approved, and the ball makes those files read-only for the agent.
 
 - `hb approve` prints the project root, each file with a short digest and everything the project adds beyond your base,
-  including what the presets it names grant. It accepts only a typed `y` or `yes`, at a terminal. There is no `--yes`.
+  including what the presets it names grant. It accepts only that typed phrase, at a terminal. There is no `--yes`.
 - Any change to a byte, or a renamed, added or removed file, asks again. Moving the project asks again.
 - Records live in `~/.local/state/hamster-ball/approvals/` (the floor hides the directory from the agent). `XDG_STATE_HOME` is ignored.
 - Without a terminal an unapproved config exits **78** and runs nothing. `hb approve --revoke` works without one.
@@ -553,10 +556,11 @@ Do not paste `[env] set` values or hook arguments into one; `hb explain` hides t
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features                       # about 1800 tests; the sandbox ones skip when sandbox-exec is nested
-HB_REQUIRE_SANDBOX=1 cargo test --all-features  # fail instead of skipping when the sandbox is not usable
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --lib
+RUSTUP_TOOLCHAIN=1.88 bash scripts/check-features.sh # default dependency isolation and opt-in supervisor build
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features             # includes the optional supervisor; sandbox tests skip when nested
+HB_REQUIRE_SANDBOX=1 cargo test --locked --all-features # fail instead of skipping when the sandbox is not usable
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --lib --all-features
 ```
 
 - The offline MCP servers are proved against the real tools by an opt-in test that uses your home, your `uvx`, `npx` and `node`, hb's real cache and the network:

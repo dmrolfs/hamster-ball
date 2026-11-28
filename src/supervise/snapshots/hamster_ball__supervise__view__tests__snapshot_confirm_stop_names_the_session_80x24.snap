@@ -1,0 +1,31 @@
+---
+source: src/supervise/view.rs
+expression: text
+---
+┌ Sessions ────────────────────────────────────────────────────────────────────┐
+│> 1 shopfront Running                                                         │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                                                           │
+  styles:              yyyyyyy
+│  3 docs Exited 0                                                             │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│    ┌ Confirm ───────────────────────────────────────────────────────────┐    │
+│    │Stop shopfront (/work/shopfront)?                                   │    │
+│    │                                                                    │    │
+│    │y = yes, any other key = cancel                                     │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ CONFIRM  y confirms · any other key cancels

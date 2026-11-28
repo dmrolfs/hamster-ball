@@ -1,0 +1,5 @@
+---
+source: src/supervise/terminal.rs
+expression: styled(&screen)
+---
+r[Some(Indexed(1))/Some(Reset)/NONE]e[Some(Indexed(1))/Some(Reset)/NONE]d[Some(Indexed(1))/Some(Reset)/NONE]b[Some(Indexed(2))/Some(Reset)/BOLD | UNDERLINED]u[Some(Indexed(2))/Some(Reset)/BOLD | UNDERLINED]o[Some(Indexed(208))/Some(Reset)/NONE]t[Some(Indexed(208))/Some(Rgb(1, 2, 3))/NONE]i[Some(Indexed(208))/Some(Rgb(1, 2, 3))/REVERSED]

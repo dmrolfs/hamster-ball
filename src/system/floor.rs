@@ -578,13 +578,14 @@ impl<'a> Builder<'a> {
     }
 
     fn note_hard_links(&mut self, path: &Path) {
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            if meta.is_file() && meta.nlink() > 1 {
-                self.diagnostics.push(FloorDiagnostic::HardLinkedFloorFile {
-                    path: path.to_path_buf(),
-                    links: meta.nlink(),
-                });
-            }
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.is_file()
+            && meta.nlink() > 1
+        {
+            self.diagnostics.push(FloorDiagnostic::HardLinkedFloorFile {
+                path: path.to_path_buf(),
+                links: meta.nlink(),
+            });
         }
     }
 

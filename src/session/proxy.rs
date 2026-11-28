@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use super::denials::{Collector, DenialSink, Denials};
+use super::reporter::Telemetry;
 use crate::config::Policy;
 use crate::policy::{HostRule, Port};
 use crate::proxy::{
@@ -105,6 +106,8 @@ pub struct ProxyTrail {
     denials: Option<Channel>,
     log: Option<Channel>,
     tally: Mutex<Tally>,
+    /// Where every connection also goes, as a typed event, when a supervisor is listening.
+    telemetry: Option<Telemetry>,
 }
 
 impl ProxyTrail {
@@ -115,7 +118,15 @@ impl ProxyTrail {
             denials: denials.map(Channel::new),
             log: log.map(Channel::new),
             tally: Mutex::new(Tally::default()),
+            telemetry: None,
         }
+    }
+
+    /// Also reports every connection to the supervisor. `Telemetry` never waits.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Option<Telemetry>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// What the run saw.
@@ -138,6 +149,9 @@ impl ProxyTrail {
 
 impl AuditSink for ProxyTrail {
     fn record(&self, event: &AuditEvent) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.proxy(event);
+        }
         let line = event.to_string();
         if let Some(log) = &self.log {
             log.push(line.clone());

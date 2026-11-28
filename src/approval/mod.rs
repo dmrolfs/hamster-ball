@@ -12,4 +12,4 @@ pub use gate::{
     ApproveError, Candidate, GateError, NoTerminal, StdTerminal, Terminal, Verdict, require,
 };
 pub use store::{ApprovalStore, Changes, RecordProblem, Standing, StoreError, Why};
-pub use summary::{Addition, GrantSummary};
+pub use summary::{Addition, GrantSummary, MAX_VALUE_CHARS};

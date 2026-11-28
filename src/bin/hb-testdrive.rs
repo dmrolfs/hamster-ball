@@ -85,7 +85,11 @@ fn fake_guard(args: &[OsString]) -> Option<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    let _ = hamster_ball::session::close_inherited_fds();
+    let start = hamster_ball::session::start_up();
+    if let Some(problem) = start.problem {
+        eprintln!("hb-testdrive: {}", snafu::Report::from_error(problem));
+        return ExitCode::from(2);
+    }
     let args: Vec<OsString> = std::env::args_os().collect();
     if let Some(status) = fake_guard(&args) {
         return status;
@@ -106,11 +110,12 @@ fn main() -> ExitCode {
     } else {
         PtyChoice::Auto
     };
-    hamster_ball::cli::main_with_options(
+    hamster_ball::cli::main_supervised(
         args,
         env.as_ref(),
         &mut stdout(),
         &mut stderr(),
         Supervision { grace, pty },
+        start.channel,
     )
 }

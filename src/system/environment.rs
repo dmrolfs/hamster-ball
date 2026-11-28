@@ -33,8 +33,15 @@ pub struct ParentVars(BTreeMap<OsString, OsString>);
 
 impl ParentVars {
     /// A snapshot of `pairs`.
+    ///
+    /// The supervisor channel variable is never kept: it names a descriptor only `hb` may use.
     pub fn from_pairs(pairs: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
-        Self(pairs.into_iter().collect())
+        Self(
+            pairs
+                .into_iter()
+                .filter(|(name, _)| name != crate::session::supervised::SUPERVISOR_FD_VAR)
+                .collect(),
+        )
     }
 
     /// The value of `name`, if set.
@@ -147,6 +154,17 @@ mod tests {
     use crate::testutil::Tree;
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn the_supervisor_descriptor_variable_is_never_part_of_the_snapshot() {
+        let pairs = [
+            (OsString::from("HB_SUPERVISOR_FD"), OsString::from("9")),
+            (OsString::from("LANG"), OsString::from("C")),
+        ];
+        let vars = ParentVars::from_pairs(pairs);
+        assert_eq!(vars.get("HB_SUPERVISOR_FD"), None);
+        assert_eq!(vars.get("LANG"), Some(OsStr::new("C")));
+    }
 
     #[test]
     fn a_new_environment_has_nothing_but_cwd_and_home() {

@@ -239,10 +239,10 @@ fn http_upstream(body_len: usize, body: &'static str) -> (u16, thread::JoinHandl
         let mut got = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n") {
-                if got.len() >= at + 4 + body_len {
-                    break;
-                }
+            if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n")
+                && got.len() >= at + 4 + body_len
+            {
+                break;
             }
             match s.read(&mut chunk) {
                 Ok(0) | Err(_) => break,

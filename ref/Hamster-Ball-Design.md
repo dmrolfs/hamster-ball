@@ -77,6 +77,8 @@ hb ctl launchd status|kickstart|restart <label>  # inside: the launchd jobs list
 
 Install: `cargo install --path .`. `hb` must live in a directory the hamster ball cannot write
 (the floor write-denies every PATH directory).
+To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
+It installs `hb-supervise` beside the matching `hb`; default builds omit the UI dependencies.
 
 A project contains only TOML. No Rust or scripts are added to projects.
 

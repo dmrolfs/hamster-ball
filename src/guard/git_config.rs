@@ -210,7 +210,7 @@ const PROFILE: &str = r#"(version 1)
 fn run(command: &mut Command, timeout: Duration) -> Result<crate::sys::Finished, QueryError> {
     run_bounded(command, timeout, MAX_OUTPUT).map_err(|error| match error {
         BoundedError::Spawn(source) => QueryError::Start { source },
-        BoundedError::TimedOut => QueryError::TimedOut,
+        BoundedError::TimedOut | BoundedError::Cancelled => QueryError::TimedOut,
     })
 }
 

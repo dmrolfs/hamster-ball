@@ -6,7 +6,7 @@
 
 mod common;
 
-use claims::assert_ok;
+use claims::{assert_ok, assert_some_eq};
 use common::World;
 use hamster_ball::approval::GrantSummary;
 use hamster_ball::config::{EmbeddedPresets, LoadRequest, discover, load};
@@ -154,12 +154,42 @@ fn terminal_control_characters_in_a_value_are_escaped_in_what_is_printed() {
 }
 
 #[test]
-fn a_very_long_value_is_cut_in_what_is_printed() {
-    let long = "x".repeat(2000);
+fn a_long_value_is_printed_whole_so_a_suffix_cannot_hide() {
+    // Over the old 300-character cut, under the review limit: the end must be on screen.
+    let long = format!("{}EVIL-SUFFIX", "x".repeat(1500));
     let summary = summary("", &format!("[env]\nset = {{ X = \"{long}\" }}\n"));
     let line = summary.to_string();
-    assert!(line.len() < 700, "{}", line.len());
-    assert!(line.contains("..."), "{line}");
+    assert!(line.contains("EVIL-SUFFIX"), "{line}");
+    assert!(!line.contains("..."), "{line}");
+    assert_eq!(summary.too_long(), None);
+}
+
+#[test]
+fn a_value_past_the_review_limit_is_not_offered_for_approval() {
+    let long = "x".repeat(hamster_ball::approval::MAX_VALUE_CHARS + 1);
+    let summary = summary("", &format!("[env]\nset = {{ X = \"{long}\" }}\n"));
+    assert_some_eq!(summary.too_long(), "env.set");
+}
+
+#[test]
+fn arguments_keep_their_boundaries_so_one_argument_cannot_pass_for_two() {
+    let one = summary(
+        "",
+        "[mcp.a]\ncommand = \"tool\"\nargs = [\"-c\", \"echo hi; rm -rf x\"]\n",
+    );
+    let two = summary(
+        "",
+        "[mcp.a]\ncommand = \"tool\"\nargs = [\"-c\", \"echo\", \"hi;\", \"rm\", \"-rf\", \"x\"]\n",
+    );
+    let value = |s: &GrantSummary| {
+        s.additions()
+            .iter()
+            .find(|a| a.setting == "mcp")
+            .map(|a| a.value.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(value(&one), "a = tool -c 'echo hi; rm -rf x'");
+    assert_eq!(value(&two), "a = tool -c echo 'hi;' rm -rf x");
 }
 
 #[test]

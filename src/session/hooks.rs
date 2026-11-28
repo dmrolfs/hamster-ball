@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use serde::Deserialize;
 use snafu::{ResultExt, Snafu, ensure};
@@ -22,7 +23,7 @@ use crate::policy::{
     AwsProfile, CanonicalPath, EnvName, EnvNameError, HomeDir, Hook, HookFormat, HookName,
     PathError,
 };
-use crate::sys::{BoundedError, run_bounded};
+use crate::sys::{BoundedError, run_cancellable};
 
 /// Most a hook's standard output may be.
 const MAX_OUTPUT_BYTES: u64 = 1_048_576;
@@ -70,6 +71,13 @@ pub enum HookRunError {
         name: HookName,
         /// Its limit.
         seconds: u64,
+    },
+
+    /// The run was stopped while the hook was running, and the hook was killed.
+    #[snafu(display("hook `{name}` was stopped because the run was stopped"))]
+    Cancelled {
+        /// The hook.
+        name: HookName,
     },
 
     /// The hook's output did not have the shape its `format` promises.
@@ -242,6 +250,7 @@ pub fn run_pre_run(
     hooks: &BTreeMap<HookName, Sourced<Hook>>,
     session: &CanonicalPath,
     home: &HomeDir,
+    cancel: Option<&AtomicBool>,
 ) -> Result<HookOutputs, HookRunError> {
     let mut outputs = HookOutputs::default();
     if hooks.is_empty() {
@@ -253,7 +262,7 @@ pub fn run_pre_run(
     for (name, hook) in hooks {
         let dir = root.join(name.as_str());
         private_dir(&dir)?;
-        let produced = run_one(name, &hook.value, &dir, home)?;
+        let produced = run_one(name, &hook.value, &dir, home, cancel)?;
         for (variable, path) in produced {
             if let Some(first) = owners.insert(variable.clone(), name.clone()) {
                 return VariableTwiceSnafu {
@@ -293,6 +302,7 @@ fn run_one(
     hook: &Hook,
     dir: &Path,
     home: &HomeDir,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Vec<(EnvName, CanonicalPath)>, HookRunError> {
     let words = hook.command.words();
     let mut command = Command::new(expand_home(words[0].as_str(), home));
@@ -304,13 +314,17 @@ fn run_one(
         .env("PATH", HOOK_PATH)
         .env("TMPDIR", dir)
         .env("HB_HOOK_DIR", dir);
-    let finished = match run_bounded(&mut command, hook.timeout.get(), MAX_OUTPUT_BYTES) {
+    let finished = match run_cancellable(&mut command, hook.timeout.get(), MAX_OUTPUT_BYTES, cancel)
+    {
         Ok(finished) => finished,
         Err(BoundedError::Spawn(source)) => {
             return Err(HookRunError::Start {
                 name: name.clone(),
                 source,
             });
+        }
+        Err(BoundedError::Cancelled) => {
+            return CancelledSnafu { name: name.clone() }.fail();
         }
         Err(BoundedError::TimedOut) => {
             return TimedOutSnafu {
@@ -482,7 +496,7 @@ mod tests {
     }
 
     fn run(f: &Fixture, entries: Vec<(&str, Hook)>) -> Result<HookOutputs, HookRunError> {
-        run_pre_run(&hooks(entries), &f.session, &f.home)
+        run_pre_run(&hooks(entries), &f.session, &f.home, None)
     }
 
     fn mode(path: &Path) -> u32 {
@@ -629,6 +643,32 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_stop_during_a_hook_kills_it_and_the_later_hooks_never_start() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let f = fixture();
+        let slow = script(&f, "slow", "sleep 30 & wait");
+        let later = script(&f, "later", "echo ran > ran");
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&flag);
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let error = assert_err!(run_pre_run(
+            &hooks(vec![("a", hook(&slow, &[])), ("b", hook(&later, &[]))]),
+            &f.session,
+            &f.home,
+            Some(&flag),
+        ));
+        assert!(matches!(error, HookRunError::Cancelled { .. }), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!f.session.as_path().join("hooks/b/ran").exists());
+        assert_ok!(timer.join());
     }
 
     #[test]

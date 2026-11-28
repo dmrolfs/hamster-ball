@@ -8,7 +8,7 @@
 These steps assume you use a terminal and have built a Rust program before.
 
 - A Mac with Apple silicon. `hb` was built and measured on macOS 15.7.
-- Rust 1.85 or newer, to build `hb`. If you do not have it, install it with [rustup](https://rustup.rs).
+- Rust 1.88 or newer, to build `hb`. If you do not have it, install it with [rustup](https://rustup.rs).
 - An agent you already use. Log in to it outside the ball first, because the ball has no browser and cannot open one.
 
 `hb` uses `/usr/bin/sandbox-exec`, which ships with macOS.
@@ -22,6 +22,10 @@ cd hamster-ball
 cargo install --path .
 hb --version
 ```
+
+To also install the optional terminal supervisor, use `cargo install --locked --path . --features supervise`.
+This installs `hb-supervise` beside the matching `hb`.
+Without this feature, ordinary `hb` builds do not compile the UI dependencies.
 
 Put `hb` in a directory that the agent cannot write.
 The floor blocks writes to every directory on your `PATH` and to `hb` itself.

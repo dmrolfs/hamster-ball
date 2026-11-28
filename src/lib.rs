@@ -31,6 +31,8 @@ pub mod proxy;
 pub(crate) mod safe_json;
 pub mod seatbelt;
 pub mod session;
+#[cfg(feature = "supervise")]
+pub mod supervise;
 pub(crate) mod sys;
 pub mod system;
 pub mod text;

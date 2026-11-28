@@ -1,0 +1,19 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene(), 50, 12, COLOR)"
+---
+┌ Sessions ──────────────────────────────────────┐
+│> 1 shopfront Running                           │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                             │
+  styles:              yyyyyyy
+│  3 docs Exited 0                               │
+│                                                │
+│                                                │
+│                                                │
+Make the terminal larger to see the agent's      │
+terminal.                                        │
+└────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ OVERVIEW  Enter interact · n new · s stop · r res

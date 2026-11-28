@@ -1,0 +1,31 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene, 80, 24, COLOR)"
+---
+┌ Sessions ────────────────────────────────────────────────────────────────────┐
+│> 1 shopfront Running                                                         │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                                                           │
+  styles:              yyyyyyy
+│  3 docs Exited 0                                                             │
+│                                                                              │
+│    ┌ Help ──────────────────────────────────────────────────────────────┐    │
+│    │Overview keys                                                       │    │
+│    │  j k, arrows   select a session        1-8   jump to a session     │    │
+│    │  Enter         type to the agent       n     start a session       │    │
+│    │  s             stop (asks first)       r     restart (asks first)  │    │
+│    │  a             review approval         Tab   switch Denials / Proxy│    │
+│    │  ?             this help               q     quit (asks first)     │    │
+│    │                                                                    │    │
+│    │While typing to an agent, every key goes to it.                     │    │
+│    │Ctrl-g returns here. Ctrl-g Ctrl-g sends one Ctrl-g to the agent.   │    │
+│    │Denials are information; there is no allow action here.             │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ HELP  Esc or ? closes

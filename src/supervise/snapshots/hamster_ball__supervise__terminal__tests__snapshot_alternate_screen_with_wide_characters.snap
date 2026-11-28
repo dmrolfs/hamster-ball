@@ -1,0 +1,6 @@
+---
+source: src/supervise/terminal.rs
+expression: styled(&screen)
+---
+世[Some(Reset)/Some(Reset)/NONE]界[Some(Reset)/Some(Reset)/NONE]o[Some(Reset)/Some(Reset)/NONE]k[Some(Reset)/Some(Reset)/NONE]
+b[Some(Reset)/Some(Indexed(4))/NONE]a[Some(Reset)/Some(Indexed(4))/NONE]r[Some(Reset)/Some(Indexed(4))/NONE]

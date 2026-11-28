@@ -74,7 +74,8 @@ fn at_a_terminal(w: &World, args: &[&str], answer: &str) -> (String, i32) {
     let body = format!(
         "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
          set timeout 30\n{guard}spawn {drive} {args}\n\
-         expect -ex {{Approve this config? [y/N] }}\nsend {{{answer}}}\nsend \"\\r\"\n\
+         expect -re {{Type `approve ([0-9a-f]+)` to approve: }}\nset code $expect_out(1,string)\n\
+         send \"{answer}\"\nsend \"\\r\"\n\
          expect eof\ncatch wait result\nputs \"EXIT=[lindex $result 3]\"\n",
         home = w.home_dir().display(),
         cwd = w.project.display(),
@@ -187,10 +188,10 @@ fn hb_approve_without_a_terminal_is_exit_78_and_stores_nothing() {
 }
 
 #[test]
-fn a_yes_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
+fn the_typed_approval_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
     sandboxed!();
     let w = World::new(PROJECT);
-    let (text, exit) = at_a_terminal(&w, &["approve"], "y");
+    let (text, exit) = at_a_terminal(&w, &["approve"], "approve $code");
     if exit == -2 {
         eprintln!("SKIP: no expect to provide a terminal");
         return;
@@ -203,7 +204,7 @@ fn a_yes_at_the_terminal_approves_and_the_next_run_needs_no_terminal() {
 }
 
 #[test]
-fn anything_but_yes_at_the_terminal_leaves_the_config_unapproved() {
+fn anything_but_the_typed_approval_at_the_terminal_leaves_the_config_unapproved() {
     sandboxed!();
     let w = World::new(PROJECT);
     let (text, exit) = at_a_terminal(&w, &["approve"], "no");
@@ -216,10 +217,35 @@ fn anything_but_yes_at_the_terminal_leaves_the_config_unapproved() {
 }
 
 #[test]
-fn hb_run_at_a_terminal_asks_then_runs_the_command_on_a_yes() {
+fn a_plain_y_or_yes_or_a_made_up_code_at_the_terminal_no_longer_approves() {
+    sandboxed!();
+    for answer in [
+        "y",
+        "yes",
+        "approve",
+        "approve 000000",
+        "approve $code extra",
+    ] {
+        let w = World::new(PROJECT);
+        let (text, exit) = at_a_terminal(&w, &["approve"], answer);
+        if exit == -2 {
+            eprintln!("SKIP: no expect to provide a terminal");
+            return;
+        }
+        assert_eq!(exit, NOT_APPROVED, "{answer:?}: {text}");
+        assert_eq!(records(&w), 0, "{answer:?}");
+    }
+}
+
+#[test]
+fn hb_run_at_a_terminal_asks_then_runs_the_command_on_the_typed_approval() {
     sandboxed!();
     let w = World::new(PROJECT);
-    let (text, exit) = at_a_terminal(&w, &["run", "/bin/sh", "-c", &marker_script(&w)], "yes");
+    let (text, exit) = at_a_terminal(
+        &w,
+        &["run", "/bin/sh", "-c", &marker_script(&w)],
+        "approve $code",
+    );
     if exit == -2 {
         eprintln!("SKIP: no expect to provide a terminal");
         return;
@@ -388,4 +414,37 @@ fn a_terminal_for_input_alone_is_not_enough_when_the_questions_would_go_to_a_fil
     };
     assert_eq!(exit, NOT_APPROVED, "{text}");
     assert_eq!(records(&w), 0);
+}
+
+#[test]
+fn a_value_too_long_to_review_is_refused_before_any_question_and_a_yes_does_nothing() {
+    sandboxed!();
+    let long = "x".repeat(hamster_ball::approval::MAX_VALUE_CHARS + 1);
+    let w = World::new(&format!(
+        "[fs]\nwrite = [\".\"]\n[env]\nset = {{ BIG = \"{long}\" }}\n"
+    ));
+    if !std::path::Path::new("/usr/bin/expect").exists() {
+        return;
+    }
+    // At a terminal, `y` typed right away: if a question were put, this would approve.
+    let exp = w.base.join("long.exp");
+    let body = format!(
+        "set env(HB_TD_HOME) {home}\nset env(HB_TD_CWD) {cwd}\nset env(HB_TD_PATH) {path}\nset env(HB_TD_TMP) {tmp}\n\
+         set timeout 30\n{guard}spawn {drive} approve\nsend \"y\\r\"\n\
+         expect eof\ncatch wait result\nputs \"EXIT=[lindex $result 3]\"\n",
+        home = w.home_dir().display(),
+        cwd = w.project.display(),
+        path = w.base.join("bin").display(),
+        tmp = w.base.join("tmp").display(),
+        drive = DRIVE,
+        guard = EXPECT_GUARD,
+    );
+    common::write(&exp, &body);
+    let out = assert_ok!(Command::new("/usr/bin/expect").arg(&exp).output());
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_no_expect_timeout(&text);
+    assert!(text.contains("too long to review in full"), "{text}");
+    assert!(!text.contains("Approve this config?"), "{text}");
+    assert!(text.contains("EXIT=78"), "{text}");
+    assert_eq!(records(&w), 0, "nothing may be stored");
 }

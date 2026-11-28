@@ -120,6 +120,8 @@ pub(crate) enum BoundedError {
     Spawn(io::Error),
     /// It ran past the time allowed and its process group was killed.
     TimedOut,
+    /// The caller's cancel flag was set and its process group was killed.
+    Cancelled,
 }
 
 /// What a program that ended on its own left behind.
@@ -145,9 +147,21 @@ pub(crate) fn run_bounded(
     timeout: std::time::Duration,
     max_bytes: u64,
 ) -> Result<Finished, BoundedError> {
+    run_cancellable(command, timeout, max_bytes, None)
+}
+
+/// [`run_bounded`] with cancellation checked during both execution and output draining.
+/// Checks are spaced about 5 ms apart; process reaping is not a hard real-time operation.
+pub(crate) fn run_cancellable(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    max_bytes: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Finished, BoundedError> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     command
@@ -172,40 +186,49 @@ pub(crate) fn run_bounded(
         let _ = sender.send(bytes);
     });
     let deadline = Instant::now() + timeout;
-    let kill_group = |child: &mut std::process::Child| {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        let _ = child.wait();
-    };
+    let mut status = None;
+    let mut output = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+        let wait_failed = if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => {
+                    status = observed;
+                    false
+                }
+                Err(_) => true,
             }
-            Ok(None) | Err(_) => {
-                kill_group(&mut child);
-                return Err(BoundedError::TimedOut);
+        } else {
+            false
+        };
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(bytes) => output = Some(bytes),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    kill_bounded_group(&mut child);
+                    return Err(BoundedError::Spawn(io::Error::other(
+                        "the output reader failed",
+                    )));
+                }
             }
         }
-    };
-    let mut stdout = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        Ok(bytes) => bytes,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            kill_group(&mut child);
-            return Err(BoundedError::TimedOut);
+        if let Some(status) = status
+            && output.is_some()
+        {
+            break status;
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(BoundedError::Spawn(io::Error::other(
-                "the output reader failed",
-            )));
+        let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        if cancelled || wait_failed || Instant::now() >= deadline {
+            kill_bounded_group(&mut child);
+            return Err(if cancelled {
+                BoundedError::Cancelled
+            } else {
+                BoundedError::TimedOut
+            });
         }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     };
+    let mut stdout = output.unwrap_or_default();
     let truncated = u64::try_from(stdout.len()).is_ok_and(|len| len > max_bytes);
     stdout.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
     Ok(Finished {
@@ -213,6 +236,16 @@ pub(crate) fn run_bounded(
         stdout,
         truncated,
     })
+}
+
+fn kill_bounded_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -310,6 +343,103 @@ mod bounded_tests {
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         }
         assert!(gone, "the descendant outlived the timeout");
+    }
+
+    #[test]
+    fn a_cancelled_program_is_killed_with_what_it_started_and_reported_as_cancelled() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&flag);
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = run_cancellable(
+            &mut sh("sleep 20 & wait"),
+            Duration::from_secs(60),
+            1024,
+            Some(&flag),
+        );
+        assert!(matches!(result, Err(BoundedError::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_ok!(timer.join());
+    }
+
+    #[test]
+    fn timeout_still_applies_after_the_leader_exits_with_stdout_held_open() {
+        let result = run_bounded(
+            &mut sh("sleep 2 & exit 3"),
+            Duration::from_millis(100),
+            1024,
+        );
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+    }
+
+    #[test]
+    fn cancellation_still_applies_after_the_leader_has_been_reaped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = assert_ok!(tempfile::TempDir::new());
+        let marker = dir.path().join("leader");
+        let flag = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let timer = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(pid) = std::fs::read_to_string(&marker)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .filter(|pid| *pid > 1)
+                        && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                            == Err(nix::errno::Errno::ESRCH)
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "leader was never reaped");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let result = run_cancellable(
+                &mut sh(&format!(
+                    "sleep 2 & echo $$ > '{}'; exit 3",
+                    marker.display()
+                )),
+                Duration::from_secs(10),
+                1024,
+                Some(&flag),
+            );
+            assert_ok!(timer.join());
+            assert!(matches!(result, Err(BoundedError::Cancelled)), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn output_arriving_after_leader_exit_is_preserved_with_its_exit_status() {
+        let done = assert_ok!(run_bounded(
+            &mut sh("(sleep 0.1; printf late) & exit 3"),
+            Duration::from_secs(10),
+            1024,
+        ));
+        assert_eq!(done.status.code(), Some(3));
+        assert_eq!(done.stdout, b"late");
+    }
+
+    #[test]
+    fn a_cancel_flag_that_is_never_set_changes_nothing() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let done = assert_ok!(run_cancellable(
+            &mut sh("echo ok"),
+            Duration::from_secs(10),
+            64,
+            Some(&flag)
+        ));
+        assert_eq!(done.stdout, b"ok\n");
     }
 
     #[test]

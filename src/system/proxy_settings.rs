@@ -348,7 +348,9 @@ fn proxies_from(scutil: &Path, timeout: Duration) -> Check<Vec<ProxySetting>> {
     command.arg("--proxy");
     let done = match run_bounded(&mut command, timeout, MAX_BYTES) {
         Ok(done) => done,
-        Err(BoundedError::TimedOut) => return unavailable(DiagnosticCode::InspectionLimitReached),
+        Err(BoundedError::TimedOut | BoundedError::Cancelled) => {
+            return unavailable(DiagnosticCode::InspectionLimitReached);
+        }
         Err(BoundedError::Spawn(_)) => return unavailable(DiagnosticCode::InspectionUnavailable),
     };
     if done.truncated {

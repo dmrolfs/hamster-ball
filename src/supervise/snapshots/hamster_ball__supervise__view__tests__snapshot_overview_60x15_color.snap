@@ -1,0 +1,22 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene(), 60, 15, COLOR)"
+---
+┌ Sessions ────────────────────────────────────────────────┐
+│> 1 shopfront Running                                     │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                                       │
+  styles:              yyyyyyy
+│  3 docs Exited 0                                         │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ OVERVIEW  Enter interact · n new · s stop · r restart · a a

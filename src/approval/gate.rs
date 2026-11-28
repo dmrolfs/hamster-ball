@@ -1,8 +1,9 @@
 // ABOUTME: The approval decision at `hb run` and `hb approve`: check the store, show the summary, ask at a terminal.
-// ABOUTME: Nothing approves without a typed yes from a person at a terminal; there is no flag or variable that skips it.
+// ABOUTME: New approval requires a terminal answer containing `approve` and the fresh displayed code; no flag skips it.
 //! Asking the owner (design section 5).
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 use super::digest::Fingerprint;
 use super::store::{ApprovalStore, Standing, StoreError, Why};
@@ -15,10 +16,23 @@ use crate::text::Escaped;
 /// How many hex digits of a file's digest the prompt shows.
 const SHOWN_DIGEST_DIGITS: usize = 12;
 
+/// How many random bytes make the code that must be typed to approve (shown as twice as many
+/// hex digits). It reduces blind queued-input acceptance, not screen-reading input injection.
+const CODE_BYTES: usize = 3;
+
+/// The most an answer may be: a longer line is not read further and does not approve.
+const MAX_ANSWER_BYTES: u64 = 256;
+
 /// A person at a terminal, or not.
 pub trait Terminal {
     /// Whether a person can be asked: input and the place the question appears are both terminals.
     fn is_interactive(&self) -> bool;
+
+    /// Discards what was typed but not yet read, so the answer is one given after the question.
+    ///
+    /// # Errors
+    /// The queue could not be discarded; the caller must then not ask.
+    fn discard_pending_input(&mut self) -> io::Result<()>;
 
     /// Shows `question` and reads one line of answer. The end of the input is an empty answer.
     ///
@@ -36,14 +50,26 @@ impl Terminal for StdTerminal {
         io::stdin().is_terminal() && io::stderr().is_terminal()
     }
 
+    fn discard_pending_input(&mut self) -> io::Result<()> {
+        rustix::termios::tcflush(io::stdin(), rustix::termios::QueueSelector::IFlush)
+            .map_err(io::Error::from)
+    }
+
     fn ask(&mut self, question: &str) -> io::Result<String> {
         let mut err = io::stderr().lock();
         write!(err, "{question}")?;
         err.flush()?;
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
-        Ok(line)
+        read_answer(io::stdin().lock())
     }
+}
+
+/// Reads one line of answer, at most [`MAX_ANSWER_BYTES`] long. A line cut off at the bound is not
+/// an answer, whatever its first bytes say: it is returned as no answer, so it declines.
+fn read_answer(reader: impl BufRead) -> io::Result<String> {
+    let mut line = String::new();
+    let read = reader.take(MAX_ANSWER_BYTES).read_line(&mut line)?;
+    let cut = read as u64 >= MAX_ANSWER_BYTES && !line.ends_with('\n');
+    Ok(if cut { String::new() } else { line })
 }
 
 /// No terminal at all: nobody is ever asked. For callers that must not prompt, such as in-process tests.
@@ -53,6 +79,10 @@ pub struct NoTerminal;
 impl Terminal for NoTerminal {
     fn is_interactive(&self) -> bool {
         false
+    }
+
+    fn discard_pending_input(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     fn ask(&mut self, _question: &str) -> io::Result<String> {
@@ -104,6 +134,8 @@ pub enum Verdict {
     Declined,
     /// Nobody could be asked, and the config is not approved.
     NoTerminal(Why),
+    /// A value in the config is too long to review in full, so nothing was asked.
+    TooLongToReview(&'static str),
 }
 
 impl Verdict {
@@ -134,11 +166,22 @@ pub fn require(
     if !terminal.is_interactive() {
         return Ok(Verdict::NoTerminal(why));
     }
+    // Before anything is shown: a yes must never cover a value the owner could not read.
+    if let Some(setting) = candidate.summary.too_long() {
+        return Ok(Verdict::TooLongToReview(setting));
+    }
     show(candidate, &why, out).map_err(|source| GateError::Show { source })?;
+    // What was typed while the summary was on screen was not an answer to it.
+    terminal
+        .discard_pending_input()
+        .map_err(|source| GateError::Discard { source })?;
+    let code = new_code().map_err(|source| GateError::Code { source })?;
     let answer = terminal
-        .ask("Approve this config? [y/N] ")
+        .ask(&format!(
+            "Approve this config? Type `approve {code}` to approve: "
+        ))
         .map_err(|source| GateError::Ask { source })?;
-    if !is_yes(&answer) {
+    if !is_approval(&answer, &code) {
         return Ok(Verdict::Declined);
     }
     store
@@ -147,8 +190,17 @@ pub fn require(
     Ok(Verdict::Approved)
 }
 
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+/// Whether `answer` is exactly `approve` and the code of this question.
+fn is_approval(answer: &str, code: &str) -> bool {
+    let mut words = answer.split_whitespace();
+    words.next() == Some("approve") && words.next() == Some(code) && words.next().is_none()
+}
+
+/// A fresh code as lowercase hex digits.
+fn new_code() -> io::Result<String> {
+    let mut bytes = [0u8; CODE_BYTES];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn show(candidate: &Candidate, why: &Why, out: &mut dyn Write) -> io::Result<()> {
@@ -194,6 +246,20 @@ pub enum GateError {
         source: io::Error,
     },
 
+    /// The input typed ahead could not be discarded, so an old answer might be read as the new one.
+    #[snafu(display("cannot clear the terminal's pending input, so no question was asked"))]
+    Discard {
+        /// The OS error.
+        source: io::Error,
+    },
+
+    /// No fresh code could be made for the question.
+    #[snafu(display("cannot make a code for the question, so none was asked"))]
+    Code {
+        /// The OS error.
+        source: io::Error,
+    },
+
     /// The answer could not be read.
     #[snafu(display("cannot ask for approval"))]
     Ask {
@@ -224,6 +290,8 @@ mod tests {
         interactive: bool,
         answers: VecDeque<String>,
         asked: Vec<String>,
+        discards: usize,
+        discard_fails: bool,
     }
 
     impl Scripted {
@@ -232,6 +300,8 @@ mod tests {
                 interactive: true,
                 answers: answers.iter().map(|a| (*a).to_owned()).collect(),
                 asked: Vec::new(),
+                discards: 0,
+                discard_fails: false,
             }
         }
 
@@ -240,6 +310,8 @@ mod tests {
                 interactive: false,
                 answers: VecDeque::new(),
                 asked: Vec::new(),
+                discards: 0,
+                discard_fails: false,
             }
         }
     }
@@ -249,9 +321,27 @@ mod tests {
             self.interactive
         }
 
+        fn discard_pending_input(&mut self) -> io::Result<()> {
+            self.discards += 1;
+            if self.discard_fails {
+                return Err(io::Error::other("flush failed"));
+            }
+            Ok(())
+        }
+
+        /// `CODE` in a scripted answer stands for the code the question showed.
         fn ask(&mut self, question: &str) -> io::Result<String> {
             self.asked.push(question.to_owned());
-            Ok(self.answers.pop_front().unwrap_or_default())
+            let code = question
+                .split('`')
+                .nth(1)
+                .and_then(|s| s.split_whitespace().nth(1))
+                .unwrap_or_default();
+            Ok(self
+                .answers
+                .pop_front()
+                .unwrap_or_default()
+                .replace("CODE", code))
         }
     }
 
@@ -312,7 +402,7 @@ mod tests {
     #[test]
     fn a_yes_at_a_terminal_approves_and_the_next_run_is_not_asked() {
         let f = fixture(&[("/p/hamster-ball.toml", "x")]);
-        let mut terminal = Scripted::saying(&["y\n"]);
+        let mut terminal = Scripted::saying(&["approve CODE\n"]);
         let (verdict, shown) = run(&f, &mut terminal);
         assert_matches!(verdict, Verdict::Approved);
         assert!(verdict.allows_run());
@@ -332,7 +422,21 @@ mod tests {
 
     #[test]
     fn anything_but_yes_declines_and_stores_nothing() {
-        for answer in ["", "\n", "n\n", "no\n", "yess\n", "maybe\n", "y y\n"] {
+        for answer in [
+            "",
+            "\n",
+            "n\n",
+            "no\n",
+            "y\n",
+            "yes\n",
+            "approve\n",
+            "approve CODEX\n",
+            "approve 000000\n",
+            "approve CODE extra\n",
+            "approveCODE\n",
+            "APPROVE CODE\n",
+            "approve  CODE  more\n",
+        ] {
             let f = fixture(&[("/p/hamster-ball.toml", "x")]);
             let (verdict, _) = run(&f, &mut Scripted::saying(&[answer]));
             assert_matches!(verdict, Verdict::Declined);
@@ -345,12 +449,109 @@ mod tests {
     }
 
     #[test]
-    fn yes_in_either_case_with_spaces_counts() {
-        for answer in ["y\n", "Y\n", "yes\n", "YES\n", "  yes  \n", "y"] {
+    fn the_exact_words_with_spaces_or_no_newline_approve() {
+        for answer in [
+            "approve CODE\n",
+            "approve CODE",
+            "  approve   CODE  \n",
+            "approve CODE\r\n",
+        ] {
             let f = fixture(&[("/p/hamster-ball.toml", "x")]);
             let (verdict, _) = run(&f, &mut Scripted::saying(&[answer]));
             assert_matches!(verdict, Verdict::Approved, "{answer:?}");
         }
+    }
+
+    #[test]
+    fn the_question_names_the_code_and_each_question_has_a_new_one() {
+        let f = fixture(&[("/p/hamster-ball.toml", "x")]);
+        let mut first = Scripted::saying(&["n"]);
+        let mut second = Scripted::saying(&["n"]);
+        run(&f, &mut first);
+        run(&f, &mut second);
+        let code = |t: &Scripted| {
+            t.asked[0]
+                .split('`')
+                .nth(1)
+                .and_then(|s| s.split_whitespace().nth(1))
+                .map(str::to_owned)
+        };
+        let (a, b) = (code(&first), code(&second));
+        assert!(
+            a.as_deref().is_some_and(
+                |c| c.len() == 2 * CODE_BYTES && c.bytes().all(|x| x.is_ascii_hexdigit())
+            ),
+            "{:?}",
+            first.asked
+        );
+        assert_ne!(a, b, "the same code twice");
+    }
+
+    #[test]
+    fn an_answer_for_an_earlier_question_does_not_approve_this_one() {
+        let f = fixture(&[("/p/hamster-ball.toml", "x")]);
+        // The code an earlier question showed, typed (or pasted) again.
+        let mut first = Scripted::saying(&["n"]);
+        run(&f, &mut first);
+        let old = first.asked[0]
+            .split('`')
+            .nth(1)
+            .and_then(|s| s.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_owned();
+        let answer = format!("approve {old}");
+        let (verdict, _) = run(&f, &mut Scripted::saying(&[answer.as_str()]));
+        assert_matches!(verdict, Verdict::Declined);
+    }
+
+    #[test]
+    fn an_answer_cut_at_the_read_bound_is_no_answer_even_if_it_starts_with_the_approval() {
+        let padding = " ".repeat(MAX_ANSWER_BYTES as usize);
+        let long = format!("approve 3fa9c2{padding}reject\n");
+        // Without the cut check this returns the first 256 bytes, which parse as an approval.
+        let cut = assert_ok!(read_answer(io::Cursor::new(long.as_bytes())));
+        assert_eq!(cut, "");
+        assert!(!is_approval(&cut, "3fa9c2"));
+        // A line that fits is returned whole, with or without its newline at the end of the input.
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(b"approve 3fa9c2\n".as_slice()))),
+            "approve 3fa9c2\n"
+        );
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(b"approve 3fa9c2".as_slice()))),
+            "approve 3fa9c2"
+        );
+        // Exactly the bound with its newline is an ordinary line.
+        let exact = format!("{}\n", "y".repeat(MAX_ANSWER_BYTES as usize - 1));
+        assert_eq!(
+            assert_ok!(read_answer(io::Cursor::new(exact.as_bytes()))),
+            exact
+        );
+    }
+
+    #[test]
+    fn typed_ahead_input_is_discarded_after_the_summary_and_before_the_question() {
+        let f = fixture(&[("/p/hamster-ball.toml", "x")]);
+        let mut terminal = Scripted::saying(&["approve CODE"]);
+        let (verdict, _) = run(&f, &mut terminal);
+        assert_matches!(verdict, Verdict::Approved);
+        assert_eq!(terminal.discards, 1);
+    }
+
+    #[test]
+    fn a_discard_that_fails_means_no_question_and_no_approval() {
+        let f = fixture(&[("/p/hamster-ball.toml", "x")]);
+        let mut terminal = Scripted::saying(&["approve CODE"]);
+        terminal.discard_fails = true;
+        let mut out = Vec::new();
+        let result = require(&f.candidate, &f.store, &mut terminal, &mut out);
+        assert_matches!(result, Err(GateError::Discard { .. }));
+        assert!(terminal.asked.is_empty(), "asked after a failed discard");
+        assert_matches!(
+            f.store
+                .standing(f.candidate.root(), f.candidate.fingerprint()),
+            Standing::Unapproved(_)
+        );
     }
 
     #[test]
@@ -360,6 +561,8 @@ mod tests {
             interactive: true,
             answers: VecDeque::from([String::new()]),
             asked: Vec::new(),
+            discards: 0,
+            discard_fails: false,
         };
         let (verdict, _) = run(&f, &mut terminal);
         assert_matches!(verdict, Verdict::Declined);
@@ -368,7 +571,10 @@ mod tests {
     #[test]
     fn a_change_after_approval_asks_again_and_names_the_file() {
         let f = fixture(&[("/p/hamster-ball.toml", "x")]);
-        assert_matches!(run(&f, &mut Scripted::saying(&["y"])).0, Verdict::Approved);
+        assert_matches!(
+            run(&f, &mut Scripted::saying(&["approve CODE"])).0,
+            Verdict::Approved
+        );
         let changed = Fixture {
             candidate: Candidate {
                 fingerprint: Fingerprint::from_files([(
@@ -408,7 +614,7 @@ mod tests {
         let result = require(
             &f.candidate,
             &f.store,
-            &mut Scripted::saying(&["y"]),
+            &mut Scripted::saying(&["approve CODE"]),
             &mut out,
         );
         assert_matches!(result, Err(GateError::Store { .. }));

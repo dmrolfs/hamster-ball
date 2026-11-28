@@ -94,10 +94,10 @@ fn run(
                 }
             }
         }
-        if let Some(since) = draining_since {
-            if !ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX {
-                break;
-            }
+        if let Some(since) = draining_since
+            && (!ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX)
+        {
+            break;
         }
     }
     end_of_output(&mut filter, &mut sink);

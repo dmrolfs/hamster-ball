@@ -114,7 +114,7 @@ fn list(root: &CanonicalPath, git: &Path, timeout: Duration) -> Result<Vec<u8>, 
     match result {
         Ok(done) if done.status.success() && !done.truncated => Ok(done.stdout),
         Ok(_) => Err(Listing::NotARepository),
-        Err(BoundedError::TimedOut) => Err(Listing::TimedOut),
+        Err(BoundedError::TimedOut | BoundedError::Cancelled) => Err(Listing::TimedOut),
         Err(BoundedError::Spawn(_)) => Err(Listing::Unavailable),
     }
 }

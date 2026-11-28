@@ -1,0 +1,31 @@
+---
+source: src/supervise/view.rs
+expression: "render(&scene, 80, 24, COLOR)"
+---
+┌ Sessions ────────────────────────────────────────────────────────────────────┐
+│> 1 shopfront Running                                                         │
+  styles:  RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+│  2 billing Approve                                                           │
+  styles:              yyyyyyy
+│  3 docs Exited 0                                                             │
+│                                                                              │
+│                                                                              │
+│    ┌ Launch a session ──────────────────────────────────────────────────┐    │
+│    │  Project: /work/docs                                               │    │
+│    │> Command: opencode_                                                │    │
+│    │                                                                    │    │
+│    │Recent projects (Up/Down):                                          │    │
+│    │  * /work/docs                                                      │    │
+│    │    /work/billing                                                   │    │
+│    │    /work/shopfront                                                 │    │
+│    └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+billing: needs approval
+  styles: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+ LAUNCH  Enter starts · Tab next field · Up/Down recent · Esc cancels

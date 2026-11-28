@@ -717,6 +717,120 @@ fn a_helper_that_dies_before_prepared_is_reported_at_once_not_after_the_deadline
     assert!(!log.exists());
 }
 
+#[test]
+fn killing_hb_after_supervision_starts_never_releases_the_armed_helper() {
+    sandboxed!();
+    let w = world();
+    let ready = w.project.join("armed");
+    let marker = w.project.join("ran");
+    let mut parent = assert_ok!(
+        w.drive(
+            DRIVE,
+            &[
+                "run",
+                "--",
+                "/usr/bin/touch",
+                claims::assert_some!(marker.to_str())
+            ]
+        )
+        .env("HB_TEST_ARMED_GATE", &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() && Instant::now() < deadline {
+        if assert_ok!(parent.try_wait()).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let observed = std::fs::read_to_string(&ready);
+    let ran_before_kill = marker.exists();
+    let _ = parent.kill();
+    let _ = parent.wait();
+    let helper = Pid::from_raw(assert_ok!(assert_ok!(observed).trim().parse::<i32>()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while kill(helper, None) != Err(Errno::ESRCH) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let gone = kill(helper, None) == Err(Errno::ESRCH);
+    if !gone {
+        let _ = kill(helper, nix::sys::signal::Signal::SIGKILL);
+    }
+    assert!(gone, "the armed helper outlived hb");
+    assert!(
+        !ran_before_kill && !marker.exists(),
+        "target ran before release"
+    );
+}
+
+#[test]
+fn a_helper_killed_before_release_is_reported_without_hanging_cleanup() {
+    sandboxed!();
+    let w = world();
+    let ready = w.project.join("armed");
+    let marker = w.project.join("ran");
+    let mut parent = assert_ok!(
+        w.drive(
+            DRIVE,
+            &[
+                "run",
+                "--",
+                "/usr/bin/touch",
+                claims::assert_some!(marker.to_str())
+            ]
+        )
+        .env("HB_TEST_ARMED_GATE", &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() && Instant::now() < deadline {
+        if assert_ok!(parent.try_wait()).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let observed = std::fs::read_to_string(&ready);
+    if observed.is_err() {
+        let _ = parent.kill();
+        let _ = parent.wait();
+    }
+    let helper = Pid::from_raw(assert_ok!(assert_ok!(observed).trim().parse::<i32>()));
+    assert_ok!(kill(helper, nix::sys::signal::Signal::SIGKILL));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let state = assert_ok!(
+            Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &helper.as_raw().to_string()])
+                .output()
+        );
+        if !state.status.success() || String::from_utf8_lossy(&state.stdout).contains('Z') {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ok!(std::fs::write(ready.with_extension("continue"), ""));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = assert_ok!(parent.try_wait()) {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!claims::assert_some!(status, "cleanup hung").success());
+    assert!(!marker.exists(), "target ran without release");
+}
+
 /// A parent that starts `__exec`, sends stdin, waits for `prepared`, prints the helper's pid and
 /// then idles: a process the test can SIGKILL while the helper is parked.
 fn parked_parent(hb: &str, marker: &Path) -> String {

@@ -479,7 +479,7 @@ How to measure and check a preset is in [presets/README.md](https://github.com/d
 A project's `hamster-ball.toml`, and any file it extends from inside the project, can be changed by the agent or by a `git pull`.
 So `hb run` runs them only when their exact bytes were approved.
 
-- `hb approve` shows the project root, each file with a short digest, and everything the project adds beyond your base config, including what its presets grant. It accepts a typed `y` or `yes`, at a terminal.
+- `hb approve` shows the project root, each file with a short digest, and everything the project adds beyond your base config, including what its presets grant. It accepts only the typed words `approve` and the code shown with the question, at a terminal.
 - Any change to a byte, or a renamed, added or removed file, asks again. Moving the project asks again.
 - Approval records live in `~/.local/state/hamster-ball/approvals/`, which the floor hides from the agent.
 - Without a terminal, an unapproved config exits with code 78 and runs nothing.

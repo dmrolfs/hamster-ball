@@ -62,16 +62,64 @@ path /Users/you/.ssh/id_rsa
 
 Warnings you may see include `project_not_granted` (no grant covers the project), `grant_shadowed_by_floor` (a grant the floor overrides), `git_config_unreadable` and `not_approved`.
 
+## `hb-supervise`: install
+
+The terminal supervisor is optional: `cargo install --locked --path . --features supervise` installs both `hb` and `hb-supervise`.
+Keep these matching binaries in the same directory; the supervisor launches the `hb` beside itself.
+A default build installs only `hb` and does not compile the UI dependencies.
+
+## `hb-supervise`: private channel environment
+
+The launcher passes the private channel descriptor number in `HB_SUPERVISOR_FD`.
+The live `hb` process retains that variable; it is excluded from child environment snapshots.
+Child commands use explicit environments, while descriptor sweeping and close-on-exec independently prevent channel inheritance.
+This is snapshot exclusion, not immediate erasure from the live process environment.
+The descriptor number alone is not access to the channel.
+
+## `hb-supervise`: restart and cleanup evidence
+
+Restart prevents overlap between the old and new agent leaders.
+It does not certify that every descendant, background task or temporary resource is gone.
+A valid normal-exit report permits restart after the old worker ends.
+Without that report, a known leader's disappearance can also permit restart,
+provided no cleanup failure, invalid report or abandonment was recorded.
+The protocol's `cleanup: complete` means normal leader exit and teardown without a reported failure,
+or that no session work started; it is not an all-descendants cleanup certificate.
+
+Failed or malformed cleanup evidence, an unknown agent, and abandoned report delivery block restart.
+Those blockers survive retries and make shutdown unclean, even if a known leader PID later disappears.
+A session error during setup is conservative too: lack of a Running report does not prove nothing started.
+When a known leader remains alive, the timeout refuses the requested restart but preserves its exclusion.
+PID reuse may cause a conservative false refusal; stored PIDs are probed, never used to kill strangers.
+
+## `hb-supervise`: suspending the terminal UI
+
+SIGTSTP restores the terminal before suspending the supervisor.
+During an approval review, Ctrl-Z suspends the review and supervisor together.
+Use `fg` to resume; `bg` leaves the shell's terminal modes and input alone.
+A pending review remains a review until it finishes or is cancelled.
+
+Agent sessions keep running under their own `hb` supervision while the UI job is stopped.
+The stopped UI does not drain reports; their queues remain bounded.
+After background continuation the supervisor drains reports and handles TERM/HUP,
+but does not read the keyboard or redraw until the shell gives it foreground ownership.
+SIGSTOP and SIGKILL bypass this restoration path and can leave terminal modes unchanged.
+
 ## `hb approve`
 
 Reviews this project's config and records your approval.
 
 ```
-Approve this config? [y/N]
+Approve this config? Type `approve 3fa9c2` to approve:
 ```
 
 It shows the project root, each file with a short digest, and what the project adds beyond your base.
-It accepts only a typed `y` or `yes`, and only at a terminal.
+It accepts only the words `approve` and the six-digit code shown with that question, typed at a terminal.
+The code is new for every question, and anything typed before the question appeared is discarded, so a pasted or queued answer cannot approve a config you did not read.
+A plain `y` or `yes` does nothing.
+The code stops answers that were typed, pasted or queued before the question appeared.
+It does not stop a program that can read your terminal's screen and send it input (for example one that owns the terminal's master side, or one that can drive your terminal emulator or tmux).
+Agents that `hb` runs have their own terminal and cannot do either by default; a program outside the sandbox can.
 There is no `--yes`.
 
 | Option | Meaning |

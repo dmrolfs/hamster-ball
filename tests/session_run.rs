@@ -931,3 +931,65 @@ mod proxy {
         assert!(!warning[0].contains(&open.to_string()), "{}", warning[0]);
     }
 }
+
+/// Runs inside a re-executed copy of this test binary, as `hb` does at start. A failing sweep
+/// cannot be provoked in a real process, so that is covered in the library's own tests; this
+/// checks what only a real process can: after `start_up`, no descriptor above 2 is left.
+#[test]
+fn start_up_probe_child() {
+    let Some(_) = std::env::var_os("HB_START_UP_PROBE") else {
+        return;
+    };
+    let start = hamster_ball::session::start_up();
+    let open: Vec<String> = fs::read_dir("/dev/fd")
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.parse::<i32>().is_ok_and(|fd| fd > 2))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The directory listing holds one descriptor of its own, already closed when it is read.
+    println!(
+        "STARTUP problem={} channel={} open={}",
+        start.problem.is_some(),
+        start.channel.is_some(),
+        open.len()
+    );
+}
+
+#[test]
+fn start_up_leaves_no_inherited_descriptor_open_and_a_bad_channel_variable_is_reported() {
+    if !sandbox_available() {
+        return;
+    }
+    let exe = assert_ok!(std::env::current_exe());
+    let run = |extra: &str| {
+        let script = format!(
+            "exec 3</etc/hosts; exec 4</etc/hosts; {extra} exec {} --exact start_up_probe_child --nocapture",
+            common::quote(&exe)
+        );
+        let out = assert_ok!(
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("HB_START_UP_PROBE", "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // No supervisor: every descriptor the shell left is closed, and nothing is reported.
+    let plain = run("");
+    assert!(
+        plain.contains("STARTUP problem=false channel=false open=1")
+            || plain.contains("STARTUP problem=false channel=false open=0"),
+        "{plain}"
+    );
+    // A variable that names a descriptor that is not a socket is reported, and still swept.
+    let bad = run("HB_SUPERVISOR_FD=3");
+    assert!(bad.contains("problem=true"), "{bad}");
+    assert!(
+        bad.contains("open=1") || bad.contains("open=0"),
+        "a refused channel must not leave descriptors behind: {bad}"
+    );
+}

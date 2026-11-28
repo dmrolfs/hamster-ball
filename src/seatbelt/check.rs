@@ -150,14 +150,14 @@ pub fn check(rules: &[Rule]) -> Result<(), InvariantViolation> {
         if rule.ops.is_empty() {
             return Err(InvariantViolation::NoOperations { index });
         }
-        if let Some(previous) = previous {
-            if rule.section < previous {
-                return Err(InvariantViolation::SectionOrder {
-                    index,
-                    previous,
-                    found: rule.section,
-                });
-            }
+        if let Some(previous) = previous
+            && rule.section < previous
+        {
+            return Err(InvariantViolation::SectionOrder {
+                index,
+                previous,
+                found: rule.section,
+            });
         }
         previous = Some(rule.section);
         check_action(index, rule)?;
@@ -302,13 +302,12 @@ fn check_filters(index: usize, rule: &Rule) -> Result<(), InvariantViolation> {
             }
             check_param(index, param.kind, &param.text)?;
         }
-        if let Some(text) = filter.static_text() {
-            if text
+        if let Some(text) = filter.static_text()
+            && text
                 .chars()
                 .any(|c| c == '"' || c == '\\' || c.is_control())
-            {
-                return Err(InvariantViolation::BadStaticText { index });
-            }
+        {
+            return Err(InvariantViolation::BadStaticText { index });
         }
     }
     Ok(())
