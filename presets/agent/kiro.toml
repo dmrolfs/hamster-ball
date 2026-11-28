@@ -15,8 +15,12 @@
 #
 # `data.sqlite3` stays writable and is NOT protected: it holds the login token (so a refresh can work) next to
 # conversations and counters. Its 22 settings keys name no path, command or hook, and a chat ran with the file write-denied,
-# but a token refresh without the write was not measured. An owner who does not want the risk can add
-# `deny_write = ["~/Library/Application Support/kiro-cli/data.sqlite3"]` and log in again outside hb when the token expires.
+# but a token refresh without the write was not measured. SQLite also keeps `data.sqlite3-wal`, `-shm` and `-journal` beside
+# the file, and those can change what the database holds when it is next opened, so an owner who does not want the risk
+# must deny all four names, not only `data.sqlite3`, and log in again outside hb when the token expires.
+#
+# In the PROJECT, `.kiro/settings`, `.kiro/agents` and `.kiro/hooks` are not written (they hold MCP commands and hooks).
+# `.kiro/steering` and `.kiro/skills` stay writable. The names come from strings in kiro-cli 3.6.2, not from a run.
 #
 # Hosts a one-shot chat contacted: app.kiro.dev, runtime / management / telemetry .us-east-1.kiro.dev and
 # client-telemetry.us-east-1.amazonaws.com. cognito-identity is the credential source for that telemetry
@@ -40,6 +44,9 @@ deny_write = [
   "~/Library/Application Support/kiro-cli/shell-integration-backup",
   "~/.kiro/settings",
   "~/.kiro/agents",
+  ".kiro/settings",
+  ".kiro/agents",
+  ".kiro/hooks",
 ]
 
 [net]

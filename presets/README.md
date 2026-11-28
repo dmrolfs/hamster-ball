@@ -40,13 +40,17 @@ lists the second kind in `deny_write`, and a test (`tests/executable_state.rs`) 
 
 | Agent (measured version) | Read-only inside hb | Writable: history | Writable: login and other state | Not measured |
 |---|---|---|---|---|
-| claude 2.1.328 | `settings.json`, `~/.claude.json`, `hooks`, `plugins`, `commands`, `agents`, `shell-snapshots` | `projects`, `sessions`, `history.jsonl` | Bedrock credentials come from your own `pre_run` hook, not from a file here | interactive use: onboarding, `/config`, OAuth refresh, the Bash tool's shell snapshot |
-| pi 1.7.0 | `settings.json`, `models.json`, `models-store.json`, `trust.json`, `extensions`, `npm`, `git`, `agents`, `bin`, `install` | `sessions` | `auth.json` (so a refresh can work) | whether pi treats `auth.json` or its other files as code; a provider that needs a denied file |
-| kiro-cli 3.6.2 | `run/chat-cli-*`, `shell-integration-backup`, `~/.kiro/settings`, `~/.kiro/agents`, `bun`, `bunfig.toml`, `kas`, `node`, `tui.js` | `~/.kiro/sessions` | `data.sqlite3` holds the login token and conversations in one file, so it stays writable and is not protected | a token refresh with the file write-denied |
-| opencode 1.2.0 | `~/.config/opencode`, the plugin cache files, `~/.local/share/opencode/bin` | `~/.local/share/opencode`, `~/.local/state/opencode` | `auth.json` is in `~/.local/share/opencode`, so the agent can read it | the whole row: opencode was not installed when this was last checked |
+| claude 2.1.328 | `settings.json`, `~/.claude.json`, `hooks`, `plugins`, `commands`, `agents`, `shell-snapshots`; in the project `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`, `.claude/hooks`, `.claude/plugins`, `.claude/commands`, `.claude/agents` | `projects`, `sessions`, `history.jsonl` | Bedrock credentials come from your own `pre_run` hook, not from a file here | interactive use: onboarding, `/config`, OAuth refresh, the Bash tool's shell snapshot |
+| pi 1.7.0 | `settings.json`, `models.json`, `models-store.json`, `trust.json`, `extensions`, `npm`, `git`, `agents`, `tmp/extensions`, `bin`, `install`; in the project `.pi/settings.json`, `.pi/extensions`, `.pi/npm`, `.pi/git`, `.pi/agents` | `sessions` | `auth.json` (so a refresh can work) | whether pi treats `auth.json` or its other files as code; a provider that needs a denied file |
+| kiro-cli 3.6.2 | `run/chat-cli-*`, `shell-integration-backup`, `~/.kiro/settings`, `~/.kiro/agents`, `bun`, `bunfig.toml`, `kas`, `node`, `tui.js`; in the project `.kiro/settings`, `.kiro/agents`, `.kiro/hooks` | `~/.kiro/sessions` | `data.sqlite3` holds the login token and conversations in one file, so it stays writable and is not protected; to protect it, deny `data.sqlite3` and its `-wal`, `-shm` and `-journal` files together | a token refresh with the file write-denied |
+| opencode 1.2.0 | `~/.config/opencode`, the plugin cache files, `~/.local/share/opencode/bin`; in the project `.opencode`, `opencode.json`, `opencode.jsonc` | `~/.local/share/opencode`, `~/.local/state/opencode` | `auth.json` is in `~/.local/share/opencode`, so the agent can read it | the whole row: opencode was not installed when this was last checked |
 
 What this does not do:
 
+- Which project files are denied comes from strings in each agent's program or its docs, not from watching a run, and opencode was
+  not installed, so its names are unchecked. A project file an agent loads that is not listed is still writable. A denied
+  project file also means the agent cannot save to it: for claude, a permission you "always allow" is not stored in
+  `.claude/settings.local.json`.
 - It does not make files the agent can still write safe. `data.sqlite3` (kiro) is the one row the presets leave open on purpose; a
   test pins that set, so adding another needs an owner decision.
 - It does not check what is already on disk. Hooks or plugins that were planted before you used these presets are still there.

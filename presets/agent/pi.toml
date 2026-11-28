@@ -13,6 +13,11 @@
 # is done outside hb. `sessions` stays writable. `auth.json` (pi's login) stays writable so a token refresh can work;
 # whether pi ever treats it as code is not measured.
 #
+# `~/.pi/agent/tmp/extensions` is also not written: pi unpacks extensions named on its command line (`-e npm:...`, `-e git:...`)
+# there under a name that is the same every time, and reuses what it finds (pi 1.7.0, `getExtensionTempFolder`); a run that
+# changed it would change what a later plain `pi -e ...` runs. Prepare such extensions outside hb. In the PROJECT, `.pi/settings.json`,
+# `.pi/extensions`, `.pi/npm`, `.pi/git` and `.pi/agents` are not written either (pi loads them for a trusted project).
+#
 # No hosts: the model provider is yours. Put it in your own config:
 #   [net]  allow = ["your-gateway.example.com"]   a gateway reached over HTTPS (the check used a remote one)
 #   [net]  loopback_ports = [18089]               a gateway on this machine (pi's default provider is
@@ -37,6 +42,12 @@ deny_write = [
   "~/.pi/agent/npm",
   "~/.pi/agent/git",
   "~/.pi/agent/agents",
+  "~/.pi/agent/tmp/extensions",
+  ".pi/settings.json",
+  ".pi/extensions",
+  ".pi/npm",
+  ".pi/git",
+  ".pi/agents",
 ]
 
 [tls]

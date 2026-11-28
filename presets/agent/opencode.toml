@@ -12,6 +12,8 @@
 # `~/.config/opencode` is read only because the preset grants only a read, and it is also denied for writes (hb-82i) so a
 # broader write grant in your own config cannot reopen it. opencode is NOT installed on the machine this was last checked on,
 # so the 1.2.0 measurement above has not been repeated.
+# In the PROJECT, `.opencode`, `opencode.json` and `opencode.jsonc` are not written: opencode loads plugins, agents, commands
+# and MCP servers from them. These names come from opencode's documentation, not from a run (it is not installed here).
 # Not written: what a plain `opencode` runs outside the sandbox, so the agent cannot plant code there:
 # the plugin cache (`~/.cache/opencode/node_modules`, `package.json`, `bun.lock`) and downloaded tools
 # (`~/.local/share/opencode/bin`). Run opencode once outside hb after installing or updating it: it
@@ -40,6 +42,9 @@ read = [
 write = ["~/.cache/opencode", "~/.local/share/opencode", "~/.local/state/opencode"]
 deny_write = [
   "~/.config/opencode",
+  ".opencode",
+  "opencode.json",
+  "opencode.jsonc",
   "~/.cache/opencode/bun.lock",
   "~/.cache/opencode/node_modules",
   "~/.cache/opencode/package.json",

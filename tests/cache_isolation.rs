@@ -734,6 +734,17 @@ fn the_documented_recipe_lists_only_the_unused_generation_and_removing_it_keeps_
     // A second warm publishes a new generation and leaves the first on disk.
     fake_uvx(&w);
     warm(&w);
+    // A second project, with its own generation and its own `current`. The recipe must not list that
+    // generation as unused, and must not keep the first project's old one alive.
+    let other = w.add_project("other", PROJECT);
+    let other_warm = assert_ok!(
+        w.drive_at(&other, DRIVE, &["warm"])
+            .stdin(Stdio::null())
+            .output()
+    );
+    assert_eq!(other_warm.status.code(), Some(0), "{}", text(&other_warm));
+    let generations = assert_ok!(fs::read_dir(store(&w).join("generations"))).count();
+    assert_eq!(generations, 3, "two for this project, one for the other");
     // The loop is read out of the doc, so the test cannot drift from what the doc tells people to run.
     let doc = assert_ok!(fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/05-commands.md")
@@ -753,6 +764,11 @@ fn the_documented_recipe_lists_only_the_unused_generation_and_removing_it_keeps_
             .arg(store(&w))
             .output()
     );
+    assert!(
+        listed.status.success(),
+        "the listing itself failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&listed.stdout).trim(),
         format!("unused: {first_id}"),
@@ -762,9 +778,10 @@ fn the_documented_recipe_lists_only_the_unused_generation_and_removing_it_keeps_
     assert_ok!(fs::remove_dir_all(
         store(&w).join("generations").join(&first_id)
     ));
-    let out = run(&w, "echo still-runs");
+    // What stayed holds the warmed tool's files: a run copies the current generation and reads them.
+    let out = run(&w, "cat \"$TMPDIR/cache/uv/archive-v0/aaa/mod.py\"");
     assert!(
-        out.status.success() && text(&out).contains("still-runs"),
+        out.status.success() && text(&out).contains("trusted"),
         "{}",
         text(&out)
     );

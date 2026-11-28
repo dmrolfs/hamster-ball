@@ -17,6 +17,12 @@
 # shell snapshot). If one of those needs a denied path, install or change it outside hb. History (`projects`, `sessions`,
 # `history.jsonl`) stays writable.
 #
+# The same files in the PROJECT are also not written: `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`,
+# `.claude/hooks`, `.claude/plugins`, `.claude/commands`, `.claude/agents` (claude loads them from the project, the project is
+# writable, and a later plain `claude` there would run what a run planted). Cost: claude cannot save a permission it asks
+# you to "always allow" into `.claude/settings.local.json`; add such rules outside hb. `.claude/skills`, `rules` and `CLAUDE.md`
+# stay writable: they are instructions, not programs claude starts. Names come from strings in claude 2.1.328, not from a run.
+#
 # Credentials are yours and are not in this preset. Your credential command and `~/.aws` are not
 # reachable from inside, so run the command on the host with a hook in your base config
 # (`~/.config/hamster-ball/base.toml`; a project file cannot define hooks):
@@ -55,6 +61,13 @@ deny_write = [
   "~/.claude/commands",
   "~/.claude/agents",
   "~/.claude/shell-snapshots",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
+  ".mcp.json",
+  ".claude/hooks",
+  ".claude/plugins",
+  ".claude/commands",
+  ".claude/agents",
 ]
 
 [net]

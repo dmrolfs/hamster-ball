@@ -198,11 +198,23 @@ fn agent_world(agent: &str, deny: &str) -> World {
     World::with_base(&base, &format!("extends = [\"agent/{agent}\"]\n"))
 }
 
-/// The pre-hb-82i grants of each agent, kept here as the permissive CONTROL: the attack must work
-/// against them (so the canary is real) and fail against the shipped preset.
-fn permissive_world(grants: &str) -> World {
+/// The CONTROL: the agent's preset exactly as it shipped before hb-82i (95db22c, saved under
+/// tests/fixtures/pre-hb-82i), loaded as the user's own preset. The attack must work against it (so the
+/// canary is real) and fail against the shipped `agent/<name>`.
+fn control_world(agent: &str) -> World {
     let base = "[tls]\nsystem_trust = true\n[fs]\nwrite = [\".\"]\n";
-    World::with_base(base, &format!("[fs]\nwrite = [\".\", {grants}]\n"))
+    let w = World::with_base(base, &format!("extends = [\"pre-{agent}\"]\n"));
+    let old = assert_ok!(fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pre-hb-82i")
+            .join(format!("{agent}.toml"))
+    ));
+    write(
+        &w.home_dir()
+            .join(format!(".config/hamster-ball/presets/pre-{agent}.toml")),
+        &old,
+    );
+    w
 }
 
 /// Stand-in for the shape of one SessionStart command, not evidence about real claude.
@@ -226,7 +238,7 @@ fn claude_fixture(shipped: bool) -> (World, PathBuf, PathBuf) {
     let w = if shipped {
         agent_world("claude", "")
     } else {
-        permissive_world("\"~/.claude\", \"~/.claude.json\"")
+        control_world("claude")
     };
     let settings = w.home_dir().join(".claude/settings.json");
     write(
@@ -295,7 +307,7 @@ fn kiro_fixture(shipped: bool) -> (World, PathBuf, PathBuf, PathBuf) {
     let w = if shipped {
         agent_world("kiro", "")
     } else {
-        permissive_world("\"~/.kiro\", \"~/Library/Application Support/kiro-cli\"")
+        control_world("kiro")
     };
     let program = w.home_dir().join(".local/bin/kiro-cli");
     let alias = w
@@ -426,6 +438,8 @@ fn each_way_to_replace_a_denied_file_fails_on_its_own() {
             format!("echo x > {dir}/t2.json && ln -f {dir}/t2.json {s}"),
         ),
         ("chmod", format!("chmod 666 {s}")),
+        // The parent directory cannot be moved aside to make room for a planted copy (ancestor pin).
+        ("rename the parent", format!("mv {dir} {dir}-aside")),
     ] {
         let out = run(&w, &script);
         assert!(!out.status.success(), "{what} succeeded: {}", text(&out));
@@ -436,6 +450,124 @@ fn each_way_to_replace_a_denied_file_fails_on_its_own() {
         );
     }
     assert!(!assert_some!(settings.parent()).join("aside.json").exists());
+}
+
+// ---- hb-82i review: project-local executable settings, per shipped preset, absent and present.
+/// What each preset must keep read-only inside the PROJECT, and what must stay writable beside it.
+const PROJECT_LOCAL: &[(&str, &[&str], &[&str])] = &[
+    (
+        "claude",
+        &[
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".mcp.json",
+            ".claude/hooks/h.sh",
+            ".claude/plugins/p.json",
+            ".claude/commands/c.md",
+            ".claude/agents/a.md",
+        ],
+        &[".claude/skills/s.md", ".claude/rules/r.md", "CLAUDE.md"],
+    ),
+    (
+        "pi",
+        &[
+            ".pi/settings.json",
+            ".pi/extensions/e.ts",
+            ".pi/npm/n.json",
+            ".pi/git/g.json",
+            ".pi/agents/a.md",
+        ],
+        &[".pi/skills/s.md", ".pi/prompts/p.md"],
+    ),
+    (
+        "kiro",
+        &[
+            ".kiro/settings/mcp.json",
+            ".kiro/agents/a.json",
+            ".kiro/hooks/h.sh",
+        ],
+        &[".kiro/steering/s.md", ".kiro/skills/s.md"],
+    ),
+    (
+        "opencode",
+        &[".opencode/plugin/p.js", "opencode.json", "opencode.jsonc"],
+        &[".opencode-notes.md"],
+    ),
+];
+
+#[test]
+fn every_shipped_preset_denies_project_local_executable_settings_and_leaves_instructions_writable()
+{
+    sandboxed!();
+    for (name, denied, open) in PROJECT_LOCAL {
+        let w = agent_world(name, "");
+        // `.opencode-notes.md` also proves `.opencode` is matched as a directory, not as a prefix.
+        for path in *denied {
+            let target = w.project.join(path);
+            let dir = quote(assert_some!(target.parent()));
+            let script = format!("mkdir -p {dir} 2>&1; echo x > {t} 2>&1", t = quote(&target));
+            let out = run(&w, &script);
+            assert!(
+                !target.exists(),
+                "{name}: {path} was written under the shipped preset: {}",
+                text(&out)
+            );
+        }
+        for path in *open {
+            let target = w.project.join(path);
+            let dir = quote(assert_some!(target.parent()));
+            let out = run(
+                &w,
+                &format!("mkdir -p {dir} && echo x > {t}", t = quote(&target)),
+            );
+            assert!(
+                out.status.success() && target.exists(),
+                "{name}: {path} should stay writable: {}",
+                text(&out)
+            );
+        }
+    }
+}
+
+/// hb-82i criterion 3 and 2: a project that extends a SHIPPED agent preset (so with its denies) and declares an
+/// offline server still gets a working warm-then-run, where the tool uses the run's own cache copy, and an
+/// ordinary history write next to the denied files works. The preset's denies must not touch the session cache.
+#[test]
+fn a_project_extending_each_shipped_preset_runs_its_offline_tool_from_its_own_cache_copy() {
+    sandboxed!();
+    for agent in ["claude", "pi", "kiro", "opencode"] {
+        let base = "[tls]\nsystem_trust = true\n[fs]\nwrite = [\".\"]\n[env]\ntools = [\"uvx\"]\n";
+        let project = format!(
+            "extends = [\"agent/{agent}\"]\n[mcp.time]\ncommand = \"uvx\"\nargs = [\"mcp-server-time\"]\n"
+        );
+        let w = World::with_base(base, &project);
+        executable(
+            &w.base.join("bin/uvx"),
+            "#!/bin/sh\necho \"uvx-ran cache=$UV_CACHE_DIR\"\ncat \"$UV_CACHE_DIR/seed\"\n",
+        );
+        w.publish_cache(&[("uv/seed", "published")]);
+        let out = run(
+            &w,
+            "uvx anything; echo written > \"$TMPDIR/cache/uv/own\" && echo own-copy-writable",
+        );
+        let all = text(&out);
+        assert!(
+            all.contains("uvx-ran"),
+            "{agent}: the tool did not run: {all}"
+        );
+        assert!(
+            all.contains("published"),
+            "{agent}: the tool did not see the published cache: {all}"
+        );
+        assert!(
+            all.contains("own-copy-writable"),
+            "{agent}: the run's own copy is not writable: {all}"
+        );
+        assert!(
+            !all.contains(".cache/hamster-ball"),
+            "{agent}: the tool was pointed at the shared store: {all}"
+        );
+    }
 }
 
 // ---- Versioned inventory (hb-tx4 criteria 1 and 3). Test-only table; shortcut: move to src/ when hb-82i makes presets consume it.
@@ -511,6 +643,13 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.claude/commands",
             "~/.claude/agents",
             "~/.claude/shell-snapshots",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".mcp.json",
+            ".claude/hooks",
+            ".claude/plugins",
+            ".claude/commands",
+            ".claude/agents",
         ],
         preset_toml: include_str!("../presets/agent/claude.toml"),
         entries: &[
@@ -561,6 +700,12 @@ const INVENTORY: &[AgentInventory] = &[
             "~/.pi/agent/npm",
             "~/.pi/agent/git",
             "~/.pi/agent/agents",
+            "~/.pi/agent/tmp/extensions",
+            ".pi/settings.json",
+            ".pi/extensions",
+            ".pi/npm",
+            ".pi/git",
+            ".pi/agents",
         ],
         preset_toml: include_str!("../presets/agent/pi.toml"),
         entries: &[
@@ -582,6 +727,11 @@ const INVENTORY: &[AgentInventory] = &[
                 "~/.pi/agent/trust.json",
                 Executable,
                 "assumed: records what pi trusts",
+            ),
+            e(
+                "~/.pi/agent/tmp/extensions",
+                Executable,
+                "read in pi 1.7.0 source (package-manager.js getExtensionTempFolder): created on demand, stable hashed names, reused; absent on this machine",
             ),
             e(
                 "~/.pi/agent/models-store.json",
@@ -632,13 +782,21 @@ const INVENTORY: &[AgentInventory] = &[
             "~/Library/Application Support/kiro-cli/shell-integration-backup",
             "~/.kiro/settings",
             "~/.kiro/agents",
+            ".kiro/settings",
+            ".kiro/agents",
+            ".kiro/hooks",
         ],
         preset_toml: include_str!("../presets/agent/kiro.toml"),
         entries: &[
             e(
-                "~/Library/Application Support/kiro-cli/run",
+                "~/Library/Application Support/kiro-cli/run/chat-cli-3.6.2",
                 Executable,
-                "read: chat-cli-<v> was a hard link to ~/.local/bin/kiro-cli",
+                "read: chat-cli-<v> was a hard link to ~/.local/bin/kiro-cli; the preset denies the glob chat-cli-*",
+            ),
+            e(
+                "~/Library/Application Support/kiro-cli/run/turn-markers",
+                SessionData,
+                "read: written on every chat; a deny cost one refusal",
             ),
             e(
                 "~/Library/Application Support/kiro-cli/shell-integration-backup",
@@ -699,6 +857,9 @@ const INVENTORY: &[AgentInventory] = &[
         ],
         deny: &[
             "~/.config/opencode",
+            ".opencode",
+            "opencode.json",
+            "opencode.jsonc",
             "~/.cache/opencode/bun.lock",
             "~/.cache/opencode/node_modules",
             "~/.cache/opencode/package.json",
@@ -752,12 +913,10 @@ fn grants(inv: &AgentInventory, key: &str) -> Vec<String> {
 }
 
 fn under(path: &str, root: &str) -> bool {
-    // `dir/prefix*` covers the entries of `dir` that start with `prefix`; the inventory names the
-    // directory (`dir`) because its entries are version-named, so the directory counts as covered.
+    // `dir/prefix*` covers the entries of `dir` whose name starts with `prefix` (and what is under
+    // them), and nothing else: not `dir` itself and not a differently named sibling.
     if let Some(star) = root.strip_suffix('*') {
-        return star
-            .rsplit_once('/')
-            .is_some_and(|(dir, _)| path == dir || path.starts_with(star));
+        return path.starts_with(star);
     }
     path == root
         || path
@@ -795,11 +954,16 @@ fn every_write_grant_of_a_shipped_preset_has_inventory_rows_and_every_deny_names
                 inv.preset
             );
         }
-        for deny in grants(inv, "deny_write") {
+        // Project-relative denies (no `~`) are proven by real writes in
+        // every_shipped_preset_denies_project_local_..., and the inventory only lists home paths.
+        for deny in grants(inv, "deny_write")
+            .iter()
+            .filter(|d| d.starts_with('~'))
+        {
             assert!(
                 inv.entries
                     .iter()
-                    .any(|en| matches!(en.class, Executable | Mixed(_)) && under(&deny, en.path)),
+                    .any(|en| matches!(en.class, Executable | Mixed(_)) && under(en.path, deny)),
                 "{}: deny_write {deny} protects no inventoried executable state",
                 inv.preset
             );
@@ -1061,4 +1225,25 @@ fn under_treats_a_sibling_with_a_shared_prefix_as_a_different_path() {
     assert!(under("~/.claude", "~/.claude"));
     assert!(!under("~/.claude.json", "~/.claude"));
     assert!(!under("~/.claude-other/x", "~/.claude"));
+}
+
+#[test]
+fn a_glob_covers_only_the_names_it_matches_and_what_is_under_them() {
+    let glob = "~/K/run/chat-cli-*";
+    assert!(under("~/K/run/chat-cli-3.6.2", glob), "a matching name");
+    assert!(under("~/K/run/chat-cli-9.9.9", glob), "a name made later");
+    assert!(under("~/K/run/chat-cli-3.6.2/inner", glob), "under a match");
+    assert!(
+        !under("~/K/run", glob),
+        "the parent directory is not covered"
+    );
+    assert!(
+        !under("~/K/run/turn-markers", glob),
+        "a sibling is not covered"
+    );
+    assert!(
+        !under("~/K/run/chat-cl", glob),
+        "a shorter name is not covered"
+    );
+    assert!(!under("~/K/other/chat-cli-1", glob), "another directory");
 }
