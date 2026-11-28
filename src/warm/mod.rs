@@ -21,8 +21,8 @@ use snafu::Snafu;
 use crate::config::{Loaded, Policy};
 use crate::policy::{CanonicalPath, HostRule};
 use crate::session::cache::{
-    CacheError, CacheGeneration, CacheLimits, CacheStore, WarmLock, expected_inputs_for,
-    remove_tree, seed_python,
+    CacheError, CacheGeneration, CacheLimits, CacheStore, ExpectedInputs, WarmLock,
+    expected_inputs_for, remove_tree, seed_python,
 };
 use crate::session::offline::{Launcher, cache_root};
 use crate::session::{DenialSink, ExitKind, Outcome, RunError, RunSpec, SignalMode, WarmSpec, run};
@@ -245,6 +245,10 @@ pub fn warm_server(
 pub struct WarmBuild {
     store: CacheStore,
     workspace: PathBuf,
+    /// What the generation is built FROM, fixed when the warm began. The tools and servers that
+    /// ran during the warm are these; a publish that recomputed them could label A's artifacts
+    /// with B's identity after a tool was replaced mid-warm.
+    inputs: ExpectedInputs,
     _lock: WarmLock,
 }
 
@@ -300,6 +304,7 @@ pub fn begin(
     let build = WarmBuild {
         store,
         workspace,
+        inputs,
         _lock: lock,
     };
     let uv_python = env.home.path().as_path().join(".local/share/uv/python");
@@ -319,11 +324,17 @@ pub fn publish(
     selected: &[Server],
     tools: &ToolLookup,
 ) -> Result<CacheGeneration, CacheError> {
-    let inputs = expected_inputs_for(root, selected, tools)?;
+    // The generation is labelled with what the warm STARTED with, and only if the tools and
+    // servers are still those: if anything changed while the servers ran, what was built came from
+    // inputs that no longer exist, so nothing is published.
+    let now = expected_inputs_for(root, selected, tools)?;
+    if let Some(what) = build.inputs.changed_since(&now) {
+        return Err(CacheError::InputsChangedDuringWarm { what });
+    }
     let old_root = build.workspace.clone();
     let made = build.store.seal_and_publish(
         &build.workspace,
-        &inputs,
+        &build.inputs,
         Some(&old_root),
         CacheLimits::default(),
     )?;

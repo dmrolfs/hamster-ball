@@ -309,7 +309,7 @@ pub enum RunError {
     /// A read or write grant covers the per-user temporary directory, which holds every run's
     /// private directory (its cache copy, hook credentials and sockets).
     #[snafu(display(
-        "the grant {grant} covers {temp}, where every run keeps its private directory, so this run could read or change another run's cache and credentials; narrow it to a project directory"
+        "the grant {grant} overlaps {temp}, where every run keeps its private directory, so this run could read or change another run's cache and credentials; grant a project directory instead"
     ))]
     SharedTempGrant {
         /// The offending grant.
@@ -553,6 +553,9 @@ pub fn run(env: &Environment, loaded: &Loaded, spec: &RunSpec) -> Result<Outcome
 
     let temp = temp_parent(env)?;
     refuse_grants_over_shared_temp(loaded, &temp)?;
+    // Every run reaches the store only through hb, but a project that never uses it can still
+    // have rewritten a link on the way to it, so the check does not depend on an offline plan.
+    check_cache_store(env, loaded)?;
     sweep_stale(temp.as_path());
     let session = SessionDir::create(&temp)?;
     // Registered before the hooks so that a signal or a stop during them is seen: the hooks can
@@ -1316,11 +1319,17 @@ fn launcher_words(helper: Option<&Path>, controlling_tty: bool) -> Vec<OsString>
     }
 }
 
-/// Refuses a policy whose `fs.read` or `fs.write` contains the per-user temporary directory.
+/// Refuses a policy whose `fs.read` or `fs.write` overlaps the per-user temporary directory, as the
+/// directory itself, a parent of it, or anything inside it.
 ///
-/// Every run's session directory is a child of it. The directory's 0700 mode does not separate two
-/// balls of the same user, so such a grant lets one ball read another's credentials or change its
-/// private cache copy. A grant inside one session directory cannot happen (the name is random).
+/// Every run's session directory, every warm workspace and every private cache copy is a child of
+/// it. The directory's 0700 mode does not separate two balls of the same user, and a random name is
+/// not access control: a ball can list the directory, learn a peer's name, and (if it was granted
+/// that exact directory) read the peer's credentials or rewrite its cache copy. So no grant may
+/// reach in. A ball's own session directory is not a config grant: hb adds it itself.
+///
+/// # Errors
+/// [`RunError::SharedTempGrant`] naming the first overlapping grant.
 fn refuse_grants_over_shared_temp(loaded: &Loaded, temp: &CanonicalPath) -> Result<(), RunError> {
     let grants = loaded
         .policy
@@ -1329,7 +1338,9 @@ fn refuse_grants_over_shared_temp(loaded: &Loaded, temp: &CanonicalPath) -> Resu
         .iter()
         .chain(loaded.policy.fs.write.iter());
     for grant in grants {
-        if grant.value.is_same_or_ancestor_of(temp) {
+        let overlaps =
+            grant.value.is_same_or_ancestor_of(temp) || temp.is_same_or_ancestor_of(&grant.value);
+        if overlaps {
             return Err(RunError::SharedTempGrant {
                 grant: grant.value.as_str().to_owned(),
                 temp: temp.as_str().to_owned(),
@@ -1368,7 +1379,6 @@ fn run_cache(
     use super::cache::{CacheLimits, CacheStore, expected_inputs, materialize};
     use super::offline::cache_root;
     let expected = expected_inputs(loaded.root.path(), &loaded.policy, tools)?;
-    check_cache_store(env, loaded)?;
     let generation = CacheStore::new(cache_root(&env.home)).select(&expected)?;
     let copy = materialize(&generation, session.as_path(), CacheLimits::default())?;
     let resolved = fs::canonicalize(copy.root()).context(TempDirSnafu {

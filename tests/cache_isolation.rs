@@ -460,7 +460,7 @@ fn a_read_grant_over_the_shared_temp_directory_is_refused_too_because_it_exposes
     ));
     let out = hb(&w, &["warm"]);
     assert_ne!(out.status.code(), Some(0), "{}", text(&out));
-    assert!(text(&out).contains("covers"), "{}", text(&out));
+    assert!(text(&out).contains("overlaps"), "{}", text(&out));
 }
 
 #[test]
@@ -553,5 +553,168 @@ fn a_store_reached_through_a_link_nothing_can_write_works_and_stays_protected() 
         text(&out).contains("Operation not permitted"),
         "{}",
         text(&out)
+    );
+}
+
+/// A grant INSIDE the shared temp directory (a peer's exact session directory, say) is as bad as
+/// one over it: the ball is given the peer's whole subtree.
+#[test]
+fn a_grant_inside_the_shared_temp_directory_is_refused_too() {
+    sandboxed!();
+    let w = World::with_base(BASE, PROJECT);
+    fake_uvx(&w);
+    let temp = fs::canonicalize(w.base.join("tmp")).unwrap_or_else(|_| w.base.join("tmp"));
+    let peer = temp.join("hb-1-2-3");
+    assert_ok!(fs::create_dir_all(&peer));
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\", \"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        peer.display()
+    ));
+    let out = hb(&w, &["warm"]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(text(&out).contains("overlaps"), "{}", text(&out));
+}
+
+/// The store check applies to a run that never uses the cache (an absolute-path server only).
+#[test]
+fn a_run_with_no_cache_still_refuses_a_store_a_grant_can_redirect() {
+    sandboxed!();
+    let w = World::with_base(BASE, "[mcp.local]\ncommand = \"/usr/bin/true\"\n");
+    fake_uvx(&w);
+    let home = w.home_dir();
+    let (redirect, real) = (home.join("redirect"), home.join("real-cache"));
+    assert_ok!(fs::create_dir_all(&redirect));
+    assert_ok!(fs::create_dir_all(&real));
+    assert_ok!(std::os::unix::fs::symlink(&real, redirect.join("current")));
+    assert_ok!(std::os::unix::fs::symlink(
+        redirect.join("current"),
+        home.join(".cache")
+    ));
+    w.set_base(&format!(
+        "[fs]\nwrite = [\".\", \"{}\"]\n[env]\ntools = [\"uvx\"]\n",
+        redirect.display()
+    ));
+    let out = run(&w, "echo agent-started");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("agent-started"), "{}", text(&out));
+    assert!(
+        text(&out).contains("lets a run rewrite it"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// The warm's own server replaces the tool while it runs (the project directory is writable and
+/// is where this fake `uvx` lives). What was built came from the OLD tool, so it must not be
+/// published under the NEW tool's identity, where a run with the new tool would accept it.
+#[test]
+fn a_tool_replaced_while_the_servers_ran_publishes_nothing() {
+    sandboxed!();
+    let w = world();
+    warm(&w);
+    let data = published(&w);
+    let before = tree(&data);
+    // A tool directory the ball cannot write; the swap happens from outside, driven by the test:
+    // the server blocks on a file the test creates after replacing the tool.
+    write(
+        &w.base.join("bin/uvx"),
+        "#!/bin/sh\n\
+         mkdir -p \"$UV_CACHE_DIR/archive-v0\"; echo old-tool-output > \"$UV_CACHE_DIR/archive-v0/f\"\n\
+         touch ready.flag\n\
+         while [ ! -f go.flag ]; do sleep 0.2; done\n\
+         read line\n\
+         echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'\n\
+         sleep 20\n",
+    );
+    assert_ok!(fs::set_permissions(
+        w.base.join("bin/uvx"),
+        fs::Permissions::from_mode(0o755)
+    ));
+    let mut cmd = w.drive(DRIVE, &["warm"]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = assert_ok!(cmd.spawn());
+    for _ in 0..100 {
+        if w.project.join("ready.flag").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(w.project.join("ready.flag").exists(), "the server started");
+    // Replace the tool, then let the server finish.
+    let tool = w.base.join("bin/uvx");
+    let current = assert_ok!(fs::read_to_string(&tool));
+    write(&tool, &format!("{current}\n# a different tool\n"));
+    assert_ok!(fs::set_permissions(
+        &tool,
+        fs::Permissions::from_mode(0o755)
+    ));
+    write(&w.project.join("go.flag"), "");
+    let out = assert_ok!(child.wait_with_output());
+    let said = text(&out);
+    assert_ne!(out.status.code(), Some(0), "{said}");
+    assert!(said.contains("changed while hb warm was running"), "{said}");
+    assert_eq!(published(&w), data, "still exactly the first generation");
+    assert_eq!(tree(&data), before);
+}
+
+/// `hb warm` is killed with SIGKILL while its server is still running (the longest window before
+/// sealing): nothing may be published, nothing selectable may exist, and the next `hb warm`
+/// must work (the lock dies with the process) and publish normally.
+#[test]
+fn a_warm_killed_with_sigkill_publishes_nothing_leaves_nothing_selectable_and_the_next_warm_works()
+{
+    sandboxed!();
+    let w = world();
+    warm(&w);
+    let data = published(&w);
+    let before = tree(&data);
+    write(
+        &w.base.join("bin/uvx"),
+        "#!/bin/sh\nmkdir -p \"$UV_CACHE_DIR/archive-v0\"; echo partial > \"$UV_CACHE_DIR/archive-v0/f\"\n\
+         touch ready.flag\nsleep 60\n",
+    );
+    assert_ok!(fs::set_permissions(
+        w.base.join("bin/uvx"),
+        fs::Permissions::from_mode(0o755)
+    ));
+    let mut cmd = w.drive(DRIVE, &["warm"]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = assert_ok!(cmd.spawn());
+    for _ in 0..100 {
+        if w.project.join("ready.flag").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(w.project.join("ready.flag").exists(), "the server started");
+    assert_ok!(child.kill());
+    let _ = child.wait();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(published(&w), data, "still exactly the first generation");
+    assert_eq!(tree(&data), before);
+    // Put the original tool back: the old generation was built with it, so it serves runs again.
+    fake_uvx(&w);
+    let out = run(&w, "echo still-runs");
+    assert!(
+        out.status.success() && text(&out).contains("still-runs"),
+        "the old generation still serves runs: {}",
+        text(&out)
+    );
+    // The lock died with the process; the next warm is not "already running".
+    let again = hb(&w, &["warm"]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    assert!(
+        !text(&again).contains("already running"),
+        "{}",
+        text(&again)
+    );
+    let generations = assert_ok!(fs::read_dir(store(&w).join("generations"))).count();
+    assert_eq!(
+        generations, 2,
+        "the first and the new one, nothing half-built"
     );
 }
