@@ -1,0 +1,22 @@
+# ABOUTME: Differential checks against the unmodified crates.io vte parser.
+# ABOUTME: Kept outside the application dependency graph; run with this manifest.
+[package]
+name = "hb-vte-compat"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+patched = { package = "vte", path = "../../vendor/vte" }
+baseline = { package = "vte", version = "=0.15.0" }
+proptest = "1.11.0"
+
+[[bin]]
+name = "measure"
+path = "measure.rs"
+
+[[test]]
+name = "compat"
+path = "compat.rs"

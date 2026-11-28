@@ -210,9 +210,10 @@ fn exercise(
         return;
     };
     assert!(
-        agent.settle(Duration::from_secs(2), 40),
+        agent.settle(Duration::from_secs(4), 40),
         "{name}: startup never settled"
     );
+    let quiet_bytes = agent.received();
     let first = agent.text();
     eprintln!(
         "{name}: start-up screen, {} bytes received, suppressed {:?}\n{first}\n---",
@@ -224,8 +225,7 @@ fn exercise(
         "{name}: nothing rendered:\n{first}"
     );
 
-    let quiet_bytes = agent.received();
-    std::thread::sleep(Duration::from_secs(2));
+    // Four continuous quiet seconds above replace two disconnected startup windows.
     assert_eq!(
         agent.received(),
         quiet_bytes,

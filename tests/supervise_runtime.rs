@@ -166,16 +166,10 @@ fn a_flooding_session_does_not_starve_the_shared_runtime_or_other_session() {
     sandboxed!();
     let w = World::new(PROJECT);
     let mut rt = runtime(&w);
-    rt.send(launch(
-        &w,
-        &[
-            "/bin/sh",
-            "-c",
-            "yes flood | head -c 30000000; echo FLOOD-DONE",
-        ],
-    ));
+    // Keep pressure on the reader until shutdown instead of benchmarking 30 MB of debug parsing.
+    rt.send(launch(&w, &["/usr/bin/yes", "flood"]));
     rt.send(launch(&w, &["/bin/sh", "-c", "sleep 1; echo QUIET-DONE"]));
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut frames = 0;
     let mut max_step = Duration::ZERO;
     let mut finished = false;
@@ -191,25 +185,26 @@ fn a_flooding_session_does_not_starve_the_shared_runtime_or_other_session() {
         if rt.frame_due(step.applied > 0, Instant::now()) {
             frames += 1;
         }
-        if phase(&rt, 1) == Phase::Exited && phase(&rt, 2) == Phase::Exited {
+        if phase(&rt, 2) == Phase::Exited {
             finished = true;
-            break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     let bounded = rt.screen(SessionId(1)).is_some_and(|shared| {
         let mut screen = claims::assert_ok!(shared.screen.lock());
         screen.scroll_to(usize::MAX);
-        screen.scrolled() <= hamster_ball::supervise::terminal::SCROLLBACK_LINES
+        screen.scrolled() == hamster_ball::supervise::terminal::SCROLLBACK_LINES
     });
+    let flooding = phase(&rt, 1) == Phase::Running;
+    let before_shutdown = format!("{:?}", rt.app.sessions());
     let clean = rt.shut_down(Duration::from_secs(15));
     assert!(
-        finished && clean,
-        "sessions did not complete through the shared runtime"
+        finished && clean && flooding,
+        "quiet_finished={finished}, clean={clean}, flooding={flooding}, frames={frames}, max_step={max_step:?}; before shutdown: {before_shutdown}"
     );
     assert!(
         bounded && frames > 1,
-        "flood must retain bounded scrollback and allow redraws"
+        "flood must fill but not exceed scrollback and allow redraws"
     );
     assert!(
         max_step < Duration::from_millis(250),
