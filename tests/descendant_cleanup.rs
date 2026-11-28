@@ -395,10 +395,12 @@ fn a_guard_with_nothing_left_after_a_complete_look_does_not_wait_out_the_grace_p
     drop(guardian);
     let ended = within(Duration::from_secs(4), || {
         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-        matches!(
-            waitpid(guard, Some(WaitPidFlag::WNOHANG)),
-            Ok(status) if status != WaitStatus::StillAlive
-        )
+        match waitpid(guard, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status) => status != WaitStatus::StillAlive,
+            // Guardian drop now transfers its Child to the process-lifetime custodian.
+            Err(nix::errno::Errno::ECHILD) => true,
+            Err(_) => false,
+        }
     });
     assert!(
         ended,

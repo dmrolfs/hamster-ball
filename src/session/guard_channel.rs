@@ -42,7 +42,18 @@ impl Channel {
     }
 
     pub(super) fn request(&self, command: &str) -> Result<String, GuardianError> {
-        let deadline = Instant::now() + DEADLINE;
+        self.request_until(command, Instant::now() + DEADLINE)
+    }
+
+    pub(super) fn request_until(
+        &self,
+        command: &str,
+        by: Instant,
+    ) -> Result<String, GuardianError> {
+        let deadline = by.min(Instant::now() + DEADLINE);
+        if Instant::now() >= deadline {
+            return Err(GuardianError::Deadline);
+        }
         let mut state = loop {
             match self.transaction.try_lock() {
                 Ok(state) => break state,

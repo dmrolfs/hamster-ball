@@ -13,6 +13,7 @@
 //! This avoids signalling a known replacement, but the final check and signal are separate
 //! syscalls. Cleanup is best effort and never establishes that no descendants remain.
 
+use super::launch_end::{EndPhase, EndStatus, Launches};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -20,7 +21,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,6 +59,12 @@ const RELEASE_WAIT: Duration = Duration::from_secs(2);
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum GuardianError {
+    /// Child cleanup ownership could not be reserved.
+    #[snafu(display("the guardian has no cleanup owner"))]
+    Custody {
+        /// Why reservation failed.
+        source: super::CustodyError,
+    },
     /// The guard process could not be started.
     #[snafu(display("the cleanup guard could not be started"))]
     Spawn {
@@ -160,6 +167,15 @@ pub(super) enum GuardCommand {
         role: WatchRole,
         target: Target,
     },
+    AckLaunch {
+        id: u64,
+        pid: i32,
+    },
+    AckEnd {
+        id: u64,
+        ticket: u64,
+        phase: EndPhase,
+    },
     /// An acknowledged release.
     AckRelease(u64),
     /// An acknowledged terminal registration.
@@ -196,6 +212,20 @@ const FIRST_SIGNALLABLE_PID: i32 = 2;
 pub(super) fn parse_line(line: &str) -> Result<GuardCommand, LineError> {
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
+        ["ack", id, "launch", pid] => {
+            let Target::Group(pid) = parse_target("group", pid)? else {
+                return UnknownSnafu.fail();
+            };
+            Ok(GuardCommand::AckLaunch {
+                id: id.parse().map_err(|_| LineError::Unknown)?,
+                pid: pid.as_raw(),
+            })
+        }
+        ["ack", id, "end", ticket, phase] => Ok(GuardCommand::AckEnd {
+            id: id.parse().map_err(|_| LineError::Unknown)?,
+            ticket: ticket.parse().map_err(|_| LineError::Unknown)?,
+            phase: phase.parse().map_err(|_| LineError::Unknown)?,
+        }),
         ["ack", id, "watch", role, kind @ ("group" | "process"), pid] => {
             let id = id.parse().map_err(|_| LineError::Unknown)?;
             let role = role.parse().map_err(|_| LineError::Unknown)?;
@@ -392,7 +422,7 @@ const HINT_DELAY: Duration = Duration::from_millis(300);
 /// `hb` is gone even when broker handles still exist.
 #[derive(Debug)]
 pub struct Guardian {
-    process: Child,
+    process: super::custody::Lease,
     channel: Arc<Channel>,
 }
 
@@ -403,7 +433,44 @@ pub struct GuardHandle {
     channel: Arc<Channel>,
 }
 
+/// A launch ticket belongs to the channel that acknowledged it, not to a reusable PID.
+#[derive(Debug)]
+pub(crate) struct LaunchHandle {
+    channel: Arc<Channel>,
+    ticket: u64,
+}
+
+impl LaunchHandle {
+    pub(crate) fn end(&self, phase: EndPhase, by: Instant) -> Result<EndStatus, GuardianError> {
+        let reply = self
+            .channel
+            .request_until(&format!("end {} {phase}", self.ticket), by)?;
+        reply.parse().map_err(|_| GuardianError::Protocol)
+    }
+}
+
 impl GuardHandle {
+    pub(crate) fn launch(&self, pid: i32) -> Result<LaunchHandle, GuardianError> {
+        let reply = self.channel.request(&format!("launch {pid}"))?;
+        if reply == "gone" {
+            return Err(GuardianError::Refused {
+                reason: WatchRefusal::Invalid,
+            });
+        }
+        if reply.starts_with("refused ") {
+            let _ = watch_outcome(&reply)?;
+        }
+        let ticket = reply
+            .strip_prefix("armed ")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|ticket| *ticket != 0)
+            .ok_or(GuardianError::Protocol)?;
+        Ok(LaunchHandle {
+            channel: self.channel.clone(),
+            ticket,
+        })
+    }
+
     /// Asks the guard to end `target` if `hb` dies before the guard is released.
     ///
     /// # Errors
@@ -435,6 +502,9 @@ impl Guardian {
     /// # Errors
     /// [`GuardianError::Spawn`] if it cannot be started.
     pub fn start_with(hb_exe: &Path, grace: Duration) -> Result<Self, GuardianError> {
+        let permit = super::custody::Group::new(1)
+            .reserve()
+            .context(CustodySnafu)?;
         let (ours, theirs) = UnixStream::pair().context(SpawnSnafu)?;
         let output = theirs.try_clone().context(SpawnSnafu)?;
         let mut command = Command::new(hb_exe);
@@ -442,13 +512,17 @@ impl Guardian {
             .arg("__guard")
             .arg("--grace-ms")
             .arg(grace.as_millis().to_string());
-        let process = command
-            .env_clear()
-            .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .stdout(Stdio::from(OwnedFd::from(output)))
-            .stderr(Stdio::null())
-            .spawn()
-            .context(SpawnSnafu)?;
+        let mut process = permit.install(
+            command
+                .env_clear()
+                .stdin(Stdio::from(OwnedFd::from(theirs)))
+                .stdout(Stdio::from(OwnedFd::from(output)))
+                .stderr(Stdio::null())
+                .spawn()
+                .context(SpawnSnafu)?,
+        );
+        // EOF must let the guardian finish independent cleanup; custody only reaps it.
+        process.allow_cleanup_after_drop();
         let channel = Channel::new(ours).context(SpawnSnafu)?;
         Ok(Self {
             process,
@@ -520,25 +594,28 @@ impl Guardian {
     }
 
     /// Tells the guard `hb` has cleaned up and waits (briefly) for it to exit.
-    pub fn release(mut self) {
+    pub fn release(self) {
+        let _ = self.release_checked();
+    }
+
+    pub(crate) fn release_checked(mut self) -> Result<(), GuardianError> {
         let released = self
             .channel
             .request("release")
             .and_then(|reply| expect_ok(&reply));
         self.channel.close();
-        if released.is_err() {
-            // Failed release is hb gone: let the guard clean up for its own grace period.
-            return;
-        }
+        released?;
         let deadline = Instant::now() + RELEASE_WAIT;
         while Instant::now() < deadline {
             match self.process.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => return Err(GuardianError::Protocol),
+                Err(source) => return Err(GuardianError::Spawn { source }),
                 Ok(None) => thread::sleep(Duration::from_millis(5)),
             }
         }
         let _ = self.process.kill();
-        let _ = self.process.wait();
+        Err(GuardianError::Deadline)
     }
 }
 
@@ -705,15 +782,23 @@ fn run_loop(
             });
             return Ok((Ended::HbGone, registered.terminal));
         }
-        let timeout = terminating.map(|deadline| {
-            TimeSpec::from_duration(deadline.saturating_duration_since(Instant::now()))
-        });
+        let timeout = terminating
+            .map(|deadline| {
+                TimeSpec::from_duration(deadline.saturating_duration_since(Instant::now()))
+            })
+            .or_else(|| {
+                registered
+                    .launches
+                    .active()
+                    .then(|| TimeSpec::from_duration(Duration::from_millis(5)))
+            });
         let ready = match queue.kevent(&[], &mut events, timeout.as_ref().map(|t| *t.as_ref())) {
             Ok(n) => n,
             Err(Errno::EINTR) => continue,
             Err(source) => return Err(GuardError::Queue { source }),
         };
         if ready == 0 {
+            progress_launches(&mut tracker, &queue, &mut registered.launches);
             continue;
         }
         for event in &events[..ready] {
@@ -764,7 +849,161 @@ fn run_loop(
                 _ => {}
             }
         }
+        progress_launches(&mut tracker, &queue, &mut registered.launches);
     }
+}
+
+fn register_launch(
+    pid: i32,
+    watched: &mut Watched,
+    tracker: &mut Tracker,
+    launches: &mut Launches,
+    queue: &Kqueue,
+) -> String {
+    let root = match Identity::of(pid) {
+        Ok(root) => root,
+        Err(_) => return "refused invalid".into(),
+    };
+    if tracker.owned_by_other(root) {
+        return "refused invalid".into();
+    }
+    if let Some((ticket, _)) = launches
+        .records
+        .iter()
+        .find(|(_, record)| record.root == root)
+    {
+        return format!("armed {ticket}");
+    }
+    let Some(ticket) = launches.insert(root) else {
+        return "refused capacity".into();
+    };
+    match watch(
+        Target::Group(Pid::from_raw(pid)),
+        WatchRole::Broker,
+        watched,
+        tracker,
+        queue,
+    ) {
+        Ok(WatchOutcome::Armed) => format!("armed {ticket}"),
+        outcome => {
+            if tracker.root_count(root) == 0 {
+                launches.records.remove(&ticket);
+            } else {
+                launches.failed = true;
+                if let Some(record) = launches.records.get_mut(&ticket) {
+                    record.failed = true;
+                    record.internal = true;
+                    record.deadline = Some(Instant::now() + super::launch_end::CLEANUP_BUDGET);
+                }
+            }
+            match outcome {
+                Err(reason) => format!("refused {reason}"),
+                _ => "refused invalid".into(),
+            }
+        }
+    }
+}
+
+fn end_launch(
+    ticket: u64,
+    phase: EndPhase,
+    tracker: &mut Tracker,
+    launches: &mut Launches,
+    queue: &Kqueue,
+) -> String {
+    let Some(status) = launches.request(ticket, phase, Instant::now()) else {
+        return "refused invalid".into();
+    };
+    let record = launches
+        .records
+        .get_mut(&ticket)
+        .unwrap_or_else(|| unreachable!());
+    if phase == EndPhase::Pinned && record.ready {
+        tracker.discovery_until(record.deadline);
+        if tracker.discover_pinned_root(queue, record.root).is_err() {
+            record.failed = true;
+            launches.failed = true;
+        }
+        tracker.discovery_until(None);
+    }
+    if phase == EndPhase::Pinned && record.revision != tracker.revision(record.root) {
+        record.ready = false;
+        record.cursor = None;
+        record.revision = tracker.revision(record.root);
+        return EndStatus::Pending.to_string();
+    }
+    if phase == EndPhase::Reaped {
+        tracker.root_reaped(record.root);
+    }
+    if phase == EndPhase::Reaped && tracker.root_count(record.root) == 0 {
+        let failed = record.failed || tracker.failed(record.root);
+        tracker.forget_failure(record.root);
+        launches.records.remove(&ticket);
+        launches.failed |= failed;
+        return if failed {
+            EndStatus::Incomplete
+        } else {
+            EndStatus::Complete
+        }
+        .to_string();
+    }
+    status.to_string()
+}
+
+fn progress_launches(tracker: &mut Tracker, queue: &Kqueue, launches: &mut Launches) {
+    for record in launches.records.values_mut() {
+        let Some(deadline) = record.deadline else {
+            continue;
+        };
+        if Instant::now() >= deadline {
+            record.failed = true;
+            launches.failed = true;
+            tracker.kill_root_step(record.root, &mut record.cursor);
+            continue;
+        }
+        if record.revision != tracker.revision(record.root) {
+            record.ready = false;
+            record.cursor = None;
+            record.revision = tracker.revision(record.root);
+        }
+        tracker.discovery_until(Some(deadline));
+        if record.phase == EndPhase::Pinned
+            && !record.ready
+            && record.cursor.is_none()
+            && tracker.discover_pinned_root(queue, record.root).is_err()
+        {
+            record.failed = true;
+            launches.failed = true;
+        }
+        match tracker.end_step(
+            queue,
+            record.root,
+            record.phase == EndPhase::Pinned,
+            &mut record.cursor,
+        ) {
+            Ok(true) => {
+                let before = tracker.revision(record.root);
+                if record.phase == EndPhase::Pinned
+                    && tracker.discover_pinned_root(queue, record.root).is_err()
+                {
+                    record.failed = true;
+                }
+                record.ready = before == tracker.revision(record.root);
+                record.revision = tracker.revision(record.root);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                record.failed = true;
+                launches.failed = true;
+            }
+        }
+        record.failed |= tracker.failed(record.root);
+        launches.failed |= record.failed;
+    }
+    launches
+        .records
+        .retain(|_, record| !record.internal || tracker.root_count(record.root) != 0);
+    tracker.discovery_until(None);
 }
 
 fn zero() -> nix::libc::timespec {
@@ -928,6 +1167,7 @@ struct Registered {
     session_dir: Option<PathBuf>,
     /// Whether the look made after the tracked processes ended has been done.
     final_sweep_done: bool,
+    launches: Launches,
 }
 
 /// Reads what is available, runs the complete lines, and reports whether to stop and whether the
@@ -959,10 +1199,26 @@ fn read_commands(
             reply_line(replies, id, body);
         };
         match parsed {
-            Ok(GuardCommand::Release) => return Ok((Next::Release, true)),
+            Ok(GuardCommand::AckLaunch { id, pid }) => {
+                let body = register_launch(pid, watched, tracker, &mut registered.launches, queue);
+                reply(replies, id, &body);
+            }
+            Ok(GuardCommand::AckEnd { id, ticket, phase }) => {
+                let body = end_launch(ticket, phase, tracker, &mut registered.launches, queue);
+                reply(replies, id, &body);
+            }
+            Ok(GuardCommand::Release) => {
+                if registered.launches.records.is_empty() && !registered.launches.failed {
+                    return Ok((Next::Release, true));
+                }
+            }
             Ok(GuardCommand::AckRelease(id)) => {
-                reply(replies, id, "ok");
-                return Ok((Next::Release, true));
+                if !registered.launches.records.is_empty() || registered.launches.failed {
+                    reply(replies, id, "refused invalid");
+                } else {
+                    reply(replies, id, "ok");
+                    return Ok((Next::Release, true));
+                }
             }
             Ok(GuardCommand::Watch(target)) => {
                 let _ = watch(target, WatchRole::Broker, watched, tracker, queue);
@@ -1038,10 +1294,10 @@ fn watch(
     let pid = match target {
         Target::Group(pid) | Target::Child(pid) => pid,
     };
-    if let Some((existing, _, identity)) = watched.get(&pid.as_raw()).copied() {
+    if let Some((existing, existing_role, identity)) = watched.get(&pid.as_raw()).copied() {
         let current = identity.is_current().map_err(|_| WatchRefusal::Kernel)?;
         if current && tracker.contains(identity) {
-            return if existing == target {
+            return if existing == target && existing_role == role {
                 Ok(WatchOutcome::Armed)
             } else {
                 Err(WatchRefusal::Invalid)
@@ -1097,6 +1353,176 @@ mod tests {
     use claims::{assert_err, assert_ok};
     use pretty_assertions::assert_eq;
     use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+
+    #[test]
+    fn parent_group_kill_covers_late_members_when_zombie_identity_is_unreadable() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let (client, server) = assert_ok!(UnixStream::pair());
+        let commands = File::from(OwnedFd::from(assert_ok!(server.try_clone())));
+        let replies = File::from(OwnedFd::from(server));
+        let worker = thread::spawn(move || run_loop(DEFAULT_GRACE, commands, replies, |_| {}));
+        let channel = Arc::new(assert_ok!(Channel::new(client)));
+        let guard = GuardHandle {
+            channel: channel.clone(),
+        };
+        let group = super::super::custody::Group::new(2);
+        let mut root = assert_ok!(group.reserve()).install(assert_ok!(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+        ));
+        let launch = assert_ok!(guard.launch(root.id() as i32));
+        let by = Instant::now() + Duration::from_secs(5);
+        while assert_ok!(launch.end(EndPhase::Pinned, by)) == EndStatus::Pending {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let pid = claims::assert_some!(rustix::process::Pid::from_raw(root.id() as i32));
+        while assert_ok!(rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT
+        ))
+        .is_none()
+        {
+            assert!(Instant::now() < by);
+            thread::sleep(Duration::from_millis(2));
+        }
+        // libproc may no longer describe a zombie; the parent's unreaped Child still pins the group.
+        let mut late = assert_ok!(group.reserve()).install(assert_ok!(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(root.id() as i32)
+                .spawn()
+        ));
+        assert_ok!(nix::sys::signal::killpg(
+            Pid::from_raw(root.id() as i32),
+            Signal::SIGKILL
+        ));
+        while assert_ok!(launch.end(EndPhase::Pinned, by)) == EndStatus::Pending {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let late_status = loop {
+            if let Some(status) = assert_ok!(late.try_wait()) {
+                break status;
+            }
+            assert!(
+                Instant::now() < by,
+                "late group member never received cleanup"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(late_status.signal(), Some(nix::libc::SIGKILL));
+        assert_ok!(root.wait());
+        while assert_ok!(launch.end(EndPhase::Reaped, by)) == EndStatus::Pending {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(assert_ok!(channel.request("release")), "ok");
+        assert_ok!(assert_ok!(worker.join()));
+    }
+
+    #[test]
+    fn ticket_loop_kills_an_adopted_detached_child_before_reporting_complete() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let (client, server) = assert_ok!(UnixStream::pair());
+        let commands = File::from(OwnedFd::from(assert_ok!(server.try_clone())));
+        let replies = File::from(OwnedFd::from(server));
+        let worker = thread::spawn(move || run_loop(DEFAULT_GRACE, commands, replies, |_| {}));
+        let channel = Arc::new(assert_ok!(Channel::new(client)));
+        let guard = GuardHandle {
+            channel: channel.clone(),
+        };
+        let group = super::super::custody::Group::new(1);
+        let mut root = assert_ok!(group.reserve()).install(assert_ok!(Command::new("/usr/bin/perl")
+            .args(["-e", "use POSIX; $|=1; my $p=fork(); die unless defined $p; if (!$p) { setsid(); print qq($$\\n); sleep 20; exit 0; } scalar <STDIN>; waitpid($p,0);"])
+            .process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()));
+        let mut line = String::new();
+        assert_ok!(BufReader::new(claims::assert_some!(root.stdout.take())).read_line(&mut line));
+        let detached: i32 = assert_ok!(line.trim().parse());
+        let identity = assert_ok!(Identity::of(detached));
+        let launch = assert_ok!(guard.launch(root.id() as i32));
+        let by = Instant::now() + Duration::from_secs(5);
+        while assert_ok!(launch.end(EndPhase::Pinned, by)) == EndStatus::Pending {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_ok!(root.wait());
+        loop {
+            match assert_ok!(launch.end(EndPhase::Reaped, by)) {
+                EndStatus::Complete => break,
+                EndStatus::Pending => thread::sleep(Duration::from_millis(2)),
+                other => assert_eq!(other, EndStatus::Complete),
+            }
+        }
+        // Identity::of treats an exited zombie as Gone, unlike signal(pid, 0).
+        assert!(
+            !assert_ok!(identity.is_current()),
+            "detached owned child still runs"
+        );
+        assert_eq!(assert_ok!(channel.request("release")), "ok");
+        assert_ok!(assert_ok!(worker.join()));
+    }
+
+    #[test]
+    fn ticket_loop_ends_one_launch_and_keeps_another_alive() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let (client, server) = assert_ok!(UnixStream::pair());
+        let commands = File::from(OwnedFd::from(assert_ok!(server.try_clone())));
+        let replies = File::from(OwnedFd::from(server));
+        let worker = thread::spawn(move || run_loop(DEFAULT_GRACE, commands, replies, |_| {}));
+        let channel = Arc::new(assert_ok!(Channel::new(client)));
+        let guard = GuardHandle {
+            channel: channel.clone(),
+        };
+        let mut a = assert_ok!(
+            Command::new("/bin/sh")
+                .args(["-c", "echo ready; read done"])
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+        );
+        let mut b = assert_ok!(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+        );
+        let mut ready = String::new();
+        assert_ok!(BufReader::new(claims::assert_some!(a.stdout.take())).read_line(&mut ready));
+        let launch_a = assert_ok!(guard.launch(a.id() as i32));
+        let launch_b = assert_ok!(guard.launch(b.id() as i32));
+        let by = Instant::now() + Duration::from_secs(5);
+        while assert_ok!(launch_a.end(EndPhase::Pinned, by)) == EndStatus::Pending {
+            assert!(Instant::now() < by);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_ok!(a.wait());
+        loop {
+            match assert_ok!(launch_a.end(EndPhase::Reaped, by)) {
+                EndStatus::Complete => break,
+                EndStatus::Pending => thread::sleep(Duration::from_millis(2)),
+                other => assert_eq!(other, EndStatus::Complete),
+            }
+        }
+        assert!(assert_ok!(b.try_wait()).is_none());
+        assert!(launch_a.end(EndPhase::Pinned, by).is_err());
+        loop {
+            match assert_ok!(launch_b.end(EndPhase::Pinned, by)) {
+                EndStatus::ReapReady => break,
+                EndStatus::Pending => thread::sleep(Duration::from_millis(2)),
+                other => assert_eq!(other, EndStatus::ReapReady),
+            }
+        }
+        assert_ok!(b.wait());
+        while assert_ok!(launch_b.end(EndPhase::Reaped, by)) == EndStatus::Pending {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(assert_ok!(channel.request("release")), "ok");
+        assert_ok!(assert_ok!(worker.join()));
+    }
 
     #[test]
     fn the_second_sweep_finds_a_holder_created_after_the_first_completed() {
@@ -1213,6 +1639,81 @@ mod tests {
         assert_ok!(std::fs::create_dir(&sock));
         remove_socket(&sock);
         assert!(sock.is_dir());
+    }
+
+    #[test]
+    fn cleanup_failure_refuses_release_even_after_all_ticket_records_retire() {
+        let (mut client, server) = assert_ok!(UnixStream::pair());
+        let mut commands = File::from(OwnedFd::from(assert_ok!(server.try_clone())));
+        let mut replies = File::from(OwnedFd::from(server));
+        let queue = assert_ok!(Kqueue::new());
+        let mut registered = Registered::default();
+        registered.launches.failed = true;
+        assert_ok!(writeln!(client, "ack 7 release"));
+        let result = assert_ok!(read_commands(
+            &mut commands,
+            &mut replies,
+            &mut Vec::new(),
+            &mut Watched::new(),
+            &mut Tracker::default(),
+            &mut registered,
+            &queue
+        ));
+        assert_eq!(result, (Next::Keep, true));
+        use std::io::{BufRead, BufReader};
+        let mut reply = String::new();
+        assert_ok!(BufReader::new(client).read_line(&mut reply));
+        assert_eq!(reply, "7 refused invalid\n");
+    }
+
+    #[test]
+    fn an_expired_launch_still_signals_known_work_and_keeps_failure() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut child = sleeper();
+        let mut tracker = Tracker::default();
+        let root = assert_ok!(tracker.arm(&queue, child.id() as i32, false));
+        let mut launches = Launches::default();
+        let ticket = claims::assert_some!(launches.insert(root));
+        claims::assert_some!(launches.records.get_mut(&ticket)).deadline = Some(Instant::now());
+        progress_launches(&mut tracker, &queue, &mut launches);
+        let status = assert_ok!(child.wait());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        assert!(launches.failed);
+        assert!(launches.records[&ticket].failed);
+    }
+
+    #[test]
+    fn duplicate_ticket_does_not_rearm_or_reset_an_ending_launch() {
+        let queue = assert_ok!(Kqueue::new());
+        let mut child = sleeper();
+        let mut tracker = Tracker::default();
+        let mut watched = Watched::new();
+        let mut launches = Launches::default();
+        let first = register_launch(
+            child.id() as i32,
+            &mut watched,
+            &mut tracker,
+            &mut launches,
+            &queue,
+        );
+        let ticket = claims::assert_some!(launches.records.keys().next().copied());
+        let _ = launches.request(ticket, EndPhase::Pinned, Instant::now());
+        let deadline = launches.records[&ticket].deadline;
+        let root = launches.records[&ticket].root;
+        let revision = tracker.revision(root);
+        let duplicate = register_launch(
+            child.id() as i32,
+            &mut watched,
+            &mut tracker,
+            &mut launches,
+            &queue,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(first, duplicate);
+        assert_eq!(launches.records[&ticket].deadline, deadline);
+        assert_eq!(tracker.revision(root), revision);
     }
 
     #[test]

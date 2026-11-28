@@ -62,13 +62,30 @@ fn fake_guard(args: &[OsString]) -> Option<ExitCode> {
             let (Some(id), Some(command)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            let answer = if command.starts_with("watch ") {
+            let answer = if command.starts_with("watch ") || command.starts_with("launch ") {
                 let mut log = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path.with_extension("watched"))?;
-                writeln!(log, "{command}")?;
-                reply.trim()
+                if let Some(pid) = command.strip_prefix("launch ") {
+                    writeln!(log, "watch broker group {pid}")?;
+                    if matches!(reply.trim(), "armed" | "incomplete") {
+                        "armed 1"
+                    } else {
+                        reply.trim()
+                    }
+                } else {
+                    writeln!(log, "{command}")?;
+                    reply.trim()
+                }
+            } else if command.starts_with("end ") {
+                if reply.trim() == "incomplete" {
+                    "incomplete"
+                } else if command.ends_with(" pinned") {
+                    "reap_ready"
+                } else {
+                    "complete"
+                }
             } else {
                 "ok"
             };

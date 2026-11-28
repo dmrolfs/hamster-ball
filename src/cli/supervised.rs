@@ -118,6 +118,18 @@ fn report_run(
                 event: exited_event(outcome.exit),
             }
         }
+        Err(RunError::Cleanup { exit: Some(exit) }) => {
+            let mut event = exited_event(exit);
+            if let Event::Exited { cleanup, .. } = &mut event {
+                *cleanup = Cleanup::Failed {
+                    what: "broker or guardian cleanup failed".into(),
+                };
+            }
+            Ended {
+                code: ExitCode::FAILURE,
+                event,
+            }
+        }
         Err(RunError::Stopped) => unconfirmed(ExitCode::from(143)),
         Err(error) => unconfirmed(fail(err, crate::Error::from(error))),
     }
