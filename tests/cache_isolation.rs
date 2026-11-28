@@ -11,7 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
-use claims::assert_ok;
+use claims::{assert_ok, assert_some};
 use common::{World, quote, sandbox_available, write};
 use pretty_assertions::assert_eq;
 
@@ -716,5 +716,56 @@ fn a_warm_killed_with_sigkill_publishes_nothing_leaves_nothing_selectable_and_th
     assert_eq!(
         generations, 2,
         "the first and the new one, nothing half-built"
+    );
+}
+
+/// hb-82i: the cleanup recipe in docs/05-commands.md, run as written against a store a real
+/// `hb warm` made twice. It must list exactly the generation no project names, and a run must
+/// still work after that one is removed (the documented outcome of following the recipe).
+#[test]
+fn the_documented_recipe_lists_only_the_unused_generation_and_removing_it_keeps_runs_working() {
+    sandboxed!();
+    let w = world();
+    warm(&w);
+    let first = published(&w);
+    let first_id = assert_some!(assert_some!(first.parent()).file_name())
+        .to_string_lossy()
+        .into_owned();
+    // A second warm publishes a new generation and leaves the first on disk.
+    fake_uvx(&w);
+    warm(&w);
+    // The loop is read out of the doc, so the test cannot drift from what the doc tells people to run.
+    let doc = assert_ok!(fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/05-commands.md")
+    ));
+    let block = assert_some!(
+        doc.split("```sh\n")
+            .find(|b| b.contains("for g in generations/*;"))
+    );
+    let loop_text = assert_some!(block.split("# review the list").next());
+    let recipe = format!(
+        "cd \"$1\"\n{}",
+        loop_text.replacen("cd ~/.cache/hamster-ball\n", "", 1)
+    );
+    let listed = assert_ok!(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", recipe.as_str(), "sh"])
+            .arg(store(&w))
+            .output()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        format!("unused: {first_id}"),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_ok!(fs::remove_dir_all(
+        store(&w).join("generations").join(&first_id)
+    ));
+    let out = run(&w, "echo still-runs");
+    assert!(
+        out.status.success() && text(&out).contains("still-runs"),
+        "{}",
+        text(&out)
     );
 }

@@ -31,6 +31,33 @@ Only what the agent needs for *itself*:
 Not in a preset: a model provider's host or gateway (user config), MCP servers' hosts (`[mcp.*]`), credentials or
 paths the floor protects, and `net.internal_hosts` or `system.launchctl` (settings that only a user should turn on).
 
+## State, login and persistence
+
+A preset gives the agent a write grant on its own home, and that home mixes two kinds of file: what the agent needs to write
+(history, caches) and what a plain run of the same agent later executes outside the sandbox (hooks, plugins, settings that name
+programs). A write to the second kind changes what a later, unconfined run does (hb-tx4 F10, F14). So every shipped preset
+lists the second kind in `deny_write`, and a test (`tests/executable_state.rs`) fails if one is reopened.
+
+| Agent (measured version) | Read-only inside hb | Writable: history | Writable: login and other state | Not measured |
+|---|---|---|---|---|
+| claude 2.1.328 | `settings.json`, `~/.claude.json`, `hooks`, `plugins`, `commands`, `agents`, `shell-snapshots` | `projects`, `sessions`, `history.jsonl` | Bedrock credentials come from your own `pre_run` hook, not from a file here | interactive use: onboarding, `/config`, OAuth refresh, the Bash tool's shell snapshot |
+| pi 1.7.0 | `settings.json`, `models.json`, `models-store.json`, `trust.json`, `extensions`, `npm`, `git`, `agents`, `bin`, `install` | `sessions` | `auth.json` (so a refresh can work) | whether pi treats `auth.json` or its other files as code; a provider that needs a denied file |
+| kiro-cli 3.6.2 | `run/chat-cli-*`, `shell-integration-backup`, `~/.kiro/settings`, `~/.kiro/agents`, `bun`, `bunfig.toml`, `kas`, `node`, `tui.js` | `~/.kiro/sessions` | `data.sqlite3` holds the login token and conversations in one file, so it stays writable and is not protected | a token refresh with the file write-denied |
+| opencode 1.2.0 | `~/.config/opencode`, the plugin cache files, `~/.local/share/opencode/bin` | `~/.local/share/opencode`, `~/.local/state/opencode` | `auth.json` is in `~/.local/share/opencode`, so the agent can read it | the whole row: opencode was not installed when this was last checked |
+
+What this does not do:
+
+- It does not make files the agent can still write safe. `data.sqlite3` (kiro) is the one row the presets leave open on purpose; a
+  test pins that set, so adding another needs an owner decision.
+- It does not check what is already on disk. Hooks or plugins that were planted before you used these presets are still there.
+  Reinstall the agent from its distributor outside `hb`, and review `settings.json`, `hooks` and `plugins`. `hb` never rewrites a
+  host agent home and never copies a change from a run back into it.
+- "History stays usable" means `hb` does not deny the history paths. It does not mean every agent resumes every session. Measured: a
+  `claude -p` run wrote its transcript and a kiro chat wrote a session while the denies were on, and pi's `sessions` is outside every deny.
+  Resuming a session was not exercised.
+- A deny that breaks something you rely on cannot be undone from inside `hb`: a deny wins over any broader `[fs] write` grant.
+  Do that one action outside `hb` (install a plugin, trust a folder, log in again).
+
 ## Measuring
 
 ```sh
