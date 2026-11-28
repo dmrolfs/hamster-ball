@@ -207,7 +207,9 @@ fn wanted(kind: MouseEventKind, mode: MouseProtocolMode) -> bool {
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
             | MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown,
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight,
         ) => true,
         (MouseProtocolMode::PressRelease, _) => false,
         (MouseProtocolMode::ButtonMotion, MouseEventKind::Moved) => false,
@@ -519,6 +521,17 @@ mod tests {
             mouse: mode,
             mouse_encoding: encoding,
             ..InputModes::default()
+        }
+    }
+
+    #[test]
+    fn horizontal_wheel_reports_follow_press_release_mode() {
+        let modes = mouse_modes(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Sgr);
+        for (kind, bytes) in [
+            (MouseEventKind::ScrollLeft, b"\x1b[<66;1;1M"),
+            (MouseEventKind::ScrollRight, b"\x1b[<67;1;1M"),
+        ] {
+            assert_eq!(encode_mouse(mouse(kind), 0, 0, modes), Some(bytes.to_vec()));
         }
     }
 
