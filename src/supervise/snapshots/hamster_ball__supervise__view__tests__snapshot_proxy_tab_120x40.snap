@@ -2,7 +2,7 @@
 source: src/supervise/view.rs
 expression: "render(&scene, 120, 40, COLOR)"
 ---
-┌ Sessions ────────────────┐┌ shopfront · claude · Running · /work/shopfront · keys: to the supervisor ────────────────┐
+┌ Sessions ────────────────┐┌ keys: supervisor | Running | shopfront | claude | /work/shopfront ───────────────────────┐
 │> 1 shopfront Running     ││$ claude                                                                                  │
   styles:  RRRRRRRRRRRRRRRRRRRRRRRRRR
 │  2 billing Approve       ││Welcome to shopfront                                                                      │

@@ -10,6 +10,23 @@
 # private directory. Without it claude needs `/private/tmp/claude-<uid>` and fails with EPERM. The shared
 # `/private/tmp` stays closed.
 #
+# Not written, because a plain `claude` runs or loads them outside the sandbox (hb-82i): `settings.json` (hooks, helper
+# commands, environment, enabled plugins), `~/.claude.json`, `hooks`, `plugins`, `commands`, `agents` and `shell-snapshots`.
+# They stay readable. Measured with `claude -p`: same output, transcript still written under `projects/`; only claude's
+# plugin-store refresh writes are refused. NOT measured: interactive use (onboarding, `/config`, OAuth refresh, the Bash tool's
+# shell snapshot). If one of those needs a denied path, install or change it outside hb. History (`projects`, `sessions`,
+# `history.jsonl`) stays writable.
+#
+# In the PROJECT, every `.claude` directory at any depth and every `.mcp.json` is not written. Claude reads `.claude` from the
+# directory it is started in, so `pkg/.claude` counts as much as `.claude`. The whole directory is denied, not its files one by one:
+# a deny on `**/.claude/settings.json` alone lets a run build `.moved/settings.json` and rename `.moved` to `.claude` (measured).
+# Inside `.claude` are `settings.json`, `settings.local.json` and the `hooks`, `plugins`, `commands`, `agents`, `skills` and
+# `workflows` trees; skills count because a skill can register hooks ("Hooks registered while this skill is active. Same shape
+# as settings.json `hooks`") and is loaded as a plugin source. Cost: nothing inside a project `.claude` can be written from hb, so
+# claude cannot save a permission you "always allow", and a skill or a rule is created or edited outside hb. A `CLAUDE.md` in the
+# project stays writable: it is text the model reads, and a command the model chooses to run is not something a deny can stop.
+# Names come from strings in claude 2.1.328, not from a run.
+#
 # Credentials are yours and are not in this preset. Your credential command and `~/.aws` are not
 # reachable from inside, so run the command on the host with a hook in your base config
 # (`~/.config/hamster-ball/base.toml`; a project file cannot define hooks):
@@ -40,6 +57,19 @@ set = { CLAUDE_CODE_TMPDIR = "{session_dir}", DISABLE_AUTOUPDATER = "1" }
 [fs]
 read = ["~/.local/share/claude", "~/.local/bin/claude"]
 write = ["~/.claude", "~/.claude.json", "~/.cache/claude", "~/.local/state/claude"]
+deny_write = [
+  "~/.claude/settings.json",
+  "~/.claude.json",
+  "~/.claude/hooks",
+  "~/.claude/plugins",
+  "~/.claude/commands",
+  "~/.claude/agents",
+  "~/.claude/shell-snapshots",
+  "~/.claude/skills",
+  "~/.claude/workflows",
+  "**/.claude",
+  "**/.mcp.json",
+]
 
 [net]
 allow = [

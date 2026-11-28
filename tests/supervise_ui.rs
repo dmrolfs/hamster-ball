@@ -126,6 +126,19 @@ impl Owner {
         assert_ok!(self.master.write_all(bytes));
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        assert_ok!(rustix::termios::tcsetwinsize(
+            &self.master,
+            Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }
+        ));
+        assert_ok!(self.seen.lock()).resize(rows, cols);
+    }
+
     /// The screen as the owner sees it.
     fn screen(&self) -> String {
         self.seen.lock().map(|s| s.text()).unwrap_or_default()
@@ -253,6 +266,59 @@ fn suspension_restores_termios_before_any_shell_can_repair_it() {
 }
 
 #[test]
+fn binary_routes_exact_bytes_and_discards_input_while_the_pane_is_hidden() {
+    sandboxed!();
+    let w = World::new("[fs]\nwrite = [\".\"]\n");
+    let script = w.project.join("record.sh");
+    let record = w.project.join("record.bin");
+    assert_ok!(std::fs::write(
+        &script,
+        "stty raw -echo\nprintf '\\033[?1hREADY\\n'\nexec cat > record.bin\n"
+    ));
+    let mut owner = Owner::start(&w, &[]);
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"n");
+    owner.wait_for("LAUNCH", 10);
+    owner.send(
+        format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .as_bytes(),
+    );
+    owner.wait_for("READY", 15);
+    owner.send(b"\r");
+    owner.wait_for("INTERACT", 10);
+    owner.send("qsr?é\t\r\x03\x1b[A".as_bytes());
+    owner.send(b"\x07");
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"\rA\x07\x07B\x1b[200~hi\x1b[201~");
+    let expected = "qsr?é\t\r\x03\x1bOAA\x07Bhi".as_bytes();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read(&record).unwrap_or_default() != expected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(assert_ok!(std::fs::read(&record)), expected);
+    owner.resize(12, 50);
+    owner.wait_for("Make the terminal larger", 10);
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"\x1b[200~hidden\x1b[201~x\x07");
+    owner.resize(30, 120);
+    owner.wait_for("keys: supervisor", 10);
+    owner.send(b"\rS");
+    let mut final_bytes = expected.to_vec();
+    final_bytes.push(b'S');
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read(&record).unwrap_or_default() != final_bytes && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(assert_ok!(std::fs::read(&record)), final_bytes);
+    owner.send(b"\x07qy");
+    assert_eq!(owner.exit_code(15), Some(0));
+    assert_restored(&owner);
+}
+
+#[test]
 fn quitting_with_nothing_running_restores_every_terminal_mode_and_exits_cleanly() {
     sandboxed!();
     let w = World::new(PROJECT);
@@ -327,7 +393,12 @@ fn sessions_do_not_outlive_a_supervisor_that_is_killed() {
             let previous = format!("/bin/sh {}", agents.0[index - 1].1.display());
             owner.send(&vec![0x7f; previous.len()]);
         }
-        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        for key in format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .bytes()
+        {
             owner.send(&[key]);
         }
         assert!(
@@ -374,7 +445,12 @@ fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
         owner.wait_for("Sessions", 30);
         owner.send(b"n");
         owner.wait_for("Launch a session", 10);
-        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        for key in format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .bytes()
+        {
             owner.send(&[key]);
         }
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -415,7 +491,12 @@ fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     owner.wait_for("Approve", 60);
@@ -489,7 +570,12 @@ fn start_review(w: &World) -> Owner {
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     owner.wait_for("Approve", 60);
@@ -556,7 +642,12 @@ fn an_agent_that_never_reads_cannot_freeze_the_ui_and_quit_still_stops_it() {
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     assert!(appears(&marker, 60), "no agent; {}", owner.screen());
@@ -627,7 +718,12 @@ fn a_panic_in_a_session_thread_restores_the_terminal_stops_the_agent_and_ends_no
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     // The panic happens as the session starts: the supervisor ends, nonzero, terminal restored.

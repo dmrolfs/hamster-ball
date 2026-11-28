@@ -9,17 +9,17 @@ expression: "render(&scene, 80, 24, COLOR)"
   styles:              yyyyyyy
 │  3 docs Exited 0                                                             │
 │                                                                              │
-│                                                                              │
 │    ┌ Launch a session ──────────────────────────────────────────────────┐    │
 │    │  Project: /work/docs                                               │    │
 │    │> Command: opencode_                                                │    │
+│    │  [x] Log denials                                                   │    │
+│    │  [x] Log proxy                                                     │    │
 │    │                                                                    │    │
 │    │Recent projects (Up/Down):                                          │    │
 │    │  * /work/docs                                                      │    │
 │    │    /work/billing                                                   │    │
 │    │    /work/shopfront                                                 │    │
 │    └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │

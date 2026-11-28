@@ -679,12 +679,13 @@ fn read_channel(
                     deliver(
                         inbox,
                         kill,
-                        Msg::SessionLost {
+                        Msg::ChannelBroken {
                             id,
                             generation,
                             reason: error.to_string(),
                         },
                     );
+                    let _ = io::copy(&mut reader, &mut io::sink());
                     return;
                 }
             };
@@ -694,12 +695,13 @@ fn read_channel(
                     deliver(
                         inbox,
                         kill,
-                        Msg::SessionLost {
+                        Msg::ChannelBroken {
                             id,
                             generation,
                             reason: error.to_string(),
                         },
                     );
+                    let _ = io::copy(&mut reader, &mut io::sink());
                     return;
                 }
             };
@@ -787,6 +789,33 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_channel_keeps_draining_until_the_peer_closes() {
+        let (ours, mut theirs) = assert_ok!(UnixStream::pair());
+        assert_ok!(theirs.set_write_timeout(Some(Duration::from_secs(5))));
+        let (tx, rx) = sync_channel(4);
+        let worker = thread::spawn(move || {
+            read_channel(SessionId(7), 3, ours, &tx, &AtomicBool::new(false))
+        });
+        let ack = HelloAck {
+            v: Hello::new(7, 3).v,
+            launch: 7,
+            generation: 3,
+            pid: 1,
+        };
+        assert_ok!(theirs.write_all(&assert_ok!(encode_line(&ack))));
+        assert_ok!(theirs.write_all(b"not a frame\n"));
+        assert!(matches!(
+            assert_ok!(rx.recv_timeout(Duration::from_secs(5))),
+            Msg::ChannelBroken { .. }
+        ));
+        let drained = theirs.write_all(&vec![b'x'; 1024 * 1024]);
+        drop(theirs);
+        assert_ok!(worker.join());
+        assert_ok!(drained);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn malformed_suffix_is_not_normal_eof_after_a_complete_report() {
         use crate::session::supervised::{Cleanup, Event, Frame};
         let (ours, mut theirs) = assert_ok!(UnixStream::pair());
@@ -811,7 +840,10 @@ mod tests {
         let (tx, rx) = sync_channel(4);
         read_channel(SessionId(7), 3, ours, &tx, &AtomicBool::new(false));
         assert!(matches!(assert_ok!(rx.try_recv()), Msg::Channel { .. }));
-        assert!(matches!(assert_ok!(rx.try_recv()), Msg::SessionLost { .. }));
+        assert!(matches!(
+            assert_ok!(rx.try_recv()),
+            Msg::ChannelBroken { .. }
+        ));
     }
 
     /// What the app would be sent when `hb` answers the handshake with `ack` and then says

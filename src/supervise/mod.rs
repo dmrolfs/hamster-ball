@@ -3,6 +3,7 @@
 //! The supervisor (epic hb-b6q): what `hb-supervise` is built from.
 
 pub mod app;
+mod argv;
 pub mod input;
 pub mod keys;
 pub mod launch;

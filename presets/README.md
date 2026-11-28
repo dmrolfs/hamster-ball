@@ -31,6 +31,39 @@ Only what the agent needs for *itself*:
 Not in a preset: a model provider's host or gateway (user config), MCP servers' hosts (`[mcp.*]`), credentials or
 paths the floor protects, and `net.internal_hosts` or `system.launchctl` (settings that only a user should turn on).
 
+## State, login and persistence
+
+A preset gives the agent a write grant on its own home, and that home mixes two kinds of file: what the agent needs to write
+(history, caches) and what a plain run of the same agent later executes outside the sandbox (hooks, plugins, settings that name
+programs). A write to the second kind changes what a later, unconfined run does (hb-tx4 F10, F14). So every shipped preset
+lists the second kind in `deny_write`, and a test (`tests/executable_state.rs`) fails if one is reopened.
+
+| Agent (measured version) | Read-only inside hb | Writable: history | Writable: login and other state | Not measured |
+|---|---|---|---|---|
+| claude 2.1.328 | home: `settings.json`, `~/.claude.json`, `hooks`, `plugins`, `commands`, `agents`, `skills`, `workflows`, `shell-snapshots`. Project, at any depth: every `.claude` directory and every `.mcp.json` | `projects`, `sessions`, `history.jsonl` | Bedrock credentials come from your own `pre_run` hook, not from a file here | interactive use: onboarding, `/config`, OAuth refresh, the Bash tool's shell snapshot; claude's message when a save to a denied file fails |
+| pi 1.7.0 | home: `settings.json`, `models.json`, `models-store.json`, `trust.json`, `extensions`, `npm`, `git`, `agents`, `tmp/extensions`, `bin`, `install`. Project, at any depth: every `.pi` directory | `sessions` | `auth.json` (so a refresh can work) | whether pi treats `auth.json` or its other files as code; a provider that needs a denied file |
+| kiro-cli 3.6.2 | home: `run/chat-cli-*`, `shell-integration-backup`, `~/.kiro/settings`, `~/.kiro/agents`, `bun`, `bunfig.toml`, `kas`, `node`, `tui.js`, and `data.sqlite3` with its `-wal`, `-shm` and `-journal` files. Project, at any depth: every `.kiro` directory | `~/.kiro/sessions` (current chat history lives here, not in the database) | none: the login token is in `data.sqlite3`, which is read-only, so an expired token is refreshed in memory on every run and not saved; this needs `oidc.us-east-1.amazonaws.com`, which the preset allows | a provider that rotates the refresh token; a refresh in the middle of a long chat; kiro's start of its chat, TUI and program-extraction path against a planted database row |
+| opencode 1.2.0 | home: `~/.config/opencode`, the plugin cache files, `~/.local/share/opencode/bin`. Project, at any depth: every `.opencode` directory, `opencode.json` and `opencode.jsonc` | `~/.local/share/opencode`, `~/.local/state/opencode` | `auth.json` is in `~/.local/share/opencode`, so the agent can read it | the whole row: opencode was not installed when this was last checked |
+
+What this does not do:
+
+- A project directory is denied as a whole (`**/.claude`, `**/.pi`, `**/.kiro`, `**/.opencode`), not file by file: with only the files
+  denied, a run can build the directory elsewhere and rename it into place (measured). The cost is that nothing inside those
+  directories is written from `hb`: for claude, a permission you "always allow" is not saved, and skills, rules and commands are created or
+  edited outside `hb`. A `CLAUDE.md` stays writable; a command a model chooses to run because a text file told it to is not something a deny can stop.
+- Which project files are denied comes from strings in each agent's program or its docs, not from watching a run, and opencode was
+  not installed, so its names are unchecked. A project file an agent loads that is not listed is still writable.
+- The kiro database holds the login token, a device registration, counters and old conversations. Denying it protects what a
+  later run reads from it, not what a run can already read: a run can still read the token. Nothing found in it names a program to run,
+  but kiro's program-extraction path was not exercised against a planted row.
+- It does not check what is already on disk. Hooks or plugins that were planted before you used these presets are still there.
+  Reinstall the agent from its distributor outside `hb`, and review `settings.json`, `hooks`, `plugins` and `skills`. `hb` never rewrites
+  a host agent home and never copies a change from a run back into it.
+- "History stays usable" means a run can read, append to, create and replace files in the history paths, and the next run and the host
+  see them (a test does this for each preset, with no agent). It does not mean every agent resumes every session; resuming was not exercised.
+- A deny that breaks something you rely on cannot be undone from inside `hb`: a deny wins over any broader `[fs] write` grant.
+  Do that one action outside `hb` (install a plugin, trust a folder, log in again).
+
 ## Measuring
 
 ```sh
