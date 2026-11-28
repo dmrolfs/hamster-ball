@@ -19,6 +19,11 @@ use {tui_term as _, vt100 as _};
 struct Args {}
 
 fn main() -> ExitCode {
+    // Helpers receive their intentional handoff on stdin; no descriptor above stdio is inherited.
+    if let Err(error) = hamster_ball::session::close_inherited_fds() {
+        eprintln!("hb-supervise: {}", snafu::Report::from_error(error));
+        return ExitCode::from(2);
+    }
     let argv: Vec<OsString> = std::env::args_os().collect();
     // The helper takes nothing from the environment and must run before anything else starts.
     if argv.get(1).is_some_and(|a| a == LAUNCH_ARG) {

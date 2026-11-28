@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod identity;
 mod interactive;
 pub mod launch;
+pub mod lease;
 pub mod offline;
 pub mod ports;
 pub mod preflight;

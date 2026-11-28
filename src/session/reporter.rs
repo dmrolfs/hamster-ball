@@ -287,12 +287,23 @@ impl Reporter {
         let mut reader = BufReader::new(HandshakeReader {
             stream: stream.try_clone().context(IoSnafu)?,
             deadline: Some(handshake_deadline),
+            lease: None,
         });
         let line = read_line(&mut reader)
             .context(HandshakeSnafu)?
             .ok_or(ProtocolError::Truncated)
             .context(HandshakeSnafu)?;
         let hello = decode_hello(&line).context(HandshakeSnafu)?;
+        reader.get_mut().lease = Some(
+            super::lease::Lease::new(
+                super::lease::Progress::now()
+                    .map_err(io::Error::other)
+                    .context(IoSnafu)?,
+                super::lease::TIMEOUT,
+            )
+            .map_err(io::Error::other)
+            .context(IoSnafu)?,
+        );
         let ack = HelloAck {
             v: hello.v,
             launch: hello.launch,
@@ -416,6 +427,19 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 struct HandshakeReader {
     stream: UnixStream,
     deadline: Option<Instant>,
+    lease: Option<super::lease::Lease>,
+}
+
+impl HandshakeReader {
+    fn lease_remaining(&self) -> io::Result<Option<Duration>> {
+        self.lease
+            .as_ref()
+            .map(|lease| {
+                let now = super::lease::Progress::now().map_err(io::Error::other)?;
+                lease.remaining(now).map_err(io::Error::other)
+            })
+            .transpose()
+    }
 }
 
 impl Read for HandshakeReader {
@@ -423,11 +447,33 @@ impl Read for HandshakeReader {
         if let Some(deadline) = self.deadline {
             self.stream.set_read_timeout(Some(remaining(deadline)?))?;
         }
-        let read = self.stream.read(bytes)?;
-        if let Some(deadline) = self.deadline {
-            remaining(deadline)?;
+        loop {
+            if let Some(left) = self.lease_remaining()? {
+                self.stream
+                    .set_read_timeout(Some(left.min(Duration::from_secs(1))))?;
+            }
+            let read = self.stream.read(bytes);
+            self.lease_remaining()?;
+            match read {
+                Err(ref error)
+                    if self.lease.is_some()
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                {
+                    continue;
+                }
+                other => {
+                    if let Some(deadline) = self.deadline {
+                        remaining(deadline)?;
+                    }
+                    return other;
+                }
+            }
         }
-        Ok(read)
     }
 }
 
@@ -501,13 +547,24 @@ fn write_batches(
 
 fn read_loop(reader: &mut BufReader<HandshakeReader>, shared: &Shared) {
     loop {
-        let stopping = match read_line(reader) {
-            Ok(Some(line)) => match decode_command(&line) {
-                Ok(Command::Stop {}) => true,
-                // A command that is not understood is not obeyed, and the channel is not trusted.
-                Err(_) => true,
-            },
-            Ok(None) | Err(_) => true,
+        let command = (|| {
+            reader.get_ref().lease_remaining()?;
+            let line = read_line(reader).map_err(io::Error::other)?;
+            reader.get_ref().lease_remaining()?;
+            line.map(|line| decode_command(&line).map_err(io::Error::other))
+                .transpose()
+        })();
+        let stopping = match command {
+            Ok(Some(Command::Heartbeat { progress_ns })) => {
+                let reading = reader.get_mut();
+                match (reading.lease.as_mut(), super::lease::Progress::now()) {
+                    (Some(lease), Ok(now)) => lease
+                        .renew(super::lease::Progress(progress_ns), now)
+                        .is_err(),
+                    _ => true,
+                }
+            }
+            Ok(Some(Command::Stop {})) | Ok(None) | Err(_) => true,
         };
         if stopping {
             if !shared.lock().closing {
@@ -526,6 +583,52 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::io::Read;
     use std::time::Instant;
+
+    #[test]
+    fn an_expired_lease_rejects_a_complete_buffered_heartbeat() {
+        use super::super::lease::{Lease, Progress};
+        let (mut peer, stream) = assert_ok!(UnixStream::pair());
+        let now = assert_ok!(Progress::now());
+        let line = assert_ok!(encode_line(&Command::Heartbeat { progress_ns: now.0 }));
+        assert_ok!(peer.write_all(&line));
+        let mut reader = BufReader::new(HandshakeReader {
+            stream,
+            deadline: None,
+            lease: None,
+        });
+        assert!(!assert_ok!(std::io::BufRead::fill_buf(&mut reader)).is_empty());
+        reader.get_mut().lease = Some(assert_ok!(Lease::new(now, Duration::ZERO)));
+        let stop = StopSignal::new();
+        let shared = Shared {
+            queues: Mutex::new(Queues::default()),
+            wake: Condvar::new(),
+            stop: Arc::clone(&stop),
+            write_timeout: Duration::from_secs(1),
+        };
+        read_loop(&mut reader, &shared);
+        assert!(stop.is_requested());
+    }
+
+    #[test]
+    fn partial_bytes_do_not_extend_the_lease_and_idle_reads_expire() {
+        use super::super::lease::{Lease, Progress};
+        for bytes in [b"".as_slice(), b"{\"cmd\":\"heart"] {
+            let (mut peer, stream) = assert_ok!(UnixStream::pair());
+            assert_ok!(peer.write_all(bytes));
+            let lease = assert_ok!(Lease::new(
+                assert_ok!(Progress::now()),
+                Duration::from_millis(30)
+            ));
+            let mut reader = BufReader::new(HandshakeReader {
+                stream,
+                deadline: None,
+                lease: Some(lease),
+            });
+            let start = Instant::now();
+            assert!(read_line(&mut reader).is_err());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
 
     /// The supervisor's end, after a successful handshake.
     struct Peer {
@@ -913,7 +1016,7 @@ mod tests {
         // `ours` was dropped with the failed connect, so this reads to the end at once.
         let _ = theirs.read_to_end(&mut rest);
         assert_eq!(rest, b"");
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

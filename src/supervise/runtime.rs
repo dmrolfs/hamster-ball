@@ -253,6 +253,7 @@ pub struct Runtime {
     waiting: HashMap<SessionId, (Generation, LaunchSpec)>,
     screens: HashMap<SessionId, Arc<Shared>>,
     last_frame: Option<Instant>,
+    last_heartbeat: Option<crate::session::lease::Progress>,
     /// A change that has not been drawn yet; kept until a frame is drawn, so one that lands
     /// inside the frame interval is drawn on the next eligible call and not lost.
     redraw_pending: bool,
@@ -276,6 +277,7 @@ impl Runtime {
             waiting: HashMap::new(),
             screens: HashMap::new(),
             last_frame: None,
+            last_heartbeat: None,
             redraw_pending: false,
             approvals: Vec::new(),
         }
@@ -320,6 +322,25 @@ impl Runtime {
             }
             _ => {}
         }
+    }
+
+    /// Renews sessions only when called by a progressing foreground UI or approval loop.
+    ///
+    /// # Errors
+    /// A failed clock must end supervision, not manufacture progress.
+    pub fn heartbeat(&mut self) -> Result<(), crate::session::lease::LeaseError> {
+        use crate::session::lease::{HEARTBEAT, Progress};
+        let now = Progress::now()?;
+        if self
+            .last_heartbeat
+            .is_none_or(|last| now.0.saturating_sub(last.0) >= HEARTBEAT.as_nanos() as u64)
+        {
+            for live in self.live.values() {
+                live.worker.heartbeat(now);
+            }
+            self.last_heartbeat = Some(now);
+        }
+        Ok(())
     }
 
     /// One turn: apply up to `MAX_PER_STEP + INBOX` messages, including the final-report drain.

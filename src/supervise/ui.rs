@@ -40,6 +40,12 @@ type Screen = Terminal<CrosstermBackend<io::Stdout>>;
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum UiError {
+    /// Session leases could not be renewed safely.
+    #[snafu(display("supervisor lease failed"))]
+    Lease {
+        /// The clock or freshness failure.
+        source: crate::session::lease::LeaseError,
+    },
     /// The owner's terminal could not be read, drawn on or handed over.
     #[snafu(display("the terminal failed"))]
     Terminal {
@@ -350,6 +356,7 @@ fn event_loop(
         if quit {
             return Ok(());
         }
+        ui.runtime.heartbeat().context(LeaseSnafu)?;
     }
 }
 
@@ -625,6 +632,9 @@ impl Loop<'_> {
                     Ok(false) => return None,
                     Err(error) => return Some(Waited::Error(error.to_string())),
                 }
+            }
+            if let Err(error) = self.runtime.heartbeat() {
+                return Some(Waited::Error(error.to_string()));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

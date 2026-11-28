@@ -220,6 +220,8 @@ impl Sink {
         };
         let mut idle_since: Option<Instant> = None;
         while !self.pending.is_empty() {
+            // No write is in flight here. Pause keeps the suffix for resume, not a second writer.
+            hold_while_paused(&self.shared);
             let stopping = self.shared.hurry.load(Ordering::Relaxed)
                 || self.shared.stop.load(Ordering::Relaxed);
             // One short wait for room at a time, so the stop flag is looked at between them.
@@ -317,6 +319,7 @@ fn run(
 ) {
     let mut input_open = true;
     let mut draining_since: Option<Instant> = None;
+    let mut quiet_since = Instant::now();
     loop {
         hold_while_paused(shared);
         let stopping = shared.stop.load(Ordering::Relaxed);
@@ -338,16 +341,25 @@ fn run(
             };
             (ready(&fds[0]), fds.get(1).is_some_and(ready))
         };
-        if master_ready && !copy_chunk(&mut master, output, Some(filter)) {
-            // End of the child's output: nothing more can come.
-            end_of_output(filter, output);
-            return;
+        if master_ready {
+            let delivery_started = Instant::now();
+            let open = copy_chunk(&mut master, output, Some(filter));
+            // Source admission is bounded independently of time spent delivering accepted bytes.
+            if let Some(since) = &mut draining_since {
+                *since += delivery_started.elapsed();
+            }
+            quiet_since = Instant::now();
+            if !open {
+                end_of_output(filter, output);
+                return;
+            }
         }
         if input_ready && !copy_chunk(&mut input, &mut master, None) {
             input_open = false;
         }
         if let Some(since) = draining_since
-            && (!master_ready && since.elapsed() >= drain.quiet || since.elapsed() >= drain.max)
+            && (!master_ready && quiet_since.elapsed() >= drain.quiet
+                || since.elapsed() >= drain.max)
         {
             end_of_output(filter, output);
             return;
@@ -381,6 +393,112 @@ mod tests {
                 .write(true)
                 .open(pty.slave_path().as_str())
         )
+    }
+
+    #[test]
+    fn pause_acknowledges_backpressure_and_resume_keeps_the_pending_suffix() {
+        let rig = rig();
+        let Rig {
+            mut user,
+            mut child,
+            relay,
+            _outer,
+            _inner,
+        } = rig;
+        let payload = vec![b'x'; 60_000];
+        let expected = payload.clone();
+        let producer = std::thread::spawn(move || {
+            assert_ok!(child.write_all(&payload));
+            child
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let shared = Arc::clone(&relay.shared);
+        let pausing = std::thread::spawn(move || {
+            relay.pause();
+            relay
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while !pausing.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let acknowledged = pausing.is_finished();
+        // Unblock only this fixture on failure, so the regression reports instead of hanging.
+        shared.hurry.store(true, Ordering::Relaxed);
+        if !acknowledged {
+            *shared.gate() = Gate::Open;
+            shared.changed.notify_all();
+        }
+        let relay = assert_ok!(pausing.join());
+        relay.resume();
+        let mut got = Vec::new();
+        let until = Instant::now() + Duration::from_secs(5);
+        while got.len() < expected.len() && Instant::now() < until {
+            let mut fds = [PollFd::new(user.as_fd(), PollFlags::POLLIN)];
+            if assert_ok!(poll(&mut fds, PollTimeout::from(50u8))) > 0 {
+                let mut bytes = [0; 4096];
+                let n = assert_ok!(user.read(&mut bytes));
+                got.extend_from_slice(&bytes[..n]);
+            }
+        }
+        let child = assert_ok!(producer.join());
+        relay.finish();
+        drop(child);
+        assert!(acknowledged, "pause waited behind terminal backpressure");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn slow_final_delivery_does_not_consume_the_source_drain_budget() {
+        let rig = rig_draining(Drain {
+            quiet: Duration::from_millis(30),
+            max: Duration::from_millis(80),
+        });
+        let Rig {
+            mut user,
+            mut child,
+            relay,
+            _outer,
+            _inner,
+        } = rig;
+        let expected = vec![b'x'; 60_000];
+        let payload = expected.clone();
+        let producer = std::thread::spawn(move || {
+            let flags = assert_ok!(rustix::fs::fcntl_getfl(&child));
+            assert_ok!(rustix::fs::fcntl_setfl(
+                &child,
+                flags | rustix::fs::OFlags::NONBLOCK
+            ));
+            let until = Instant::now() + Duration::from_secs(3);
+            let mut sent = 0;
+            while sent < payload.len() && Instant::now() < until {
+                match child.write(&payload[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => break,
+                }
+            }
+            child
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let finishing = std::thread::spawn(move || relay.finish());
+        let until = Instant::now() + Duration::from_secs(8);
+        let mut got = Vec::new();
+        while got.len() < expected.len() && Instant::now() < until {
+            let mut fds = [PollFd::new(user.as_fd(), PollFlags::POLLIN)];
+            if assert_ok!(poll(&mut fds, PollTimeout::from(50u8))) > 0 {
+                let mut bytes = [0; 512];
+                let n = assert_ok!(user.read(&mut bytes));
+                got.extend_from_slice(&bytes[..n]);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Keep the slave alive, so success cannot depend on EOF bypassing the drain path.
+        let child = assert_ok!(producer.join());
+        assert_ok!(finishing.join());
+        drop(child);
+        assert_eq!(got, expected);
     }
 
     fn rig() -> Rig {

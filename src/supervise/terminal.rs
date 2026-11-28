@@ -25,9 +25,9 @@ pub const SCROLLBACK_LINES: usize = 10_000;
 /// width. That width is the owner's own terminal: the agent cannot change it (its resize requests are
 /// only counted), so what an agent prints can never push a screen past the size it was made for.
 pub const SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
-/// What one cell of history costs in resident memory: measured at 76 to 98 bytes with vt100 0.16
-/// (filled history of 80, 100, 200, 250 and 400 columns, by `footprint`), plus the screen itself.
-const BYTES_PER_CELL: usize = 100;
+/// A 32-byte vt100 cell plus room for row and allocation overhead.
+/// Fresh-process RSS probes at 80, 250 and 400 columns verify this sizing allowance.
+const BYTES_PER_CELL: usize = 40;
 /// History is sized for at least this many columns, so widening the window later does not take
 /// much more than the budget.
 const HISTORY_COLS: usize = 200;

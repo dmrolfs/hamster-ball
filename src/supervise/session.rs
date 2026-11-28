@@ -383,6 +383,7 @@ fn spawn_writer(
     let outbox = Arc::clone(wiring.outbox);
     let kill = Arc::clone(wiring.kill);
     let inbox = messages.clone();
+    channel.set_write_timeout(Some(outbox::POLL))?;
     let stop_line = encode_line(&Command::Stop {}).map_err(io::Error::other)?;
     thread::Builder::new()
         .name(format!("hb-write-{}", id.0))
@@ -535,6 +536,11 @@ fn wait_for_exit(
 }
 
 impl Worker {
+    /// Enqueues progress produced by the UI loop, never by this worker.
+    pub fn heartbeat(&self, progress: crate::session::lease::Progress) {
+        self.outbox.heartbeat(progress);
+    }
+
     /// Queues `bytes` for the agent's terminal, whole or not at all. Never waits.
     ///
     /// # Errors

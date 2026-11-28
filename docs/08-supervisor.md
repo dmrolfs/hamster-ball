@@ -15,6 +15,8 @@ It only starts sessions and shows what they report.
 
 ## Install
 
+On macOS, from the repository root, install the pair together.
+Follow the [getting-started prerequisites](03-getting-started.md) first.
 A default build does not include it, so ordinary `hb` builds do not compile its terminal libraries.
 
 ```sh
@@ -22,6 +24,7 @@ cargo install --locked --path . --features supervise
 ```
 
 This installs `hb` and `hb-supervise` into the same directory.
+Update them together: protocol version 2 requires a matching pair.
 Keep them together: the supervisor starts the `hb` that sits beside it.
 It needs Rust 1.88 or newer, like `hb`.
 
@@ -32,16 +35,22 @@ It opens in Overview mode with an empty list.
 
 Press `n` to start a session.
 The form asks for a project directory and a command, such as `claude`.
-The directory defaults to where you started the supervisor, and the command to the last one used for that directory.
-`hb` checks them, so a wrong directory or a missing command shows `hb`'s own message in the form.
+The directory defaults to where you started the supervisor; recent commands are remembered only within this supervisor instance.
+Use Tab or Shift-Tab to move between fields, Space to toggle Denials or Proxy, Enter to submit, and Esc to cancel.
+Up/Down recalls recent projects.
+Commands support quoted arguments and backslash escaping, but no shell expansion: `$HOME`, `~`, pipes and wildcards are literal.
+Use an explicit shell command if you intend shell syntax.
+Empty fields or malformed quoting keep the form open.
+After submission, inspect the session row, alert and terminal output for launch errors.
 
 A project that you have not approved yet shows as `Approve`, and nothing runs.
 Press `a` to review the config.
 The review runs `hb approve` in your terminal while the other sessions carry on.
-Nothing is typed for you, and starting the session again checks approval again.
+Nothing is typed for you.
+Successful approval automatically retries the same command; declining or cancelling launches nothing.
 
-You can run up to 8 sessions at once.
-A ninth is refused with a message, and nothing starts.
+You can occupy up to 8 session slots at once, including unresolved Lost sessions, and retain at most 32 rows.
+Restarting a row reuses it instead of adding another row.
 
 ## The screen
 
@@ -77,7 +86,7 @@ Overview mode, where keys belong to the supervisor:
 | `Enter` | Type to the selected session |
 | `n` | Start a session |
 | `s` | Stop the selected session (asks first, naming it) |
-| `r` | Restart it as a new run (asks first, naming it) |
+| `r` | Restart as a new run; asks first for a running session, immediately retries an ended or failed row |
 | `a` | Review approval for a session that is waiting for it |
 | `Tab` | Switch between Denials and Proxy |
 | `?` | Help |
@@ -93,13 +102,25 @@ Interact mode, where every key goes to the agent:
 | `Ctrl-g` | Return to Overview at once |
 | `Ctrl-g` then `Ctrl-g` | Send one `Ctrl-g` to the agent, and stay in Interact |
 | `Ctrl-Alt-g` | Goes to the agent as it is |
-| any other key | Goes to the agent unchanged |
+| supported terminal keys | Encoded for the agent's terminal modes; unsupported keys are ignored |
+
+Two consecutive Ctrl-g presses must target the same session and generation; the first returns to Overview, and the second sends Ctrl-g and re-enters Interact.
 
 Pasted text reaches the agent with its paste markers, only when the agent asked for them.
 
 If an agent stops while you are typing to it, the screen goes back to Overview and says so.
 Your next keys do nothing until you press `Esc` or `Ctrl-g`.
 Without that pause, the end of a sentence you were typing could restart, quit or start a session.
+
+## Logging
+
+Denials and Proxy are on by default in the launch form.
+Sandbox denial recording is best effort; an empty pane does not prove nothing was blocked.
+The Proxy switch hides its pane and controls textual logging, not whether typed proxy telemetry is produced.
+Each pane retains at most 1,000 records and draws the newest that fit.
+The count includes records evicted locally; reported dropped counts describe transport losses separately.
+Restart resets the row's history and counters.
+There is no persistent transcript or export action.
 
 ## What it protects
 
@@ -125,21 +146,28 @@ Without that pause, the end of a sentence you were typing could restart, quit or
 
 - It is not a second sandbox.
   An agent is confined by its own `hb` and the Seatbelt profile, exactly as in `hb run`.
-- A stopped supervisor is not noticed while the channel stays open and quiet.
-  `SIGSTOP`, or a job stopped with `Ctrl-Z`, leaves sessions running under their own `hb`, and they keep running.
-  `SIGSTOP` and `SIGKILL` also cannot restore your terminal; run `reset` if it is left raw.
+- The UI renews each session's lease every 5 seconds while it makes progress, including while waiting for an approval answer.
+  After 60 seconds without fresh progress, `hb` requests shutdown even if the channel remains open.
+  This starts at handshake, without waiting for a first heartbeat.
+  A long job-control stop or `SIGSTOP` therefore ends sessions; resuming does not restart them.
+  A sleeping machine cannot run cleanup; expiration is checked when it wakes and hb runs again.
+  `SIGSTOP` and `SIGKILL` cannot restore your terminal; run `reset` if it is left raw.
 - A restart or stop ends the agent and what it started in its group.
   It cannot prove that something that left the group, or was started by a program that ended first, is gone.
   The report `cleanup: complete` means the agent exited and `hb` finished its normal teardown.
   It does not mean every process or file is gone.
 - Cleanup of a process that leaves its session on purpose has the limits described for `hb run`.
   See [Reference](07-reference.md).
-- Output the agent produces while nothing reads your terminal is dropped once a stop begins.
-  It is not kept for later.
+- Output is abandoned if the terminal accepts no bytes for two seconds after a stop begins.
+  A slow reader that keeps accepting bytes is not a stalled reader.
+  Abandoned output is not kept for later.
 - Each session's scrollback is sized when it starts: at most 10,000 lines, fewer for a wide window, for about 8 MiB.
   Widening your window later keeps that line count, so the memory grows in proportion.
   The agent cannot resize it.
   Older lines are dropped.
+  This is emulator history; the supervisor currently has no keys to browse it.
+- A worker panic can race an in-progress frame with terminal restoration.
+  One final frame may appear outside the UI; run `reset` if necessary.
 
 ## Which agents were tried
 
@@ -169,9 +197,11 @@ It does not attach to sessions that were started somewhere else, keep sessions a
 | Shown | Meaning |
 |---|---|
 | `Exited 0` | The agent ended with that status and `hb` finished its normal teardown. |
-| `Exited` with an alert | It ended, and cleanup was not confirmed. Restart is refused until that is settled. |
-| `Failed` | `hb` could not start it. The reason is shown in the pane. |
+| `Exited` with an alert | `hb` reported an end or startup failure; inspect the alert and terminal output for status and cleanup details. |
+| `Failed` | Launch or reporting failed. Inspect the pane, output and alert. |
 | `Lost` | The channel broke before the session reported its end. |
 
 A restart waits until the old agent has ended.
-It never runs two copies of one session at the same time.
+Unknown cleanup blocks restart for that row for the rest of this supervisor instance; repeatedly pressing `r` cannot settle it.
+Inspect the failure and verify cleanup before starting elsewhere.
+The restart barrier is per row, not a project-wide duplicate detector: starting another row does not prove the old run ended.

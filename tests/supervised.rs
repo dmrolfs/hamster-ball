@@ -639,6 +639,42 @@ fn an_unusable_descriptor_variable_ends_the_process_and_is_reported() {
 
 /// A background child of the agent that ignores TERM and HUP, started by a shell that then waits.
 /// The leader dies of TERM at once; the child stays in the agent's group.
+#[test]
+fn an_open_quiet_supervisor_channel_expires_without_its_first_heartbeat() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut session = Session::start(&w, &[], &["/bin/sleep", "180"], true);
+    session.wait_for("running", 30);
+    let ended = session.finish(80);
+    assert!(
+        ended
+            .frames
+            .iter()
+            .any(|frame| matches!(frame.event, Event::Stopping { .. }))
+    );
+}
+
+#[test]
+fn fresh_supervisor_progress_keeps_an_idle_session_alive_beyond_bootstrap_grace() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut session = Session::start(&w, &[], &["/bin/sleep", "180"], true);
+    session.wait_for("running", 30);
+    let until = Instant::now() + Duration::from_secs(65);
+    while Instant::now() < until {
+        let progress = assert_ok!(hamster_ball::session::lease::Progress::now());
+        assert_ok!(session.peer.write_all(&assert_ok!(encode_line(
+            &hamster_ball::session::supervised::Command::Heartbeat {
+                progress_ns: progress.0
+            }
+        ))));
+        assert_eq!(assert_ok!(session.child.try_wait()), None);
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    session.close_channel();
+    session.finish(30);
+}
+
 fn term_ignoring_child_script(pid_file: &std::path::Path) -> String {
     format!(
         "(trap '' TERM HUP; exec sleep 90) </dev/null >/dev/null 2>&1 & echo $! > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 120",
