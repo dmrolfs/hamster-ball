@@ -365,6 +365,78 @@ fn a_deny_write_on_kiros_run_directory_keeps_the_linked_program() {
     assert!(!marker.exists());
 }
 
+// ---- hb-82i probe: deny_write on paths that do not exist yet (a fresh home has no hooks/ or plugins/).
+#[test]
+fn a_deny_write_on_an_absent_directory_and_an_absent_file_blocks_creating_them() {
+    sandboxed!();
+    let w = agent_world(
+        "claude",
+        "deny_write = [\"~/.claude/hooks\", \"~/.claude/settings.json\", \"~/.claude.json\"]\n",
+    );
+    let home = w.home_dir();
+    assert_ok!(fs::create_dir_all(home.join(".claude")));
+    let mk = run(
+        &w,
+        &format!(
+            "mkdir {h}/.claude/hooks 2>&1; echo '{{}}' > {h}/.claude/settings.json 2>&1; echo '{{}}' > {h}/.claude.json 2>&1; true",
+            h = quote(&home)
+        ),
+    );
+    assert_eq!(
+        text(&mk).matches("Operation not permitted").count(),
+        3,
+        "{}",
+        text(&mk)
+    );
+    assert!(!home.join(".claude/hooks").exists());
+    assert!(!home.join(".claude/settings.json").exists());
+    assert!(!home.join(".claude.json").exists());
+    // The rest of the directory still takes ordinary writes (history).
+    let ok = run(
+        &w,
+        &format!(
+            "mkdir -p {h}/.claude/projects && echo t > {h}/.claude/projects/s.jsonl",
+            h = quote(&home)
+        ),
+    );
+    assert!(ok.status.success(), "{}", text(&ok));
+}
+
+/// hb-82i probe: the oracle asked whether a file that an agent rewrites by temp-file-plus-rename can be protected.
+/// Each operation is run on its own so one refusal cannot hide another that succeeded.
+#[test]
+fn each_way_to_replace_a_denied_file_fails_on_its_own() {
+    sandboxed!();
+    let (w, settings, _marker) = claude_fixture(true);
+    let before = assert_ok!(fs::read(&settings));
+    let dir = quote(assert_some!(settings.parent()));
+    let s = quote(&settings);
+    for (what, script) in [
+        ("truncate", format!(": > {s}")),
+        ("append", format!("echo x >> {s}")),
+        (
+            "temp then rename over it",
+            format!("echo x > {dir}/t.json && mv -f {dir}/t.json {s}"),
+        ),
+        ("unlink", format!("rm -f {s}")),
+        ("move aside", format!("mv {s} {dir}/aside.json")),
+        (
+            "link over",
+            format!("echo x > {dir}/t2.json && ln -f {dir}/t2.json {s}"),
+        ),
+        ("chmod", format!("chmod 666 {s}")),
+    ] {
+        let out = run(&w, &script);
+        assert!(!out.status.success(), "{what} succeeded: {}", text(&out));
+        assert_eq!(
+            assert_ok!(fs::read(&settings)),
+            before,
+            "{what} changed the file"
+        );
+    }
+    assert!(!assert_some!(settings.parent()).join("aside.json").exists());
+}
+
 // ---- Versioned inventory (hb-tx4 criteria 1 and 3). Test-only table; shortcut: move to src/ when hb-82i makes presets consume it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
