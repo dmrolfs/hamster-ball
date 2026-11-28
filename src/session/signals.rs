@@ -17,7 +17,7 @@ use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 use snafu::{ResultExt, Snafu, ensure};
 
-use super::identity::{Identity, group_members};
+use super::identity::{Identity, IdentityError, ListError, Observed, group_members};
 
 /// The signals `hb` blocks and forwards.
 pub const SUPERVISED: [Signal; 3] = [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP];
@@ -107,16 +107,6 @@ pub enum Target {
     Group(Pid),
     /// Only the child. Used when the child shares hb's group, which also holds hb.
     Child(Pid),
-}
-
-impl Target {
-    pub(super) fn send(self, signal: Signal) {
-        // ESRCH only means the child is already gone.
-        let _ = match self {
-            Self::Group(pgid) => killpg(pgid, signal),
-            Self::Child(pid) => kill(pid, signal),
-        };
-    }
 }
 
 /// Notification that shutdown has begun. Must return promptly; may be called more than once.
@@ -261,6 +251,8 @@ impl Watch {
     ) -> Result<Supervisor, SignalError> {
         let queue = Arc::clone(&self.queue);
         let on_stopping = self.on_stopping;
+        let retire = Arc::new(AtomicBool::new(false));
+        let retiring = Arc::clone(&retire);
         let handle = thread::Builder::new()
             .name("hb-signals".to_owned())
             .spawn(move || {
@@ -270,12 +262,13 @@ impl Watch {
                     rule,
                     on_winch.as_deref(),
                     on_stopping.as_ref(),
+                    &retiring,
                 )
             })
             .context(ThreadSnafu)?;
         Ok(Supervisor {
-            queue: self.queue,
-            handle,
+            retire,
+            handle: Some(handle),
         })
     }
 }
@@ -430,28 +423,74 @@ fn await_stop(queue: &Kqueue, stopped: &AtomicBool, on_stopping: Option<&OnStopp
     }
 }
 
-/// The running thread. Call [`Supervisor::finish`] once the child has been waited for.
+/// A failure that prevents claiming normal signal cleanup.
+#[derive(Debug, Snafu)]
+pub enum SignalCleanupError {
+    /// The group inventory failed.
+    #[snafu(display("signal cleanup could not list group members"))]
+    List {
+        /// Kernel query failure.
+        source: ListError,
+    },
+    /// A member could not be identified.
+    #[snafu(display("signal cleanup could not identify a member"))]
+    Identity {
+        /// Kernel query failure.
+        source: IdentityError,
+    },
+    /// The event queue failed.
+    #[snafu(display("signal cleanup event queue failed"))]
+    Queue {
+        /// Kernel error.
+        source: Errno,
+    },
+    /// A signal could not be delivered.
+    #[snafu(display("signal cleanup could not signal {pid}"))]
+    Send {
+        /// Process or group number.
+        pid: i32,
+        /// Kernel error.
+        source: Errno,
+    },
+    /// The supervising thread panicked.
+    #[snafu(display("signal cleanup worker panicked"))]
+    Panicked,
+}
+
+/// The running thread. Join it before reaping or transferring its child to another reaper.
 #[derive(Debug)]
 pub struct Supervisor {
-    queue: Arc<Kqueue>,
-    handle: JoinHandle<()>,
+    retire: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<(), SignalCleanupError>>>,
 }
 
 impl Supervisor {
-    /// Stops the thread and waits for it.
-    pub fn finish(self) {
-        let stop = KEvent::new(
-            STOP_ID,
-            EventFilter::EVFILT_USER,
-            EvFlags::empty(),
-            FilterFlag::NOTE_TRIGGER,
-            0,
-            0,
-        );
-        // If this fails the thread would wait forever, so do not join it then; it ends with the process.
-        if self.queue.kevent(&[stop], &mut [], None).is_ok() {
-            let _ = self.handle.join();
+    /// Whether the worker ended before its owner asked for retirement.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Retires signal authority and joins before the caller releases the child identifier.
+    ///
+    /// # Errors
+    /// Any failed inventory, identity check, signal, event read or worker panic.
+    pub fn finish(mut self) -> Result<(), SignalCleanupError> {
+        self.end()
+    }
+
+    fn end(&mut self) -> Result<(), SignalCleanupError> {
+        self.retire.store(true, Ordering::SeqCst);
+        match self.handle.take() {
+            Some(handle) => handle.join().unwrap_or(Err(SignalCleanupError::Panicked)),
+            None => Ok(()),
         }
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 
@@ -462,7 +501,8 @@ fn supervise(
     mut rule: Escalation,
     on_winch: Option<&(dyn Fn() + Send + Sync)>,
     on_stopping: Option<&OnStopping>,
-) {
+    retire: &AtomicBool,
+) -> Result<(), SignalCleanupError> {
     let blank = KEvent::new(
         0,
         EventFilter::EVFILT_USER,
@@ -477,8 +517,9 @@ fn supervise(
     // Set once the thread was told to end: from then on it only waits for the group to empty.
     let mut ending = false;
     loop {
+        ending |= retire.load(Ordering::SeqCst);
         if ending && roster.settled(&rule) {
-            return;
+            return roster.error.take().map_or(Ok(()), Err);
         }
         let timeout = rule.deadline().map(|deadline| {
             let wake = if ending {
@@ -488,19 +529,19 @@ fn supervise(
             };
             TimeSpec::from_duration(wake.saturating_duration_since(Instant::now()))
         });
-        let timeout = match (timeout, ending) {
-            (None, true) => Some(TimeSpec::from_duration(SETTLE_POLL)),
-            (timeout, _) => timeout,
-        };
+        let timeout = Some(timeout.map_or_else(
+            || TimeSpec::from_duration(SETTLE_POLL),
+            |timeout| timeout.min(TimeSpec::from_duration(SETTLE_POLL)),
+        ));
         let ready = match queue.kevent(&[], &mut events, timeout.as_ref().map(|t| *t.as_ref())) {
             Ok(n) => n,
             Err(Errno::EINTR) => continue,
-            Err(_) => return,
+            Err(source) => return Err(SignalCleanupError::Queue { source }),
         };
         if ready == 0 {
             let step = rule.on_tick(Instant::now());
             roster.before(&step, target, ending);
-            apply(step, target, on_stopping, &roster, ending);
+            apply(step, target, on_stopping, &mut roster, ending);
             continue;
         }
         for event in &events[..ready] {
@@ -508,7 +549,7 @@ fn supervise(
                 Ok(EventFilter::EVFILT_USER) if event.ident() == DISCONNECT_ID => {
                     let step = rule.on_signal(Signal::SIGTERM, Instant::now());
                     roster.before(&step, target, ending);
-                    apply(step, target, on_stopping, &roster, ending);
+                    apply(step, target, on_stopping, &mut roster, ending);
                 }
                 Ok(EventFilter::EVFILT_USER) => ending = true,
                 Ok(EventFilter::EVFILT_SIGNAL) => {
@@ -528,7 +569,7 @@ fn supervise(
                     for _ in 0..event.data().clamp(1, 2) {
                         let step = rule.on_signal(signal, Instant::now());
                         roster.before(&step, target, ending);
-                        apply(step, target, on_stopping, &roster, ending);
+                        apply(step, target, on_stopping, &mut roster, ending);
                     }
                 }
                 _ => {}
@@ -561,6 +602,7 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 struct Roster {
     members: Vec<Identity>,
     taken: bool,
+    error: Option<SignalCleanupError>,
 }
 
 impl Roster {
@@ -579,15 +621,34 @@ impl Roster {
         if ended {
             return;
         }
-        let listed = group_members(pgid.as_raw()).unwrap_or_default();
-        self.members = listed
-            .into_iter()
-            .filter(|pid| *pid != i32::try_from(std::process::id()).unwrap_or(0))
-            .filter_map(|pid| Identity::of(pid).ok())
-            .collect();
+        let listed = match group_members(pgid.as_raw()) {
+            Ok(listed) => listed,
+            Err(source) => {
+                self.error = Some(SignalCleanupError::List { source });
+                return;
+            }
+        };
+        for pid in listed {
+            if pid <= 1 || pid == pgid.as_raw() || pid == Pid::this().as_raw() {
+                continue;
+            }
+            self.admit(pgid.as_raw(), Observed::of(pid));
+        }
+    }
+
+    fn admit(&mut self, pgid: i32, observation: Result<Observed, IdentityError>) {
+        match observation {
+            Ok(observed) if observed.pgid == pgid => self.members.push(observed.identity),
+            Ok(_) | Err(IdentityError::Gone { .. }) => {}
+            Err(source) => {
+                self.error
+                    .get_or_insert(SignalCleanupError::Identity { source });
+            }
+        }
     }
 
     /// Members that are still the processes that were recorded.
+    #[cfg(test)]
     fn alive(&self) -> Vec<Identity> {
         self.members
             .iter()
@@ -598,17 +659,44 @@ impl Roster {
 
     /// Whether the thread, told to end, may do so now: no stop is pending, nothing recorded is
     /// left, or the kill has been sent.
-    fn settled(&self, rule: &Escalation) -> bool {
-        rule.deadline().is_none() || self.alive().is_empty()
+    fn settled(&mut self, rule: &Escalation) -> bool {
+        if rule.deadline().is_none() {
+            return true;
+        }
+        let mut current = false;
+        for member in &self.members {
+            match member.is_current() {
+                Ok(alive) => current |= alive,
+                Err(source) => {
+                    self.error
+                        .get_or_insert(SignalCleanupError::Identity { source });
+                    current = true;
+                }
+            }
+        }
+        !current
     }
 
     /// Sends `signal` to each recorded member that is still the same process.
-    fn send(&self, signal: Signal) {
-        for member in self.alive() {
-            // A member that left between the check and the signal is a different process only if
-            // its number was reused in those microseconds: the same residual every kill by number
-            // has, and smaller than signalling a whole group number.
-            let _ = kill(Pid::from_raw(member.pid()), signal);
+    fn send(&mut self, signal: Signal) {
+        for member in &self.members {
+            match member.is_current() {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(source) => {
+                    self.error
+                        .get_or_insert(SignalCleanupError::Identity { source });
+                    continue;
+                }
+            }
+            if let Err(source) = kill(Pid::from_raw(member.pid()), signal)
+                && source != Errno::ESRCH
+            {
+                self.error.get_or_insert(SignalCleanupError::Send {
+                    pid: member.pid(),
+                    source,
+                });
+            }
         }
     }
 }
@@ -619,7 +707,7 @@ fn apply(
     step: Step,
     target: Target,
     on_stopping: Option<&OnStopping>,
-    roster: &Roster,
+    roster: &mut Roster,
     ended: bool,
 ) {
     if step != Step::Ignore {
@@ -634,7 +722,18 @@ fn apply(
         roster.send(signal);
         return;
     }
-    target.send(signal);
+    let sent = match target {
+        Target::Group(pid) => killpg(pid, signal).map_err(|source| (pid, source)),
+        Target::Child(pid) => kill(pid, signal).map_err(|source| (pid, source)),
+    };
+    if let Err((pid, source)) = sent
+        && source != Errno::ESRCH
+    {
+        roster.error.get_or_insert(SignalCleanupError::Send {
+            pid: pid.as_raw(),
+            source,
+        });
+    }
     if step == Step::Kill {
         // The leader may already be gone while members are not; name them as well.
         roster.send(signal);
@@ -741,11 +840,49 @@ mod tests {
     }
 
     #[test]
+    fn roster_admission_rejects_a_recycled_number_and_preserves_query_failure() {
+        let identity = assert_ok!(Identity::of(Pid::this().as_raw()));
+        let mut roster = Roster::default();
+        roster.admit(
+            42,
+            Ok(Observed {
+                identity,
+                ppid: 1,
+                pgid: 43,
+            }),
+        );
+        assert!(roster.members.is_empty());
+        roster.admit(
+            42,
+            Ok(Observed {
+                identity,
+                ppid: 1,
+                pgid: 42,
+            }),
+        );
+        assert_eq!(roster.members, vec![identity]);
+        roster.admit(42, Err(IdentityError::Gone { pid: 99 }));
+        assert!(roster.error.is_none());
+        roster.admit(
+            42,
+            Err(IdentityError::Query {
+                pid: 99,
+                source: std::io::Error::other("injected"),
+            }),
+        );
+        assert!(matches!(
+            roster.error,
+            Some(SignalCleanupError::Identity { .. })
+        ));
+    }
+
+    #[test]
     fn a_recorded_member_is_signalled_while_it_is_the_same_process() {
         let mut child = sleeper();
-        let roster = Roster {
+        let mut roster = Roster {
             members: vec![assert_ok!(Identity::of(pid_of(&child)))],
             taken: true,
+            error: None,
         };
         roster.send(Signal::SIGKILL);
         assert!(gone(&mut child), "the recorded member was not signalled");
@@ -758,9 +895,10 @@ mod tests {
         // (hb-807 re-review: process-group existence is not process-group identity).
         let mut stranger = sleeper();
         let real = assert_ok!(Identity::of(pid_of(&stranger)));
-        let roster = Roster {
+        let mut roster = Roster {
             members: vec![real.with_start(real.started().1.wrapping_add(1))],
             taken: true,
+            error: None,
         };
         assert!(roster.alive().is_empty());
         roster.send(Signal::SIGKILL);
@@ -797,7 +935,7 @@ mod tests {
     #[test]
     fn a_thread_told_to_end_with_no_stop_pending_does_not_wait() {
         let rule = Escalation::new(Duration::from_secs(5), false);
-        let roster = Roster::default();
+        let mut roster = Roster::default();
         assert!(roster.settled(&rule), "a normal exit would be held up");
     }
 
@@ -806,9 +944,10 @@ mod tests {
         let mut child = sleeper();
         let mut rule = Escalation::new(Duration::from_secs(5), false);
         let _ = rule.on_signal(Signal::SIGTERM, Instant::now());
-        let roster = Roster {
+        let mut roster = Roster {
             members: vec![assert_ok!(Identity::of(pid_of(&child)))],
             taken: true,
+            error: None,
         };
         assert!(
             !roster.settled(&rule),
@@ -920,7 +1059,7 @@ mod tests {
                 rule.on_signal(signal, now),
                 target,
                 Some(&callback),
-                &Roster::default(),
+                &mut Roster::default(),
                 false,
             );
         }
@@ -930,7 +1069,7 @@ mod tests {
             rule.on_signal(Signal::SIGTERM, now),
             target,
             Some(&callback),
-            &Roster::default(),
+            &mut Roster::default(),
             false,
         );
         let _ = child.kill();
@@ -1004,7 +1143,7 @@ mod tests {
             let supervisor = watch.start(Target::Child(pid), rule, None).ok()?;
             stop.request();
             thread::sleep(Duration::from_millis(500));
-            supervisor.finish();
+            supervisor.finish().ok()?;
             Some(())
         });
         let status = assert_ok!(child.wait());
@@ -1022,10 +1161,7 @@ mod tests {
             let rule = Escalation::new(Duration::from_secs(5), false);
             // Not a real child: the thread must end on the stop event alone.
             match watch.start(Target::Child(Pid::from_raw(i32::MAX)), rule, None) {
-                Ok(supervisor) => {
-                    supervisor.finish();
-                    true
-                }
+                Ok(supervisor) => supervisor.finish().is_ok(),
                 Err(_) => false,
             }
         })
@@ -1057,8 +1193,7 @@ mod tests {
             {
                 thread::sleep(Duration::from_millis(10));
             }
-            supervisor.finish();
-            count.load(std::sync::atomic::Ordering::Relaxed) >= 1
+            supervisor.finish().is_ok() && count.load(std::sync::atomic::Ordering::Relaxed) >= 1
         })
         .join();
         assert!(ok.unwrap_or(false));

@@ -106,6 +106,9 @@ impl Relay {
         clipboard: ClipboardPolicy,
         drain: Drain,
     ) -> io::Result<Self> {
+        let flags = rustix::fs::fcntl_getfl(&master).map_err(io::Error::from)?;
+        rustix::fs::fcntl_setfl(&master, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(io::Error::from)?;
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             hurry: AtomicBool::new(false),
@@ -265,6 +268,14 @@ impl Write for Sink {
 fn copy_chunk(from: &mut File, to: &mut impl Write, filter: Option<&mut Sanitizer>) -> bool {
     let mut buffer = [0u8; BUFFER];
     match from.read(&mut buffer) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            true
+        }
         Ok(0) | Err(_) => false,
         Ok(n) => {
             // The other side may be gone (the child ended); nothing useful to do about that here.
@@ -318,17 +329,38 @@ fn run(
     drain: Drain,
 ) {
     let mut input_open = true;
+    let mut pending_input = Vec::new();
     let mut draining_since: Option<Instant> = None;
     let mut quiet_since = Instant::now();
     loop {
         hold_while_paused(shared);
         let stopping = shared.stop.load(Ordering::Relaxed);
+        if stopping || shared.hurry.load(Ordering::Relaxed) {
+            pending_input.clear();
+            input_open = false;
+        }
+        if !pending_input.is_empty() {
+            match master.write(&pending_input) {
+                Ok(n) => {
+                    pending_input.drain(..n);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    pending_input.clear();
+                    input_open = false;
+                }
+            }
+        }
         if stopping && draining_since.is_none() {
             draining_since = Some(Instant::now());
         }
         let (master_ready, input_ready) = {
             let mut fds = vec![PollFd::new(master.as_fd(), PollFlags::POLLIN)];
-            if input_open && !stopping {
+            if input_open && pending_input.is_empty() && !stopping {
                 fds.push(PollFd::new(input.as_fd(), PollFlags::POLLIN));
             }
             if poll(&mut fds, PollTimeout::from(TICK_MS)).is_err() {
@@ -354,8 +386,20 @@ fn run(
                 return;
             }
         }
-        if input_ready && !copy_chunk(&mut input, &mut master, None) {
-            input_open = false;
+        if input_ready {
+            // Output delivery may have acknowledged a pause and allowed input to be flushed.
+            // No pause can be acknowledged between this fresh poll and the following read.
+            let mut ready = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut ready, PollTimeout::ZERO).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut bytes = [0; BUFFER];
+            match input.read(&mut bytes) {
+                Ok(0) => input_open = false,
+                Ok(n) => pending_input.extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => input_open = false,
+            }
         }
         if let Some(since) = draining_since
             && (!master_ready && quiet_since.elapsed() >= drain.quiet
@@ -408,7 +452,22 @@ mod tests {
         let payload = vec![b'x'; 60_000];
         let expected = payload.clone();
         let producer = std::thread::spawn(move || {
-            assert_ok!(child.write_all(&payload));
+            let flags = assert_ok!(rustix::fs::fcntl_getfl(&child));
+            assert_ok!(rustix::fs::fcntl_setfl(
+                &child,
+                flags | rustix::fs::OFlags::NONBLOCK
+            ));
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut sent = 0;
+            while sent < payload.len() && Instant::now() < until {
+                match child.write(&payload[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => break,
+                }
+            }
             child
         });
         std::thread::sleep(Duration::from_millis(100));
@@ -499,6 +558,54 @@ mod tests {
         assert_ok!(finishing.join());
         drop(child);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn unread_child_input_cannot_block_pause_or_finish() {
+        let rig = rig();
+        let flags = assert_ok!(rustix::fs::fcntl_getfl(&rig.user));
+        assert_ok!(rustix::fs::fcntl_setfl(
+            &rig.user,
+            flags | rustix::fs::OFlags::NONBLOCK
+        ));
+        let mut user = rig.user;
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            let _ = user.write(&[b'x'; 4096]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let shared = Arc::clone(&rig.relay.shared);
+        let thread = std::thread::spawn(move || {
+            rig.relay.pause();
+            rig.relay.resume();
+            rig.relay.finish()
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let finished = thread.is_finished();
+        // A broken blocking writer is released by draining this fixture's slave only.
+        shared.stop.store(true, Ordering::Relaxed);
+        *shared.gate() = Gate::Open;
+        shared.changed.notify_all();
+        let mut child = rig.child;
+        let flags = assert_ok!(rustix::fs::fcntl_getfl(&child));
+        assert_ok!(rustix::fs::fcntl_setfl(
+            &child,
+            flags | rustix::fs::OFlags::NONBLOCK
+        ));
+        let until = Instant::now() + Duration::from_secs(3);
+        while !thread.is_finished() && Instant::now() < until {
+            let _ = child.read(&mut [0; 4096]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            thread.is_finished(),
+            "relay did not end after fixture drain"
+        );
+        assert_ok!(thread.join());
+        assert!(finished, "input write blocked pause/finish");
     }
 
     fn rig() -> Rig {

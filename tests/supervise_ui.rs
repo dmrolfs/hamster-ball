@@ -454,15 +454,20 @@ fn sigterm_sighup_and_sigquit_restore_the_terminal_and_stop_the_agent_before_exi
             owner.send(&[key]);
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(marker.exists(), "{signal:?}: no agent; {}", owner.screen());
-        let pid: i32 = assert_some!(
-            std::fs::read_to_string(&marker)
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
                 .ok()
                 .and_then(|t| t.trim().parse().ok())
-        );
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{signal:?}: no ready agent; {}",
+                owner.screen()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
         // Not 0: the owner did not ask for this. Not a signal death either: it ended itself.
         assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");

@@ -237,7 +237,10 @@ pub(crate) struct Lease {
 }
 
 impl Lease {
-    pub(crate) fn wait_with_output(mut self) -> io::Result<std::process::Output> {
+    pub(crate) fn wait_with_output_before_reap(
+        &mut self,
+        before_reap: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<std::process::Output> {
         use std::io::Read;
         let mut buffers = Vec::new();
         let streams: [Option<Box<dyn Read + Send>>; 2] = [
@@ -260,9 +263,10 @@ impl Lease {
             }
             buffers.push(buffer);
         }
+        before_reap()?;
         let status = self.wait()?;
         self.join_readers(std::time::Instant::now() + super::launch_end::CLEANUP_BUDGET);
-        if self.settle() {
+        if !self.readers.is_empty() {
             return Err(io::Error::other("agent output cleanup incomplete"));
         }
         Ok(std::process::Output {

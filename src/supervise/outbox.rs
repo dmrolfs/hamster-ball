@@ -294,8 +294,15 @@ impl Outbox {
 }
 
 /// The caller bounds each write by POLL; partial progress never resets the frame deadline.
-fn write_control(channel: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
-    let until = Instant::now() + STALL;
+fn write_control(channel: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_control_until(channel, bytes, Instant::now() + STALL)
+}
+
+fn write_control_until(
+    channel: &mut impl Write,
+    mut bytes: &[u8],
+    until: Instant,
+) -> io::Result<()> {
     while !bytes.is_empty() {
         if Instant::now() >= until {
             return Err(io::Error::new(
@@ -373,6 +380,40 @@ mod tests {
     use std::io::Read;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn partial_control_progress_does_not_reset_the_frame_deadline() {
+        struct Trickling {
+            bytes: Vec<u8>,
+        }
+        impl Write for Trickling {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(10));
+                self.bytes.push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Trickling { bytes: Vec::new() };
+        let message = b"a control frame longer than the deadline permits";
+        let error = assert_err!(write_control_until(
+            &mut writer,
+            message,
+            Instant::now() + Duration::from_millis(35)
+        ));
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!writer.bytes.is_empty() && writer.bytes.len() < message.len());
+        assert_eq!(writer.bytes, message[..writer.bytes.len()]);
+        let mut complete = Vec::new();
+        assert_ok!(write_control_until(
+            &mut complete,
+            message,
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert_eq!(complete, message);
+    }
 
     #[test]
     fn heartbeat_is_coalesced_outside_full_input_budget_and_stop_discards_it() {

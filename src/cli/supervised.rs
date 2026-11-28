@@ -118,11 +118,16 @@ fn report_run(
                 event: exited_event(outcome.exit),
             }
         }
-        Err(RunError::Cleanup { exit: Some(exit) }) => {
+        Err(
+            RunError::Cleanup { exit: Some(exit) }
+            | RunError::SignalCleanup {
+                exit: Some(exit), ..
+            },
+        ) => {
             let mut event = exited_event(exit);
             if let Event::Exited { cleanup, .. } = &mut event {
                 *cleanup = Cleanup::Failed {
-                    what: "broker or guardian cleanup failed".into(),
+                    what: "session cleanup failed".into(),
                 };
             }
             Ended {

@@ -284,6 +284,14 @@ pub struct Outcome {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum RunError {
+    /// Signal cleanup failed after its worker was retired.
+    #[snafu(display("signal cleanup could not be confirmed"))]
+    SignalCleanup {
+        /// The observed agent exit, if available.
+        exit: Option<ExitKind>,
+        /// The failed inventory, identity check, signal or worker operation.
+        source: super::signals::SignalCleanupError,
+    },
     /// Child cleanup ownership could not be reserved before launch.
     #[snafu(display("the agent has no cleanup owner"))]
     Custody {
@@ -977,8 +985,9 @@ fn stdin_is_tty(stdio: StdioMode, own_stdin_is_terminal: bool) -> bool {
 
 /// A spawned child, with the signal thread that watches over it if there is one.
 struct Running {
-    child: Lease,
+    // Rust drops fields in declaration order: retire signals before custody can reap on unwind.
     supervisor: Option<Supervisor>,
+    child: Lease,
     terminal: Option<Interactive>,
     /// The filters between the agent's streams and the user's terminal, when there is no pty.
     pumps: Vec<Pump>,
@@ -1196,27 +1205,32 @@ fn open_pty(spec: &RunSpec) -> Result<Option<Pty>, RunError> {
 impl Running {
     /// Waits for the child, then stops the signal thread, and returns how it ended.
     fn wait_for_exit(
-        self,
+        mut self,
         stdio: StdioMode,
         on_stopping: Option<&OnStopping>,
     ) -> Result<Waited, RunError> {
-        let Self {
-            child,
-            supervisor,
-            terminal,
-            pumps,
-        } = self;
-        if let Some(terminal) = terminal {
-            let pid = RustixPid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+        if let Some(terminal) = self.terminal.take() {
+            let pid = RustixPid::from_raw(i32::try_from(self.child.id()).unwrap_or(i32::MAX));
             let exit = match pid {
-                Some(pid) => terminal.wait(pid),
+                Some(pid) => terminal.wait(pid, self.supervisor.as_ref()),
                 None => Err(io::Error::other("the child has no valid pid")),
             };
             OnStopping::notify(on_stopping);
-            if let Some(supervisor) = supervisor {
-                supervisor.finish();
-            }
+            let signals = self.supervisor.take().map_or(Ok(()), Supervisor::finish);
+            let reaped = if exit.is_ok() {
+                self.child.wait().map(|_| ())
+            } else {
+                Ok(())
+            };
             let clipboard = terminal.finish();
+            signals.context(SignalCleanupSnafu {
+                exit: exit.as_ref().ok().copied(),
+            })?;
+            if reaped.is_err() {
+                return Err(RunError::Cleanup {
+                    exit: exit.as_ref().ok().copied(),
+                });
+            }
             return exit
                 .map(|exit| Waited {
                     exit,
@@ -1226,21 +1240,29 @@ impl Running {
                 })
                 .context(SpawnSnafu);
         }
+        let pid = self.child.id();
+        let supervisor = &mut self.supervisor;
+        let mut signal_result = Ok(());
+        let mut observed_exit = None;
+        let mut before_reap = || {
+            let observed = observe_exit(pid, supervisor.as_ref());
+            observed_exit = observed.as_ref().ok().copied();
+            OnStopping::notify(on_stopping);
+            signal_result = supervisor.take().map_or(Ok(()), Supervisor::finish);
+            observed.map(|_| ())
+        };
         let result = match stdio {
-            StdioMode::Capture => child
-                .wait_with_output()
+            StdioMode::Capture => self
+                .child
+                .wait_with_output_before_reap(before_reap)
                 .map(|o| (ExitKind::from_status(o.status), o.stdout, o.stderr)),
-            StdioMode::Inherit => {
-                let mut child = child;
-                child
+            StdioMode::Inherit => before_reap().and_then(|()| {
+                self.child
                     .wait()
                     .map(|status| (ExitKind::from_status(status), Vec::new(), Vec::new()))
-            }
+            }),
         };
-        OnStopping::notify(on_stopping);
-        if let Some(supervisor) = supervisor {
-            supervisor.finish();
-        }
+        let pumps = std::mem::take(&mut self.pumps);
         // The agent has ended: let the filters write what is left before anything else is printed.
         let filtered = !pumps.is_empty();
         let clipboard = pumps
@@ -1250,6 +1272,14 @@ impl Running {
         if filtered && let Some(terminal) = output_terminal() {
             settle(&terminal);
         }
+        signal_result.context(SignalCleanupSnafu {
+            exit: observed_exit,
+        })?;
+        if result.is_err() && observed_exit.is_some() {
+            return Err(RunError::Cleanup {
+                exit: observed_exit,
+            });
+        }
         result
             .map(|(exit, stdout, stderr)| Waited {
                 exit,
@@ -1258,6 +1288,35 @@ impl Running {
                 clipboard,
             })
             .context(SpawnSnafu)
+    }
+}
+
+/// Observe exit without releasing the PID reserved by the owned child.
+fn observe_exit(pid: u32, supervisor: Option<&Supervisor>) -> io::Result<ExitKind> {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(RustixPid::from_raw)
+        .ok_or_else(|| io::Error::other("invalid child pid"))?;
+    loop {
+        if supervisor.is_some_and(Supervisor::is_finished) {
+            return Err(io::Error::other("signal worker ended before child exit"));
+        }
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(status)) => {
+                return Ok(match (status.exit_status(), status.terminating_signal()) {
+                    (Some(code), _) => ExitKind::Exited(code),
+                    (_, Some(signal)) => ExitKind::Signalled(signal),
+                    _ => ExitKind::Exited(1),
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -1514,6 +1573,61 @@ fn check_size(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_child_stays_waitable_while_finalization_is_held_before_signal_retirement() {
+        for stdio in [StdioMode::Inherit, StdioMode::Capture] {
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let (identity, child_id) = std::sync::mpsc::channel();
+            let finalizing = std::thread::spawn(move || {
+                assert_ok!(super::super::signals::block_supervised());
+                let watch = assert_ok!(Watch::prepare(false));
+                let group = super::super::custody::Group::new(1);
+                let permit = assert_ok!(group.reserve());
+                let mut command = Command::new("/usr/bin/true");
+                if matches!(stdio, StdioMode::Capture) {
+                    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+                let child = permit.install(assert_ok!(command.spawn()));
+                let pid = child.id();
+                assert_ok!(identity.send(pid));
+                let supervisor = assert_ok!(watch.start(
+                    Target::Child(Pid::from_raw(pid as i32)),
+                    Escalation::new(Duration::from_secs(1), false),
+                    None
+                ));
+                let running = Running {
+                    supervisor: Some(supervisor),
+                    child,
+                    terminal: None,
+                    pumps: Vec::new(),
+                };
+                let released = std::sync::Mutex::new(released);
+                let callback = OnStopping(std::sync::Arc::new(move || {
+                    let _ = entered.send(());
+                    let _ = assert_ok!(released.lock()).recv_timeout(Duration::from_secs(5));
+                }));
+                running.wait_for_exit(stdio, Some(&callback))
+            });
+            let pid = assert_ok!(child_id.recv_timeout(Duration::from_secs(5)));
+            assert_ok!(waiting.recv_timeout(Duration::from_secs(5)));
+            let still_waitable = observe_exit(pid, None);
+            assert_ok!(release.send(()));
+            let result = assert_ok!(finalizing.join());
+            assert_eq!(assert_ok!(still_waitable), ExitKind::Exited(0));
+            assert_eq!(assert_ok!(result).exit, ExitKind::Exited(0));
+        }
+    }
+
+    #[test]
+    fn non_reaping_exit_observation_keeps_child_waitable_until_retirement() {
+        let mut child = claims::assert_ok!(std::process::Command::new("/usr/bin/true").spawn());
+        claims::assert_ok!(super::observe_exit(child.id(), None));
+        // A second NOWAIT observation must still see the same waitable exit.
+        claims::assert_ok!(super::observe_exit(child.id(), None));
+        assert!(claims::assert_ok!(child.wait()).success());
+    }
+
     #[test]
     fn broker_or_logger_cleanup_failure_keeps_the_observed_exit_and_fails() {
         for (broker, logger) in [(true, false), (false, true), (true, true)] {

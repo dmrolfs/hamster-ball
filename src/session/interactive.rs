@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
 use rustix::process::{
-    Pid as RustixPid, Signal as RustixSignal, WaitOptions, getpid, kill_process, waitpid,
+    Pid as RustixPid, Signal as RustixSignal, WaitId, WaitIdOptions, getpid, kill_process, waitid,
 };
 use rustix::termios::tcsetwinsize;
 use snafu::{ResultExt, Snafu};
@@ -119,10 +119,32 @@ impl Interactive {
     /// Waits for the child to end. If it stops itself (a TUI handling Ctrl-Z), gives the terminal
     /// back, stops `hb` so the shell shows a suspended job, and on `fg` returns to raw mode,
     /// repaints and continues the child.
-    pub(super) fn wait(&self, child: RustixPid) -> io::Result<ExitKind> {
+    pub(super) fn wait(
+        &self,
+        child: RustixPid,
+        supervisor: Option<&super::signals::Supervisor>,
+    ) -> io::Result<ExitKind> {
         loop {
-            match waitpid(Some(child), WaitOptions::UNTRACED) {
-                Ok(Some((_, status))) if status.stopped() => {
+            if supervisor.is_some_and(super::signals::Supervisor::is_finished) {
+                return Err(io::Error::other("signal worker ended before child exit"));
+            }
+            match waitid(
+                WaitId::Pid(child),
+                WaitIdOptions::EXITED
+                    | WaitIdOptions::STOPPED
+                    | WaitIdOptions::NOWAIT
+                    | WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(status)) if status.stopped() => {
+                    // Consume only a stop notification: an intervening exit must stay waitable.
+                    match waitid(
+                        WaitId::Pid(child),
+                        WaitIdOptions::STOPPED | WaitIdOptions::NOHANG,
+                    ) {
+                        Ok(Some(stopped)) if stopped.stopped() => {}
+                        Ok(_) | Err(rustix::io::Errno::INTR) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
                     // The relay must not hold a read on the terminal while it is flushed.
                     self.relay.pause();
                     hand_back(&self.output, &self.user);
@@ -133,8 +155,9 @@ impl Interactive {
                     self.relay.resume();
                     let _ = kill_process(child, RustixSignal::CONT);
                 }
-                Ok(Some((_, status))) => return Ok(exit_kind(status)),
-                Ok(None) | Err(rustix::io::Errno::INTR) => {}
+                Ok(Some(status)) => return Ok(exit_kind(status)),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(rustix::io::Errno::INTR) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -164,7 +187,7 @@ fn copy_size(user: &OwnedFd, master: &File) {
     }
 }
 
-fn exit_kind(status: rustix::process::WaitStatus) -> ExitKind {
+fn exit_kind(status: rustix::process::WaitIdStatus) -> ExitKind {
     match (status.exit_status(), status.terminating_signal()) {
         (Some(code), _) => ExitKind::Exited(code),
         (None, Some(signal)) => ExitKind::Signalled(signal),

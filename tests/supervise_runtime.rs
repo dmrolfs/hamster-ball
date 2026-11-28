@@ -193,7 +193,10 @@ fn a_flooding_session_does_not_starve_the_shared_runtime_or_other_session() {
     let bounded = rt.screen(SessionId(1)).is_some_and(|shared| {
         let mut screen = claims::assert_ok!(shared.screen.lock());
         screen.scroll_to(usize::MAX);
-        screen.scrolled() == hamster_ball::supervise::terminal::SCROLLBACK_LINES
+        screen.scrolled()
+            == hamster_ball::supervise::terminal::scrollback_lines(
+                hamster_ball::supervise::runtime::START_SIZE.1,
+            )
     });
     let flooding = phase(&rt, 1) == Phase::Running;
     let before_shutdown = format!("{:?}", rt.app.sessions());
