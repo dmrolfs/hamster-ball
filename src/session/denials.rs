@@ -7,13 +7,20 @@
 //! The log is not complete (about 36 of 40 for Python and 38 of 40 for Node were seen), so these
 //! lines are hints for a person to read, never input to a rule generator.
 
+use super::custody::{Group, Lease};
+use super::guardian::{Guardian, GuardianError, WatchOutcome, WatchRefusal};
+use super::launch::{GateError, prepare_launch};
+use super::signals::Target;
+use nix::unistd::Pid;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use snafu::{ResultExt, Snafu};
@@ -170,6 +177,24 @@ pub struct Denials {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum DenialsError {
+    /// Cleanup ownership could not be reserved.
+    #[snafu(display("the log stream has no cleanup owner"))]
+    Custody {
+        /// Why custody could not be reserved.
+        source: super::CustodyError,
+    },
+    /// The parked helper did not complete its handshake.
+    #[snafu(display("the log stream launch gate failed"))]
+    Gate {
+        /// The handshake failure.
+        source: GateError,
+    },
+    /// The guardian refused protection before exec.
+    #[snafu(display("the log stream was not protected"))]
+    Guard {
+        /// Why registration failed.
+        source: GuardianError,
+    },
     /// `log stream` could not be started.
     #[snafu(display("{LOG} could not be started"))]
     Spawn {
@@ -180,8 +205,7 @@ pub enum DenialsError {
 
 /// A running `log stream` for one run.
 pub struct LogStream {
-    process: Child,
-    reader: JoinHandle<()>,
+    process: Lease,
     last_line: Arc<Mutex<Instant>>,
     kept: Arc<Mutex<Collector>>,
 }
@@ -193,27 +217,81 @@ impl LogStream {
     /// # Errors
     /// [`DenialsError::Spawn`] if `log` cannot be started.
     pub fn start(tag: &LogTag, sink: DenialSink) -> Result<Self, DenialsError> {
-        let mut process = Command::new(LOG)
+        Self::start_with(tag, sink, None)
+    }
+
+    pub(crate) fn start_guarded(
+        tag: &LogTag,
+        sink: DenialSink,
+        helper: &Path,
+        guard: &mut Guardian,
+    ) -> Result<Self, DenialsError> {
+        Self::start_with(tag, sink, Some((helper, guard)))
+    }
+
+    fn start_with(
+        tag: &LogTag,
+        sink: DenialSink,
+        guarded: Option<(&Path, &mut Guardian)>,
+    ) -> Result<Self, DenialsError> {
+        let group = Group::new(1);
+        let permit = group.reserve().context(CustodySnafu)?;
+        let mut command = match &guarded {
+            Some((helper, _)) => {
+                let mut command = Command::new(helper);
+                command.arg("__exec").arg(LOG);
+                command
+            }
+            None => Command::new(LOG),
+        };
+        command
             .args(["stream", "--style", "compact", "--predicate"])
             .arg(predicate(tag))
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .context(SpawnSnafu)?;
+            .process_group(0);
+        let mut process = if let Some((_, guard)) = guarded {
+            let null = std::fs::File::open("/dev/null").context(SpawnSnafu)?;
+            let (child, gate, ()) = prepare_launch(
+                &mut command,
+                &null,
+                |child| permit.install(child),
+                |lease| &mut **lease,
+                |pid| match guard
+                    .watch(Target::Group(Pid::from_raw(pid)))
+                    .context(GuardSnafu)?
+                {
+                    WatchOutcome::Armed => Ok(()),
+                    WatchOutcome::Gone => Err(DenialsError::Guard {
+                        source: GuardianError::Refused {
+                            reason: WatchRefusal::Invalid,
+                        },
+                    }),
+                },
+                |source| DenialsError::Spawn { source },
+                |source| DenialsError::Gate { source },
+            )?;
+            gate.release().context(GateSnafu)?;
+            child
+        } else {
+            permit.install(command.spawn().context(SpawnSnafu)?)
+        };
         let stdout = process.stdout.take();
         let last_line = Arc::new(Mutex::new(Instant::now()));
         let kept = Arc::new(Mutex::new(Collector::default()));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = {
             let (tag, last_line, kept) = (tag.clone(), Arc::clone(&last_line), Arc::clone(&kept));
-            thread::spawn(move || read_stream(stdout, &tag, &sink, &last_line, &kept, &ready_tx))
+            thread::Builder::new()
+                .spawn(move || read_stream(stdout, &tag, &sink, &last_line, &kept, &ready_tx))
+                .context(SpawnSnafu)?
         };
+        process.adopt_reader(reader);
         let _ = ready_rx.recv_timeout(READY_TIMEOUT);
         Ok(Self {
             process,
-            reader,
             last_line,
             kept,
         })
@@ -228,14 +306,30 @@ impl LogStream {
     /// Waits for the stream to go quiet (the log lags the event a little), stops it, and returns
     /// what it kept.
     #[must_use]
-    pub fn finish(mut self) -> Denials {
+    pub fn finish(self) -> Denials {
+        self.finish_checked().0
+    }
+
+    pub(crate) fn finish_checked(mut self) -> (Denials, bool) {
         wait_until_quiet(&self.last_line, QUIET, MAX_TAIL);
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-        let _ = self.reader.join();
+        let killed = self.process.kill();
+        let by = Instant::now() + super::launch_end::CLEANUP_BUDGET;
+        let mut reaped = false;
+        while Instant::now() < by {
+            match self.process.try_wait() {
+                Ok(Some(_)) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+        self.process.join_readers(by);
+        let failed = self.process.settle() || !reaped || killed.is_err();
         let collector = self.kept.lock().map(|k| k.clone()).unwrap_or_default();
         let (lines, dropped) = collector.into_parts();
-        Denials { lines, dropped }
+        (Denials { lines, dropped }, failed)
     }
 }
 

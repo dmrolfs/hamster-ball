@@ -26,6 +26,7 @@ It is written for someone who has not seen the tool before.
 | 5 | [Commands](05-commands.md) | Every `hb` command and option |
 | 6 | [Use cases](06-use-cases.md) | Common situations: what to run, and what happens underneath |
 | 7 | [Reference](07-reference.md) | Exit codes, files, environment variables, the floor, limits and troubleshooting |
+| 8 | [The supervisor](08-supervisor.md) | The optional `hb-supervise` terminal UI: several sessions in one terminal, its keys, what it protects, and its limits |
 
 ## Where to start
 

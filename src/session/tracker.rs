@@ -94,9 +94,142 @@ pub(super) struct Tracker {
     /// once the roots are gone, and a candidate older than every root cannot be this run's.
     earliest_root: Option<Identity>,
     discovery_deadline: Option<Instant>,
+    failure_overflow: bool,
+    failures: Vec<Identity>,
 }
 
 impl Tracker {
+    pub(super) fn failed(&self, root: Identity) -> bool {
+        self.failure_overflow || self.failures.contains(&root)
+    }
+
+    fn record_failure(&mut self, root: Identity) {
+        if !self.failures.contains(&root) {
+            if self.failures.len() < MAX_IDENTITIES {
+                self.failures.push(root);
+            } else {
+                self.failure_overflow = true;
+            }
+        }
+    }
+
+    pub(super) fn root_count(&self, root: Identity) -> usize {
+        self.members
+            .values()
+            .filter(|member| member.root == root)
+            .count()
+    }
+
+    pub(super) fn revision(&self, root: Identity) -> isize {
+        self.members
+            .values()
+            .filter(|member| member.root == root)
+            .map(|member| member.cookie)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn owned_by_other(&self, identity: Identity) -> bool {
+        self.members
+            .get(&identity.pid())
+            .is_some_and(|member| member.identity == identity && member.root != identity)
+    }
+
+    pub(super) fn kill_root_step(&mut self, root: Identity, cursor: &mut Option<i32>) {
+        let next = self
+            .members
+            .values()
+            .filter(|member| {
+                member.root == root && cursor.is_none_or(|pid| member.identity.pid() > pid)
+            })
+            .min_by_key(|member| member.identity.pid())
+            .copied();
+        if let Some(member) = next {
+            *cursor = Some(member.identity.pid());
+            if self.signal_member(member, Signal::SIGKILL).is_err() {
+                self.record_failure(root);
+            }
+        } else {
+            *cursor = None;
+        }
+    }
+
+    pub(super) fn root_reaped(&mut self, root: Identity) {
+        for member in self
+            .members
+            .values_mut()
+            .filter(|member| member.root == root)
+        {
+            member.scan_group = false;
+        }
+    }
+
+    pub(super) fn discover_pinned_root(
+        &mut self,
+        queue: &Kqueue,
+        root: Identity,
+    ) -> Result<(), TrackerError> {
+        let result = self.scan_group(queue, root, root);
+        if result.is_err() {
+            self.record_failure(root);
+        }
+        result
+    }
+
+    pub(super) fn forget_failure(&mut self, root: Identity) {
+        self.failures.retain(|identity| *identity != root);
+    }
+
+    /// One identity per pass, yielding to command handling between members.
+    pub(super) fn end_step(
+        &mut self,
+        queue: &Kqueue,
+        root: Identity,
+        pinned: bool,
+        cursor: &mut Option<i32>,
+    ) -> Result<bool, TrackerError> {
+        let next = self
+            .members
+            .values()
+            .filter(|member| {
+                member.root == root && cursor.is_none_or(|pid| member.identity.pid() > pid)
+            })
+            .min_by_key(|member| member.identity.pid())
+            .copied();
+        let Some(member) = next else {
+            *cursor = None;
+            return Ok(true);
+        };
+        *cursor = Some(member.identity.pid());
+        let discovery = self.discover(queue, member.identity, root, pinned && member.scan_group);
+        if discovery.is_err() {
+            self.record_failure(root);
+        }
+        let signalled = self.signal_member(member, Signal::SIGKILL);
+        if signalled.is_err() {
+            self.record_failure(root);
+        }
+        discovery.and(signalled).map(|()| false)
+    }
+
+    fn signal_member(&mut self, member: Member, signal: Signal) -> Result<(), TrackerError> {
+        if !member.identity.is_current().context(IdentitySnafu)? {
+            self.members.remove(&member.identity.pid());
+            return Ok(());
+        }
+        match kill(Pid::from_raw(member.identity.pid()), signal) {
+            Ok(()) => Ok(()),
+            Err(Errno::ESRCH) => {
+                self.members.remove(&member.identity.pid());
+                Ok(())
+            }
+            Err(source) => Err(TrackerError::Signal {
+                pid: member.identity.pid(),
+                source,
+            }),
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
@@ -142,7 +275,10 @@ impl Tracker {
         if let Some(member) = self.members.get_mut(&root.pid()) {
             member.scan_group = group;
         }
-        self.discover(queue, root, root, group)?;
+        if let Err(error) = self.discover(queue, root, root, group) {
+            self.record_failure(root);
+            return Err(error);
+        }
         Ok(root)
     }
 
@@ -367,10 +503,11 @@ impl Tracker {
         // refusal) must not leave a dead root holding its slot, where a reused number would then be
         // taken for it.
         let exited = event.fflags().contains(FilterFlag::NOTE_EXIT);
+        if discovery.is_err() {
+            self.record_failure(member.root);
+        }
         if exited {
             self.members.remove(&pid);
-            // shortcut: the discovery error is dropped when the process also exited, because the caller
-            // must learn of the exit; the sweep and the documented residual cover what was missed.
             return Ok(true);
         }
         discovery.map(|()| false)

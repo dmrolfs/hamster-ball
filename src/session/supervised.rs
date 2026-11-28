@@ -19,8 +19,8 @@
 //!   still holds a control character is refused on both the write and the read side, so text
 //!   from the sandbox cannot move the cursor, set a title or write the clipboard of the
 //!   terminal that shows it.
-//! - The only command is [`Command::Stop`]. Nothing here can approve, widen a policy or grant
-//!   access.
+//! - Commands stop the session or renew its UI-progress lease.
+//!   Nothing here can approve, widen a policy or grant access.
 
 use std::io::{self, BufRead, Read};
 
@@ -36,7 +36,7 @@ use crate::proxy::{AuditEvent, Decision};
 /// environment snapshot every child is built from, so no child ever sees it.
 pub const SUPERVISOR_FD_VAR: &str = "HB_SUPERVISOR_FD";
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// The most bytes in one frame, including the newline.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
 /// The most bytes in one text field.
@@ -348,10 +348,15 @@ pub struct Frame {
     pub event: Event,
 }
 
-/// What the supervisor may ask of `hb`. There is one command.
+/// What the supervisor may ask of `hb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    /// Renew using the original UI progress time, not the writer's delivery time.
+    Heartbeat {
+        /// Nanoseconds on the local host's sleep-inclusive monotonic clock.
+        progress_ns: u64,
+    },
     /// Shut the session down as SIGTERM would.
     Stop {},
 }
@@ -625,6 +630,19 @@ mod tests {
             Command::Stop {}
         );
 
+        let heartbeat = Command::Heartbeat { progress_ns: 123 };
+        let encoded = assert_ok!(encode_line(&heartbeat));
+        assert_eq!(
+            assert_ok!(decode_command(&encoded[..encoded.len() - 1])),
+            heartbeat
+        );
+        for invalid in [
+            br#"{"cmd":"heartbeat"}"#.as_slice(),
+            br#"{"cmd":"heartbeat","progress_ns":-1}"#,
+            br#"{"cmd":"heartbeat","progress_ns":1,"extra":0}"#,
+        ] {
+            assert!(decode_command(invalid).is_err());
+        }
         let hello = Hello::new(7, 2);
         let line = assert_ok!(encode_line(&hello));
         assert_eq!(assert_ok!(decode_hello(&line[..line.len() - 1])), hello);
@@ -657,14 +675,14 @@ mod tests {
     #[test]
     fn a_wrong_or_missing_version_is_reported_before_any_other_field() {
         for bad in [
-            &br#"{"v":2,"launch":1,"generation":1}"#[..],
-            &br#"{"v":2,"nonsense":true}"#[..],
+            &br#"{"v":1,"launch":1,"generation":1}"#[..],
+            &br#"{"v":1,"nonsense":true}"#[..],
             &br#"{"launch":1,"generation":1}"#[..],
         ] {
             assert_matches!(decode_hello(bad), Err(ProtocolError::WrongVersion { .. }));
         }
         assert_matches!(
-            decode_hello(br#"{"v":1,"launch":1,"generation":1,"x":1}"#),
+            decode_hello(br#"{"v":2,"launch":1,"generation":1,"x":1}"#),
             Err(ProtocolError::Malformed { .. })
         );
     }

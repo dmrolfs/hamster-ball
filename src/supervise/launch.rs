@@ -139,9 +139,14 @@ pub fn start_with_env(
         .arg(LAUNCH_ARG)
         .arg(hb)
         .arg("run")
-        .arg("--supervised")
-        .arg("--log-denials")
-        .arg("--log-proxy")
+        .arg("--supervised");
+    if spec.logging.denials {
+        command.arg("--log-denials");
+    }
+    if spec.logging.proxy {
+        command.arg("--log-proxy");
+    }
+    command
         .arg("--")
         .args(&spec.command)
         .current_dir(&spec.project)

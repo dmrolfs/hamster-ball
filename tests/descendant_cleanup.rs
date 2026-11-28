@@ -275,11 +275,15 @@ fn a_process_the_tracker_missed_is_found_by_its_token_and_ended() {
     assert!(alive(pid_of(&stranger)));
     drop(guardian);
     // The test is its parent, so an ended process stays a zombie until it is waited for.
-    assert!(
-        within(Duration::from_secs(6), || assert_ok!(stranger.try_wait())
-            .is_some()),
-        "the process carrying the token survived"
-    );
+    let ended = within(Duration::from_secs(6), || {
+        assert_ok!(stranger.try_wait()).is_some()
+    });
+    // A failed cleanup check must not leave its 300-second fixture running.
+    if !ended {
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+    assert!(ended, "the process carrying the token survived");
 }
 
 #[test]
@@ -395,10 +399,12 @@ fn a_guard_with_nothing_left_after_a_complete_look_does_not_wait_out_the_grace_p
     drop(guardian);
     let ended = within(Duration::from_secs(4), || {
         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-        matches!(
-            waitpid(guard, Some(WaitPidFlag::WNOHANG)),
-            Ok(status) if status != WaitStatus::StillAlive
-        )
+        match waitpid(guard, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status) => status != WaitStatus::StillAlive,
+            // Guardian drop now transfers its Child to the process-lifetime custodian.
+            Err(nix::errno::Errno::ECHILD) => true,
+            Err(_) => false,
+        }
     });
     assert!(
         ended,

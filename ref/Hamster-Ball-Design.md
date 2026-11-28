@@ -676,6 +676,25 @@ process's number with its start time. Before every signal it reads the process a
 not signalled, so a number the system has given to an unrelated program is left alone. The check and the signal are two steps,
 so a gap remains that is unlikely and not bounded in time (hb-caj).
 
+**Acknowledged launches and broker teardown** (hb-6wk).
+The agent, broker command and denial logger share the descriptor-passing Prepared/Armed/Release gate.
+The logger is registered as a group before it can execute.
+Each broker launch receives a guardian-local ticket bound to its original process identity.
+Short end requests start and poll identity-scoped cleanup without holding the channel while waiting for exit.
+The parent observes exit with `waitid(NOWAIT)`, signals the still-pinned group, requests a final pinned pass, and only then reaps.
+After the reaped transition the guardian never scans that launch's numeric group again.
+A saved zombie can be unavailable to libproc even while NOWAIT pins it; the parent's group kill covers group members in that case, not a claim that the guardian discovered them.
+Known tracked descendants continue receiving identity-qualified KILL attempts after discovery time expires.
+
+Command cleanup has one two-second cooperative budget, not a bound on scheduler or kernel stalls.
+A failed cleanup prevents later launches through that host, requests session stop, and prevents a successful guardian release.
+Observed command exit and cleanup failure are kept separately; supervised reporting retains the agent's exit while marking cleanup failed.
+One process-lifetime custody worker retains unresolved direct children and reader handles across library returns.
+Its 64 slots are reserved before spawn, with 14 slots per broker host; exhausted capacity refuses a launch rather than abandoning custody.
+The guardian's custody entry only reaps it and never kills its independent EOF cleanup.
+At actual failed executable termination, the OS adopts any remaining children; library return alone does not transfer parenthood.
+These mechanisms do not eliminate hb-caj's untracked rapid-detach or non-atomic identity-check residuals.
+
 **Descendants** (hb-caj). macOS refuses `NOTE_TRACK`, so the kernel does not follow forks. The guard registers `NOTE_FORK` and
 `NOTE_EXIT` on each owned process and, on a fork, lists the children and adopts them.
 A group's original leader must still be identifiable (live or unreaped zombie) through observation before additional members are adopted.

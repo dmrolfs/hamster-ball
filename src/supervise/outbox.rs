@@ -78,6 +78,7 @@ struct State {
     /// the budget bounds everything the outbox holds, not only what has not been picked up yet.
     pending: usize,
     stop: bool,
+    heartbeat: Option<crate::session::lease::Progress>,
     /// Input is refused from here on: stopping, ended, or failed.
     refusing: bool,
 }
@@ -133,10 +134,21 @@ impl Outbox {
         Ok(())
     }
 
+    /// Coalesces UI progress independently of queued terminal input.
+    pub fn heartbeat(&self, progress: crate::session::lease::Progress) {
+        let mut state = self.lock();
+        if !state.refusing {
+            state.heartbeat = Some(progress);
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+
     /// Asks for the Stop command to be sent ahead of any waiting input, which is dropped.
     pub fn request_stop(&self) {
         let mut state = self.lock();
         state.stop = true;
+        state.heartbeat = None;
         state.refusing = true;
         state.queue.clear();
         state.pending = 0;
@@ -194,6 +206,8 @@ impl Outbox {
                 let mut state = self.lock();
                 if state.stop {
                     Next::Stop
+                } else if let Some(progress) = state.heartbeat.take() {
+                    Next::Heartbeat(progress)
                 } else if let Some(bytes) = state.queue.pop_front() {
                     // Still charged: it is held until it has been written (see `finished`).
                     Next::Input(bytes)
@@ -204,15 +218,13 @@ impl Outbox {
             };
             match next {
                 Next::Stop => {
-                    channel
-                        .write_all(stop_line)
-                        .and_then(|()| channel.flush())
-                        .context(ChannelSnafu)?;
+                    write_control(channel, stop_line).context(ChannelSnafu)?;
                     // Nothing is sent after Stop: the writer's work is done.
                     return Ok(());
                 }
+                Next::Heartbeat(progress) => Self::write_heartbeat(channel, progress)?,
                 Next::Input(bytes) => {
-                    let written = self.write_input(terminal, &bytes);
+                    let written = self.write_input(terminal, &bytes, channel);
                     self.finished(bytes);
                     written?;
                 }
@@ -230,13 +242,36 @@ impl Outbox {
         state.pending = state.pending.saturating_sub(len);
     }
 
+    fn write_heartbeat(
+        channel: &mut impl Write,
+        progress: crate::session::lease::Progress,
+    ) -> Result<(), WriterError> {
+        let line = crate::session::supervised::encode_line(
+            &crate::session::supervised::Command::Heartbeat {
+                progress_ns: progress.0,
+            },
+        )
+        .map_err(io::Error::other)
+        .context(ChannelSnafu)?;
+        write_control(channel, &line).context(ChannelSnafu)
+    }
+
     /// Writes all of `bytes`, or stops early (without error) if a stop or cancel arrives.
-    fn write_input(&self, terminal: &File, bytes: &[u8]) -> Result<(), WriterError> {
+    fn write_input(
+        &self,
+        terminal: &File,
+        bytes: &[u8],
+        channel: &mut impl Write,
+    ) -> Result<(), WriterError> {
         let mut sent = 0;
         let mut progress = Instant::now();
         while sent < bytes.len() {
             if self.is_cancelled() || self.lock().stop {
                 return Ok(());
+            }
+            let heartbeat = self.lock().heartbeat.take();
+            if let Some(progress) = heartbeat {
+                Self::write_heartbeat(channel, progress)?;
             }
             match rustix::io::write(terminal, &bytes[sent..]) {
                 Ok(0) => return Err(WriterError::Stalled),
@@ -258,7 +293,41 @@ impl Outbox {
     }
 }
 
+/// The caller bounds each write by POLL; partial progress never resets the frame deadline.
+fn write_control(channel: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_control_until(channel, bytes, Instant::now() + STALL)
+}
+
+fn write_control_until(
+    channel: &mut impl Write,
+    mut bytes: &[u8],
+    until: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if Instant::now() >= until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control frame write expired",
+            ));
+        }
+        match channel.write(bytes) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => bytes = &bytes[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 enum Next {
+    Heartbeat(crate::session::lease::Progress),
     Stop,
     Input(Vec<u8>),
 }
@@ -311,6 +380,77 @@ mod tests {
     use std::io::Read;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn partial_control_progress_does_not_reset_the_frame_deadline() {
+        struct Trickling {
+            bytes: Vec<u8>,
+        }
+        impl Write for Trickling {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                thread::sleep(Duration::from_millis(10));
+                self.bytes.push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Trickling { bytes: Vec::new() };
+        let message = b"a control frame longer than the deadline permits";
+        let error = assert_err!(write_control_until(
+            &mut writer,
+            message,
+            Instant::now() + Duration::from_millis(35)
+        ));
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!writer.bytes.is_empty() && writer.bytes.len() < message.len());
+        assert_eq!(writer.bytes, message[..writer.bytes.len()]);
+        let mut complete = Vec::new();
+        assert_ok!(write_control_until(
+            &mut complete,
+            message,
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert_eq!(complete, message);
+    }
+
+    #[test]
+    fn heartbeat_is_coalesced_outside_full_input_budget_and_stop_discards_it() {
+        use crate::session::lease::Progress;
+        let outbox = Outbox::new();
+        assert_ok!(outbox.push(vec![0; MAX_PENDING_BYTES]));
+        outbox.heartbeat(Progress(1));
+        outbox.heartbeat(Progress(2));
+        assert_eq!(outbox.lock().heartbeat, Some(Progress(2)));
+        assert_eq!(outbox.lock().pending, MAX_PENDING_BYTES);
+        outbox.request_stop();
+        outbox.heartbeat(Progress(3));
+        assert_eq!(outbox.lock().heartbeat, None);
+    }
+
+    #[test]
+    fn heartbeat_interrupts_a_paste_waiting_for_terminal_space() {
+        use crate::session::lease::Progress;
+        let (terminal, _slave) = stalled_terminal();
+        let outbox = Arc::new(Outbox::new());
+        assert_ok!(outbox.push(vec![b'x'; MAX_PENDING_BYTES]));
+        let sink = Sink::default();
+        let observed = sink.clone();
+        let sending = Arc::clone(&outbox);
+        let writer = thread::spawn(move || sending.run(&terminal, &mut sink.clone(), b"stop\n"));
+        thread::sleep(Duration::from_millis(100));
+        outbox.heartbeat(assert_ok!(Progress::now()));
+        let delivered = within(2, || {
+            assert_ok!(observed.0.lock())
+                .windows(9)
+                .any(|w| w == b"heartbeat")
+        });
+        outbox.cancel();
+        assert!(within(2, || writer.is_finished()));
+        assert_ok!(assert_ok!(writer.join()));
+        assert!(delivered, "control renewal starved behind a paste");
+    }
 
     /// A PTY whose master the writer fills, and the slave end that must stay open and unread for
     /// the test's life. The slave is in raw mode: in line mode the terminal throws input away
@@ -563,7 +703,7 @@ mod tests {
                 got += assert_ok!(slave.read(&mut buffer));
             }
         }
-        assert_eq!(outbox.lock().pending, 0);
+        assert!(within(5, || outbox.lock().pending == 0));
         outbox.cancel();
         assert_ok!(assert_ok!(writer.join()));
     }

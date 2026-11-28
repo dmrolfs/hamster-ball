@@ -25,6 +25,12 @@ const FD_DIR: &str = "/dev/fd";
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum SweepError {
+    /// Neither the descriptor directory nor the kernel inventory could be read.
+    #[snafu(display("open descriptors could not be inventoried"))]
+    Inventory {
+        /// The kernel inventory error.
+        source: io::Error,
+    },
     /// A descriptor could not be closed.
     #[snafu(display("descriptor {fd} could not be closed"))]
     Close {
@@ -34,15 +40,6 @@ pub enum SweepError {
         source: Errno,
     },
 }
-
-/// The most descriptor numbers tried when the open ones cannot be listed.
-///
-/// Measured on macOS: `kern.maxfilesperproc` is 65535 and `dup2` to 65535 fails with `EBADF`, so a
-/// descriptor can never be above 65534 whatever `ulimit -n` says (it reports 1048575 here).
-/// Closing the whole range took 0.22 s at 1 Mi numbers and about 15 ms at this one.
-/// shortcut: a kernel with a higher per-process limit would need this raised; the test below
-/// compares it with the limit the machine reports, so it fails when that happens.
-const MAX_RANGE: i32 = 1 << 16;
 
 #[test]
 fn fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered() {
@@ -64,6 +61,7 @@ fn fallback_closes_descriptors_opened_before_the_soft_limit_was_lowered() {
     let high = assert_ok!(rustix::io::fcntl_dupfd_cloexec(&file, 200)).into_raw_fd();
     let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
     limit.current = Some(64);
+    limit.maximum = Some(64);
     assert_ok!(rustix::process::setrlimit(
         rustix::process::Resource::Nofile,
         limit
@@ -111,24 +109,16 @@ fn list_open() -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// Every number a descriptor could have, for when the open ones cannot be listed: the sandbox
-/// profile denies reading `/dev/fd`, and `hb ctl` and the helpers run inside it. Closing a number
-/// that is not open finds nothing (`EBADF`), which the sweep allows.
-fn every_possible() -> Vec<String> {
-    // Lowering the allocation limit does not close descriptors already open above it.
-    (3..MAX_RANGE).map(|fd| fd.to_string()).collect()
-}
-
-/// The sweep, with the listing and the closing passed in so each case can be tested. A listing
-/// that fails is not a reason to leave descriptors open: every possible number is closed instead.
+/// The sweep must run before threads or child processes start: descriptor numbers can otherwise
+/// be reused between inventory and close. Allocation limits are not an inventory of open files.
 fn sweep(
     keep: Option<RawFd>,
     list: impl FnOnce() -> io::Result<Vec<String>>,
     mut close_fd: impl FnMut(RawFd) -> Result<(), Errno>,
 ) -> Result<Vec<i32>, SweepError> {
-    let names = list().unwrap_or_else(|_| every_possible());
+    let fds = inventory(list, darwin_libproc::self_fds)?;
     let mut closed = Vec::new();
-    for fd in inherited_from(names.iter().map(String::as_str)) {
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
         if Some(fd) == keep {
             continue;
         }
@@ -141,6 +131,16 @@ fn sweep(
         }
     }
     Ok(closed)
+}
+
+fn inventory(
+    list: impl FnOnce() -> io::Result<Vec<String>>,
+    kernel: impl FnOnce() -> io::Result<Vec<i32>>,
+) -> Result<Vec<i32>, SweepError> {
+    match list() {
+        Ok(names) => Ok(inherited_from(names.iter().map(String::as_str))),
+        Err(_) => kernel().context(InventorySnafu),
+    }
 }
 
 /// Takes the supervisor channel the launcher left open as descriptor `number`.
@@ -372,26 +372,17 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_list_that_cannot_be_read_closes_every_possible_number_instead() {
-        use claims::assert_ok;
-        let mut tried = Vec::new();
-        let closed = assert_ok!(sweep(
-            Some(5),
+    fn unreadable_directory_uses_actual_inventory_not_an_allocation_limit() {
+        let fds = claims::assert_ok!(inventory(
             || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-            |fd| {
-                tried.push(fd);
-                // Almost none of them are open.
-                if fd == 7 { Ok(()) } else { Err(Errno::EBADF) }
-            },
+            || Ok(vec![3, 100_000]),
         ));
-        assert_eq!(closed, vec![7], "only what was open counts as closed");
-        assert!(
-            tried.len() > 100,
-            "it must try the whole range, tried {}",
-            tried.len()
-        );
-        assert!(!tried.contains(&5), "the kept descriptor is not touched");
-        assert!(!tried.iter().any(|fd| *fd <= 2), "standard streams stay");
+        assert_eq!(fds, vec![3, 100_000]);
+        let problem = claims::assert_err!(inventory(
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        ));
+        assert!(matches!(problem, SweepError::Inventory { .. }));
     }
 
     #[test]
@@ -454,28 +445,5 @@ mod tests {
         );
         let none = start_up_with(None, |_| Ok(Vec::new()));
         assert!(none.channel.is_none() && none.problem.is_none());
-    }
-
-    #[test]
-    fn the_fallback_range_covers_every_descriptor_the_kernel_allows() {
-        // sysctl kern.maxfilesperproc is the most descriptors one process may hold, so the highest
-        // possible number is one less. The range must reach it.
-        let out = std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.maxfilesperproc"])
-            .output();
-        let Ok(out) = out else { return };
-        let Ok(limit) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() else {
-            return;
-        };
-        assert!(
-            MAX_RANGE >= limit,
-            "the machine allows {limit} descriptors per process but the fallback stops at {MAX_RANGE}"
-        );
-        let names = every_possible();
-        assert_eq!(names.first().map(String::as_str), Some("3"));
-        assert_eq!(
-            names.last().map(String::as_str),
-            Some((MAX_RANGE - 1).to_string().as_str())
-        );
     }
 }

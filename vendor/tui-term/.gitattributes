@@ -1,0 +1,2 @@
+# Recorded terminal streams contain intentional CR and trailing spaces.
+test/typescript/*.typescript -text -diff

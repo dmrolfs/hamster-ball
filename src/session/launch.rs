@@ -13,6 +13,7 @@ use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::net::{
@@ -98,6 +99,47 @@ impl ParentGate {
     pub fn release(mut self) -> Result<(), GateError> {
         self.socket.set_nonblocking(false).context(IoSnafu)?;
         self.socket.write_all(RELEASE).context(IoSnafu)
+    }
+}
+
+/// Spawns a parked helper, drops the parent's duplicate socket end, and validates Prepared.
+/// The owner supplies its child-custody installation and arming operations before any release.
+pub(crate) fn prepare_launch<C, A, E>(
+    command: &mut Command,
+    stdin: impl AsFd,
+    install: impl FnOnce(Child) -> C,
+    mut child_ref: impl FnMut(&mut C) -> &mut Child,
+    arm: impl FnOnce(i32) -> Result<A, E>,
+    io_error: impl Fn(io::Error) -> E,
+    gate_error: impl Fn(GateError) -> E,
+) -> Result<(C, ParentGate, A), E> {
+    let (ours, theirs) = UnixStream::pair().map_err(&io_error)?;
+    command.stdin(Stdio::from(OwnedFd::from(theirs)));
+    let spawned = command.spawn();
+    command.stdin(Stdio::null());
+    let mut child = install(spawned.map_err(io_error)?);
+    let mut gate = ParentGate::new(ours);
+    let prepared = gate.prepare(stdin).map_err(&gate_error).and_then(|pid| {
+        if u32::try_from(pid).ok() != Some(child_ref(&mut child).id()) {
+            return Err(gate_error(GateError::Protocol));
+        }
+        arm(pid)
+    });
+    match prepared {
+        Ok(armed) => Ok((child, gate, armed)),
+        Err(error) => {
+            let child = child_ref(&mut child);
+            let _ = child.kill();
+            let by = Instant::now() + super::launch_end::CLEANUP_BUDGET;
+            while Instant::now() < by {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(POLL),
+                }
+            }
+            // An unresolved child remains in its pre-reserved custody slot.
+            Err(error)
+        }
     }
 }
 

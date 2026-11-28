@@ -113,7 +113,7 @@ impl Agent {
             state: KeyEventState::NONE,
         };
         if let Some(bytes) = encode_key(event, modes) {
-            let _ = self.master.write_all(&bytes);
+            assert_ok!(self.master.write_all(&bytes));
         }
     }
 
@@ -131,7 +131,7 @@ impl Agent {
 
     /// Waits until output has started and then stopped arriving for `quiet`, or `secs` pass.
     /// An agent behind a slow launcher sends nothing at first, which is not yet quiet.
-    fn settle(&self, quiet: Duration, secs: u64) {
+    fn settle(&self, quiet: Duration, secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while self.received() == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -145,9 +145,10 @@ impl Agent {
                 last = now;
                 since = Instant::now();
             } else if since.elapsed() >= quiet {
-                return;
+                return true;
             }
         }
+        false
     }
 
     fn ended(&mut self) -> bool {
@@ -168,6 +169,15 @@ impl Agent {
 
 impl Drop for Agent {
     fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -184,16 +194,28 @@ fn exercise(
     if !enabled() {
         return;
     }
-    if !std::path::Path::new(program).exists() {
-        eprintln!("SKIP {name}: {program} is not installed");
-        return;
-    }
+    assert!(
+        std::path::Path::new(program).exists(),
+        "{name}: {program} is not installed"
+    );
+    let version = assert_ok!(Command::new(program).arg("--version").output());
+    assert!(version.status.success(), "{name}: version command failed");
+    eprintln!(
+        "{name}: version {}",
+        String::from_utf8_lossy(&version.stdout).trim()
+    );
     let dir = assert_ok!(tempfile::TempDir::new());
     let Some(mut agent) = Agent::start(program, args, dir.path()) else {
         assert_ok!(Err::<(), String>(format!("{name}: could not start")));
         return;
     };
-    agent.settle(Duration::from_secs(2), 40);
+    assert!(
+        agent.settle(
+            Duration::from_secs(if name == "opencode" { 1 } else { 4 }),
+            40
+        ),
+        "{name}: startup never settled"
+    );
     let first = agent.text();
     eprintln!(
         "{name}: start-up screen, {} bytes received, suppressed {:?}\n{first}\n---",
@@ -205,14 +227,64 @@ fn exercise(
         "{name}: nothing rendered:\n{first}"
     );
 
+    let quiet_bytes = agent.received();
+    std::thread::sleep(Duration::from_secs(2));
+    if name == "opencode" {
+        // opencode 2.4.2 keeps a live status line (a counter that ticks, plugin and MCP notices)
+        // and redraws it with no input: measured 84 bytes per tick, 658 to 1,650 for a notice, every
+        // few seconds. The check for this agent is that the background output is small and bounded,
+        // not that there is none, so a loop in the pipeline would still fail it.
+        let extra = agent.received() - quiet_bytes;
+        assert!(
+            extra <= 4096,
+            "{name}: {extra} bytes arrived in 2 s with no input"
+        );
+        eprintln!(
+            "{name}: background output in 2 s with no input: {extra} bytes (live status line)"
+        );
+    } else {
+        assert_eq!(
+            agent.received(),
+            quiet_bytes,
+            "{name}: output arrives without input"
+        );
+        assert_eq!(agent.text(), first, "{name}: screen changes without input");
+    }
+    let first = agent.text();
     // Keys the agent reacts to by changing its screen: text in an input box, or a menu move.
     for (code, mods) in probe {
         agent.key(*code, *mods);
     }
     let typed = agent.wait_for_change(&first, 10);
-    agent.settle(Duration::from_secs(1), 10);
-    let after_typing = agent.text();
+    assert!(typed, "{name}: input did not change the screen");
+    assert!(
+        agent.settle(Duration::from_secs(1), 10),
+        "{name}: input never settled"
+    );
     eprintln!("{name}: typing changed the screen: {typed}");
+    if matches!(name, "pi" | "opencode") {
+        assert!(
+            agent.text().contains("hbprobe"),
+            "{name}: typed token missing: {}",
+            agent.text()
+        );
+        for _ in "hbprobe".chars() {
+            agent.key(KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        assert!(agent.settle(Duration::from_secs(1), 10));
+        assert!(
+            !agent.text().contains("hbprobe"),
+            "{name}: input was not cleared"
+        );
+    } else {
+        let down = agent.text();
+        agent.key(KeyCode::Up, KeyModifiers::NONE);
+        assert!(
+            agent.wait_for_change(&down, 10),
+            "{name}: Up did not move the menu"
+        );
+        assert!(agent.settle(Duration::from_secs(1), 10));
+    }
 
     // Resize: both sides change, and the agent redraws for the new width.
     let bytes_before = agent.received();
@@ -220,8 +292,12 @@ fn exercise(
     if let Ok(mut screen) = agent.screen.lock() {
         screen.resize(30, 80);
     }
-    agent.settle(Duration::from_secs(1), 10);
+    assert!(
+        agent.settle(Duration::from_secs(1), 10),
+        "{name}: resize never settled"
+    );
     let redrew = agent.received() > bytes_before;
+    assert!(redrew, "{name}: no output after resize");
     eprintln!(
         "{name}: resize to 30x80 made the agent redraw: {redrew}\n{}\n---",
         agent.text()
@@ -230,7 +306,6 @@ fn exercise(
         agent.screen.lock().map(|s| s.size()).unwrap_or_default(),
         (30, 80)
     );
-    let _ = after_typing;
 
     // Exit: the keys the agent documents, then, failing that, Ctrl-C twice and Ctrl-D.
     for (code, mods) in quit {
@@ -278,7 +353,10 @@ fn pi_renders_accepts_typing_resizes_and_exits() {
         "pi",
         "/Users/rolfs/.pi/agent/bin/pi",
         &[],
-        &[(KeyCode::Char('h'), NONE), (KeyCode::Char('i'), NONE)],
+        &"hbprobe"
+            .chars()
+            .map(|c| (KeyCode::Char(c), NONE))
+            .collect::<Vec<_>>(),
         &[(KeyCode::Char('c'), CTRL), (KeyCode::Char('c'), CTRL)],
     );
 }
@@ -301,11 +379,10 @@ fn opencode_renders_accepts_typing_resizes_and_exits() {
         "opencode",
         "/opt/homebrew/bin/opencode",
         &[],
-        &[(KeyCode::Char('h'), NONE), (KeyCode::Char('i'), NONE)],
-        &[
-            (KeyCode::Char('c'), CTRL),
-            (KeyCode::Char('c'), CTRL),
-            (KeyCode::Enter, NONE),
-        ],
+        &"hbprobe"
+            .chars()
+            .map(|c| (KeyCode::Char(c), NONE))
+            .collect::<Vec<_>>(),
+        &[(KeyCode::Char('c'), CTRL), (KeyCode::Char('c'), CTRL)],
     );
 }

@@ -126,6 +126,19 @@ impl Owner {
         assert_ok!(self.master.write_all(bytes));
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        assert_ok!(rustix::termios::tcsetwinsize(
+            &self.master,
+            Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }
+        ));
+        assert_ok!(self.seen.lock()).resize(rows, cols);
+    }
+
     /// The screen as the owner sees it.
     fn screen(&self) -> String {
         self.seen.lock().map(|s| s.text()).unwrap_or_default()
@@ -253,6 +266,59 @@ fn suspension_restores_termios_before_any_shell_can_repair_it() {
 }
 
 #[test]
+fn binary_routes_exact_bytes_and_discards_input_while_the_pane_is_hidden() {
+    sandboxed!();
+    let w = World::new("[fs]\nwrite = [\".\"]\n");
+    let script = w.project.join("record.sh");
+    let record = w.project.join("record.bin");
+    assert_ok!(std::fs::write(
+        &script,
+        "stty raw -echo\nprintf '\\033[?1hREADY\\n'\nexec cat > record.bin\n"
+    ));
+    let mut owner = Owner::start(&w, &[]);
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"n");
+    owner.wait_for("LAUNCH", 10);
+    owner.send(
+        format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .as_bytes(),
+    );
+    owner.wait_for("READY", 15);
+    owner.send(b"\r");
+    owner.wait_for("INTERACT", 10);
+    owner.send("qsr?é\t\r\x03\x1b[A".as_bytes());
+    owner.send(b"\x07");
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"\rA\x07\x07B\x1b[200~hi\x1b[201~");
+    let expected = "qsr?é\t\r\x03\x1bOAA\x07Bhi".as_bytes();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read(&record).unwrap_or_default() != expected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(assert_ok!(std::fs::read(&record)), expected);
+    owner.resize(12, 50);
+    owner.wait_for("Make the terminal larger", 10);
+    owner.wait_for("OVERVIEW", 10);
+    owner.send(b"\x1b[200~hidden\x1b[201~x\x07");
+    owner.resize(30, 120);
+    owner.wait_for("keys: supervisor", 10);
+    owner.send(b"\rS");
+    let mut final_bytes = expected.to_vec();
+    final_bytes.push(b'S');
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read(&record).unwrap_or_default() != final_bytes && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(assert_ok!(std::fs::read(&record)), final_bytes);
+    owner.send(b"\x07qy");
+    assert_eq!(owner.exit_code(15), Some(0));
+    assert_restored(&owner);
+}
+
+#[test]
 fn quitting_with_nothing_running_restores_every_terminal_mode_and_exits_cleanly() {
     sandboxed!();
     let w = World::new(PROJECT);
@@ -327,7 +393,12 @@ fn sessions_do_not_outlive_a_supervisor_that_is_killed() {
             let previous = format!("/bin/sh {}", agents.0[index - 1].1.display());
             owner.send(&vec![0x7f; previous.len()]);
         }
-        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        for key in format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .bytes()
+        {
             owner.send(&[key]);
         }
         assert!(
@@ -360,9 +431,9 @@ fn sessions_do_not_outlive_a_supervisor_that_is_killed() {
 }
 
 #[test]
-fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
+fn sigterm_sighup_and_sigquit_restore_the_terminal_and_stop_the_agent_before_exiting() {
     sandboxed!();
-    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+    for signal in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGQUIT] {
         let w = World::new(PROJECT);
         let marker = w.project.join("agent.pid");
         let script = w.project.join("agent.sh");
@@ -374,19 +445,29 @@ fn sigterm_and_sighup_restore_the_terminal_and_stop_the_agent_before_exiting() {
         owner.wait_for("Sessions", 30);
         owner.send(b"n");
         owner.wait_for("Launch a session", 10);
-        for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        for key in format!(
+            "/bin/sh '{}'\r",
+            script.display().to_string().replace('\'', "'\\''")
+        )
+        .bytes()
+        {
             owner.send(&[key]);
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(marker.exists(), "{signal:?}: no agent; {}", owner.screen());
-        let pid: i32 = assert_some!(
-            std::fs::read_to_string(&marker)
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
                 .ok()
                 .and_then(|t| t.trim().parse().ok())
-        );
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{signal:?}: no ready agent; {}",
+                owner.screen()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
         // Not 0: the owner did not ask for this. Not a signal death either: it ended itself.
         assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");
@@ -415,7 +496,12 @@ fn keys_typed_behind_the_review_key_act_on_nothing_and_a_fresh_answer_starts_the
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     owner.wait_for("Approve", 60);
@@ -489,7 +575,12 @@ fn start_review(w: &World) -> Owner {
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     owner.wait_for("Approve", 60);
@@ -507,15 +598,59 @@ fn start_review(w: &World) -> Owner {
 }
 
 #[test]
-fn sigterm_during_a_review_ends_the_supervisor_instead_of_only_the_review() {
+fn a_termination_signal_during_a_review_ends_the_supervisor_instead_of_only_the_review() {
     sandboxed!();
-    for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+    for signal in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGQUIT] {
         let w = World::new(PROJECT);
         let mut owner = start_review(&w);
         assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), signal));
         assert_eq!(owner.exit_code(60), Some(0), "{signal:?}");
         assert_restored(&owner);
     }
+}
+
+/// hb-807 review B, LOW 5: a SIGINT that arrives before the review is not the owner cancelling it.
+///
+/// Seeing the prompt is not enough: a review that was cancelled at once can print it first. The
+/// proof is a fresh, correct answer that approves, after which the agent really starts.
+#[test]
+fn a_sigint_from_before_a_review_does_not_cancel_it() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let ran = w.project.join("ran");
+    let script = w.project.join("agent.sh");
+    common::write(&script, &format!("touch '{}'\nsleep 300\n", ran.display()));
+    let mut owner = Owner::start_unapproved(&w, &[]);
+    owner.wait_for("Sessions", 30);
+    owner.send(b"n");
+    owner.wait_for("Launch a session", 10);
+    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+        owner.send(&[key]);
+    }
+    owner.wait_for("Approve", 60);
+    // A SIGINT with no review running, as from a stray Ctrl-C or a script.
+    assert_ok!(kill(Pid::from_raw(owner.child.id() as i32), Signal::SIGINT));
+    std::thread::sleep(Duration::from_millis(300));
+    owner.send(b"a");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while code_shown(&owner).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let code = assert_some!(code_shown(&owner), "no review was offered");
+    // Give a cancelled review time to have ended, then answer it: only a live review can approve.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!ran.exists(), "the agent ran before it was approved");
+    owner.send(format!("approve {code}\n").as_bytes());
+    assert!(
+        appears(&ran, 30),
+        "the review had been cancelled by the earlier SIGINT; the screen:\n{}",
+        owner.screen()
+    );
+    owner.wait_for("Running", 30);
+    owner.send(b"q");
+    owner.send(b"y");
+    assert_eq!(owner.exit_code(60), Some(0));
+    assert_restored(&owner);
 }
 
 #[test]
@@ -556,7 +691,12 @@ fn an_agent_that_never_reads_cannot_freeze_the_ui_and_quit_still_stops_it() {
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     assert!(appears(&marker, 60), "no agent; {}", owner.screen());
@@ -627,7 +767,12 @@ fn a_panic_in_a_session_thread_restores_the_terminal_stops_the_agent_and_ends_no
     owner.wait_for("Sessions", 30);
     owner.send(b"n");
     owner.wait_for("Launch a session", 10);
-    for key in format!("/bin/sh {}\r", script.display()).bytes() {
+    for key in format!(
+        "/bin/sh '{}'\r",
+        script.display().to_string().replace('\'', "'\\''")
+    )
+    .bytes()
+    {
         owner.send(&[key]);
     }
     // The panic happens as the session starts: the supervisor ends, nonzero, terminal restored.

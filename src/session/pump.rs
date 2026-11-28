@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-use super::relay::{BUFFER, DRAIN_MAX, DRAIN_QUIET, TICK_MS, end_of_output};
+use super::relay::{BUFFER, Drain, TICK_MS, end_of_output};
 use super::sanitize::{ClipboardPolicy, ClipboardUse, Sanitizer};
 
 /// A running copy of one stream to the terminal. Call [`Pump::finish`] after the agent has ended.
@@ -45,11 +45,28 @@ impl Pump {
         sink: OwnedFd,
         clipboard: ClipboardPolicy,
     ) -> io::Result<Self> {
+        Self::spawn(source, sink, clipboard, Drain::default())
+    }
+
+    fn spawn(
+        source: OwnedFd,
+        sink: OwnedFd,
+        clipboard: ClipboardPolicy,
+        drain: Drain,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("hb-pump".to_owned())
-            .spawn(move || run(File::from(source), File::from(sink), &flag, clipboard))?;
+            .spawn(move || {
+                run(
+                    File::from(source),
+                    File::from(sink),
+                    &flag,
+                    clipboard,
+                    drain,
+                )
+            })?;
         Ok(Self { stop, handle })
     }
 
@@ -62,18 +79,36 @@ impl Pump {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DrainClock {
+    started: Instant,
+    last_output: Instant,
+}
+
+impl DrainClock {
+    fn expired(self, now: Instant, ready: bool, drain: Drain) -> bool {
+        (!ready && now.duration_since(self.last_output) >= drain.quiet)
+            || now.duration_since(self.started) >= drain.max
+    }
+}
+
 fn run(
     mut source: File,
     mut sink: File,
     stop: &AtomicBool,
     clipboard: ClipboardPolicy,
+    drain: Drain,
 ) -> ClipboardUse {
     let mut filter = Sanitizer::with_clipboard(clipboard);
-    let mut draining_since: Option<Instant> = None;
+    let mut draining: Option<DrainClock> = None;
     let mut buffer = [0u8; BUFFER];
     loop {
-        if stop.load(Ordering::Relaxed) && draining_since.is_none() {
-            draining_since = Some(Instant::now());
+        if stop.load(Ordering::Relaxed) && draining.is_none() {
+            let now = Instant::now();
+            draining = Some(DrainClock {
+                started: now,
+                last_output: now,
+            });
         }
         let mut fds = [PollFd::new(source.as_fd(), PollFlags::POLLIN)];
         let ready = match poll(&mut fds, PollTimeout::from(TICK_MS)) {
@@ -86,16 +121,22 @@ fn run(
             match source.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let delivery_started = Instant::now();
                     let mut clean = Vec::with_capacity(n);
                     filter.feed(&buffer[..n], &mut clean);
                     // The terminal may be gone; nothing useful to do about that here.
                     let _ = sink.write_all(&clean);
                     let _ = sink.flush();
+                    if let Some(clock) = &mut draining {
+                        // Terminal backpressure is not silence from the agent.
+                        clock.started += delivery_started.elapsed();
+                        clock.last_output = Instant::now();
+                    }
                 }
             }
         }
-        if let Some(since) = draining_since
-            && (!ready && since.elapsed() >= DRAIN_QUIET || since.elapsed() >= DRAIN_MAX)
+        if let Some(clock) = draining
+            && clock.expired(Instant::now(), ready, drain)
         {
             break;
         }
@@ -106,6 +147,7 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::relay::{DRAIN_MAX, DRAIN_QUIET};
     use super::*;
     use claims::assert_ok;
     use pretty_assertions::assert_eq;
@@ -120,10 +162,19 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_draining(Drain::default())
+    }
+
+    fn rig_draining(drain: Drain) -> Rig {
         let (agent, theirs) = assert_ok!(UnixStream::pair());
         let (screen, sink) = assert_ok!(UnixStream::pair());
         assert_ok!(screen.set_read_timeout(Some(Duration::from_millis(300))));
-        let pump = assert_ok!(Pump::start(OwnedFd::from(theirs), OwnedFd::from(sink)));
+        let pump = assert_ok!(Pump::spawn(
+            OwnedFd::from(theirs),
+            OwnedFd::from(sink),
+            ClipboardPolicy::default(),
+            drain
+        ));
         Rig {
             agent,
             screen,
@@ -141,6 +192,26 @@ mod tests {
             seen.extend_from_slice(&buffer[..n]);
         }
         seen
+    }
+
+    #[test]
+    fn recent_output_restarts_quiet_time_without_extending_the_maximum() {
+        let start = Instant::now();
+        let clock = DrainClock {
+            started: start,
+            last_output: start + DRAIN_QUIET,
+        };
+        assert!(!clock.expired(
+            start + DRAIN_QUIET + Duration::from_millis(1),
+            false,
+            Drain::default()
+        ));
+        assert!(clock.expired(start + DRAIN_QUIET * 2, false, Drain::default()));
+        let busy = DrainClock {
+            started: start,
+            last_output: start + DRAIN_MAX,
+        };
+        assert!(busy.expired(start + DRAIN_MAX, true, Drain::default()));
     }
 
     #[test]
@@ -186,19 +257,22 @@ mod tests {
         assert_eq!(rig.pump.finish().allowed, 1);
     }
 
+    // Test scheduling slack; production limits are checked separately by the clock test.
+    const SLOW_RUNNER: Drain = Drain {
+        quiet: Duration::from_millis(900),
+        max: Duration::from_millis(1500),
+    };
+
     #[test]
     fn output_that_arrives_shortly_after_the_agent_ended_is_still_copied() {
-        let mut rig = rig();
+        let mut rig = rig_draining(SLOW_RUNNER);
         let mut agent = assert_ok!(rig.agent.try_clone());
         let writer = thread::spawn(move || {
-            // After the pump's first idle poll of the drain (50 ms) and inside its quiet window (150 ms).
-            thread::sleep(Duration::from_millis(110));
+            // Exercise idle polls before the output arrives, within the test quiet window.
+            thread::sleep(Duration::from_millis(250));
             let _ = agent.write_all(b"just in time");
         });
-        assert_ok!(
-            rig.screen
-                .set_read_timeout(Some(Duration::from_millis(600)))
-        );
+        assert_ok!(rig.screen.set_read_timeout(Some(Duration::from_secs(2))));
         rig.pump.finish();
         assert_ok!(writer.join().map_err(|_| "writer panicked"));
         assert_eq!(read_all(&mut rig.screen), b"just in time");
@@ -242,7 +316,7 @@ mod tests {
 
     #[test]
     fn a_writer_that_never_stops_still_lets_the_run_end() {
-        let mut rig = rig();
+        let mut rig = rig_draining(SLOW_RUNNER);
         let mut agent = assert_ok!(rig.agent.try_clone());
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
@@ -251,7 +325,8 @@ mod tests {
                 if agent.write_all(b"noise").is_err() {
                     break;
                 }
-                thread::sleep(Duration::from_millis(20));
+                // Leave idle polls between writes, without reaching the quiet limit.
+                thread::sleep(Duration::from_millis(120));
             }
         });
         assert_ok!(rig.screen.set_read_timeout(Some(Duration::from_millis(20))));
@@ -268,6 +343,10 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         let _ = writer.join();
         let _ = drain.join();
-        assert!(took < DRAIN_MAX + Duration::from_secs(1), "{took:?}");
+        assert!(
+            took >= SLOW_RUNNER.max,
+            "stream was cut off while still writing: {took:?}"
+        );
+        assert!(took < SLOW_RUNNER.max + Duration::from_secs(1), "{took:?}");
     }
 }

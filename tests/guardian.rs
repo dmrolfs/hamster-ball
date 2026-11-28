@@ -395,6 +395,25 @@ fn broker_watches_beyond_capacity_are_refused_not_reported_as_success() {
 }
 
 #[test]
+fn a_guarded_broker_command_completes_its_ticket_without_waiting_for_hb_to_die() {
+    use hamster_ball::ctl::runner::{Cancel, Capture, Execute, Host};
+    let guard = guardian();
+    let host = Host::new("/usr/bin:/bin", |_| None).with_guard(guard.handle(), HB.into());
+    for _ in 0..20 {
+        let result = assert_ok!(host.run(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "printf ticket-done".into()],
+            Capture::Tail(100),
+            Duration::from_secs(5),
+            &Cancel::default(),
+        ));
+        assert!(result.success);
+        assert_eq!(result.bytes, b"ticket-done");
+    }
+    guard.release();
+}
+
+#[test]
 fn a_broker_command_the_guard_refuses_is_killed_and_reported() {
     use hamster_ball::ctl::runner::{Cancel, Capture, Execute, Host, RunError};
     let guard = guardian();

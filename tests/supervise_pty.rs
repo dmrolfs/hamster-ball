@@ -32,6 +32,22 @@ struct Live {
     ended: Arc<Mutex<bool>>,
 }
 
+impl Drop for Live {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn size(rows: u16, cols: u16) -> Winsize {
     Winsize {
         ws_row: rows,
@@ -226,6 +242,7 @@ fn bracketed_paste_markers_are_sent_only_after_the_program_asks_and_cannot_be_en
         "no markers were asked for:\n{}",
         plain.text()
     );
+    assert!(plain.finish(10).success());
     // With the mode on: one start marker, the text, one end marker; the text's own end marker is gone.
     let mut asked = Live::start(
         60,
@@ -266,6 +283,7 @@ fn bracketed_paste_markers_are_sent_only_after_the_program_asks_and_cannot_be_en
         "{joined}"
     );
     assert_eq!(joined.matches("30 31 7e").count(), 1, "{joined}");
+    assert!(asked.finish(10).success());
 }
 
 #[test]
@@ -316,7 +334,8 @@ fn arrow_keys_follow_the_programs_cursor_mode() {
     live.key(KeyCode::Up, KeyModifiers::NONE);
     live.key(KeyCode::Char('x'), KeyModifiers::NONE);
     live.wait_for("^[OAx", 10);
-    live.send(&[4]);
+    live.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!live.finish(10).success());
 }
 
 #[test]

@@ -636,3 +636,100 @@ fn an_unusable_descriptor_variable_ends_the_process_and_is_reported() {
         common::stderr(&out)
     );
 }
+
+/// A background child of the agent that ignores TERM and HUP, started by a shell that then waits.
+/// The leader dies of TERM at once; the child stays in the agent's group.
+#[test]
+fn an_open_quiet_supervisor_channel_expires_without_its_first_heartbeat() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut session = Session::start(&w, &[], &["/bin/sleep", "180"], true);
+    session.wait_for("running", 30);
+    let ended = session.finish(80);
+    assert!(
+        ended
+            .frames
+            .iter()
+            .any(|frame| matches!(frame.event, Event::Stopping { .. }))
+    );
+}
+
+#[test]
+fn fresh_supervisor_progress_keeps_an_idle_session_alive_beyond_bootstrap_grace() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let mut session = Session::start(&w, &[], &["/bin/sleep", "180"], true);
+    session.wait_for("running", 30);
+    let until = Instant::now() + Duration::from_secs(65);
+    while Instant::now() < until {
+        let progress = assert_ok!(hamster_ball::session::lease::Progress::now());
+        assert_ok!(session.peer.write_all(&assert_ok!(encode_line(
+            &hamster_ball::session::supervised::Command::Heartbeat {
+                progress_ns: progress.0
+            }
+        ))));
+        assert_eq!(assert_ok!(session.child.try_wait()), None);
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    session.close_channel();
+    session.finish(30);
+}
+
+fn term_ignoring_child_script(pid_file: &std::path::Path) -> String {
+    format!(
+        "(trap '' TERM HUP; exec sleep 90) </dev/null >/dev/null 2>&1 & echo $! > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 120",
+        pid_file.display()
+    )
+}
+
+/// hb-807 review A, HIGH 1: closing the channel must end descendants too, not only the leader.
+/// The leader exits on TERM inside the grace period, which used to disarm the SIGKILL that was
+/// meant for the rest of the group.
+#[test]
+fn closing_the_channel_also_ends_a_term_ignoring_descendant_of_a_leader_that_exits() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let pid_file = w.project.join("child.pid");
+    let script = term_ignoring_child_script(&pid_file);
+    let mut session = Session::start(&w, &[], &["/bin/sh", "-c", &script], true);
+    session.wait_for("running", 60);
+    let child: i32 = assert_ok!(wait_for_file(&pid_file, 20).trim().parse());
+    assert!(alive(child), "the descendant did not start");
+    session.close_channel();
+    let ended = session.finish(40);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(child) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let survived = alive(child);
+    if survived {
+        let _ = kill(Pid::from_raw(child), nix::sys::signal::Signal::SIGKILL);
+    }
+    assert!(!survived, "the TERM-ignoring descendant {child} survived");
+    // It is ended at the end of the grace period (2 s here), not instantly and not never.
+    assert!(ended.took < Duration::from_secs(25), "{:?}", ended.took);
+}
+
+/// The control: nothing asked to stop, the leader just finishes, and hb leaves the background
+/// child alone as before. This is what keeps the fix from becoming a kill-everything-at-exit rule.
+#[test]
+fn a_leader_that_simply_exits_leaves_its_background_child_alone() {
+    sandboxed!();
+    let w = World::new(PROJECT);
+    let pid_file = w.project.join("child.pid");
+    let script = format!(
+        "(exec sleep 90) </dev/null >/dev/null 2>&1 & echo $! > '{0}.tmp'; mv '{0}.tmp' '{0}'",
+        pid_file.display()
+    );
+    let mut session = Session::start(&w, &[], &["/bin/sh", "-c", &script], true);
+    session.wait_for("running", 60);
+    let child: i32 = assert_ok!(wait_for_file(&pid_file, 20).trim().parse());
+    let _ended = session.finish(40);
+    std::thread::sleep(Duration::from_millis(500));
+    let alive_after = alive(child);
+    let _ = kill(Pid::from_raw(child), nix::sys::signal::Signal::SIGKILL);
+    assert!(
+        alive_after,
+        "a normal exit now kills background children; that is a behaviour change"
+    );
+}

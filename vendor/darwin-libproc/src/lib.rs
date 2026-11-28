@@ -24,6 +24,7 @@ mod pid_cwd;
 mod pid_info;
 mod pid_path;
 mod pid_rusage;
+mod self_fds;
 mod version;
 
 // Structs re-export
@@ -41,4 +42,5 @@ pub use self::pid_cwd::pid_cwd;
 pub use self::pid_info::{task_all_info, task_info, vnode_path_info};
 pub use self::pid_path::pid_path;
 pub use self::pid_rusage::*;
+pub use self::self_fds::self_fds;
 pub use self::version::version;
